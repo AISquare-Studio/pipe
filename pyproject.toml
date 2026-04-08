@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe"
+version = "0.1.0"
+description = "Universal anything-to-anything connector framework"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+authors = [{name = "A-Square"}]
+keywords = ["connectors", "data-pipeline", "etl", "integration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+
+[project.scripts]
+pipe = "aisquare.pipe.cli.main:cli"
+
+[project.entry-points."aisquare_pipe.connectors"]
+mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
+mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
+
+[project.entry-points."aisquare_pipe.converters"]
+mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
