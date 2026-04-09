@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe-dropbox"
+version = "0.1.0"
+description = "Dropbox connector for aisquare.pipe"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "A-Square"}]
+dependencies = [
+    "aisquare-pipe>=0.1.0",
+    "dropbox>=12.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+
+[project.entry-points."aisquare_pipe.connectors"]
+dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
+dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
