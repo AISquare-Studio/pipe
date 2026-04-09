@@ -11,6 +11,7 @@ import sys
 import click
 
 from aisquare.pipe.core.connector import SinkConnector, SourceConnector
+from aisquare.pipe.core.envelope import PullParams, PushParams
 from aisquare.pipe.core.pipeline import Pipeline
 from aisquare.pipe.core.registry import discover_connectors, get_connector
 from aisquare.pipe.core.types import TypeMatcher
@@ -119,7 +120,21 @@ def check(source_name: str, sink_name: str) -> None:
 @click.option("--source", "source_name", required=True, help="Source connector name")
 @click.option("--sink", "sink_name", required=True, help="Sink connector name")
 @click.option("--config", "config_path", required=True, help="Path to JSON config file")
-def run(source_name: str, sink_name: str, config_path: str) -> None:
+@click.option(
+    "--pull-params", "pull_params_json", default=None,
+    help='JSON string of pull params, e.g. \'{"recursive": true, "extensions": [".pdf"]}\'',
+)
+@click.option(
+    "--push-params", "push_params_json", default=None,
+    help='JSON string of push params, e.g. \'{"target_path": "backup", "conflict": "overwrite"}\'',
+)
+def run(
+    source_name: str,
+    sink_name: str,
+    config_path: str,
+    pull_params_json: str | None,
+    push_params_json: str | None,
+) -> None:
     """Build and run a pipeline from CLI args."""
     try:
         source_cls = get_connector(source_name)
@@ -135,10 +150,26 @@ def run(source_name: str, sink_name: str, config_path: str) -> None:
         click.echo(f"Error reading config: {e}", err=True)
         sys.exit(1)
 
+    pull_params = None
+    if pull_params_json:
+        try:
+            pull_params = PullParams(params=json.loads(pull_params_json))
+        except Exception as e:
+            click.echo(f"Error parsing --pull-params: {e}", err=True)
+            sys.exit(1)
+
+    push_params = None
+    if push_params_json:
+        try:
+            push_params = PushParams(params=json.loads(push_params_json))
+        except Exception as e:
+            click.echo(f"Error parsing --push-params: {e}", err=True)
+            sys.exit(1)
+
     source = source_cls()
     sink = sink_cls()
     pipeline = Pipeline(source=source, sink=sink)
-    result = pipeline.run(config)
+    result = pipeline.run(config, pull_params=pull_params, push_params=push_params)
 
     click.echo(f"Success: {result.success_count}")
     click.echo(f"Failed:  {result.failure_count}")

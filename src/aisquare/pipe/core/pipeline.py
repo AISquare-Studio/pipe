@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from aisquare.pipe.core.connector import SinkConnector, SourceConnector
-from aisquare.pipe.core.envelope import DataEnvelope, PushResult
+from aisquare.pipe.core.envelope import DataEnvelope, PullParams, PushParams, PushResult
 from aisquare.pipe.core.merge import MergeStrategy, apply_merge
 from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
 from aisquare.pipe.errors import (
@@ -83,13 +83,15 @@ class Pipeline:
                 f"Config validation failed for sink '{self.sink.name}'"
             )
 
-    def _pull_envelopes(self, config: dict) -> Iterator[DataEnvelope]:
+    def _pull_envelopes(
+        self, config: dict, pull_params: PullParams | None = None
+    ) -> Iterator[DataEnvelope]:
         """Pull envelopes, applying merge strategy if multiple sources."""
         sources = self._get_sources()
 
         if len(sources) == 1:
             src_config = config.get(sources[0].name, config)
-            yield from sources[0].pull(src_config)
+            yield from sources[0].pull(src_config, pull_params)
             return
 
         if self.merge is None:
@@ -101,13 +103,13 @@ class Pipeline:
             source_iters: dict[str, Iterator[DataEnvelope]] = {}
             for name, src in self.source.items():
                 src_config = config.get(src.name, config)
-                source_iters[name] = src.pull(src_config)
+                source_iters[name] = src.pull(src_config, pull_params)
             yield from apply_merge(self.merge, source_iters)
         else:
             source_list: list[Iterator[DataEnvelope]] = []
             for src in sources:
                 src_config = config.get(src.name, config)
-                source_list.append(src.pull(src_config))
+                source_list.append(src.pull(src_config, pull_params))
             yield from apply_merge(self.merge, source_list)
 
     def _check_metadata(self, envelope: DataEnvelope) -> list[str]:
@@ -123,13 +125,18 @@ class Pipeline:
                 )
         return warnings
 
-    def run(self, config: dict) -> PipelineResult:
+    def run(
+        self,
+        config: dict,
+        pull_params: PullParams | None = None,
+        push_params: PushParams | None = None,
+    ) -> PipelineResult:
         """Execute the pipeline end-to-end."""
         self._validate_configs(config)
 
         result = PipelineResult()
 
-        for idx, envelope in enumerate(self._pull_envelopes(config)):
+        for idx, envelope in enumerate(self._pull_envelopes(config, pull_params)):
             try:
                 # Type matching
                 match = self._matcher.match(
@@ -174,7 +181,7 @@ class Pipeline:
 
                 # Push
                 sink_config = config.get(self.sink.name, config)
-                push_result = self.sink.push(envelope, sink_config)
+                push_result = self.sink.push(envelope, sink_config, push_params)
                 result.results.append(push_result)
 
                 if push_result.success:
