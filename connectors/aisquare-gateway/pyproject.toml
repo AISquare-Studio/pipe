@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe-aisquare-gateway"
+version = "0.1.0"
+description = "AISquare Explainability gateway sink for aisquare.pipe"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "A-Square"}]
+dependencies = [
+    "aisquare-pipe>=0.1.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+
+[project.entry-points."aisquare_pipe.connectors"]
+aisquare-gateway = "aisquare_pipe_gateway.sink:AISquareGatewaySink"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
