@@ -16,16 +16,21 @@ API_KEY = "test-key"
 class MockN8n:
     """Programmable mock n8n server.
 
-    Tests set ``server.executions`` (the full list, ascending by id) and
-    ``server.workflows``. The handler emulates the parts of the n8n API
-    the connector uses: ``GET /api/v1/executions`` with ``lastId``,
-    ``workflowId``, ``limit``, ``includeData`` query params, plus
-    ``GET /api/v1/workflows``.
+    Tests set ``server.executions`` (full list, any order — handler sorts
+    descending to mimic n8n) and ``server.workflow_defs`` (keyed by
+    workflow id, returned by ``GET /api/v1/workflows/{id}``).
+
+    Handled endpoints:
+      * ``GET /api/v1/executions`` — supports ``workflowId``, ``limit``,
+        ``includeData``, ``status=running`` query params.
+      * ``GET /api/v1/workflows`` — used by ``N8nClient.validate``.
+      * ``GET /api/v1/workflows/{id}`` — used to enrich in-progress stubs.
     """
 
     def __init__(self) -> None:
         self.executions: list[dict[str, Any]] = []
         self.workflows: list[dict[str, Any]] = [{"id": "wf-1", "name": "Demo"}]
+        self.workflow_defs: dict[str, dict[str, Any]] = {}
         self.require_auth = True
         self.requests: list[tuple[str, dict[str, list[str]], dict[str, str]]] = []
         self._server: HTTPServer | None = None
@@ -80,17 +85,26 @@ def _make_handler(state: MockN8n) -> type[BaseHTTPRequestHandler]:
                 return
 
             if parsed.path == "/api/v1/workflows":
-                self._write_json(200, {"data": state.workflows[: int(query.get("limit", ["100"])[0])]})
+                limit = int(query.get("limit", ["100"])[0])
+                self._write_json(200, {"data": state.workflows[:limit]})
+                return
+
+            if parsed.path.startswith("/api/v1/workflows/"):
+                wid = parsed.path.rsplit("/", 1)[1]
+                if wid in state.workflow_defs:
+                    self._write_json(200, state.workflow_defs[wid])
+                else:
+                    self._write_json(404, {"error": "workflow not found"})
                 return
 
             if parsed.path == "/api/v1/executions":
-                last_id = int(query.get("lastId", ["0"])[0])
                 workflow_id = query.get("workflowId", [None])[0]
                 limit = int(query.get("limit", ["100"])[0])
+                status_filter = query.get("status", [None])[0]
 
-                filtered = [
-                    e for e in state.executions if int(e["id"]) > last_id
-                ]
+                filtered = list(state.executions)
+                if status_filter == "running":
+                    filtered = [e for e in filtered if not e.get("finished")]
                 if workflow_id:
                     filtered = [
                         e for e in filtered if str(e.get("workflowId")) == workflow_id

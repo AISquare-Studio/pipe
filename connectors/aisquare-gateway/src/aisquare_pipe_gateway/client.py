@@ -16,6 +16,7 @@ logger = logging.getLogger("aisquare.pipe.aisquare_gateway")
 HEADER_API_KEY = "X-API-KEY"
 HEADER_SOURCE_ID = "X-AISquare-Source-Id"
 HEADER_CONTENT_TYPE = "X-AISquare-Content-Type"
+HEADER_IDEMPOTENCY_KEY = "X-Idempotency-Key"
 
 DEFAULT_INGEST_PATH = "/v1/traces/ingest"
 DEFAULT_TIMEOUT = 10
@@ -76,8 +77,14 @@ class GatewayClient:
         *,
         source_id: str,
         content_type: str,
+        idempotency_key: str | None = None,
     ) -> IngestResponse:
         """POST one envelope payload. Returns the final response after retries.
+
+        ``idempotency_key`` rides as ``X-Idempotency-Key`` — the gateway
+        dedupes by it, so callers should pass a stable key per logical
+        emission (e.g. ``n8n:final:<trace_id>``) and the same key across
+        retries.
 
         Raises requests.RequestException only after retries are exhausted on
         transport failures.
@@ -88,6 +95,8 @@ class GatewayClient:
             HEADER_CONTENT_TYPE: content_type,
             "Content-Type": "application/json",
         }
+        if idempotency_key:
+            headers[HEADER_IDEMPOTENCY_KEY] = idempotency_key
         url = self._ingest_url()
 
         attempts = 0

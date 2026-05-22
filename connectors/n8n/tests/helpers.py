@@ -5,6 +5,25 @@ from __future__ import annotations
 from typing import Any
 
 
+def make_workflow_def(
+    *,
+    workflow_id: str = "wf-1",
+    name: str = "Demo Workflow",
+    node_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build an n8n-shaped workflow definition payload."""
+    node_names = node_names or ["Start", "AI Agent"]
+    return {
+        "id": workflow_id,
+        "name": name,
+        "nodes": [
+            {"name": n, "type": "n8n-nodes-base.noOp", "parameters": {}}
+            for n in node_names
+        ],
+        "tags": [],
+    }
+
+
 def make_execution(
     *,
     execution_id: int,

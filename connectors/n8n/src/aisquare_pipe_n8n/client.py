@@ -61,11 +61,15 @@ class N8nClient:
         workflow_ids: list[str] | None = None,
         include_data: bool = True,
         limit: int = 100,
+        finished_only: bool = True,
     ) -> list[dict[str, Any]]:
         """Return executions newer than last_id, sorted ascending by id.
 
         n8n's API returns the most recent first; we sort ascending so the
-        cursor advances monotonically.
+        cursor advances monotonically. When ``finished_only`` is True (the
+        default) we drop in-progress runs so the cursor never advances
+        past an unfinished execution — those are handled separately by
+        :meth:`list_running_executions`.
         """
         # n8n's API does not support a lastId query parameter. We over-fetch
         # using `limit` and then filter client-side. For v1 demo loads this
@@ -87,6 +91,9 @@ class N8nClient:
             page = self._get("/api/v1/executions", params)
             executions = page.get("data", [])
 
+        if finished_only:
+            executions = [e for e in executions if e.get("finished")]
+
         # Filter strictly greater than last_id (n8n's lastId may be inclusive).
         if last_id:
             executions = [
@@ -95,6 +102,50 @@ class N8nClient:
 
         executions.sort(key=lambda e: int(e.get("id", 0)))
         return executions
+
+    def list_running_executions(
+        self,
+        workflow_ids: list[str] | None = None,
+        include_data: bool = True,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Fetch in-progress executions. With ``include_data=True``, n8n
+        returns the runData accumulated so far — used to emit progressive
+        trace updates as nodes complete inside a still-running workflow.
+        """
+        base_params: dict[str, Any] = {
+            "limit": limit,
+            "status": "running",
+            "includeData": "true" if include_data else "false",
+        }
+
+        if workflow_ids:
+            collected: list[dict[str, Any]] = []
+            for wid in workflow_ids:
+                page = self._get(
+                    "/api/v1/executions", {**base_params, "workflowId": wid}
+                )
+                collected.extend(page.get("data", []))
+        else:
+            page = self._get("/api/v1/executions", base_params)
+            collected = page.get("data", [])
+
+        # Defensive: n8n's status filter is honoured on supported versions;
+        # we still strip any finished executions that slip through.
+        return [e for e in collected if not e.get("finished")]
+
+    def get_workflow_definition(self, workflow_id: str) -> dict[str, Any] | None:
+        """Return ``{name, nodes: [...], ...}`` or None when the workflow
+        isn't reachable. Used to enrich stub traces with the workflow's
+        true name + node list."""
+        try:
+            return self._get(f"/api/v1/workflows/{workflow_id}")
+        except PipelineError as e:
+            logger.warning(
+                "n8n get_workflow_definition(%s) failed: %s — returning None",
+                workflow_id, e,
+            )
+            return None
 
     def list_workflows(self) -> list[dict[str, Any]]:
         """Cheap call used to validate credentials."""

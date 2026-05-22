@@ -9,6 +9,7 @@ from aisquare.pipe.errors import ConfigValidationError
 from aisquare_pipe_gateway.client import (
     HEADER_API_KEY,
     HEADER_CONTENT_TYPE,
+    HEADER_IDEMPOTENCY_KEY,
     HEADER_SOURCE_ID,
     GatewayClient,
 )
@@ -61,6 +62,27 @@ class TestIngestHappy:
             {"e": 1}, source_id="s", content_type="t/t"
         )
         assert server.received[0]["path"] == "/v2/ingest"
+
+    def test_idempotency_header_set_when_provided(self, gateway_config):
+        server = gateway_config["_server"]
+        server.enqueue(200, {"trace_id": "x"})
+        GatewayClient(gateway_config).ingest(
+            {"e": 1},
+            source_id="s",
+            content_type="t/t",
+            idempotency_key="n8n:final:abc",
+        )
+        headers = server.received[0]["headers"]
+        assert headers[HEADER_IDEMPOTENCY_KEY] == "n8n:final:abc"
+
+    def test_idempotency_header_omitted_when_absent(self, gateway_config):
+        server = gateway_config["_server"]
+        server.enqueue(200, {"trace_id": "x"})
+        GatewayClient(gateway_config).ingest(
+            {"e": 1}, source_id="s", content_type="t/t"
+        )
+        headers = server.received[0]["headers"]
+        assert HEADER_IDEMPOTENCY_KEY not in headers
 
 
 class TestRetryPolicy:

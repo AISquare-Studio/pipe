@@ -1,0 +1,109 @@
+{
+  "spans": [
+    {
+      "attributes": {
+        "agent.metadata.agent_name": "Linear Demo",
+        "agent.metadata.domain": "n8n_workflow",
+        "agent.metadata.parent_run_id": "n8n-workflow-wf-linear",
+        "agent.metadata.run.title": "Linear Demo \u00b7 execution #100",
+        "agent.metadata.run_kind": "n8n_execution",
+        "agent.metadata.session.id": "n8n-workflow-wf-linear",
+        "agent.metadata.source": "n8n",
+        "agent.metadata.workflow_name": "Linear Demo",
+        "agent.name": "Linear Demo",
+        "n8n.event": "workflow_start",
+        "n8n.execution_id": "100",
+        "n8n.mode": "trigger",
+        "n8n.started_at": "2026-01-15T10:00:00.000Z",
+        "n8n.workflow_id": "wf-linear",
+        "n8n.workflow_name": "Linear Demo",
+        "openinference.span.kind": "AGENT"
+      },
+      "end_time": 1768471205249999872,
+      "kind": "INTERNAL",
+      "name": "Linear Demo",
+      "parent_span_id": null,
+      "span_id": "n8n-wf-linear-100-start",
+      "start_time": 1768471200000000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-linear-100"
+    },
+    {
+      "attributes": {
+        "n8n.event": "node_step",
+        "n8n.execution_id": "100",
+        "n8n.execution_time_ms": 50,
+        "n8n.input_items": 0,
+        "n8n.node_name": "Start",
+        "n8n.output_items": 1,
+        "n8n.output_preview": "{\n  \"ok\": true\n}",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-linear",
+        "n8n.workflow_name": "Linear Demo",
+        "openinference.span.kind": "CHAIN"
+      },
+      "end_time": 1768514400050000000,
+      "kind": "INTERNAL",
+      "name": "Start",
+      "parent_span_id": "n8n-wf-linear-100-start",
+      "span_id": "n8n-wf-linear-100-node-Start-0",
+      "start_time": 1768514400000000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-linear-100"
+    },
+    {
+      "attributes": {
+        "llm.model_name": "claude-sonnet-4-5-20250929",
+        "llm.output_messages.0.message.content": "{\n  \"reply\": \"Hello from Claude\",\n  \"tokens\": {\n    \"input\": 12,\n    \"output\": 5\n  }\n}",
+        "llm.system": "Anthropic Claude",
+        "n8n.event": "node_step",
+        "n8n.execution_id": "100",
+        "n8n.execution_time_ms": 4900,
+        "n8n.input_items": 1,
+        "n8n.node_name": "Anthropic Claude",
+        "n8n.output_items": 1,
+        "n8n.output_preview": "{\n  \"reply\": \"Hello from Claude\",\n  \"tokens\": {\n    \"input\": 12,\n    \"output\": 5\n  }\n}",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-linear",
+        "n8n.workflow_name": "Linear Demo",
+        "openinference.span.kind": "LLM"
+      },
+      "end_time": 1768514404960000000,
+      "kind": "INTERNAL",
+      "name": "Anthropic Claude",
+      "parent_span_id": "n8n-wf-linear-100-start",
+      "span_id": "n8n-wf-linear-100-node-Anthropic-Claude-0",
+      "start_time": 1768514400060000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-linear-100"
+    },
+    {
+      "attributes": {
+        "n8n.event": "workflow_complete",
+        "n8n.execution_id": "100",
+        "n8n.status": "success",
+        "n8n.stopped_at": "2026-01-15T10:00:05.250Z",
+        "n8n.workflow_id": "wf-linear",
+        "n8n.workflow_name": "Linear Demo",
+        "openinference.span.kind": "CHAIN"
+      },
+      "end_time": 1768471205249999872,
+      "kind": "INTERNAL",
+      "name": "Linear Demo \u00b7 complete",
+      "parent_span_id": "n8n-wf-linear-100-start",
+      "span_id": "n8n-wf-linear-100-complete",
+      "start_time": 1768471205249999872,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-linear-100"
+    }
+  ],
+  "trace_id": "n8n-wf-linear-100"
+}

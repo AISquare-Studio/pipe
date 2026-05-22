@@ -1,0 +1,82 @@
+{
+  "spans": [
+    {
+      "attributes": {
+        "agent.metadata.agent_name": "Errored Demo",
+        "agent.metadata.domain": "n8n_workflow",
+        "agent.metadata.parent_run_id": "n8n-workflow-wf-err",
+        "agent.metadata.run.title": "Errored Demo \u00b7 execution #300",
+        "agent.metadata.run_kind": "n8n_execution",
+        "agent.metadata.session.id": "n8n-workflow-wf-err",
+        "agent.metadata.source": "n8n",
+        "agent.metadata.workflow_name": "Errored Demo",
+        "agent.name": "Errored Demo",
+        "n8n.event": "workflow_start",
+        "n8n.execution_id": "300",
+        "n8n.mode": "manual",
+        "n8n.started_at": "2026-01-15T12:00:00.000Z",
+        "n8n.workflow_id": "wf-err",
+        "n8n.workflow_name": "Errored Demo",
+        "openinference.span.kind": "AGENT"
+      },
+      "end_time": 1768478402000000000,
+      "kind": "INTERNAL",
+      "name": "Errored Demo",
+      "parent_span_id": null,
+      "span_id": "n8n-wf-err-300-start",
+      "start_time": 1768478400000000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-err-300"
+    },
+    {
+      "attributes": {
+        "llm.model_name": "OpenAI GPT (model unspecified)",
+        "llm.system": "OpenAI GPT",
+        "n8n.error": "rate limit exceeded",
+        "n8n.event": "node_step",
+        "n8n.execution_id": "300",
+        "n8n.execution_time_ms": 1900,
+        "n8n.input_items": 0,
+        "n8n.node_name": "OpenAI GPT",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-err",
+        "n8n.workflow_name": "Errored Demo",
+        "openinference.span.kind": "LLM"
+      },
+      "end_time": 1768521601900000000,
+      "kind": "INTERNAL",
+      "name": "OpenAI GPT",
+      "parent_span_id": "n8n-wf-err-300-start",
+      "span_id": "n8n-wf-err-300-node-OpenAI-GPT-0",
+      "start_time": 1768521600000000000,
+      "status": {
+        "code": "ERROR"
+      },
+      "trace_id": "n8n-wf-err-300"
+    },
+    {
+      "attributes": {
+        "n8n.event": "workflow_complete",
+        "n8n.execution_id": "300",
+        "n8n.status": "error",
+        "n8n.stopped_at": "2026-01-15T12:00:02.000Z",
+        "n8n.workflow_id": "wf-err",
+        "n8n.workflow_name": "Errored Demo",
+        "openinference.span.kind": "CHAIN"
+      },
+      "end_time": 1768478402000000000,
+      "kind": "INTERNAL",
+      "name": "Errored Demo \u00b7 complete",
+      "parent_span_id": "n8n-wf-err-300-start",
+      "span_id": "n8n-wf-err-300-complete",
+      "start_time": 1768478402000000000,
+      "status": {
+        "code": "ERROR"
+      },
+      "trace_id": "n8n-wf-err-300"
+    }
+  ],
+  "trace_id": "n8n-wf-err-300"
+}

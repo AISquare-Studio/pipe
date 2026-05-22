@@ -1,0 +1,137 @@
+{
+  "spans": [
+    {
+      "attributes": {
+        "agent.metadata.agent_name": "Branching Demo",
+        "agent.metadata.domain": "hrms",
+        "agent.metadata.parent_run_id": "n8n-workflow-wf-branching",
+        "agent.metadata.run.title": "Branching Demo \u00b7 execution #200",
+        "agent.metadata.run_kind": "n8n_execution",
+        "agent.metadata.session.id": "n8n-workflow-wf-branching",
+        "agent.metadata.source": "n8n",
+        "agent.metadata.workflow_name": "Branching Demo",
+        "agent.name": "Branching Demo",
+        "n8n.event": "workflow_start",
+        "n8n.execution_id": "200",
+        "n8n.mode": "webhook",
+        "n8n.started_at": "2026-01-15T11:00:00.000Z",
+        "n8n.workflow_id": "wf-branching",
+        "n8n.workflow_name": "Branching Demo",
+        "openinference.span.kind": "AGENT"
+      },
+      "end_time": 1768474801500000000,
+      "kind": "INTERNAL",
+      "name": "Branching Demo",
+      "parent_span_id": null,
+      "span_id": "n8n-wf-branching-200-start",
+      "start_time": 1768474800000000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-branching-200"
+    },
+    {
+      "attributes": {
+        "n8n.event": "node_step",
+        "n8n.execution_id": "200",
+        "n8n.execution_time_ms": 10,
+        "n8n.input_items": 0,
+        "n8n.node_name": "Webhook",
+        "n8n.output_items": 1,
+        "n8n.output_preview": "{\n  \"event\": \"submitted\"\n}",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-branching",
+        "n8n.workflow_name": "Branching Demo",
+        "openinference.span.kind": "TOOL",
+        "tool.name": "Webhook",
+        "tool.return_value": "{\n  \"event\": \"submitted\"\n}"
+      },
+      "end_time": 1768518000010000000,
+      "kind": "INTERNAL",
+      "name": "Webhook",
+      "parent_span_id": "n8n-wf-branching-200-start",
+      "span_id": "n8n-wf-branching-200-node-Webhook-0",
+      "start_time": 1768518000000000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-branching-200"
+    },
+    {
+      "attributes": {
+        "n8n.event": "node_step",
+        "n8n.execution_id": "200",
+        "n8n.execution_time_ms": 400,
+        "n8n.input_items": 1,
+        "n8n.node_name": "HTTP Request",
+        "n8n.output_items": 1,
+        "n8n.output_preview": "{\n  \"status\": 200,\n  \"body\": \"ok\"\n}",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-branching",
+        "n8n.workflow_name": "Branching Demo",
+        "openinference.span.kind": "TOOL",
+        "tool.name": "HTTP Request",
+        "tool.return_value": "{\n  \"status\": 200,\n  \"body\": \"ok\"\n}"
+      },
+      "end_time": 1768518000420000000,
+      "kind": "INTERNAL",
+      "name": "HTTP Request",
+      "parent_span_id": "n8n-wf-branching-200-start",
+      "span_id": "n8n-wf-branching-200-node-HTTP-Request-0",
+      "start_time": 1768518000020000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-branching-200"
+    },
+    {
+      "attributes": {
+        "n8n.event": "node_step",
+        "n8n.execution_id": "200",
+        "n8n.execution_time_ms": 80,
+        "n8n.input_items": 1,
+        "n8n.node_name": "Slack",
+        "n8n.output_items": 1,
+        "n8n.output_preview": "{\n  \"posted\": true\n}",
+        "n8n.run_index": 0,
+        "n8n.workflow_id": "wf-branching",
+        "n8n.workflow_name": "Branching Demo",
+        "openinference.span.kind": "TOOL",
+        "tool.name": "Slack",
+        "tool.return_value": "{\n  \"posted\": true\n}"
+      },
+      "end_time": 1768518000510000000,
+      "kind": "INTERNAL",
+      "name": "Slack",
+      "parent_span_id": "n8n-wf-branching-200-start",
+      "span_id": "n8n-wf-branching-200-node-Slack-0",
+      "start_time": 1768518000430000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-branching-200"
+    },
+    {
+      "attributes": {
+        "n8n.event": "workflow_complete",
+        "n8n.execution_id": "200",
+        "n8n.status": "success",
+        "n8n.stopped_at": "2026-01-15T11:00:01.500Z",
+        "n8n.workflow_id": "wf-branching",
+        "n8n.workflow_name": "Branching Demo",
+        "openinference.span.kind": "CHAIN"
+      },
+      "end_time": 1768474801500000000,
+      "kind": "INTERNAL",
+      "name": "Branching Demo \u00b7 complete",
+      "parent_span_id": "n8n-wf-branching-200-start",
+      "span_id": "n8n-wf-branching-200-complete",
+      "start_time": 1768474801500000000,
+      "status": {
+        "code": "OK"
+      },
+      "trace_id": "n8n-wf-branching-200"
+    }
+  ],
+  "trace_id": "n8n-wf-branching-200"
+}
