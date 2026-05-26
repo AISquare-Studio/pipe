@@ -158,3 +158,21 @@ twine upload dist/*
 - Package name: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
 - Connector name attribute: `{service}` (e.g., `"s3"`)
 - Entry point name: `{service}` or `{service}-source` / `{service}-sink`
+
+## Which Tier?
+
+All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`.
+
+- **Super-popular and broadly useful** → add the package name to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
+- **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via direct install (`pip install aisquare-pipe-{service}`).
+- **When in doubt, leave it out of `[popular]`.** Promoting later is cheap; demoting feels worse to users.
+
+## Code & Folder Isolation
+
+Connector PRs must keep all new code inside `connectors/<name>/`:
+
+- Source under `connectors/<name>/src/aisquare_pipe_<name>/`
+- Tests under `connectors/<name>/tests/`
+- Any auxiliary directories the connector needs (e.g., `migrations/`, `schemas/`, `fixtures/`) go **inside** `connectors/<name>/`, not at the repo root.
+- No imports from another connector's `src/`. Connectors compose via the framework, not via each other.
+- No edits to `src/aisquare/pipe/` from a connector PR. Framework changes ship in separate PRs.

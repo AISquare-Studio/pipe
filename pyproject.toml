@@ -23,6 +23,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+popular = [
+    "aisquare-pipe-local",
+    "aisquare-pipe-dropbox",
+    "aisquare-pipe-onedrive",
+]
+full = [
+    "aisquare-pipe[popular]",
+    "aisquare-pipe-salesforce",
+    "aisquare-pipe-docusign",
+]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"

@@ -7,7 +7,10 @@
 ## Install
 
 ```bash
-pip install aisquare-pipe
+pip install aisquare-pipe                       # framework only
+pip install "aisquare-pipe[popular]"            # framework + the canonical core connectors
+pip install "aisquare-pipe[full]"               # framework + all connectors maintained in this repo
+pip install aisquare-pipe-<service>             # framework + a single connector (e.g. aisquare-pipe-dropbox)
 ```
 
 For development:
@@ -18,6 +21,20 @@ pip install -e ".[dev]"
 ```
 
 > **Note:** Plugin discovery via `entry_points` requires the package to be installed (`pip install -e .`).
+
+## Connectors
+
+Each connector is its own independently published pip package under `connectors/<name>/`. The user-facing tier is encoded in the extras bundles — folder location does not determine tier.
+
+| Connector | Package | In `[popular]` | In `[full]` |
+|---|---|:-:|:-:|
+| Local filesystem | `aisquare-pipe-local` | ✓ | ✓ |
+| Dropbox | `aisquare-pipe-dropbox` | ✓ | ✓ |
+| OneDrive | `aisquare-pipe-onedrive` | ✓ | ✓ |
+| Salesforce | `aisquare-pipe-salesforce` |   | ✓ |
+| DocuSign | `aisquare-pipe-docusign` |   | ✓ |
+
+Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
 ## Quick Start
 
