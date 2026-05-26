@@ -1,7 +1,7 @@
 """Tests for the Docker entrypoint's env-var -> config translation.
 
 Run from the repo root:
-    .venv/bin/python -m pytest docker/pipe-n8n/test_entrypoint.py -v
+    .venv/bin/python -m pytest connectors/n8n/docker/pipe-n8n/test_entrypoint.py -v
 """
 
 from __future__ import annotations

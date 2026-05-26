@@ -6,9 +6,9 @@ Strategy:
 1. **Frozen reference** (always runs): each fixture has a stored
    ``expected/<name>.json`` file. The pipe shaper output is compared
    byte-for-byte against it. Frozen references are regenerated via
-   ``scripts/regen_parity_fixtures.py`` against the SDK source whenever
-   the SDK shaper changes — that script is the bridge that keeps the two
-   in sync.
+   ``connectors/n8n/scripts/regen_parity_fixtures.py`` against the SDK
+   source whenever the SDK shaper changes — that script is the bridge
+   that keeps the two in sync.
 
 2. **Live SDK comparison** (runs only when the SDK is sibling-checked
    out at ``../AISquare-Explainability-SDK``): imports the SDK shaper
@@ -32,7 +32,7 @@ import pytest
 
 from aisquare_pipe_n8n.spans import execution_to_trace_batch
 
-from tests.parity.fixtures import all_fixtures
+from .fixtures import all_fixtures
 
 EXPECTED_DIR = Path(__file__).parent / "expected"
 
@@ -49,7 +49,7 @@ def test_pipe_shaper_matches_frozen_reference(
     if not expected_path.exists():
         pytest.skip(
             f"Frozen reference {expected_path} missing — regenerate via "
-            "`python scripts/regen_parity_fixtures.py`"
+            "`python connectors/n8n/scripts/regen_parity_fixtures.py`"
         )
 
     expected = json.loads(expected_path.read_text())
@@ -62,7 +62,7 @@ def test_pipe_shaper_matches_frozen_reference(
     expected_norm = json.loads(json.dumps(expected, sort_keys=True))
     assert actual_norm == expected_norm, (
         f"shape drift in fixture {name}; "
-        "regenerate via scripts/regen_parity_fixtures.py if the SDK changed, "
+        "regenerate via connectors/n8n/scripts/regen_parity_fixtures.py if the SDK changed, "
         "or fix the pipe shaper if it diverged."
     )
 
@@ -72,11 +72,18 @@ def test_pipe_shaper_matches_frozen_reference(
 
 def _try_import_sdk_shaper():
     """Try to import the SDK's execution_to_spans. Returns the function or
-    None when the SDK isn't reachable."""
-    sdk_root = os.environ.get(
-        "AISQUARE_SDK_ROOT",
-        str(Path(__file__).resolve().parents[3] / "AISquare-Explainability-SDK"),
+    None when the SDK isn't reachable.
+
+    Layout assumed by the default sibling-checkout path:
+        <workspace>/pipe/connectors/n8n/tests/parity/test_sdk_parity.py
+        <workspace>/AISquare-Explainability-SDK/
+    """
+    # parents[4] is the pipe repo root; its parent is the workspace that holds
+    # the sibling SDK checkout.
+    sibling_default = (
+        Path(__file__).resolve().parents[4].parent / "AISquare-Explainability-SDK"
     )
+    sdk_root = os.environ.get("AISQUARE_SDK_ROOT", str(sibling_default))
     sdk_root_path = Path(sdk_root)
     if not (sdk_root_path / "gateway" / "connectors" / "n8n.py").exists():
         return None

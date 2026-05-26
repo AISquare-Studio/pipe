@@ -7,7 +7,8 @@ changes to existing n8n workflows.
 ## Build
 
 ```bash
-docker build -t aisquare/pipe-n8n:latest -f docker/pipe-n8n/Dockerfile .
+docker build -t aisquare/pipe-n8n:latest \
+  -f connectors/n8n/docker/pipe-n8n/Dockerfile .
 ```
 
 (Build context is the repo root — the Dockerfile copies the framework
@@ -58,7 +59,7 @@ volumes:
 | `N8N_CURSOR_PATH` | no | source.cursor_path | default `/var/lib/pipe/n8n-cursor.json` |
 | `AISQUARE_GATEWAY_URL` | yes | sink.gateway_url | |
 | `AISQUARE_API_KEY` | yes | sink.api_key | |
-| `AISQUARE_INGEST_PATH` | no | sink.ingest_path | default `/traces/ingest` |
+| `AISQUARE_INGEST_PATH` | no | sink.ingest_path | default `/v1/traces/ingest` |
 | `AISQUARE_TIMEOUT_SECONDS` | no | sink.timeout_seconds | |
 | `AISQUARE_MAX_RETRIES` | no | sink.max_retries | retries 429/5xx with exponential backoff |
 
@@ -67,8 +68,10 @@ with a non-zero status and a single-line message on stderr.
 
 ## What flows through
 
-For each n8n execution, the bridge POSTs three or more envelopes to the
-gateway: one `workflow_start`, one `node_step` per executed node, and one
-`workflow_complete` once the run is `finished`. All envelopes use the
-content type `application/x-aisquare-trace+json` and carry execution and
-workflow identifiers in their metadata.
+For each n8n execution, the bridge POSTs one TraceBatch envelope per
+emission: a `stub` when the run is first seen, `progress` envelopes as
+nodes complete, and a `final` envelope once the run is `finished`. All
+envelopes use the content type `application/x-aisquare-trace+json` and
+carry execution + workflow identifiers and a stable `idempotency_key` in
+their metadata. The gateway dedupes by `X-Idempotency-Key` so retries and
+steady-state polls collapse to no-ops.

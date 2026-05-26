@@ -6,7 +6,7 @@ import pytest
 
 from aisquare.pipe.core.envelope import DataEnvelope, PushResult
 
-from aisquare_pipe_gateway.sink import AISquareGatewaySink
+from aisquare_pipe_gateway.connector import AISquareGatewaySink
 
 from tests.helpers import make_trace_envelope
 

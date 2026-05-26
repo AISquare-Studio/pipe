@@ -35,7 +35,19 @@ class AISquareGatewaySink(SinkConnector):
     auth_type = AuthType.API_KEY
 
     description = "Pushes envelopes to the AISquare Explainability gateway."
-    docs_url = ""
+
+    metadata_spec = {
+        "idempotency_key": MetaField(
+            type=str,
+            required=True,
+            description=(
+                "Stable key forwarded as the X-Idempotency-Key header so the "
+                "gateway can dedupe retries and steady-state re-emissions. "
+                "Required so the framework warns when a paired source doesn't "
+                "produce it."
+            ),
+        ),
+    }
 
     CONFIG_SPEC: dict[str, MetaField] = {
         "gateway_url": MetaField(

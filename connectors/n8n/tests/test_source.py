@@ -12,7 +12,7 @@ import pytest
 
 from aisquare.pipe.core.envelope import PullParams
 
-from aisquare_pipe_n8n.source import (
+from aisquare_pipe_n8n.connector import (
     IDEMPOTENCY_PREFIX_FINAL,
     IDEMPOTENCY_PREFIX_PROGRESS,
     IDEMPOTENCY_PREFIX_STUB,

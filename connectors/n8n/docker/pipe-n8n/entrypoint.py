@@ -79,14 +79,17 @@ def main() -> None:
     Path(CONFIG_PATH).write_text(json.dumps(config), encoding="utf-8")
 
     # Replace this process with `pipe run ...` so signals propagate cleanly
-    # and the container's lifecycle matches the pipeline's.
+    # and the container's lifecycle matches the pipeline's. The connector
+    # entry-point names follow the canonical `<service>-source`/`<service>-sink`
+    # convention; config keys still use the class `name` attribute (n8n /
+    # aisquare-gateway) so the Pipeline can resolve per-connector sub-dicts.
     argv = [
         "pipe",
         "run",
         "--source",
-        "n8n",
+        "n8n-source",
         "--sink",
-        "aisquare-gateway",
+        "aisquare-gateway-sink",
         "--config",
         CONFIG_PATH,
     ]

@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aisquare-pipe-aisquare-gateway"
+name = "aisquare-pipe-gateway"
 version = "0.1.0"
 description = "AISquare Explainability gateway sink for aisquare.pipe"
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ dependencies = [
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
 
 [project.entry-points."aisquare_pipe.connectors"]
-aisquare-gateway = "aisquare_pipe_gateway.sink:AISquareGatewaySink"
+aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -10,8 +10,8 @@ path forward.
 >   into TraceBatches and POSTs them. Reusable across future sources.
 > * **Cloud n8n → Explainability** = container polls n8n REST API, transforms,
 >   POSTs to gateway, gateway pushes to FE via SSE.
-> * **Docker wrapper (`docker/pipe-n8n/`)** = the BYO-bridge container —
->   one image, two env vars, no Python, no n8n workflow changes.
+> * **Docker wrapper (`connectors/n8n/docker/pipe-n8n/`)** = the BYO-bridge
+>   container — one image, two env vars, no Python, no n8n workflow changes.
 > * **Why we kept the SDK version** = it does stub/progress emit, definition
 >   enrichment, span-kind classification, and idempotency that the pipe version
 >   doesn't yet do — and the FE depends on those.
@@ -282,7 +282,7 @@ Restarts pick up where it left off — no replay of historical executions.
 
 ---
 
-## 4. The Docker wrapper — `docker/pipe-n8n/`
+## 4. The Docker wrapper — `connectors/n8n/docker/pipe-n8n/`
 
 The pipe framework and the two connectors are pure Python wheels. To turn that
 into something a customer can deploy without writing any code, we ship a
@@ -291,7 +291,7 @@ purpose-built container image. **This is the artifact a customer actually runs.*
 ### What's in the folder
 
 ```
-   docker/pipe-n8n/
+   connectors/n8n/docker/pipe-n8n/
    ├── Dockerfile          ← image recipe (python:3.11-slim + wheels)
    ├── entrypoint.py       ← env vars → JSON config → exec `pipe run`
    ├── README.md           ← docker-compose snippet for customers
@@ -310,7 +310,7 @@ purpose-built container image. **This is the artifact a customer actually runs.*
    │   pip-installed:                                           │
    │     • aisquare-pipe              (framework + CLI)         │
    │     • aisquare-pipe-n8n          (source connector)        │
-   │     • aisquare-pipe-aisquare-gateway  (sink connector)     │
+   │     • aisquare-pipe-gateway      (sink connector)          │
    │                                                            │
    │   /usr/local/bin/pipe-n8n-entrypoint  ← entrypoint.py      │
    │   /var/lib/pipe/                       ← cursor volume     │
@@ -335,8 +335,8 @@ purpose-built container image. **This is the artifact a customer actually runs.*
                 │
                 ▼
    3.  execvp("pipe", "run",
-               "--source", "n8n",
-               "--sink",   "aisquare-gateway",
+               "--source", "n8n-source",
+               "--sink",   "aisquare-gateway-sink",
                "--config", "/tmp/pipe-config.json")
                 │
                 ▼
@@ -528,7 +528,7 @@ should both use the same wire-format library.
    Versioned alongside the gateway. Owned by the gateway team.
 
    ─── Step 3 ─────────────────────────────────────────────────────────
-   In pipe, update aisquare-pipe-aisquare-gateway:
+   In pipe, update aisquare-pipe-gateway:
 
        pyproject.toml:
          dependencies = [

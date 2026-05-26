@@ -16,11 +16,11 @@ COPY pyproject.toml /app/pyproject.toml
 COPY README.md /app/README.md
 COPY src /app/src
 COPY connectors/n8n /app/connectors/n8n
-COPY connectors/aisquare-gateway /app/connectors/aisquare-gateway
+COPY connectors/gateway /app/connectors/gateway
 
-RUN pip install /app /app/connectors/n8n /app/connectors/aisquare-gateway
+RUN pip install /app /app/connectors/n8n /app/connectors/gateway
 
-COPY docker/pipe-n8n/entrypoint.py /usr/local/bin/pipe-n8n-entrypoint
+COPY connectors/n8n/docker/pipe-n8n/entrypoint.py /usr/local/bin/pipe-n8n-entrypoint
 RUN chmod +x /usr/local/bin/pipe-n8n-entrypoint
 
 # Default cursor location is /var/lib/pipe so the brief's tmp default is
