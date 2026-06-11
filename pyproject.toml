@@ -32,6 +32,7 @@ full = [
     "aisquare-pipe[popular]",
     "aisquare-pipe-salesforce",
     "aisquare-pipe-docusign",
+    "aisquare-pipe-composio",
 ]
 
 [project.scripts]
