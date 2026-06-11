@@ -37,7 +37,7 @@ config = {
     "toolkit_filter": ["gmail"],      # optional — allow-list of toolkit slugs (governance)
     "base_url": None,                 # optional — Composio backend override
     "timeout_seconds": 60,            # optional — request timeout
-    "file_workdir": None,             # optional — directory for file uploads/downloads
+    "file_workdir": None,             # optional — default: ~/.cache/aisquare-pipe/composio-files
 }
 ```
 
@@ -148,7 +148,7 @@ config = {
     "user_id": "default",
     "trigger_slugs": ["GMAIL_NEW_GMAIL_MESSAGE"],   # optional filter
     "poll_interval_seconds": 10,
-    "cursor_path": "/tmp/composio-pipe-cursor.json",
+    "cursor_path": None,   # optional — default: ~/.cache/aisquare-pipe/composio-cursor.json
 }
 for envelope in source.pull(config):               # polls forever
     print(envelope.data["payload"])
@@ -157,6 +157,7 @@ for envelope in source.pull(config):               # polls forever
 - One `application/json` envelope per event; `envelope.data["payload"]` is the app payload.
 - `idempotency_key` metadata (`composio:event:<id>`) is stable across re-polls, pairing with sinks that dedupe (e.g. aisquare-gateway).
 - Position is a timestamp watermark + bounded seen-id ring persisted atomically to `cursor_path`; `PullParams` `since` sets the initial watermark (default: now). `max_polls`/`sleep` params support tests and one-shot drains.
+- `cursor_path` defaults to `~/.cache/aisquare-pipe/composio-cursor.json` (honouring `$XDG_CACHE_HOME`) — per-user, not shared `/tmp`. A pre-0.1.1 cursor at `/tmp/composio-pipe-cursor.json` is migrated automatically on first run.
 - `list_resources(config)` browses available trigger types and your active trigger instances.
 
 ## Example pipelines

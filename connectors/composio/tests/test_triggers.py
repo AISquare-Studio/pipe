@@ -95,6 +95,29 @@ class TestPolling:
         # Same event re-served inside the overlap window → suppressed.
         assert len(_pull_once(source, config)) == 0
 
+    def test_default_cursor_path_with_legacy_migration(
+        self, mock_triggers_client, composio_config, tmp_path, monkeypatch
+    ):
+        from aisquare_pipe_composio.client import TriggerCursor, save_trigger_cursor
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        legacy = tmp_path / "legacy.json"
+        save_trigger_cursor(
+            str(legacy), TriggerCursor(last_ts_ms=1_700_000_000_000, seen_ids=["evt_0"])
+        )
+        monkeypatch.setattr(
+            "aisquare_pipe_composio.triggers.LEGACY_CURSOR_PATH", str(legacy)
+        )
+        mock_triggers_client.list_trigger_events.return_value = ([], None)
+
+        # No cursor_path in config → per-user default + one-time migration.
+        envelopes = _pull_once(ComposioTriggersSource(), composio_config)
+
+        assert envelopes == []
+        kwargs = mock_triggers_client.list_trigger_events.call_args.kwargs
+        assert kwargs["from_ms"] == 1_700_000_000_000  # migrated watermark used
+        assert (tmp_path / "xdg" / "aisquare-pipe" / "composio-cursor.json").exists()
+
     def test_pagination_follows_next_cursor(
         self, mock_triggers_client, composio_config, tmp_cursor_path
     ):

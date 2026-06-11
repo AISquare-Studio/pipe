@@ -11,7 +11,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import tempfile
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -31,12 +31,14 @@ from composio_client import (
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_composio.constants import (
+    CURSOR_FILENAME,
     DEFAULT_RESOURCE_LIMIT,
     DEFAULT_TIMEOUT_SECONDS,
     DEFAULT_TOOL_LIMIT,
     DEFAULT_TRIGGER_PAGE_LIMIT,
     DEFAULT_USER_ID,
     DOWNLOADS_SUBDIR,
+    FILES_SUBDIR,
     INITIAL_BACKOFF,
     MAX_RETRIES,
     SEEN_IDS_MAX,
@@ -130,9 +132,39 @@ def _epoch_ms(timestamp: str | int | float | None) -> int | None:
     return int(parsed.timestamp() * 1000)
 
 
+def default_state_dir() -> Path:
+    """Per-user state root: ``$XDG_CACHE_HOME/aisquare-pipe`` when set, else
+    ``~/.cache/aisquare-pipe``. Deliberately not a shared tempdir — fixed
+    names under world-writable ``/tmp`` collide across users and expose
+    cursor/file state."""
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "aisquare-pipe"
+
+
 def default_file_workdir() -> Path:
     """Directory used for file uploads/downloads when none is configured."""
-    return Path(tempfile.gettempdir()) / "aisquare-pipe-composio"
+    return default_state_dir() / FILES_SUBDIR
+
+
+def default_cursor_path() -> str:
+    """Per-user default location of the triggers cursor file."""
+    return str(default_state_dir() / CURSOR_FILENAME)
+
+
+def migrate_legacy_cursor(legacy_path: str, new_path: str) -> None:
+    """One-time copy of a pre-0.1.1 shared-``/tmp`` cursor file into the
+    per-user state dir. Runs only while the new file does not exist; the
+    legacy file is left in place for instances still on older versions."""
+    legacy, new = Path(legacy_path), Path(new_path)
+    try:
+        if new.exists() or not legacy.exists():
+            return
+        new.parent.mkdir(parents=True, exist_ok=True)
+        new.write_bytes(legacy.read_bytes())
+        logger.info("Migrated trigger cursor from %s to %s", legacy, new)
+    except OSError as e:
+        logger.warning("Could not migrate legacy cursor %s: %s", legacy_path, e)
 
 
 class ComposioClient:

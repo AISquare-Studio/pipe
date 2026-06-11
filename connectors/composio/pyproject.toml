@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe-composio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Composio meta-connector for aisquare.pipe — execute 500+ SaaS toolkits through one connector"
 readme = "README.md"
 license = {text = "Apache-2.0"}
