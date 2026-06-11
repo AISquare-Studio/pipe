@@ -1,23 +1,25 @@
-"""Compliance test suite for connector validation."""
+"""Compliance test suite for connector validation.
+
+The assertion logic lives in :mod:`aisquare.pipe.testing.validation` (pure
+check functions shared with ``pipe validate``); this module wraps it in the
+unittest API that connector test suites subclass. Method names are stable —
+connector suites and CI reference them — and new strictness only ever lands
+in new method names.
+"""
 
 from __future__ import annotations
 
-import re
 import unittest
-from collections.abc import Iterator
 
-from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
-from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
-
-
-def _is_valid_semver(version: str) -> bool:
-    """Check if a string looks like a semver version."""
-    return bool(re.match(r"^\d+\.\d+\.\d+", version))
+from aisquare.pipe.core.connector import SinkConnector, SourceConnector
+from aisquare.pipe.testing import validation
+from aisquare.pipe.testing.validation import CheckResult, failures
 
 
-def _is_valid_mime(mime: str) -> bool:
-    """Check if a string looks like a MIME type (contains a /)."""
-    return "/" in mime
+def _assert_checks(case: unittest.TestCase, results: list[CheckResult]) -> None:
+    failed = failures(results)
+    if failed:
+        case.fail("; ".join(f"[{r.id}] {r.message}" for r in failed))
 
 
 def connector_compliance_suite(connector_class: type) -> type:
@@ -27,6 +29,10 @@ def connector_compliance_suite(connector_class: type) -> type:
 
         class TestMyConnector(connector_compliance_suite(MyConnector)):
             pass
+
+    The suite is credential-free by design: behavioral checks run under a
+    socket guard, so a connector that needs network (or credentials) to
+    answer ``validate_config({})`` / ``pull({})`` / ``push(..., {})`` fails.
     """
 
     is_source = issubclass(connector_class, SourceConnector)
@@ -37,95 +43,55 @@ def connector_compliance_suite(connector_class: type) -> type:
 
         connector_cls = connector_class
 
-        def _make_instance(self):
-            return self.connector_cls()
+        def test_instantiation(self):
+            _assert_checks(self, validation.check_instantiation(self.connector_cls))
 
         def test_has_name(self):
-            inst = self._make_instance()
-            self.assertIsInstance(inst.name, str)
-            self.assertTrue(len(inst.name) > 0, "name must be non-empty")
+            _assert_checks(self, validation.check_name(self.connector_cls))
 
         def test_has_version(self):
-            inst = self._make_instance()
-            self.assertIsInstance(inst.version, str)
-            self.assertTrue(
-                _is_valid_semver(inst.version),
-                f"version '{inst.version}' is not valid semver",
-            )
+            _assert_checks(self, validation.check_version(self.connector_cls))
 
         def test_has_auth_type(self):
-            inst = self._make_instance()
-            self.assertIsInstance(inst.auth_type, AuthType)
+            _assert_checks(self, validation.check_auth_type(self.connector_cls))
 
         def test_metadata_spec_values(self):
-            inst = self._make_instance()
-            if hasattr(inst, "metadata_spec") and inst.metadata_spec:
-                for key, val in inst.metadata_spec.items():
-                    self.assertIsInstance(
-                        val,
-                        MetaField,
-                        f"metadata_spec['{key}'] must be a MetaField",
-                    )
+            _assert_checks(self, validation.check_metadata_spec(self.connector_cls))
 
         if is_source:
 
             def test_has_output_types(self):
-                inst = self._make_instance()
-                self.assertIsInstance(inst.output_types, list)
-                self.assertTrue(
-                    len(inst.output_types) > 0,
-                    "output_types must be non-empty",
-                )
-                for t in inst.output_types:
-                    self.assertIsInstance(t, str)
-                    self.assertTrue(
-                        _is_valid_mime(t),
-                        f"output_type '{t}' is not a valid MIME type",
-                    )
+                _assert_checks(self, validation.check_output_types(self.connector_cls))
 
             def test_pull_returns_iterator(self):
-                inst = self._make_instance()
-                result = inst.pull({})
-                self.assertTrue(
-                    isinstance(result, Iterator) or hasattr(result, "__next__"),
-                    "pull() must return an iterator/generator",
-                )
+                results = [
+                    r
+                    for r in validation.check_pull_contract(self.connector_cls)
+                    if r.id == "contract.source.pull-iterator"
+                ]
+                _assert_checks(self, results)
+
+            def test_pull_no_creds(self):
+                _assert_checks(self, validation.check_pull_contract(self.connector_cls))
 
             def test_validate_config_implemented(self):
-                inst = self._make_instance()
-                result = inst.validate_config({})
-                self.assertIsInstance(result, bool)
+                # Historical name; now also enforces the no-creds rules.
+                _assert_checks(
+                    self, validation.check_source_validate_config(self.connector_cls)
+                )
 
         if is_sink:
 
             def test_has_input_types(self):
-                inst = self._make_instance()
-                self.assertIsInstance(inst.input_types, list)
-                self.assertTrue(
-                    len(inst.input_types) > 0,
-                    "input_types must be non-empty",
-                )
-                for t in inst.input_types:
-                    self.assertIsInstance(t, str)
-                    self.assertTrue(
-                        _is_valid_mime(t),
-                        f"input_type '{t}' is not a valid MIME type",
-                    )
+                _assert_checks(self, validation.check_input_types(self.connector_cls))
 
             def test_push_returns_push_result(self):
-                inst = self._make_instance()
-                envelope = DataEnvelope(
-                    content_type="text/plain",
-                    data="test",
-                    source_id="compliance-test",
-                )
-                result = inst.push(envelope, {})
-                self.assertIsInstance(result, PushResult)
+                _assert_checks(self, validation.check_push_contract(self.connector_cls))
 
             def test_sink_validate_config_implemented(self):
-                inst = self._make_instance()
-                result = inst.validate_config({})
-                self.assertIsInstance(result, bool)
+                _assert_checks(
+                    self, validation.check_sink_validate_config(self.connector_cls)
+                )
 
     ComplianceTests.__name__ = f"{connector_class.__name__}Compliance"
     ComplianceTests.__qualname__ = f"{connector_class.__name__}Compliance"

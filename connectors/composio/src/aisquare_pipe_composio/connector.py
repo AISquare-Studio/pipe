@@ -237,7 +237,7 @@ class ComposioSource(SourceConnector):
     """Execute any Composio tool and yield its results as envelopes."""
 
     name = "composio-source"
-    version = "0.1.0"
+    version = "0.1.1"
     output_types = [JSON_CONTENT_TYPE, "*/*"]
     auth_type = AuthType.API_KEY
     description = "Execute any Composio tool (500+ SaaS toolkits) and yield its results"
@@ -384,7 +384,7 @@ class ComposioSink(SinkConnector):
     """Execute any Composio tool as a write action (send, create, upload...)."""
 
     name = "composio-sink"
-    version = "0.1.0"
+    version = "0.1.1"
     input_types = ["*/*"]
     auth_type = AuthType.API_KEY
     description = "Execute any Composio tool as a write action (Slack send, Gmail send, ...)"

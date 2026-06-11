@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,41 @@ class N8nClient:
         """Probe /api/v1/workflows to confirm the API key works."""
         self.list_workflows()
         return True
+
+
+CURSOR_FILENAME = "n8n-cursor.json"
+# Pre-0.2.1 default, kept only as a one-time migration source.
+LEGACY_CURSOR_PATH = "/tmp/n8n-pipe-cursor.json"
+
+
+def default_state_dir() -> Path:
+    """Per-user state root: ``$XDG_CACHE_HOME/aisquare-pipe`` when set, else
+    ``~/.cache/aisquare-pipe``. Deliberately not a shared tempdir — fixed
+    names under world-writable ``/tmp`` collide across users and expose
+    cursor state."""
+    base = os.environ.get("XDG_CACHE_HOME")
+    root = Path(base) if base else Path.home() / ".cache"
+    return root / "aisquare-pipe"
+
+
+def default_cursor_path() -> str:
+    """Per-user default location of the execution cursor file."""
+    return str(default_state_dir() / CURSOR_FILENAME)
+
+
+def migrate_legacy_cursor(legacy_path: str, new_path: str) -> None:
+    """One-time copy of a pre-0.2.1 shared-``/tmp`` cursor file into the
+    per-user state dir. Runs only while the new file does not exist; the
+    legacy file is left in place for instances still on older versions."""
+    legacy, new = Path(legacy_path), Path(new_path)
+    try:
+        if new.exists() or not legacy.exists():
+            return
+        new.parent.mkdir(parents=True, exist_ok=True)
+        new.write_bytes(legacy.read_bytes())
+        logger.info("Migrated execution cursor from %s to %s", legacy, new)
+    except OSError as e:
+        logger.warning("Could not migrate legacy cursor %s: %s", legacy_path, e)
 
 
 def load_cursor(path: str) -> int:

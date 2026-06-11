@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 
-import pytest
 
 from aisquare.pipe.core.envelope import PullParams
 
 from aisquare_pipe_local.connector import LocalSource
 
-from tests.helpers import create_test_tree
 
 
 class TestLocalSourcePull:

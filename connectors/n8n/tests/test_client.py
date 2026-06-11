@@ -6,7 +6,14 @@ import pytest
 
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
-from aisquare_pipe_n8n.client import N8nClient, load_cursor, save_cursor
+from aisquare_pipe_n8n.client import (
+    N8nClient,
+    default_cursor_path,
+    default_state_dir,
+    load_cursor,
+    migrate_legacy_cursor,
+    save_cursor,
+)
 
 from tests.conftest import API_KEY
 from tests.helpers import make_execution
@@ -106,3 +113,41 @@ class TestCursorPersistence:
         path = str(tmp_path / "deep" / "nested" / "cursor.json")
         save_cursor(path, 7)
         assert load_cursor(path) == 7
+
+
+class TestDefaultCursorLocation:
+    def test_state_dir_honours_xdg(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        assert default_state_dir() == tmp_path / "xdg" / "aisquare-pipe"
+
+    def test_state_dir_falls_back_to_home_cache(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert default_state_dir() == tmp_path / ".cache" / "aisquare-pipe"
+
+    def test_default_cursor_path_under_state_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        assert default_cursor_path() == str(
+            tmp_path / "aisquare-pipe" / "n8n-cursor.json"
+        )
+
+    def test_migration_copies_when_new_missing(self, tmp_path):
+        legacy = tmp_path / "legacy.json"
+        save_cursor(str(legacy), 41)
+        new = tmp_path / "state" / "cursor.json"
+        migrate_legacy_cursor(str(legacy), str(new))
+        assert load_cursor(str(new)) == 41
+        assert legacy.exists()  # left in place for older instances
+
+    def test_migration_noop_when_new_exists(self, tmp_path):
+        legacy = tmp_path / "legacy.json"
+        save_cursor(str(legacy), 41)
+        new = tmp_path / "cursor.json"
+        save_cursor(str(new), 7)
+        migrate_legacy_cursor(str(legacy), str(new))
+        assert load_cursor(str(new)) == 7
+
+    def test_migration_noop_when_legacy_missing(self, tmp_path):
+        new = tmp_path / "cursor.json"
+        migrate_legacy_cursor(str(tmp_path / "ghost.json"), str(new))
+        assert not new.exists()

@@ -49,6 +49,10 @@ The connector persists the highest seen execution ID to `cursor_path` after
 each poll. Restarting the process resumes at the next execution — historical
 runs are not re-emitted.
 
+`cursor_path` defaults to `~/.cache/aisquare-pipe/n8n-cursor.json` (honouring
+`$XDG_CACHE_HOME`) — per-user, not shared `/tmp`. A pre-0.2.1 cursor at
+`/tmp/n8n-pipe-cursor.json` is migrated automatically on first run.
+
 ## Running tests
 
 ```bash

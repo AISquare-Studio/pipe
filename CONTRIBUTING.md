@@ -11,8 +11,9 @@ pipe new-connector my-service
 # This creates:
 # aisquare-pipe-my-service/
 #   pyproject.toml
+#   README.md
 #   src/aisquare_pipe_my_service/connector.py
-#   tests/test_connector.py
+#   tests/test_compliance.py
 ```
 
 ## The SourceConnector Interface
@@ -126,20 +127,85 @@ my-service-sink = "aisquare_pipe_my_service.connector:MyServiceSink"
 
 After `pip install -e .`, running `pipe list` should show your connector.
 
-## Running Compliance Tests
+## Validating Your Connector
 
-The compliance suite validates that your connector meets the framework spec:
+One command validates everything — no credentials required:
+
+```bash
+pipe validate                # all connectors + framework
+pipe validate my-service     # just yours
+pipe validate --skip-tests   # contract + hygiene only (seconds)
+```
+
+It runs four layers per connector:
+
+| Layer | What it checks | Credentials |
+|---|---|---|
+| **Contract** | spec attributes, plus behavior with empty config under a socket guard: `validate_config({})` returns `False` without network, `pull({})` fails cleanly (`ConfigValidationError`/`ValueError`, never `KeyError`/`TypeError`), `push(garbage, {})` returns `PushResult(success=False)` without raising | none |
+| **Hygiene** | packaging rules (package name, `aisquare-pipe>=` dep, entry points resolve, class version == pyproject version), scaffold completeness, no cross-connector imports, no bare `except:` | none |
+| **Unit suite** | your `tests/` directory, run in its own pytest process | none — mock your service at the client boundary |
+| **Live** | optional `tests/test_live.py` against the real API | opt-in (`--live` + env vars) |
+
+Exit 0 = clean (warnings allowed) · 1 = failures · 2 = usage error. Check ids in failure output (`contract.source.pull-no-creds`, `hygiene.version-sync`, ...) name the exact rule.
+
+The compliance suite is the per-connector entry to the contract layer:
 
 ```python
-# tests/test_connector.py
+# tests/test_compliance.py
 from aisquare.pipe.testing.compliance import connector_compliance_suite
-from my_package.connector import MyServiceSource
+from aisquare_pipe_my_service.connector import MyServiceSource
 
 class TestMyServiceSource(connector_compliance_suite(MyServiceSource)):
     pass
 ```
 
-Run with: `pytest tests/test_connector.py -v`
+Run with: `pytest tests/test_compliance.py -v`
+
+## Live Tests (optional)
+
+Everything above is hermetic by design. If you also want to catch real
+vendor-API drift, add a live tier — it must never make plain `pytest` or
+`pipe validate` need credentials:
+
+```python
+# tests/test_live.py
+import os
+
+import pytest
+
+from aisquare.pipe import PullParams
+from aisquare_pipe_my_service.connector import MyServiceSource
+
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        not os.environ.get("MY_SERVICE_API_KEY"),
+        reason="MY_SERVICE_API_KEY not set",
+    ),
+]
+
+
+def test_pull_one_real_item():
+    config = {"api_key": os.environ["MY_SERVICE_API_KEY"]}
+    envelopes = list(
+        MyServiceSource().pull(config, PullParams(params={"limit": 1}))
+    )
+    assert envelopes
+```
+
+And register the marker in your `pyproject.toml` so plain `pytest` deselects
+it even when credentials happen to be exported:
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
+```
+
+Conventions: env vars are named `<SERVICE>_API_KEY` (or the service's natural
+credential set), tests self-skip without them, and `pipe validate --live` is
+the only thing that runs them (`SKIP (no creds)` when the env is absent).
 
 ## Publishing to PyPI
 

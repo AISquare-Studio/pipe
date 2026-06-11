@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import dropbox.files
 import pytest
 
-from aisquare.pipe.core.envelope import DataEnvelope, PullParams, RateLimit, Resource
+from aisquare.pipe.core.envelope import PullParams, RateLimit
 
 from aisquare_pipe_dropbox.connector import DropboxSource
 
-from tests.helpers import make_file_metadata, make_folder_metadata, make_list_folder_result
+from tests.helpers import make_file_metadata, make_folder_metadata
 
 
 @pytest.fixture

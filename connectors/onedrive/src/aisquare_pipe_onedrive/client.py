@@ -150,7 +150,6 @@ class OneDriveClient:
                 items = resp.json().get("value", [])
                 for item in items:
                     if "folder" in item:
-                        subfolder_path = item.get("parentReference", {}).get("path", "")
                         item_path = f"{path.strip('/')}/{item['name']}".strip("/")
                         yield from self.list_folder(item_path, recursive=True)
         except ConfigValidationError:

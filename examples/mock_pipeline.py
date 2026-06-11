@@ -31,7 +31,7 @@ def main():
     # Run the pipeline
     result = pipeline.run({})
 
-    print(f"Pipeline complete!")
+    print("Pipeline complete!")
     print(f"  Success: {result.success_count}")
     print(f"  Failed:  {result.failure_count}")
     print()

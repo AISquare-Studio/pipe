@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from aisquare.pipe.core.envelope import PullParams
 
@@ -278,3 +277,24 @@ class TestValidateConfig:
     def test_bad_credentials(self, n8n_config):
         n8n_config["api_key"] = "wrong"
         assert N8nSource().validate_config(n8n_config) is False
+
+
+class TestDefaultCursorPath:
+    def test_default_path_used_with_legacy_migration(
+        self, n8n_config, tmp_path, monkeypatch
+    ):
+        from aisquare_pipe_n8n.client import save_cursor
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        legacy = tmp_path / "legacy.json"
+        save_cursor(str(legacy), 41)
+        monkeypatch.setattr(
+            "aisquare_pipe_n8n.connector.LEGACY_CURSOR_PATH", str(legacy)
+        )
+
+        # No cursor_path in config → per-user default + one-time migration.
+        config = {k: v for k, v in n8n_config.items() if k != "cursor_path"}
+        _pull_once(N8nSource(), config)
+
+        new = tmp_path / "xdg" / "aisquare-pipe" / "n8n-cursor.json"
+        assert json.loads(new.read_text(encoding="utf-8"))["last_execution_id"] == 41

@@ -28,15 +28,17 @@ from aisquare_pipe_composio.client import (
     ComposioClient,
     TriggerCursor,
     _epoch_ms,
+    default_cursor_path,
     load_trigger_cursor,
+    migrate_legacy_cursor,
     save_trigger_cursor,
 )
 from aisquare_pipe_composio.connector import _resolve_user, _validate_config
 from aisquare_pipe_composio.constants import (
-    DEFAULT_CURSOR_PATH,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_TRIGGER_PAGE_LIMIT,
     JSON_CONTENT_TYPE,
+    LEGACY_CURSOR_PATH,
     MAX_TRIGGER_PAGES_PER_POLL,
 )
 
@@ -49,7 +51,7 @@ class ComposioTriggersSource(SourceConnector):
     """Polls Composio trigger events and yields one envelope per event."""
 
     name = "composio-triggers-source"
-    version = "0.1.0"
+    version = "0.1.1"
     output_types = [JSON_CONTENT_TYPE]
     auth_type = AuthType.API_KEY
     description = (
@@ -88,8 +90,11 @@ class ComposioTriggersSource(SourceConnector):
         "cursor_path": MetaField(
             type=str,
             required=False,
-            default=DEFAULT_CURSOR_PATH,
-            description="File path for the polling watermark",
+            description=(
+                "File path for the polling watermark (default: "
+                "~/.cache/aisquare-pipe/composio-cursor.json, honouring "
+                "$XDG_CACHE_HOME)"
+            ),
         ),
     }
 
@@ -145,7 +150,10 @@ class ComposioTriggersSource(SourceConnector):
                 self.CONFIG_SPEC["poll_interval_seconds"].default,
             )
         )
-        cursor_path = config.get("cursor_path", self.CONFIG_SPEC["cursor_path"].default)
+        cursor_path = config.get("cursor_path")
+        if not cursor_path:
+            cursor_path = default_cursor_path()
+            migrate_legacy_cursor(LEGACY_CURSOR_PATH, cursor_path)
 
         max_polls: int | None = params.get("max_polls", None)
         sleep = params.get("sleep", time.sleep)

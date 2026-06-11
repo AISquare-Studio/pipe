@@ -15,7 +15,11 @@ from aisquare_pipe_composio.client import (
     ComposioClient,
     TriggerCursor,
     _to_plain,
+    default_cursor_path,
+    default_file_workdir,
+    default_state_dir,
     load_trigger_cursor,
+    migrate_legacy_cursor,
     save_trigger_cursor,
 )
 from aisquare_pipe_composio.constants import MAX_RETRIES, SEEN_IDS_MAX
@@ -199,6 +203,57 @@ class TestTriggerEvents:
         client = ComposioClient(composio_config)
         events, _ = client.list_trigger_events()
         assert events[0]["payload"] == "not-json"
+
+
+class TestStateDirs:
+    def test_state_dir_honours_xdg(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        assert default_state_dir() == tmp_path / "xdg" / "aisquare-pipe"
+
+    def test_state_dir_falls_back_to_home_cache(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert default_state_dir() == tmp_path / ".cache" / "aisquare-pipe"
+
+    def test_defaults_live_under_state_dir(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        assert default_cursor_path() == str(
+            tmp_path / "aisquare-pipe" / "composio-cursor.json"
+        )
+        assert default_file_workdir() == tmp_path / "aisquare-pipe" / "composio-files"
+
+    def test_file_mode_defaults_to_state_dir(
+        self, mock_sdk, composio_config, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        ComposioClient(composio_config, file_mode=True)
+        kwargs = mock_sdk.call_args.kwargs
+        workdir = str(tmp_path / "aisquare-pipe" / "composio-files")
+        assert kwargs["file_download_dir"] == f"{workdir}/downloads"
+        assert kwargs["file_upload_dirs"] == [f"{workdir}/uploads"]
+
+
+class TestLegacyCursorMigration:
+    def test_copies_when_new_missing(self, tmp_path):
+        legacy = tmp_path / "legacy.json"
+        legacy.write_text('{"last_ts_ms": 99}', encoding="utf-8")
+        new = tmp_path / "state" / "cursor.json"
+        migrate_legacy_cursor(str(legacy), str(new))
+        assert json.loads(new.read_text(encoding="utf-8"))["last_ts_ms"] == 99
+        assert legacy.exists()  # left in place for older instances
+
+    def test_noop_when_new_exists(self, tmp_path):
+        legacy = tmp_path / "legacy.json"
+        legacy.write_text('{"last_ts_ms": 99}', encoding="utf-8")
+        new = tmp_path / "cursor.json"
+        new.write_text('{"last_ts_ms": 5}', encoding="utf-8")
+        migrate_legacy_cursor(str(legacy), str(new))
+        assert json.loads(new.read_text(encoding="utf-8"))["last_ts_ms"] == 5
+
+    def test_noop_when_legacy_missing(self, tmp_path):
+        new = tmp_path / "cursor.json"
+        migrate_legacy_cursor(str(tmp_path / "ghost.json"), str(new))
+        assert not new.exists()
 
 
 class TestTriggerCursor:

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from aisquare.pipe.core.connector import SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, PullParams, PushParams, PushResult
 from aisquare.pipe.core.merge import MergeStrategy, apply_merge
-from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
+from aisquare.pipe.core.types import MatchLevel, TypeConverter, TypeMatcher
 from aisquare.pipe.errors import (
     ConfigValidationError,
     PipelineError,
