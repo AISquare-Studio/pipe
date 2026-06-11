@@ -117,8 +117,6 @@ class TestClientUpload:
     def test_chunked_upload(self, mock_requests, sample_config):
         # Session creation response
         session_resp = _mock_response(200, {"uploadUrl": "https://upload.example.com/session"})
-        # Final chunk response
-        final_resp = _mock_response(201, make_upload_response("big.bin"))
 
         mock_requests.return_value = session_resp
 

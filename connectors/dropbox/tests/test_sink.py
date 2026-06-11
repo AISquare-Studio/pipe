@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aisquare.pipe.core.envelope import DataEnvelope, PushParams, PushResult
+from aisquare.pipe.core.envelope import DataEnvelope, PushParams
 
 from aisquare_pipe_dropbox.connector import DropboxSink
 

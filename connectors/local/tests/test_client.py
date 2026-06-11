@@ -10,7 +10,6 @@ from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_local.client import LocalClient
 
-from tests.helpers import create_test_file, create_test_tree
 
 
 class TestClientInit:

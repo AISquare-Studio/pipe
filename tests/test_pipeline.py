@@ -1,11 +1,9 @@
 """Tests for the Pipeline class."""
 
-from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
+from aisquare.pipe.core.connector import AuthType, SinkConnector
 from aisquare.pipe.core.envelope import (
     DataEnvelope,
     MetaField,
-    PullParams,
-    PushParams,
     PushResult,
 )
 from aisquare.pipe.core.merge import MergeStrategy
