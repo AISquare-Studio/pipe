@@ -3,25 +3,26 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aisquare-pipe-onedrive"
+name = "aisquare-pipe-composio"
 version = "0.1.0"
-description = "OneDrive connector for aisquare.pipe"
+description = "Composio meta-connector for aisquare.pipe — execute 500+ SaaS toolkits through one connector"
 readme = "README.md"
-requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
 authors = [{name = "A-Square"}]
 dependencies = [
     "aisquare-pipe>=0.1.0",
-    "azure-identity>=1.15.0",
-    "requests>=2.20.0",
+    "composio>=0.13.1,<2.0",
+    "composio-client>=1.39,<2.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
 
 [project.entry-points."aisquare_pipe.connectors"]
-onedrive-source = "aisquare_pipe_onedrive.connector:OneDriveSource"
-onedrive-sink = "aisquare_pipe_onedrive.connector:OneDriveSink"
+composio-source = "aisquare_pipe_composio.connector:ComposioSource"
+composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
+composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
 
 [tool.setuptools.packages.find]
 where = ["src"]
