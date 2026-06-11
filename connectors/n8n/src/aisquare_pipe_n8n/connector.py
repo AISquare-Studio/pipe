@@ -33,7 +33,14 @@ from typing import Any
 from aisquare.pipe.core.connector import AuthType, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
 
-from aisquare_pipe_n8n.client import N8nClient, load_cursor, save_cursor
+from aisquare_pipe_n8n.client import (
+    LEGACY_CURSOR_PATH,
+    N8nClient,
+    default_cursor_path,
+    load_cursor,
+    migrate_legacy_cursor,
+    save_cursor,
+)
 from aisquare_pipe_n8n.spans import (
     execution_to_stub_trace_batch,
     execution_to_trace_batch,
@@ -64,7 +71,7 @@ class N8nSource(SourceConnector):
     """
 
     name = "n8n"
-    version = "0.2.0"
+    version = "0.2.1"
     output_types = [TRACE_CONTENT_TYPE]
     auth_type = AuthType.API_KEY
 
@@ -91,8 +98,11 @@ class N8nSource(SourceConnector):
         "cursor_path": MetaField(
             type=str,
             required=False,
-            default="/tmp/n8n-pipe-cursor.json",
-            description="File path for last-seen execution ID",
+            description=(
+                "File path for last-seen execution ID (default: "
+                "~/.cache/aisquare-pipe/n8n-cursor.json, honouring "
+                "$XDG_CACHE_HOME)"
+            ),
         ),
         "workflow_id_filter": MetaField(
             type=list,
@@ -146,9 +156,10 @@ class N8nSource(SourceConnector):
                 self.CONFIG_SPEC["poll_interval_seconds"].default,
             )
         )
-        cursor_path = config.get(
-            "cursor_path", self.CONFIG_SPEC["cursor_path"].default
-        )
+        cursor_path = config.get("cursor_path")
+        if not cursor_path:
+            cursor_path = default_cursor_path()
+            migrate_legacy_cursor(LEGACY_CURSOR_PATH, cursor_path)
         workflow_ids = config.get("workflow_id_filter") or None
         include_running = bool(
             config.get("include_running", self.CONFIG_SPEC["include_running"].default)
