@@ -209,11 +209,27 @@ class TestTriggerCursor:
 
     def test_round_trip(self, tmp_cursor_path):
         save_trigger_cursor(
-            tmp_cursor_path, TriggerCursor(last_ts_ms=123, seen_ids=["a", "b"])
+            tmp_cursor_path,
+            TriggerCursor(
+                last_ts_ms=123,
+                seen_ids=["a", "b"],
+                pending_cursor="cur_7",
+                pending_max_ts=456,
+            ),
         )
         state = load_trigger_cursor(tmp_cursor_path)
         assert state.last_ts_ms == 123
         assert state.seen_ids == ["a", "b"]
+        assert state.pending_cursor == "cur_7"
+        assert state.pending_max_ts == 456
+
+    def test_load_tolerates_missing_pending_fields(self, tmp_cursor_path):
+        with open(tmp_cursor_path, "w", encoding="utf-8") as fd:
+            fd.write('{"last_ts_ms": 5, "seen_ids": ["x"]}')
+        state = load_trigger_cursor(tmp_cursor_path)
+        assert state.last_ts_ms == 5
+        assert state.pending_cursor is None
+        assert state.pending_max_ts == 0
 
     def test_corrupt_file_returns_empty(self, tmp_cursor_path):
         with open(tmp_cursor_path, "w", encoding="utf-8") as fd:

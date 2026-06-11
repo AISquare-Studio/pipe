@@ -388,10 +388,19 @@ class ComposioClient:
 
 @dataclass
 class TriggerCursor:
-    """Persisted polling position for the triggers source."""
+    """Persisted polling position for the triggers source.
+
+    ``pending_cursor``/``pending_max_ts`` carry an interrupted window across
+    polls: when one poll cycle hits its page cap before draining the event
+    log, the next cycle resumes from the saved page cursor instead of
+    re-reading (or worse, skipping) the remainder. The watermark only
+    advances once a window is fully drained.
+    """
 
     last_ts_ms: int = 0
     seen_ids: list[str] = field(default_factory=list)
+    pending_cursor: str | None = None
+    pending_max_ts: int = 0
 
 
 def load_trigger_cursor(path: str) -> TriggerCursor:
@@ -412,7 +421,19 @@ def load_trigger_cursor(path: str) -> TriggerCursor:
         last_ts_ms = 0
     seen = payload.get("seen_ids", [])
     seen_ids = [str(s) for s in seen] if isinstance(seen, list) else []
-    return TriggerCursor(last_ts_ms=last_ts_ms, seen_ids=seen_ids)
+    pending_cursor = payload.get("pending_cursor")
+    if pending_cursor is not None:
+        pending_cursor = str(pending_cursor)
+    try:
+        pending_max_ts = int(payload.get("pending_max_ts", 0))
+    except (TypeError, ValueError):
+        pending_max_ts = 0
+    return TriggerCursor(
+        last_ts_ms=last_ts_ms,
+        seen_ids=seen_ids,
+        pending_cursor=pending_cursor,
+        pending_max_ts=pending_max_ts,
+    )
 
 
 def save_trigger_cursor(path: str, state: TriggerCursor) -> None:
@@ -425,6 +446,8 @@ def save_trigger_cursor(path: str, state: TriggerCursor) -> None:
             {
                 "last_ts_ms": int(state.last_ts_ms),
                 "seen_ids": state.seen_ids[-SEEN_IDS_MAX:],
+                "pending_cursor": state.pending_cursor,
+                "pending_max_ts": int(state.pending_max_ts),
             }
         ),
         encoding="utf-8",

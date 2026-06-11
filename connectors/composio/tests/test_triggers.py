@@ -154,6 +154,87 @@ class TestFilters:
         assert [e.metadata["composio_event_id"] for e in envelopes] == ["evt_2"]
 
 
+class TestPageCap:
+    BASE = 1_700_000_000_000
+
+    def test_page_cap_holds_watermark_and_saves_pending_cursor(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        from aisquare_pipe_composio.constants import MAX_TRIGGER_PAGES_PER_POLL
+
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event(f"evt_{i}", ts_ms=self.BASE + (i + 1) * 1000)], f"cur_{i}")
+            for i in range(MAX_TRIGGER_PAGES_PER_POLL)
+        ]
+        config = _config(composio_config, tmp_cursor_path)
+
+        envelopes = _pull_once(ComposioTriggersSource(), config, since=self.BASE)
+
+        # Every read event is still yielded...
+        assert len(envelopes) == MAX_TRIGGER_PAGES_PER_POLL
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        # ...but the watermark is held back and the page cursor saved.
+        assert saved["last_ts_ms"] == self.BASE
+        assert saved["pending_cursor"] == f"cur_{MAX_TRIGGER_PAGES_PER_POLL - 1}"
+        assert saved["pending_max_ts"] == self.BASE + MAX_TRIGGER_PAGES_PER_POLL * 1000
+
+    def test_resume_completes_window_and_advances_watermark(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        from aisquare_pipe_composio.constants import MAX_TRIGGER_PAGES_PER_POLL
+
+        config = _config(composio_config, tmp_cursor_path)
+        source = ComposioTriggersSource()
+
+        # Poll 1: cap out mid-window.
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event(f"evt_{i}", ts_ms=self.BASE + (i + 1) * 1000)], f"cur_{i}")
+            for i in range(MAX_TRIGGER_PAGES_PER_POLL)
+        ]
+        _pull_once(source, config, since=self.BASE)
+
+        # Poll 2: resumes from the saved page cursor, window drains.
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event("evt_final", ts_ms=self.BASE + 500)], None)
+        ]
+        envelopes = _pull_once(source, config)
+
+        assert [e.metadata["composio_event_id"] for e in envelopes] == ["evt_final"]
+        first_resume_kwargs = mock_triggers_client.list_trigger_events.call_args.kwargs
+        assert first_resume_kwargs["cursor"] == f"cur_{MAX_TRIGGER_PAGES_PER_POLL - 1}"
+        assert first_resume_kwargs["from_ms"] == self.BASE
+
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        # Watermark now advances to the max ts seen across BOTH polls.
+        assert saved["pending_cursor"] is None
+        assert saved["pending_max_ts"] == 0
+        assert saved["last_ts_ms"] == self.BASE + MAX_TRIGGER_PAGES_PER_POLL * 1000
+
+    def test_stale_pending_cursor_cleared_on_poll_error(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        from aisquare_pipe_composio.client import TriggerCursor, save_trigger_cursor
+
+        save_trigger_cursor(
+            tmp_cursor_path,
+            TriggerCursor(
+                last_ts_ms=self.BASE, pending_cursor="cur_stale", pending_max_ts=123
+            ),
+        )
+        mock_triggers_client.list_trigger_events.side_effect = Exception("expired cursor")
+
+        envelopes = _pull_once(ComposioTriggersSource(), _config(composio_config, tmp_cursor_path))
+
+        assert envelopes == []
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        assert saved["pending_cursor"] is None
+        assert saved["pending_max_ts"] == 0
+        assert saved["last_ts_ms"] == self.BASE  # watermark untouched
+
+
 class TestLoopBehaviour:
     def test_poll_error_logged_and_loop_continues(
         self, mock_triggers_client, composio_config, tmp_cursor_path

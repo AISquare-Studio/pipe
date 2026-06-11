@@ -8,7 +8,10 @@ the events they produce.
 
 Incremental position is a timestamp watermark plus a bounded ring of seen
 event ids (the event log is time-windowed rather than strictly cursored
-across polls), persisted atomically to a JSON cursor file.
+across polls), persisted atomically to a JSON cursor file. When one poll
+cycle hits its page cap before draining a window, the page cursor is saved
+and the watermark held back, so the next cycle resumes mid-window — events
+are delivered at least once, never silently skipped.
 """
 
 from __future__ import annotations
@@ -165,6 +168,13 @@ class ComposioTriggersSource(SourceConnector):
             except Exception:
                 logger.exception("composio: trigger poll cycle failed")
                 changed = False
+                if state.pending_cursor is not None:
+                    # A stale resume cursor could fail every cycle forever —
+                    # drop it so the next cycle rescans the window from the
+                    # held watermark (the seen-id ring absorbs the replays).
+                    state.pending_cursor = None
+                    state.pending_max_ts = 0
+                    changed = True
 
             if changed:
                 save_trigger_cursor(cursor_path, state)
@@ -192,7 +202,9 @@ class ComposioTriggersSource(SourceConnector):
         }
 
         changed = False
-        cursor: str | None = None
+        cursor = state.pending_cursor
+        max_ts = max(state.last_ts_ms, state.pending_max_ts)
+        exhausted = False
         for _ in range(MAX_TRIGGER_PAGES_PER_POLL):
             events, next_cursor = client.list_trigger_events(
                 user_id=user_id,
@@ -208,8 +220,8 @@ class ComposioTriggersSource(SourceConnector):
 
                 state.seen_ids.append(event_id)
                 ts_ms = event.get("timestamp_ms")
-                if isinstance(ts_ms, int) and ts_ms > state.last_ts_ms:
-                    state.last_ts_ms = ts_ms
+                if isinstance(ts_ms, int) and ts_ms > max_ts:
+                    max_ts = ts_ms
                 changed = True
 
                 slug = str(event.get("trigger_slug") or "").upper()
@@ -224,12 +236,30 @@ class ComposioTriggersSource(SourceConnector):
                 yield self._envelope(event, event_id)
 
             if not next_cursor or not events:
+                exhausted = True
                 break
             cursor = next_cursor
+
+        if exhausted:
+            # Window fully drained — now (and only now) advance the watermark.
+            if state.pending_cursor is not None or state.pending_max_ts:
+                state.pending_cursor = None
+                state.pending_max_ts = 0
+                changed = True
+            if max_ts > state.last_ts_ms:
+                state.last_ts_ms = max_ts
+                changed = True
         else:
+            # Page cap hit with more pages remaining: hold the watermark and
+            # save the page cursor so the next cycle resumes mid-window
+            # instead of skipping (or re-reading) the remainder.
+            if state.pending_cursor != cursor or state.pending_max_ts != max_ts:
+                changed = True
+            state.pending_cursor = cursor
+            state.pending_max_ts = max_ts
             logger.warning(
-                "composio: trigger event window exceeded %d pages; remaining "
-                "events in this window may be skipped",
+                "composio: trigger event window exceeded %d pages; watermark "
+                "held — resuming from the saved page cursor next poll",
                 MAX_TRIGGER_PAGES_PER_POLL,
             )
 
