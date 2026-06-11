@@ -1,0 +1,38 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install framework + all connectors
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          for dir in connectors/*/; do
+            pip install -e "$dir"
+          done
+
+      - name: pipe validate
+        shell: bash
+        run: |
+          set -o pipefail
+          pipe validate --json | tee validate-report.json
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-report
+          path: validate-report.json

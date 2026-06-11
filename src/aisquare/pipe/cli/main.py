@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
+import importlib.util
 import json
 import os
 import sys
@@ -62,11 +61,11 @@ def describe(name: str) -> None:
     click.echo(f"Description: {inst.description or '(none)'}")
 
     if isinstance(inst, SourceConnector):
-        click.echo(f"Type:        source")
+        click.echo("Type:        source")
         click.echo(f"Output:      {', '.join(inst.output_types)}")
 
     if isinstance(inst, SinkConnector):
-        click.echo(f"Type:        sink")
+        click.echo("Type:        sink")
         click.echo(f"Input:       {', '.join(inst.input_types)}")
 
     if inst.metadata_spec:
@@ -179,13 +178,10 @@ def run(
             click.echo(f"  [{err['envelope_index']}] {err['error']}")
 
 
-@cli.command()
-@click.argument("path")
-def validate(path: str) -> None:
-    """Load and run compliance tests against a connector file."""
+def _validate_file(path: str) -> None:
+    """Legacy mode: load a connector .py file and run its compliance suite."""
     import unittest
 
-    # Load the module from the file path
     spec = importlib.util.spec_from_file_location("connector_module", path)
     if spec is None or spec.loader is None:
         click.echo(f"Error: cannot load {path}", err=True)
@@ -193,7 +189,6 @@ def validate(path: str) -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    # Find all connector classes in the module
     from aisquare.pipe.testing.compliance import connector_compliance_suite
 
     found = False
@@ -214,6 +209,95 @@ def validate(path: str) -> None:
     if not found:
         click.echo("No connector classes found in the file.", err=True)
         sys.exit(1)
+
+
+@cli.command()
+@click.argument("target", required=False)
+@click.option("--live", is_flag=True, help="Also run live tests (tests/test_live.py) where present; they self-skip without their env credentials.")
+@click.option("--skip-tests", is_flag=True, help="Contract + hygiene only — skip the per-connector unit suites (fast).")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON report.")
+@click.option("--install", "do_install", is_flag=True, help="pip install -e any missing/broken connector dirs before validating.")
+@click.option("--timeout", default=300, type=int, show_default=True, help="Per-suite subprocess timeout in seconds.")
+def validate(
+    target: str | None,
+    live: bool,
+    skip_tests: bool,
+    as_json: bool,
+    do_install: bool,
+    timeout: int,
+) -> None:
+    """Validate connectors — no credentials required.
+
+    \b
+    pipe validate                 all connectors + framework (contract,
+                                  hygiene, unit suites)
+    pipe validate composio        one connector
+    pipe validate path/to/file.py legacy: compliance suite against a file
+    """
+    if target and os.path.isfile(target):
+        _validate_file(target)
+        return
+
+    from aisquare.pipe.cli.validate import (
+        exit_code,
+        install_missing_connectors,
+        render_json,
+        render_table,
+        validate_installed_only,
+        validate_repo,
+    )
+    from aisquare.pipe.testing.hygiene import find_repo_root, list_connector_dirs
+
+    echo = (lambda *a, **k: None) if as_json else click.echo
+    repo_root = find_repo_root()
+
+    if repo_root is None:
+        if target:
+            click.echo(
+                "Error: validating a single connector by name requires running "
+                "inside an aisquare-pipe repo checkout.",
+                err=True,
+            )
+            sys.exit(2)
+        echo("No repo checkout found — validating installed connectors (contract layer only).")
+        reports = validate_installed_only(live=live, echo=echo)
+        render_json(reports, None) if as_json else render_table(reports)
+        sys.exit(exit_code(reports))
+
+    only: str | None = None
+    if target:
+        names = [c.dir_name for c in list_connector_dirs(repo_root)]
+        resolved = target.removeprefix("aisquare-pipe-")
+        for candidate in (target, resolved):
+            if candidate in names:
+                only = candidate
+                break
+        else:
+            click.echo(
+                f"Error: unknown connector '{target}'. Available: {', '.join(names)}",
+                err=True,
+            )
+            sys.exit(2)
+
+    if do_install:
+        install_missing_connectors(repo_root, only, echo=echo)
+        # Fresh editable installs register import hooks via .pth files that
+        # only run at interpreter startup — re-exec without --install.
+        args = [a for a in sys.argv[1:] if a != "--install"]
+        os.execv(sys.executable, [sys.executable, "-m", "aisquare.pipe.cli", *args])
+
+    scope = only or f"{len(list_connector_dirs(repo_root))} connectors + framework"
+    echo(f"Validating {scope}  (repo: {repo_root})")
+    reports = validate_repo(
+        repo_root,
+        only,
+        live=live,
+        skip_tests=skip_tests,
+        timeout=timeout,
+        echo=echo,
+    )
+    render_json(reports, repo_root) if as_json else render_table(reports)
+    sys.exit(exit_code(reports))
 
 
 @cli.command("new-connector")
@@ -241,6 +325,7 @@ build-backend = "setuptools.build_meta"
 name = "aisquare-pipe-{name}"
 version = "0.1.0"
 description = "aisquare.pipe connector for {name}"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["aisquare-pipe>=0.1.0"]
 
@@ -249,6 +334,37 @@ dependencies = ["aisquare-pipe>=0.1.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
+''')
+
+    # README.md
+    with open(f"{project_dir}/README.md", "w") as f:
+        f.write(f'''# aisquare-pipe-{name}
+
+{name} connector for aisquare.pipe.
+
+## Install
+
+```bash
+pip install -e .
+```
+
+## Configuration
+
+```python
+config = {{"api_key": "..."}}
+```
+
+## Validate
+
+```bash
+pipe validate {name}   # from the aisquare-pipe repo root
+pytest                 # this connector's own suite
+```
 ''')
 
     # Connector stub
@@ -262,6 +378,7 @@ from collections.abc import Iterator
 
 from aisquare.pipe import (
     AuthType,
+    ConfigValidationError,
     DataEnvelope,
     MetaField,
     PullParams,
@@ -278,18 +395,26 @@ class {safe_name.title()}Source(SourceConnector):
     description = "{name} source connector"
 
     def pull(self, config: dict, params: PullParams | None = None) -> Iterator[DataEnvelope]:
-        raise NotImplementedError("TODO: implement pull")
+        if not self.validate_config(config):
+            raise ConfigValidationError(f"{{self.name}}: invalid config (missing api_key)")
+        # TODO: fetch real data from the service
+        yield DataEnvelope(
+            content_type="text/plain",
+            data="TODO: replace with real data",
+            source_id=self.name,
+        )
 
     def validate_config(self, config: dict) -> bool:
-        raise NotImplementedError("TODO: implement config validation")
+        # TODO: real validation (key presence + a cheap API ping)
+        return "api_key" in config
 ''')
 
     # Test stub
     with open(f"{project_dir}/tests/__init__.py", "w") as f:
         pass
 
-    with open(f"{project_dir}/tests/test_connector.py", "w") as f:
-        f.write(f'''"""Tests for {name} connector."""
+    with open(f"{project_dir}/tests/test_compliance.py", "w") as f:
+        f.write(f'''"""Framework compliance suite for the {name} connector."""
 
 from aisquare.pipe.testing.compliance import connector_compliance_suite
 from aisquare_pipe_{safe_name}.connector import {safe_name.title()}Source

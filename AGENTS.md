@@ -25,6 +25,14 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 - Plugin discovery depends on editable/install-time entry points. If CLI discovery behaves unexpectedly, confirm the package has been installed with `pip install -e .`.
 
 ## Common Commands
+- Validate everything — every connector + the framework, no credentials needed:
+  ```bash
+  pipe validate                # contract + hygiene + every unit suite
+  pipe validate --skip-tests   # contract + hygiene only (seconds)
+  pipe validate composio       # one connector
+  pipe validate --install      # also pip install -e any missing/broken connector dirs
+  ```
+  Exit 0 = clean (warnings allowed), 1 = failures. CI runs exactly this command.
 - Run framework tests:
   ```bash
   pytest
@@ -33,9 +41,10 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
   ```bash
   pytest tests/test_pipeline.py -v
   ```
-- Run connector package tests:
+- Run connector package tests (one connector per pytest invocation — their
+  `tests` packages share a name and cannot run in one process):
   ```bash
-  pytest connectors/local/tests -v
+  cd connectors/local && pytest tests -v
   ```
 - Lint:
   ```bash
@@ -59,6 +68,7 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 - Do not remove or rename entry points in `pyproject.toml` files unless the task explicitly requires it.
 - Each connector under `connectors/<name>/` is an independently published pip package. Its source MUST stay inside its own directory; framework code is not modified from a connector change.
 - If a connector needs additional folders (e.g., `migrations/`, `schemas/`, `fixtures/`), those go **inside** `connectors/<name>/` — never at the repo root.
+- **Credentials are never required by default.** All validation layers (contract, hygiene, unit suites) are hermetic — connector tests mock at the client boundary. Live tests are opt-in via `pipe validate --live` and must self-skip when their env vars are absent.
 
 ## Connector Tiers
 All connectors live in the same `connectors/<name>/` directory; the tier signal is encoded in `pyproject.toml` extras bundles, not in folder location.
@@ -75,6 +85,7 @@ All connectors live in the same `connectors/<name>/` directory; the tier signal 
 The repo is sized to scale to ~50 connectors in this layout. If the long-tail grows past that, the `[popular]` set may need to spin out into its own repo — but that's a future problem, not a current one.
 
 ## Testing Expectations
+- Run `pipe validate` before pushing any connector change — it is the single gate (contract, hygiene, unit suites) and what CI runs.
 - Any change to pipeline logic, type matching, envelope handling, registry behavior, or merge behavior should include or update tests under `tests/`.
 - Any connector package change should run that connector's test suite and keep compliance tests passing.
 - If a change affects CLI output or connector discovery, verify with the CLI where practical.
