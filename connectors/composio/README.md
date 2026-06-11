@@ -161,6 +161,8 @@ for envelope in source.pull(config):               # polls forever
 
 ## Example pipelines
 
+These examples compose with other pipe connectors — install them first: `pip install aisquare-pipe-local aisquare-pipe-salesforce` (both included in `aisquare-pipe[full]`).
+
 ```python
 from aisquare.pipe import Pipeline, PullParams, PushParams
 from aisquare_pipe_composio import ComposioSource, ComposioSink
