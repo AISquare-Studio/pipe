@@ -136,18 +136,19 @@ class TestBridges:
         text = q.shortest_path_text(G, "SubscribeButton", "SubscribeView")
         assert "1 hops" in text or "http_call" in text
 
-    def test_blast_radius_crosses_the_bridge_in_reverse(self):
+    def test_blast_radius_crosses_the_bridge_with_bridge_relations(self):
         # Changing the BE view impacts the FE component THROUGH the bridge —
-        # but only if the bridge relation is followed; http_call is not in the
-        # default relation set, so pass it explicitly via the audit kinds.
+        # but only when the bridge relation kinds are followed: the engine's
+        # default dependency set is code-level only. extra_relations is the
+        # seam merged-graph consumers use (the PR-review 🔴 fix).
+        from aisquare_pipe_graphify.merger import BRIDGE_RELATIONS
+
         merged_json, _ = _merge(bridges=[_BRIDGE])
         G = q.load_graph_from_json(merged_json)
-        from graphify.affected import DEFAULT_AFFECTED_RELATIONS, format_affected
-
-        text = format_affected(
-            G,
-            "SubscribeView",
-            relations=tuple(DEFAULT_AFFECTED_RELATIONS) + ("http_call",),
-            depth=2,
+        without = q.blast_radius_text(G, "SubscribeView", depth=2)
+        assert "SubscribeButton" not in without  # defaults stop at the repo boundary
+        crossed = q.blast_radius_text(
+            G, "SubscribeView", depth=2, extra_relations=BRIDGE_RELATIONS
         )
-        assert "SubscribeButton" in text
+        assert "SubscribeButton" in crossed
+        assert "[http_call]" in crossed  # via-relation names the bridge

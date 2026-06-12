@@ -232,10 +232,21 @@ def shortest_path_text(G: "nx.Graph", source: str, target: str) -> str:
     return f"Path ({len(path) - 1} hops){note}: {rendered}"
 
 
-def blast_radius_text(G: "nx.Graph", query: str, *, depth: int = 2) -> str:
+def blast_radius_text(
+    G: "nx.Graph", query: str, *, depth: int = 2, extra_relations: tuple = ()
+) -> str:
     """Reverse-BFS impact set: everything that (transitively) depends on the
     node — ``graphify.affected.format_affected`` verbatim (resolves its own
-    seed, names the relations it followed, lists source locations)."""
-    from graphify.affected import format_affected
+    seed, names the relations it followed, lists source locations).
 
-    return format_affected(G, query, depth=max(1, min(int(depth), 4)))
+    ``extra_relations`` EXTENDS the engine's default dependency-relation set —
+    the seam merged-graph consumers need: cross-repo bridge edges carry their
+    own relation kinds (``http_call``/``lib_dep``/``infra``,
+    :data:`aisquare_pipe_graphify.merger.BRIDGE_RELATIONS`), which the engine's
+    code-level defaults don't include, so without this a blast radius over a
+    merged graph silently stops at repo boundaries.
+    """
+    from graphify.affected import DEFAULT_AFFECTED_RELATIONS, format_affected
+
+    relations = tuple(DEFAULT_AFFECTED_RELATIONS) + tuple(extra_relations)
+    return format_affected(G, query, relations=relations, depth=max(1, min(int(depth), 4)))

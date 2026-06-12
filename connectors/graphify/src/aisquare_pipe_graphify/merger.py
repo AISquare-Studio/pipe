@@ -42,7 +42,13 @@ except ImportError as exc:  # pragma: no cover — import-time guard
 
 from aisquare_pipe_graphify.query import load_graph_from_json
 
-__all__ = ["merge_graphs"]
+__all__ = ["BRIDGE_RELATIONS", "merge_graphs"]
+
+# The relation kinds bridge edges carry (== the card extractors' edge kinds).
+# Consumers traversing dependency direction over a MERGED graph must extend
+# the engine's default relation set with these, or reverse-BFS (blast radius)
+# silently stops at repo boundaries — see query.blast_radius_text(extra_relations=).
+BRIDGE_RELATIONS = ("http_call", "lib_dep", "infra")
 
 # Synthetic per-repo anchor for bridge edges whose evidence file maps to no
 # graph node (different head_shas between pack and graph, skeleton packs, …).
