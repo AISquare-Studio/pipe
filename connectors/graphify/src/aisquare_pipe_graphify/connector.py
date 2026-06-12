@@ -25,7 +25,7 @@ class GraphifySource(SourceConnector):
     """
 
     name = "graphify"  # config-dict key (entry-point name is graphify-source)
-    version = "0.1.0"
+    version = "0.2.0"
     output_types = [GRAPH_CONTENT_TYPE, "text/markdown", "application/json"]
     auth_type = AuthType.NONE
     description = "Knowledge-graph source: graphify a local code tree."
