@@ -6,8 +6,14 @@ import json
 
 import pytest
 
-from aisquare_pipe_graphify import query as q
-from aisquare_pipe_graphify.merger import merge_graphs
+# Both faces need the [engine] extra — skip cleanly without it (CI validator
+# runs connectors bare).
+q = pytest.importorskip(
+    "aisquare_pipe_graphify.query", reason="[engine] extra not installed"
+)
+merge_graphs = pytest.importorskip(
+    "aisquare_pipe_graphify.merger", reason="[engine] extra not installed"
+).merge_graphs
 
 # Two repos that BOTH define a node id "config" (collision bait), both import
 # the external lib "stripe" (no source_file → dedup bait), and the web repo

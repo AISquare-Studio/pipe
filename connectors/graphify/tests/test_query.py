@@ -10,7 +10,12 @@ import json
 
 import pytest
 
-from aisquare_pipe_graphify import query as q
+# The query face needs the [engine] extra (graphifyy + networkx) — environments
+# without it (e.g. the bare CI validator) skip cleanly instead of erroring at
+# collection.
+q = pytest.importorskip(
+    "aisquare_pipe_graphify.query", reason="[engine] extra not installed"
+)
 
 # A miniature web-shop graph: SubscribeButton -> apiClient -> charge -> stripe,
 # with a god-ish hub (db) and a second caller of charge for blast-radius.
