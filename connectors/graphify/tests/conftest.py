@@ -1,14 +1,24 @@
 """Shared fixtures: a recording fake `graphify` executable + a fake checkout.
 
 The stub records every invocation (argv + the env vars that matter + cwd) to
-``calls.jsonl`` beside itself, and writes a canned ``graphify-out/`` into the
-cwd. Behavior is steered by *control files* touched next to the stub (the
-engine scrubs the subprocess env, so env-var steering wouldn't reach it):
+``calls.jsonl`` beside itself and mimics the REAL per-command artifact
+contract of graphifyy 0.8.36 — this is load-bearing: an earlier stub wrote
+GRAPH_REPORT.md on every command and masked a production bug where `extract`
+never writes the report (only `cluster-only`/`update` do).
 
-  FAIL_EXTRACT  -> `extract` exits 1 with a billing-style stderr
-  FAIL_UPDATE   -> `update` exits 1
-  NO_ARTIFACTS  -> exit 0 but write nothing (sanity-gate trigger)
-  BAD_JSON      -> write an unparseable graph.json
+  extract       -> writes graph.json ONLY; prints the telemetry line
+  cluster-only  -> requires graph.json; writes GRAPH_REPORT.md
+  update        -> writes BOTH artifacts (the keyless AST path)
+
+Behavior is steered by *control files* touched next to the stub (the engine
+scrubs the subprocess env, so env-var steering wouldn't reach it):
+
+  FAIL_EXTRACT      -> `extract` exits 1 with a billing-style stderr
+  FAIL_CLUSTER      -> `cluster-only` exits 1
+  FAIL_UPDATE       -> `update` exits 1
+  CLUSTER_NO_REPORT -> `cluster-only` exits 0 but writes nothing (drift sim)
+  NO_ARTIFACTS      -> exit 0 but write nothing (sanity-gate trigger)
+  BAD_JSON          -> write an unparseable graph.json
 """
 
 from __future__ import annotations
@@ -31,24 +41,49 @@ if "--version" in sys.argv:
     print("graphify 0.8.36-fake")
     raise SystemExit(0)
 cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-if cmd == "extract" and os.path.exists(os.path.join(here, "FAIL_EXTRACT")):
-    sys.stderr.write("enriched boom: credit balance is too low\\n")
-    raise SystemExit(1)
-if cmd == "update" and os.path.exists(os.path.join(here, "FAIL_UPDATE")):
-    sys.stderr.write("update boom\\n")
-    raise SystemExit(1)
+out = os.path.join(os.getcwd(), "graphify-out")
+
+def write_graph_json():
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "graph.json"), "w") as fh:
+        if os.path.exists(os.path.join(here, "BAD_JSON")):
+            fh.write("{not json")
+        else:
+            fh.write(json.dumps({"nodes": [{}] * 12, "links": [{}] * 34}))
+
+def write_report():
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "GRAPH_REPORT.md"), "w") as fh:
+        fh.write("# Graph report\\n\\nNodes: 12\\nEdges: 34\\nCommunities: 3\\n\\n(fake)\\n")
+
 if os.path.exists(os.path.join(here, "NO_ARTIFACTS")):
     raise SystemExit(0)
-out = os.path.join(os.getcwd(), "graphify-out")
-os.makedirs(out, exist_ok=True)
-with open(os.path.join(out, "GRAPH_REPORT.md"), "w") as fh:
-    fh.write("# Graph report\\n\\nNodes: 12\\nEdges: 34\\nCommunities: 3\\n\\n(fake)\\n")
-with open(os.path.join(out, "graph.json"), "w") as fh:
-    if os.path.exists(os.path.join(here, "BAD_JSON")):
-        fh.write("{not json")
-    else:
-        fh.write(json.dumps({"nodes": [{}] * 12, "links": [{}] * 34}))
-print("ok")
+if cmd == "extract":
+    if os.path.exists(os.path.join(here, "FAIL_EXTRACT")):
+        sys.stderr.write("enriched boom: credit balance is too low\\n")
+        raise SystemExit(1)
+    write_graph_json()
+    with open(os.path.join(out, ".graphify_analysis.json"), "w") as fh:
+        fh.write(json.dumps({"tokens": {"input": 9000, "output": 400}}))
+    print("[graphify extract] wrote graph.json - 12 nodes, 34 edges (no clustering)")
+    print("[graphify extract] tokens: 1,234 in / 567 out, est. cost: $0.0123")
+    print("next: run graphify cluster-only . to generate GRAPH_REPORT.md")
+elif cmd in ("cluster-only", "label"):
+    if os.path.exists(os.path.join(here, "FAIL_CLUSTER")):
+        sys.stderr.write("cluster boom\\n")
+        raise SystemExit(1)
+    if not os.path.exists(os.path.join(here, "CLUSTER_NO_REPORT")):
+        write_report()
+    print("Done - 3 communities. GRAPH_REPORT.md and graph.json updated.")
+elif cmd == "update":
+    if os.path.exists(os.path.join(here, "FAIL_UPDATE")):
+        sys.stderr.write("update boom\\n")
+        raise SystemExit(1)
+    write_graph_json()
+    write_report()
+    print("ok")
+else:
+    print("ok")
 '''
 
 

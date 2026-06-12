@@ -2,28 +2,43 @@
 
 Two-tier build (verified against graphifyy 0.8.36):
 
-* **enriched** — ``graphify extract . --no-viz --backend <b>`` with the
-  backend's key in a scrubbed env. NEVER runs without an explicit
-  ``--backend``: a backend-less ``extract`` does NOT degrade to a free AST
-  pass — it auto-detects a backend from ambient env vars and crashes when
-  that backend's package/key is missing.
+* **enriched** — ``graphify extract . --no-viz --backend <b> --model <m>``
+  followed by ``graphify cluster-only .`` with the backend's key in a
+  scrubbed env. The two-step shape is load-bearing: ``extract`` writes ONLY
+  ``graph.json`` — ``GRAPH_REPORT.md`` (and named communities) come from
+  ``cluster-only``. NEVER runs without an explicit ``--backend``: a
+  backend-less ``extract`` does NOT degrade to a free AST pass — it
+  auto-detects a backend from ambient env vars and crashes when that
+  backend's package/key is missing.
 * **ast** — ``graphify update .`` — the version-correct keyless path
-  ("re-extract code files and update the graph (no LLM needed)"). Full
-  structural graph (nodes/edges/communities), no LLM-inferred edges, no
-  community naming.
+  ("re-extract code files and update the graph (no LLM needed)"). Writes
+  both artifacts itself. Full structural graph (nodes/edges/communities),
+  no LLM-inferred edges, no community naming.
 
 Enriched failures fall back to a *working* AST graph in the same run (the
 failure tail rides along as ``enrichment_error``) instead of erroring the
-whole build — a dead key should degrade the product, not kill it.
+whole build — a dead key should degrade the product, not kill it. The same
+degrade applies when an "enriched" run leaves no usable report behind
+(belt-and-braces against engine version drift; an enriched pass that paid
+the LLM but produced nothing storable must never fail the build outright).
+
+Cost containment, in build order: a **doc-volume preflight** counts the
+doc-class bytes (the ONLY content the LLM ever sees — code is always local
+AST) and degrades to the AST tier above a configurable ceiling; the
+enriched pass runs on a small **model** by default (extraction is
+pattern-matching, not reasoning); and per-run **LLM token/cost telemetry**
+is parsed from the extract output so spend is observable per build.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import re
 import subprocess  # nosec B404 — fixed argv, shell=False throughout
+import tarfile
 from dataclasses import dataclass
 
 import requests
@@ -31,9 +46,13 @@ import requests
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_graphify.constants import (
+    DEFAULT_CLUSTER_TIMEOUT,
+    DEFAULT_DOC_VOLUME_CAP_BYTES,
     DEFAULT_EXTRACT_FLAGS,
+    DEFAULT_EXTRACT_MODEL,
     DEFAULT_EXTRACT_TIMEOUT,
     DEFAULT_UPDATE_TIMEOUT,
+    DOC_EXTENSIONS,
     KEY_ENV,
 )
 
@@ -42,8 +61,21 @@ logger = logging.getLogger("aisquare.pipe.graphify")
 _OUT_DIRNAME = "graphify-out"
 _REPORT_NAME = "GRAPH_REPORT.md"
 _GRAPH_JSON_NAME = "graph.json"
+_ANALYSIS_NAME = ".graphify_analysis.json"
 _VERSION_TIMEOUT = 15
 _PREFLIGHT_TIMEOUT = 15
+
+# Dirs the doc-volume preflight never descends into. Deliberately short:
+# vendored doc trees SHOULD trip the cap — that's the blow-up case it exists
+# to catch.
+_DOC_SCAN_SKIP_DIRS = {".git", _OUT_DIRNAME}
+
+# graphify extract's per-run spend line, e.g.
+# "[graphify extract] tokens: 1,234 in / 567 out, est. cost: $0.0123".
+# Lenient — wording drift leaves the fields 0; .graphify_analysis.json is the
+# fallback source. (cost.json is agent-skill-only and never written headless.)
+_LLM_TOKENS_RE = re.compile(r"tokens:\s*([\d,]+)\s*in\s*/\s*([\d,]+)\s*out", re.IGNORECASE)
+_LLM_COST_RE = re.compile(r"est\.?\s*cost:\s*\$([0-9][0-9,]*\.?[0-9]*)", re.IGNORECASE)
 
 # Lenient stat parsers (ported from the backend) — wording varies across
 # graphify versions; counts are a nicety, a miss leaves the field 0. The
@@ -108,6 +140,19 @@ class GraphArtifacts:
     tier: str  # "ast" | "enriched"
     enrichment_error: str | None
     graphify_version: str
+    # Per-build LLM spend (enriched tier only; 0 on AST builds). Parsed from
+    # extract stdout with .graphify_analysis.json as fallback — best-effort,
+    # a parse miss leaves them 0 rather than failing the build.
+    llm_tokens_in: int = 0
+    llm_tokens_out: int = 0
+    llm_cost_estimate: float = 0.0
+    # Incremental-build state (V2 Phase 3): a tar of graphify-out's
+    # manifest/graph/content-hash caches. The caller persists it and feeds it
+    # into the NEXT build's ``prior_state`` — restoring it before the engine
+    # runs is what makes graphify's diff-scoped/incremental paths reachable at
+    # all (a fresh clone otherwise has no prior state), turning per-merge
+    # enriched spend into O(changed docs). b"" when capture found nothing.
+    state_tar: bytes = b""
 
 
 class GraphifyEngine:
@@ -116,9 +161,12 @@ class GraphifyEngine:
         backend: str | None = None,
         api_key: str | None = None,
         *,
+        model: str | None = None,
         extract_flags: str = DEFAULT_EXTRACT_FLAGS,
         extract_timeout: int = DEFAULT_EXTRACT_TIMEOUT,
         update_timeout: int = DEFAULT_UPDATE_TIMEOUT,
+        cluster_timeout: int = DEFAULT_CLUSTER_TIMEOUT,
+        doc_volume_cap_bytes: int = DEFAULT_DOC_VOLUME_CAP_BYTES,
         graphify_bin: str = "graphify",
         preflight: bool = True,
         fallback_to_ast: bool = True,
@@ -130,9 +178,17 @@ class GraphifyEngine:
                 f"graphify backend {self.backend!r} requires an api_key "
                 f"(env var {KEY_ENV[self.backend]}); omit backend for the free AST tier"
             )
+        # The cheap-model default applies ONLY to claude — handing a claude
+        # model id to another backend would break its extract outright. None
+        # (unset) resolves per-backend; an explicit string always wins.
+        if model is None:
+            model = DEFAULT_EXTRACT_MODEL if self.backend == "claude" else ""
+        self.model = (model or "").strip()
         self.extract_flags = extract_flags or ""
         self.extract_timeout = int(extract_timeout)
         self.update_timeout = int(update_timeout)
+        self.cluster_timeout = int(cluster_timeout)
+        self.doc_volume_cap_bytes = int(doc_volume_cap_bytes or 0)
         self.graphify_bin = graphify_bin or "graphify"
         self.preflight = bool(preflight)
         self.fallback_to_ast = bool(fallback_to_ast)
@@ -143,24 +199,50 @@ class GraphifyEngine:
         return cls(
             backend=config.get("backend"),
             api_key=config.get("api_key"),
+            model=config.get("model"),
             extract_flags=config.get("extract_flags", DEFAULT_EXTRACT_FLAGS),
             extract_timeout=config.get("extract_timeout_seconds", DEFAULT_EXTRACT_TIMEOUT),
             update_timeout=config.get("update_timeout_seconds", DEFAULT_UPDATE_TIMEOUT),
+            cluster_timeout=config.get("cluster_timeout_seconds", DEFAULT_CLUSTER_TIMEOUT),
+            doc_volume_cap_bytes=config.get("doc_volume_cap_bytes", DEFAULT_DOC_VOLUME_CAP_BYTES),
             graphify_bin=config.get("graphify_bin", "graphify"),
             preflight=config.get("preflight", True),
             fallback_to_ast=config.get("fallback_to_ast", True),
         )
 
     # ----------------------------------------------------------------- build
-    def build(self, checkout_path: str) -> GraphArtifacts:
-        tier, err = "ast", None
+    def build(self, checkout_path: str, prior_state: bytes | None = None) -> GraphArtifacts:
+        if prior_state:
+            self._restore_state(checkout_path, prior_state)
+        tier, err, extract_stdout = "ast", None, ""
         if self._enrichment_armed():
-            if not self.preflight or self._preflight_ok():
+            doc_bytes = self._doc_volume(checkout_path) if self.doc_volume_cap_bytes else 0
+            if self.doc_volume_cap_bytes and doc_bytes > self.doc_volume_cap_bytes:
+                # The LLM pass only ever reads doc-class content, so doc bytes
+                # ARE the spend; above the ceiling this build takes the free
+                # tier instead of an unbounded LLM run. Degrade, never raise:
+                # an oversized doc corpus is a property of the repo, not an
+                # error in the build.
+                err = (
+                    f"doc volume {doc_bytes} bytes exceeds cap "
+                    f"{self.doc_volume_cap_bytes} — built on the free AST tier"
+                )
+                logger.warning("graphify: %s", err)
+            elif not self.preflight or self._preflight_ok():
                 try:
                     argv = ["extract", "."]
                     argv += [flag for flag in self.extract_flags.split() if flag]
                     argv += ["--backend", self.backend]  # C1: NEVER extract without --backend
-                    self._run(argv, checkout_path, self.extract_timeout, with_key=True)
+                    if self.model:
+                        argv += ["--model", self.model]
+                    extract_stdout = self._run(argv, checkout_path, self.extract_timeout, with_key=True)
+                    # extract writes ONLY graph.json; GRAPH_REPORT.md and named
+                    # communities come from cluster-only (verified on 0.8.36 —
+                    # without this step every enriched build pays the LLM pass
+                    # and stores nothing). cluster-only takes --backend only in
+                    # = form; the key rides the env so labeling can run.
+                    cluster_argv = ["cluster-only", ".", "--no-viz", f"--backend={self.backend}"]
+                    self._run(cluster_argv, checkout_path, self.cluster_timeout, with_key=True)
                     tier = "enriched"
                 except PipelineError as exc:
                     if not self.fallback_to_ast:
@@ -172,9 +254,16 @@ class GraphifyEngine:
                 if not self.fallback_to_ast:
                     raise PipelineError(err)
                 logger.warning("graphify: %s — falling back to AST", err)
+        if tier == "enriched" and not self._report_ok(checkout_path):
+            # Belt-and-braces against engine drift: both enriched commands
+            # "succeeded" yet no usable report exists. The LLM spend is sunk
+            # either way — salvage a working AST build instead of failing.
+            err = err or "enriched run produced no usable GRAPH_REPORT.md — degraded to AST"
+            logger.warning("graphify: %s", err)
+            tier = "ast"
         if tier == "ast":
             self._run(["update", "."], checkout_path, self.update_timeout, with_key=False)
-        return self._read_artifacts(checkout_path, tier, err)
+        return self._read_artifacts(checkout_path, tier, err, extract_stdout)
 
     # ------------------------------------------------------------ subprocess
     def _minimal_env(self, with_key: bool) -> dict:
@@ -261,8 +350,100 @@ class GraphifyEngine:
             return False
         return True
 
+    # ----------------------------------------------------- incremental state
+    # What survives between builds: the manifest (file inventory), the prior
+    # graph (update's diff base), the analysis sidecar, and the content-hash
+    # caches (unchanged docs never re-hit the LLM — portable across checkouts
+    # by design, graphify #777). Everything lives under graphify-out/.
+    _STATE_MEMBERS = ("manifest.json", "graph.json", ".graphify_analysis.json", "cache")
+
+    def _restore_state(self, checkout_path: str, prior_state: bytes) -> None:
+        """Unpack a prior build's graphify-out state into the fresh checkout.
+
+        Best-effort: a corrupt/hostile archive degrades to a full (stateless)
+        build, never fails it. Members are confined to ``graphify-out/`` and
+        extracted with the ``data`` filter (no traversal, no specials).
+        """
+        try:
+            with tarfile.open(fileobj=io.BytesIO(prior_state), mode="r:gz") as tar:
+                members = [
+                    m
+                    for m in tar.getmembers()
+                    if m.name.startswith(f"{_OUT_DIRNAME}/") or m.name == _OUT_DIRNAME
+                ]
+                tar.extractall(checkout_path, members=members, filter="data")
+            logger.info("graphify: restored prior incremental state (%d members)", len(members))
+        except Exception as exc:  # noqa: BLE001 — stateless build beats a failed one
+            logger.warning("graphify: could not restore prior state (full build instead): %s", exc)
+
+    def _capture_state(self, checkout_path: str) -> bytes:
+        """Tar this build's graphify-out state for the next build. b"" on miss."""
+        out_dir = os.path.join(checkout_path, _OUT_DIRNAME)
+        try:
+            buffer = io.BytesIO()
+            added = 0
+            with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+                for member in self._STATE_MEMBERS:
+                    path = os.path.join(out_dir, member)
+                    if os.path.exists(path):
+                        tar.add(path, arcname=f"{_OUT_DIRNAME}/{member}")
+                        added += 1
+            return buffer.getvalue() if added else b""
+        except Exception as exc:  # noqa: BLE001 — state capture must never fail the build
+            logger.warning("graphify: could not capture incremental state: %s", exc)
+            return b""
+
+    # ----------------------------------------------------------- doc preflight
+    def _doc_volume(self, checkout_path: str) -> int:
+        """Total bytes of doc-class files — the only content the LLM sees."""
+        total = 0
+        for dirpath, dirnames, filenames in os.walk(checkout_path):
+            dirnames[:] = [d for d in dirnames if d not in _DOC_SCAN_SKIP_DIRS]
+            for name in filenames:
+                if name.lower().endswith(DOC_EXTENSIONS):
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, name))
+                    except OSError:
+                        continue
+        return total
+
     # ------------------------------------------------------------- artifacts
-    def _read_artifacts(self, checkout_path: str, tier: str, err: str | None) -> GraphArtifacts:
+    def _report_ok(self, checkout_path: str) -> bool:
+        report_path = os.path.join(checkout_path, _OUT_DIRNAME, _REPORT_NAME)
+        return os.path.isfile(report_path) and os.path.getsize(report_path) > 0
+
+    def _parse_llm_telemetry(self, extract_stdout: str, out_dir: str) -> tuple[int, int, float]:
+        """(tokens_in, tokens_out, cost_estimate) — stdout first, analysis-json
+        fallback, zeros on a total miss. Never raises: telemetry is observability,
+        not correctness."""
+        tokens_in = tokens_out = 0
+        cost = 0.0
+        match = _LLM_TOKENS_RE.search(extract_stdout or "")
+        if match:
+            try:
+                tokens_in = int(match.group(1).replace(",", ""))
+                tokens_out = int(match.group(2).replace(",", ""))
+            except (TypeError, ValueError):
+                tokens_in = tokens_out = 0
+        cost_match = _LLM_COST_RE.search(extract_stdout or "")
+        if cost_match:
+            try:
+                cost = float(cost_match.group(1).replace(",", ""))
+            except (TypeError, ValueError):
+                cost = 0.0
+        if not tokens_in and not tokens_out:
+            try:
+                with open(os.path.join(out_dir, _ANALYSIS_NAME), "r", encoding="utf-8") as fh:
+                    tokens = (json.load(fh) or {}).get("tokens") or {}
+                tokens_in = int(tokens.get("input") or 0)
+                tokens_out = int(tokens.get("output") or 0)
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        return tokens_in, tokens_out, cost
+
+    def _read_artifacts(
+        self, checkout_path: str, tier: str, err: str | None, extract_stdout: str = ""
+    ) -> GraphArtifacts:
         out_dir = os.path.join(checkout_path, _OUT_DIRNAME)
         report_path = os.path.join(out_dir, _REPORT_NAME)
         if not os.path.isfile(report_path) or os.path.getsize(report_path) == 0:
@@ -282,6 +463,9 @@ class GraphifyEngine:
             except (ValueError, TypeError) as exc:
                 raise PipelineError(f"graphify wrote unparseable {_GRAPH_JSON_NAME}: {exc}") from exc
         nodes, edges, communities = parse_graph_stats(report_md, graph_json)
+        # Telemetry is recorded even when the build degraded after extract —
+        # that spend is sunk and is exactly what ops needs to see.
+        llm_in, llm_out, llm_cost = self._parse_llm_telemetry(extract_stdout, out_dir)
         return GraphArtifacts(
             report_md=report_md,
             graph_json=graph_json,
@@ -292,6 +476,10 @@ class GraphifyEngine:
             tier=tier,
             enrichment_error=err,
             graphify_version=self._version(),
+            llm_tokens_in=llm_in,
+            llm_tokens_out=llm_out,
+            llm_cost_estimate=llm_cost,
+            state_tar=self._capture_state(checkout_path),
         )
 
     def _version(self) -> str:
