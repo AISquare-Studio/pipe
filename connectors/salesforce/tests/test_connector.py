@@ -14,6 +14,8 @@ from aisquare_pipe_salesforce.client import (
     SalesforceAuthError,
     SalesforceClient,
     SalesforceRateLimited,
+    authorize_url,
+    exchange_code,
     refresh_access_token,
 )
 from aisquare_pipe_salesforce.connector import SalesforceSink, SalesforceSource
@@ -74,6 +76,48 @@ class TestClient:
         tokens = refresh_access_token(config, session=session)
         assert tokens == {"access_token": "new"}
         assert session.post.call_args[1]["data"]["grant_type"] == "refresh_token"
+
+
+class TestOAuthFlow:
+    def test_authorize_url_uses_my_domain_base_and_state(self, config):
+        config = {**config, "auth_base_url": "https://ruby-agility-3766.my.salesforce.com"}
+        url = authorize_url(config, "https://app/cb", "state-123")
+        assert url.startswith(
+            "https://ruby-agility-3766.my.salesforce.com/services/oauth2/authorize?"
+        )
+        assert "response_type=code" in url
+        assert "state=state-123" in url
+        # No PKCE params unless a challenge is supplied.
+        assert "code_challenge" not in url
+
+    def test_authorize_url_adds_s256_pkce_when_challenge_given(self, config):
+        url = authorize_url(config, "https://app/cb", "s", code_challenge="CHALLENGE")
+        assert "code_challenge=CHALLENGE" in url
+        assert "code_challenge_method=S256" in url
+
+    def test_exchange_code_sends_verifier_and_returns_token_payload(self, config):
+        session = MagicMock()
+        session.post.return_value = _response(
+            json_data={
+                "access_token": "at",
+                "refresh_token": "rt",
+                "instance_url": "https://org.my.salesforce.com",
+            }
+        )
+        tokens = exchange_code(
+            config, "auth-code", "https://app/cb", code_verifier="VERIFIER", session=session
+        )
+        assert tokens["refresh_token"] == "rt"
+        data = session.post.call_args[1]["data"]
+        assert data["grant_type"] == "authorization_code"
+        assert data["code"] == "auth-code"
+        assert data["code_verifier"] == "VERIFIER"
+
+    def test_exchange_code_omits_verifier_when_not_pkce(self, config):
+        session = MagicMock()
+        session.post.return_value = _response(json_data={"access_token": "at"})
+        exchange_code(config, "auth-code", "https://app/cb", session=session)
+        assert "code_verifier" not in session.post.call_args[1]["data"]
 
 
 class TestSourceAndSink:

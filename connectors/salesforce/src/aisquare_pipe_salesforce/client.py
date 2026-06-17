@@ -46,37 +46,51 @@ def _raise_for_status(response: requests.Response) -> None:
 # ---------------------------------------------------------------------------
 
 
-def authorize_url(config: dict[str, Any], redirect_uri: str, state: str) -> str:
+def authorize_url(
+    config: dict[str, Any],
+    redirect_uri: str,
+    state: str,
+    code_challenge: str | None = None,
+) -> str:
+    """Build the authorization-code redirect URL. When ``code_challenge`` is
+    supplied, the S256 PKCE parameters are added (the host generates and
+    persists the matching ``code_verifier`` — this stays pure)."""
     base = config.get("auth_base_url") or DEFAULT_AUTH_BASE_URL
-    query = urllib.parse.urlencode(
-        {
-            "response_type": "code",
-            "client_id": config["client_id"],
-            "redirect_uri": redirect_uri,
-            "state": state,
-        }
-    )
-    return f"{base}/services/oauth2/authorize?{query}"
+    params = {
+        "response_type": "code",
+        "client_id": config["client_id"],
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+        params["code_challenge_method"] = "S256"
+    return f"{base}/services/oauth2/authorize?{urllib.parse.urlencode(params)}"
 
 
 def exchange_code(
     config: dict[str, Any],
     code: str,
     redirect_uri: str,
+    code_verifier: str | None = None,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
     """Authorization-code exchange. Returns the raw token payload
-    (``access_token`` / ``refresh_token`` / ``instance_url`` …)."""
+    (``access_token`` / ``refresh_token`` / ``instance_url`` …). Pass
+    ``code_verifier`` when the app requires PKCE."""
     base = config.get("auth_base_url") or DEFAULT_AUTH_BASE_URL
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": config["client_id"],
+        "client_secret": config["client_secret"],
+        "redirect_uri": redirect_uri,
+    }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
     response = (session or requests.Session()).post(
         f"{base}/services/oauth2/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": config["client_id"],
-            "client_secret": config["client_secret"],
-            "redirect_uri": redirect_uri,
-        },
+        data=data,
         timeout=DEFAULT_TIMEOUT,
     )
     _raise_for_status(response)
