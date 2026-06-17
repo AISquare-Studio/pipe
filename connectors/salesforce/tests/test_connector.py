@@ -61,6 +61,24 @@ class TestClient:
         assert data == b"DOCX bytes"
         assert "/sobjects/ContentVersion/068A/VersionData" in session.get.call_args[0][0]
 
+    def test_query_returns_records_and_passes_soql(self, config):
+        session = MagicMock()
+        session.get.return_value = _response(
+            json_data={"done": True, "records": [{"Id": "068A"}, {"Id": "068B"}]}
+        )
+        records = SalesforceClient(config, session=session).query(
+            "SELECT Id FROM ContentVersion LIMIT 50"
+        )
+        assert [r["Id"] for r in records] == ["068A", "068B"]
+        args, kwargs = session.get.call_args
+        assert args[0].endswith("/services/data/v60.0/query")
+        assert kwargs["params"]["q"].startswith("SELECT Id FROM ContentVersion")
+
+    def test_query_empty_when_no_records(self, config):
+        session = MagicMock()
+        session.get.return_value = _response(json_data={"done": True})
+        assert SalesforceClient(config, session=session).query("SELECT Id FROM X") == []
+
     def test_error_mapping(self, config):
         session = MagicMock()
         session.patch.return_value = _response(status_code=401)

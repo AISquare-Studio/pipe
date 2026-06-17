@@ -165,3 +165,16 @@ class SalesforceClient:
         )
         _raise_for_status(response)
         return response.content
+
+    def query(self, soql: str) -> list[dict[str, Any]]:
+        """Run a SOQL query, returning the first page of records. Callers
+        scope result size with ``LIMIT`` in the query (used by the host's
+        polling intake to list recently-created documents)."""
+        response = self._session.get(
+            f"{self._base()}/query",
+            headers=self._headers(),
+            params={"q": soql},
+            timeout=DEFAULT_TIMEOUT,
+        )
+        _raise_for_status(response)
+        return response.json().get("records", [])
