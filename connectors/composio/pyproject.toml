@@ -9,7 +9,7 @@ description = "Composio meta-connector for aisquare.pipe — execute 500+ SaaS t
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
-authors = [{name = "A-Square"}]
+authors = [{name = "AISquare Studio"}]
 dependencies = [
     "aisquare-pipe>=0.1.0",
     "composio>=0.13.1,<2.0",

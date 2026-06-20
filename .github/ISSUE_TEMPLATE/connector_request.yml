@@ -1,0 +1,50 @@
+name: New connector request
+description: Request a connector for a service that isn't supported yet
+title: "[Connector]: "
+labels: ["connector", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Want to build it yourself? See [CONTRIBUTING.md](https://github.com/AISquare-Studio/pipe/blob/main/CONTRIBUTING.md) — `pipe new-connector <service>` scaffolds a plugin in seconds.
+  - type: input
+    id: service
+    attributes:
+      label: Service / API name
+      placeholder: "Google Drive"
+    validations:
+      required: true
+  - type: input
+    id: docs
+    attributes:
+      label: API documentation URL
+    validations:
+      required: true
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      multiple: true
+      options:
+        - Source (pull data from the service)
+        - Sink (push data to the service)
+    validations:
+      required: true
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Authentication type
+      options:
+        - API key
+        - OAuth2
+        - JWT
+        - Basic
+        - None
+        - Other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case
+      description: What would you move into or out of this service?

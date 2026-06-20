@@ -9,7 +9,7 @@ description = "DocuSign connector for aisquare.pipe"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
-authors = [{name = "A-Square"}]
+authors = [{name = "AISquare Studio"}]
 dependencies = [
     "aisquare-pipe>=0.1.0",
     "docusign-esign>=4.0",
