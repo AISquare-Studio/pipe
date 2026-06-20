@@ -1,6 +1,11 @@
 # aisquare.pipe
 
+[![CI](https://github.com/AISquare-Studio/pipe/actions/workflows/validate.yml/badge.svg)](https://github.com/AISquare-Studio/pipe/actions/workflows/validate.yml)
+[![PyPI](https://img.shields.io/pypi/v/aisquare-pipe.svg)](https://pypi.org/project/aisquare-pipe/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Code style: Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 **Universal anything-to-anything connector framework.** Instead of building N² bespoke integrations between services, each service implements a single Source (pulls data) and/or Sink (pushes data) connector against a universal `DataEnvelope` spec. The framework handles type matching, pipeline orchestration, and plugin discovery.
 
@@ -91,6 +96,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide. In short:
 3. Register via `entry_points` in your `pyproject.toml`
 4. Run `connector_compliance_suite(MyConnector)` to validate
 
+## Contributing & Community
+
+Contributions are welcome! See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide — `pipe new-connector <service>` scaffolds a connector plugin in seconds.
+
+- 📋 [Changelog](CHANGELOG.md)
+- 🔒 [Security policy](SECURITY.md)
+- 🤝 [Code of Conduct](CODE_OF_CONDUCT.md)
+
 ## License
 
-[Apache License 2.0](LICENSE)
+[Apache License 2.0](LICENSE) © AISquare Studio

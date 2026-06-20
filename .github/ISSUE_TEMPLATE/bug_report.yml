@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a problem with the framework or a connector
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report! **Do not include credentials, tokens, or other secrets** — redact them first.
+  - type: input
+    id: version
+    attributes:
+      label: aisquare-pipe version
+      description: Output of `pip show aisquare-pipe` (plus any connector package + version).
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Framework (core / pipeline / CLI)
+        - Connector
+        - MCP server
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: connector
+    attributes:
+      label: Connector (if applicable)
+      placeholder: "dropbox, salesforce, ..."
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including the full traceback (secrets redacted).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or a code sample that triggers the issue.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.11"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14 / Ubuntu 22.04 / Windows 11"

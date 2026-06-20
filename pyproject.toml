@@ -9,17 +9,30 @@ description = "Universal anything-to-anything connector framework"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
-authors = [{name = "A-Square"}]
+authors = [{name = "AISquare Studio"}]
 keywords = ["connectors", "data-pipeline", "etl", "integration"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "click>=8.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/AISquare-Studio/pipe"
+Repository = "https://github.com/AISquare-Studio/pipe"
+Documentation = "https://github.com/AISquare-Studio/pipe#readme"
+Issues = "https://github.com/AISquare-Studio/pipe/issues"
+Changelog = "https://github.com/AISquare-Studio/pipe/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
@@ -47,6 +60,9 @@ mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"aisquare.pipe" = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

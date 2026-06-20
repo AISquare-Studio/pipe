@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "AISquare Explainability gateway sink for aisquare.pipe"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
-authors = [{name = "A-Square"}]
+authors = [{name = "AISquare Studio"}]
 dependencies = [
     "aisquare-pipe>=0.1.0",
     "requests>=2.31",
