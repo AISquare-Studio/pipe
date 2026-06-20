@@ -1,0 +1,55 @@
+name: publish
+
+# Publishes every package in this monorepo to PyPI using Trusted Publishing
+# (OIDC) — no API tokens are stored. Runs when a GitHub Release is published,
+# or manually via "Run workflow". Each package is uploaded at the version
+# declared in its own pyproject.toml; versions already on PyPI are skipped.
+#
+# One-time setup is documented in RELEASING.md (register a trusted publisher
+# per package on PyPI, and create the `pypi` GitHub environment).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pypi:
+    name: "publish: ${{ matrix.package }}"
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write # required for Trusted Publishing (OIDC)
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - "."
+          - connectors/local
+          - connectors/dropbox
+          - connectors/onedrive
+          - connectors/salesforce
+          - connectors/docusign
+          - connectors/composio
+          - connectors/gateway
+          - connectors/n8n
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build ${{ matrix.package }}
+        run: |
+          python -m pip install --upgrade build
+          python -m build --outdir dist "${{ matrix.package }}"
+
+      - name: Publish ${{ matrix.package }} to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
