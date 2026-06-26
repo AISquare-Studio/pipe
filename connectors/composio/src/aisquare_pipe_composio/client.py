@@ -235,6 +235,12 @@ class ComposioClient:
             kwargs["connected_account_id"] = connected_account_id
         if tool_version:
             kwargs["version"] = tool_version
+        else:
+            # No explicit version: target the latest toolkit version. Composio's
+            # manual execution rejects "latest" and otherwise raises
+            # ToolVersionRequiredError, so skip the version check (resolves to
+            # latest) when the caller hasn't pinned one.
+            kwargs["dangerously_skip_version_check"] = True
         response = self._sdk.tools.execute(slug, arguments or {}, **kwargs)
         successful = bool(response.get("successful"))
         if not successful:
