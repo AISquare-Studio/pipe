@@ -83,7 +83,8 @@ class TestExecuteTool:
         assert result == {"messages": [1]}
         args, kwargs = sdk.tools.execute.call_args
         assert args == ("GMAIL_FETCH_EMAILS", {"max_results": 5})
-        assert kwargs == {"user_id": "u1"}
+        # No explicit version pinned -> default to the latest toolkit version.
+        assert kwargs == {"user_id": "u1", "dangerously_skip_version_check": True}
 
     def test_optional_kwargs_forwarded(self, mock_sdk, composio_config):
         sdk = mock_sdk.return_value
