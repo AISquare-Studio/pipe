@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-29
+
+### Fixed
+
+- The `full` install extra now includes `aisquare-pipe-composio`, so
+  `pip install "aisquare-pipe[full]"` provides the Composio connector. The
+  published 0.1.0 metadata omitted it.
+
 ## [0.1.0] - 2026-06-19
 
 Initial public release.
@@ -26,5 +34,6 @@ Initial public release.
 - Install extras: `[popular]`, `[full]`, and per-connector packages
   (`aisquare-pipe-<service>`).
 
-[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/AISquare-Studio/pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/AISquare-Studio/pipe/releases/tag/v0.1.0
