@@ -1,4 +1,8 @@
+<!-- verified-against: 3bb1d7f 2026-07-05 -->
 # aisquare-pipe (the pipe framework)
+
+> **Live context:** query the `aisquare-graph` MCP server (workspace-root, all repos merged) for where a symbol lives / what calls what, instead of recalling; cross-repo runtime contracts (Redis bus, shared secret, wire keys, version pins) are machine-checked in the workspace `seams.json`. `make context-check` verifies.
+
 
 `aisquare-pipe` (import namespace `aisquare.pipe`, PyPI package `aisquare-pipe`) is the universal "anything-to-anything" connector **framework**: every service implements a `SourceConnector` (pull) and/or `SinkConnector` (push) against a single `DataEnvelope` spec, and `Pipeline` handles type matching, conversion, merging, and orchestration. This repo is a monorepo of the framework plus the first-party connector plugin packages under `connectors/`, each independently published to PyPI. Working conventions (venv-first, the `pipe validate` gate, one-pytest-process-per-connector, never rename entry points) live in `AGENTS.md`; read it first.
 
