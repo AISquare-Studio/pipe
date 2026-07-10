@@ -37,6 +37,8 @@ jobs:
           - connectors/composio
           - connectors/gateway
           - connectors/n8n
+          - connectors/github
+          - connectors/graphify
     steps:
       - uses: actions/checkout@v7
 

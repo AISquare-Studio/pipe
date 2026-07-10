@@ -13,6 +13,8 @@ This repo is a monorepo of independently published PyPI packages:
 | `aisquare-pipe-composio` | `connectors/composio` |
 | `aisquare-pipe-gateway` | `connectors/gateway` |
 | `aisquare-pipe-n8n` | `connectors/n8n` |
+| `aisquare-pipe-github` | `connectors/github` |
+| `aisquare-pipe-graphify` | `connectors/graphify` |
 
 Publishing is automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
 using **PyPI Trusted Publishing (OIDC)** — no API tokens are stored anywhere.
