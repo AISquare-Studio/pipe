@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe-gdrive"
+version = "0.1.0"
+description = "Google Drive connector for aisquare.pipe"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "AISquare Studio"}]
+dependencies = [
+    "aisquare-pipe>=0.1.0",
+    "google-auth>=2.28.0",
+    "requests>=2.20.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+
+[project.entry-points."aisquare_pipe.connectors"]
+gdrive-source = "aisquare_pipe_gdrive.connector:GDriveSource"
+gdrive-sink = "aisquare_pipe_gdrive.connector:GDriveSink"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
