@@ -23,6 +23,7 @@ from google.oauth2.credentials import Credentials
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.constants import (
+    DRIVE_API_BASE,
     INITIAL_BACKOFF,
     MAX_RETRIES,
     REQUEST_TIMEOUT,
@@ -176,7 +177,7 @@ class GDriveClient:
         """Confirm credentials work by fetching the About resource."""
         self._request(
             "GET",
-            "https://www.googleapis.com/drive/v3/about",
+            f"{DRIVE_API_BASE}/about",
             params={"fields": "user"},
         )
         return True

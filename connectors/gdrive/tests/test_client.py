@@ -114,8 +114,14 @@ class TestRequest:
                 client._request("GET", "https://example.test")
 
     def test_error_body_is_truncated(self, sample_config, mock_session):
-        mock_session.request.return_value = MagicMock(status_code=500, text="x" * 5000)
+        # 404 is not in _RETRY_STATUS, so this hits the immediate-raise path
+        # (via _body_tail) rather than the retry-exhaustion path, which is
+        # what actually exercises truncation.
+        mock_session.request.return_value = MagicMock(status_code=404, text="x" * 5000)
         client = GDriveClient(sample_config)
-        with pytest.raises(PipelineError) as exc:
-            client._request("GET", "https://example.test")
-        assert len(str(exc.value)) < 1200
+        with patch("aisquare_pipe_gdrive.client.time.sleep"):
+            with pytest.raises(PipelineError) as exc:
+                client._request("GET", "https://example.test")
+        message = str(exc.value)
+        assert len(message) < 1200
+        assert message.count("x") < 5000
