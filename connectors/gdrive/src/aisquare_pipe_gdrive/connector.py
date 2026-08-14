@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import fnmatch
+import io
+import json
 import logging
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
@@ -269,6 +272,15 @@ class GDriveSource(SourceConnector):
         return RateLimit(requests_per_minute=12000, concurrent=1)
 
 
+@dataclass
+class _Resolved:
+    """Outcome of applying the sink's conflict policy to a target filename."""
+
+    name: str
+    existing_id: str = ""
+    error: str = ""
+
+
 class GDriveSink(SinkConnector):
     """Push files to Google Drive via the Drive v3 API."""
 
@@ -291,9 +303,135 @@ class GDriveSink(SinkConnector):
         config: dict,
         params: PushParams | None = None,
     ) -> PushResult:
-        if not _has_valid_auth_keys(config):
-            return PushResult(success=False, error="gdrive config is missing credentials")
-        return PushResult(success=False, error="not implemented")
+        """Upload an envelope's payload to Google Drive.
+
+        Supported PushParams keys:
+            folder_id (str): Destination folder ID (default: "root")
+            target_path (str): Slash-separated subfolder path, created as needed
+            conflict (str): "fail" (default), "overwrite", or "rename"
+
+        Never raises: every failure comes back as PushResult(success=False).
+        """
+        try:
+            filename = envelope.metadata.get("filename")
+            if not filename:
+                return PushResult(
+                    success=False,
+                    error="envelope metadata is missing 'filename'",
+                )
+
+            client = GDriveClient(config)
+
+            folder_id = params.get("folder_id", "root") if params else "root"
+            target_path = params.get("target_path", "") if params else ""
+            conflict = params.get("conflict", "fail") if params else "fail"
+
+            parent_id = (
+                client.ensure_folder_path(target_path, folder_id)
+                if target_path
+                else folder_id
+            )
+
+            mime_type = envelope.content_type or "application/octet-stream"
+
+            # Stream envelopes always take the resumable path.
+            if envelope.stream is not None:
+                size = int(envelope.metadata.get("size") or 0)
+                resolved = self._resolve_conflict(client, filename, parent_id, conflict)
+                if resolved.error:
+                    return PushResult(success=False, error=resolved.error)
+                if resolved.existing_id and conflict == "overwrite":
+                    data = envelope.stream.read()
+                    result = client.update_content(resolved.existing_id, mime_type, data)
+                else:
+                    result = client.upload_resumable(
+                        resolved.name, parent_id, mime_type, envelope.stream, size
+                    )
+                return self._success(result)
+
+            data = self._coerce(envelope.data)
+            if data is None:
+                return PushResult(
+                    success=False,
+                    error=f"Unsupported data type: {type(envelope.data).__name__}",
+                )
+
+            resolved = self._resolve_conflict(client, filename, parent_id, conflict)
+            if resolved.error:
+                return PushResult(success=False, error=resolved.error)
+
+            if resolved.existing_id and conflict == "overwrite":
+                result = client.update_content(resolved.existing_id, mime_type, data)
+            elif client.should_chunk(len(data)):
+                result = client.upload_resumable(
+                    resolved.name, parent_id, mime_type, io.BytesIO(data), len(data)
+                )
+            else:
+                result = client.upload(resolved.name, parent_id, mime_type, data)
+
+            return self._success(result)
+
+        except Exception as e:  # noqa: BLE001 — push must never raise
+            logger.error("gdrive push failed: %s", e)
+            return PushResult(success=False, error=str(e))
+
+    @staticmethod
+    def _coerce(data: Any) -> bytes | None:
+        """Normalize envelope payloads to bytes. None means unsupported."""
+        if isinstance(data, bytes):
+            return data
+        if isinstance(data, str):
+            return data.encode("utf-8")
+        if isinstance(data, dict):
+            return json.dumps(data, ensure_ascii=False).encode("utf-8")
+        return None
+
+    def _resolve_conflict(
+        self, client: GDriveClient, filename: str, parent_id: str, conflict: str
+    ) -> _Resolved:
+        """Apply the conflict policy, returning the name to write under.
+
+        Drive permits duplicate names in a folder, so the check is explicit
+        rather than delegated to the API.
+        """
+        existing = client.find_child(filename, parent_id)
+        if not existing:
+            return _Resolved(name=filename)
+
+        if conflict == "overwrite":
+            return _Resolved(name=filename, existing_id=existing["id"])
+
+        if conflict == "rename":
+            stem, ext = os.path.splitext(filename)
+            for n in range(1, 1000):
+                candidate = f"{stem} ({n}){ext}"
+                if client.find_child(candidate, parent_id) is None:
+                    return _Resolved(name=candidate)
+            return _Resolved(
+                name=filename,
+                error=f"could not find a free name for {filename!r} after 999 tries",
+            )
+
+        return _Resolved(
+            name=filename,
+            error=(
+                f"{filename!r} already exists in the target folder "
+                "(set conflict to 'overwrite' or 'rename')"
+            ),
+        )
+
+    @staticmethod
+    def _success(result: dict[str, Any]) -> PushResult:
+        """Build a PushResult from a Drive file resource."""
+        return PushResult(
+            success=True,
+            ref=result.get("id"),
+            metadata={
+                "file_id": result.get("id", ""),
+                "filename": result.get("name", ""),
+                "web_view_link": result.get("webViewLink", ""),
+            },
+        )
 
     def validate_config(self, config: dict) -> bool:
         return _has_valid_auth_keys(config)
