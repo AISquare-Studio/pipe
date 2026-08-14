@@ -9,6 +9,7 @@ import pytest
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.client import GDriveClient
+from tests.helpers import make_file, make_folder, make_list_response
 
 
 class TestCredentialResolution:
@@ -125,3 +126,73 @@ class TestRequest:
         message = str(exc.value)
         assert len(message) < 1200
         assert message.count("x") < 5000
+
+
+def _json_response(payload: dict) -> MagicMock:
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = payload
+    return resp
+
+
+class TestListFiles:
+    def test_yields_files_from_single_page(self, sample_config, mock_session):
+        files = [make_file(name="a.pdf"), make_file(name="b.txt", file_id="file-2")]
+        mock_session.request.return_value = _json_response(make_list_response(files))
+        client = GDriveClient(sample_config)
+        assert [f["name"] for f in client.list_files()] == ["a.pdf", "b.txt"]
+
+    def test_follows_pagination(self, sample_config, mock_session):
+        page1 = make_list_response([make_file(name="a.pdf")], next_page_token="tok")
+        page2 = make_list_response([make_file(name="b.pdf", file_id="file-2")])
+        mock_session.request.side_effect = [
+            _json_response(page1),
+            _json_response(page2),
+        ]
+        client = GDriveClient(sample_config)
+        assert [f["name"] for f in client.list_files()] == ["a.pdf", "b.pdf"]
+        assert mock_session.request.call_count == 2
+
+    def test_scopes_query_to_parent_folder(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(make_list_response([]))
+        client = GDriveClient(sample_config)
+        list(client.list_files(folder_id="folder-xyz"))
+        sent = mock_session.request.call_args.kwargs["params"]["q"]
+        assert "'folder-xyz' in parents" in sent
+        assert "trashed = false" in sent
+
+    def test_extra_query_is_conjoined(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(make_list_response([]))
+        client = GDriveClient(sample_config)
+        list(client.list_files(query="mimeType = 'application/pdf'"))
+        sent = mock_session.request.call_args.kwargs["params"]["q"]
+        assert "mimeType = 'application/pdf'" in sent
+        assert " and " in sent
+
+    def test_recursive_descends_into_subfolders(self, sample_config, mock_session):
+        root_page = make_list_response([make_folder(file_id="sub-1"), make_file()])
+        sub_page = make_list_response([make_file(name="nested.txt", file_id="file-9")])
+        mock_session.request.side_effect = [
+            _json_response(root_page),
+            _json_response(sub_page),
+        ]
+        client = GDriveClient(sample_config)
+        names = [f["name"] for f in client.list_files(recursive=True)]
+        assert "nested.txt" in names
+
+    def test_non_recursive_does_not_descend(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(
+            make_list_response([make_folder(file_id="sub-1")])
+        )
+        client = GDriveClient(sample_config)
+        list(client.list_files(recursive=False))
+        assert mock_session.request.call_count == 1
+
+    def test_shared_drive_params_included_when_drive_id_set(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(make_list_response([]))
+        client = GDriveClient({**sample_config, "drive_id": "drive-123"})
+        list(client.list_files())
+        params = mock_session.request.call_args.kwargs["params"]
+        assert params["driveId"] == "drive-123"
+        assert params["corpora"] == "drive"
+        assert params["includeItemsFromAllDrives"] is True
+        assert params["supportsAllDrives"] is True

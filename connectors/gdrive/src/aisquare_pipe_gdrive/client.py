@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import requests
@@ -24,6 +25,8 @@ from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.constants import (
     DRIVE_API_BASE,
+    FILE_FIELDS,
+    FOLDER_MIME,
     INITIAL_BACKOFF,
     MAX_RETRIES,
     REQUEST_TIMEOUT,
@@ -181,3 +184,54 @@ class GDriveClient:
             params={"fields": "user"},
         )
         return True
+
+    def _shared_drive_params(self) -> dict[str, Any]:
+        """Params that let a query see shared drives, when one is configured."""
+        if not self._drive_id:
+            return {}
+        return {
+            "driveId": self._drive_id,
+            "corpora": "drive",
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+        }
+
+    def list_files(
+        self,
+        folder_id: str = "root",
+        recursive: bool = False,
+        query: str = "",
+    ) -> Iterator[dict[str, Any]]:
+        """Yield Drive file resources under folder_id, following pagination.
+
+        Folders are yielded like any other item; callers filter them out. When
+        recursive is set, subfolders are descended into breadth-first after the
+        current level is exhausted.
+        """
+        clauses = [f"'{folder_id}' in parents", "trashed = false"]
+        if query:
+            clauses.append(f"({query})")
+        params: dict[str, Any] = {
+            "q": " and ".join(clauses),
+            "fields": f"nextPageToken, files({FILE_FIELDS})",
+            "pageSize": 100,
+            **self._shared_drive_params(),
+        }
+
+        subfolders: list[str] = []
+        page_token: str | None = None
+        while True:
+            if page_token:
+                params["pageToken"] = page_token
+            resp = self._request("GET", f"{DRIVE_API_BASE}/files", params=params)
+            payload = resp.json()
+            for item in payload.get("files", []):
+                if recursive and item.get("mimeType") == FOLDER_MIME:
+                    subfolders.append(item["id"])
+                yield item
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
+
+        for subfolder_id in subfolders:
+            yield from self.list_files(subfolder_id, recursive=True, query=query)
