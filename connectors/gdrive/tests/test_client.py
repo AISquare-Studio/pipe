@@ -9,6 +9,7 @@ import pytest
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.client import GDriveClient
+from aisquare_pipe_gdrive.constants import FOLDER_MIME
 from tests.helpers import make_file, make_folder, make_list_response
 
 
@@ -236,3 +237,73 @@ class TestDownloadAndExport:
             client.export("doc-1", "application/pdf")
         assert "10 MB" in str(exc.value)
         assert "doc-1" in str(exc.value)
+
+
+class TestUpload:
+    def test_should_chunk_threshold(self, sample_config, mock_session):
+        client = GDriveClient(sample_config)
+        assert client.should_chunk(6 * 1024 * 1024) is True
+        assert client.should_chunk(1024) is False
+
+    def test_upload_sends_multipart_and_returns_file(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(
+            {"id": "new-1", "name": "a.txt", "webViewLink": "https://drive/x"}
+        )
+        client = GDriveClient(sample_config)
+        result = client.upload("a.txt", "root", "text/plain", b"hello")
+        assert result["id"] == "new-1"
+        assert mock_session.request.call_args.kwargs["params"]["uploadType"] == "multipart"
+
+    def test_update_content_patches_existing_file(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response({"id": "old-1"})
+        client = GDriveClient(sample_config)
+        assert client.update_content("old-1", "text/plain", b"new")["id"] == "old-1"
+        assert mock_session.request.call_args.args[0] == "PATCH"
+
+    def test_upload_resumable_uploads_in_chunks(self, sample_config, mock_session):
+        import io
+
+        session_resp = MagicMock(status_code=200, headers={"Location": "https://upload/x"})
+        final = MagicMock(status_code=200)
+        final.json.return_value = {"id": "big-1"}
+        mock_session.request.side_effect = [session_resp, final]
+        client = GDriveClient(sample_config)
+        payload = b"z" * 1024
+        result = client.upload_resumable(
+            "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
+        )
+        assert result["id"] == "big-1"
+
+    def test_find_child_returns_none_when_absent(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response({"files": []})
+        client = GDriveClient(sample_config)
+        assert client.find_child("nope.txt", "root") is None
+
+    def test_find_child_returns_first_match(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(
+            {"files": [{"id": "f-1", "name": "a.txt"}]}
+        )
+        client = GDriveClient(sample_config)
+        assert client.find_child("a.txt", "root")["id"] == "f-1"
+
+    def test_ensure_folder_path_creates_missing_segments(self, sample_config, mock_session):
+        # "a/b": a is missing (create), b is missing (create).
+        mock_session.request.side_effect = [
+            _json_response({"files": []}),
+            _json_response({"id": "folder-a"}),
+            _json_response({"files": []}),
+            _json_response({"id": "folder-b"}),
+        ]
+        client = GDriveClient(sample_config)
+        assert client.ensure_folder_path("a/b", "root") == "folder-b"
+
+    def test_ensure_folder_path_reuses_existing(self, sample_config, mock_session):
+        mock_session.request.return_value = _json_response(
+            {"files": [{"id": "folder-a", "name": "a", "mimeType": FOLDER_MIME}]}
+        )
+        client = GDriveClient(sample_config)
+        assert client.ensure_folder_path("a", "root") == "folder-a"
+
+    def test_ensure_folder_path_empty_returns_parent(self, sample_config, mock_session):
+        client = GDriveClient(sample_config)
+        assert client.ensure_folder_path("", "root") == "root"

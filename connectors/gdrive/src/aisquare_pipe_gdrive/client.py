@@ -25,7 +25,9 @@ from google.oauth2.credentials import Credentials
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.constants import (
+    CHUNK_SIZE,
     DRIVE_API_BASE,
+    DRIVE_UPLOAD_BASE,
     EXPORT_SIZE_LIMIT,
     FILE_FIELDS,
     FOLDER_MIME,
@@ -33,6 +35,7 @@ from aisquare_pipe_gdrive.constants import (
     MAX_RETRIES,
     REQUEST_TIMEOUT,
     SCOPE_FULL,
+    SIMPLE_UPLOAD_LIMIT,
 )
 
 logger = logging.getLogger("aisquare.pipe.gdrive")
@@ -280,3 +283,157 @@ class GDriveClient:
                 ) from e
             raise
         return resp.content
+
+    def should_chunk(self, size: int) -> bool:
+        """Return True when a file needs a resumable upload session."""
+        return size > SIMPLE_UPLOAD_LIMIT
+
+    def find_child(self, name: str, parent_id: str) -> dict[str, Any] | None:
+        """Return the first non-trashed child of parent_id named `name`."""
+        escaped = name.replace("\\", "\\\\").replace("'", "\\'")
+        resp = self._request(
+            "GET",
+            f"{DRIVE_API_BASE}/files",
+            params={
+                "q": (
+                    f"name = '{escaped}' and '{parent_id}' in parents "
+                    "and trashed = false"
+                ),
+                "fields": "files(id,name,mimeType)",
+                "pageSize": 1,
+                **self._shared_drive_params(),
+            },
+        )
+        files = resp.json().get("files", [])
+        return files[0] if files else None
+
+    def create_folder(self, name: str, parent_id: str) -> str:
+        """Create a folder under parent_id and return its ID."""
+        resp = self._request(
+            "POST",
+            f"{DRIVE_API_BASE}/files",
+            json_body={
+                "name": name,
+                "mimeType": FOLDER_MIME,
+                "parents": [parent_id],
+            },
+            params={"fields": "id", **self._shared_drive_params()},
+        )
+        return resp.json()["id"]
+
+    def ensure_folder_path(self, path: str, parent_id: str) -> str:
+        """Resolve a slash-separated path under parent_id, creating as needed."""
+        current = parent_id
+        for segment in [s for s in path.split("/") if s]:
+            existing = self.find_child(segment, current)
+            if existing and existing.get("mimeType") == FOLDER_MIME:
+                current = existing["id"]
+            else:
+                current = self.create_folder(segment, current)
+        return current
+
+    def upload(
+        self, name: str, parent_id: str, mime_type: str, data: bytes
+    ) -> dict[str, Any]:
+        """Upload a small file via a multipart request (metadata + content)."""
+        metadata = {"name": name, "parents": [parent_id]}
+        boundary = "aisquare-pipe-gdrive-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{json.dumps(metadata)}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        resp = self._request(
+            "POST",
+            f"{DRIVE_UPLOAD_BASE}/files",
+            headers={"Content-Type": f"multipart/related; boundary={boundary}"},
+            params={
+                "uploadType": "multipart",
+                "fields": "id,name,size,webViewLink",
+                **self._shared_drive_params(),
+            },
+            data=body,
+        )
+        return resp.json()
+
+    def update_content(
+        self, file_id: str, mime_type: str, data: bytes
+    ) -> dict[str, Any]:
+        """Replace an existing file's content, keeping its ID."""
+        resp = self._request(
+            "PATCH",
+            f"{DRIVE_UPLOAD_BASE}/files/{file_id}",
+            headers={"Content-Type": mime_type},
+            params={
+                "uploadType": "media",
+                "fields": "id,name,size,webViewLink",
+                **self._shared_drive_params(),
+            },
+            data=data,
+        )
+        return resp.json()
+
+    def upload_resumable(
+        self,
+        name: str,
+        parent_id: str,
+        mime_type: str,
+        stream: IO[bytes],
+        size: int,
+    ) -> dict[str, Any]:
+        """Upload a large file through a resumable session.
+
+        Chunks must be a multiple of 256 KiB; CHUNK_SIZE satisfies that. Drive
+        answers each intermediate chunk with 308 and the final chunk with 200/201.
+        """
+        session = self._request(
+            "POST",
+            f"{DRIVE_UPLOAD_BASE}/files",
+            headers={"X-Upload-Content-Type": mime_type},
+            params={"uploadType": "resumable", **self._shared_drive_params()},
+            json_body={"name": name, "parents": [parent_id]},
+        )
+        upload_url = session.headers.get("Location")
+        if not upload_url:
+            raise PipelineError("gdrive resumable upload session returned no Location")
+
+        offset = 0
+        while offset < size:
+            chunk = stream.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            end = offset + len(chunk) - 1
+            resp = self._session.request(
+                "PUT",
+                upload_url,
+                headers={
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{size}",
+                },
+                data=chunk,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if resp.status_code in _RETRY_STATUS:
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else INITIAL_BACKOFF
+                logger.warning("gdrive upload throttled, retrying in %.1fs", wait)
+                time.sleep(wait)
+                stream.seek(offset)
+                continue
+
+            if resp.status_code in (200, 201):
+                return resp.json()
+
+            if resp.status_code != 308:
+                raise PipelineError(
+                    f"gdrive upload chunk failed (HTTP {resp.status_code}): "
+                    f"{self._body_tail(resp)}"
+                )
+
+            offset += len(chunk)
+
+        raise PipelineError("gdrive upload session ended without a final response")
