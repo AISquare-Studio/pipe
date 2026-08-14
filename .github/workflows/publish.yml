@@ -39,6 +39,7 @@ jobs:
           - connectors/n8n
           - connectors/github
           - connectors/graphify
+          - connectors/gdrive
     steps:
       - uses: actions/checkout@v7
 
