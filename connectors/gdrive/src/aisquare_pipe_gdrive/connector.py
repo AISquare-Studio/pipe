@@ -292,9 +292,6 @@ class GDriveSink(SinkConnector):
     docs_url = "https://developers.google.com/drive/api/v3/reference"
     metadata_spec = {
         "filename": MetaField(type=str, required=True, description="Target filename"),
-        "size": MetaField(
-            type=int, required=False, description="Byte size, used to pick the upload path"
-        ),
     }
 
     def push(
@@ -309,6 +306,10 @@ class GDriveSink(SinkConnector):
             folder_id (str): Destination folder ID (default: "root")
             target_path (str): Slash-separated subfolder path, created as needed
             conflict (str): "fail" (default), "overwrite", or "rename"
+
+        Note: A stream envelope pushed with conflict="overwrite" is buffered fully
+        into memory, because Drive's update-in-place API takes bytes rather than
+        a streaming session. For very large files, prefer "rename" or "fail" modes.
 
         Never raises: every failure comes back as PushResult(success=False).
         """
@@ -341,6 +342,7 @@ class GDriveSink(SinkConnector):
                 if resolved.error:
                     return PushResult(success=False, error=resolved.error)
                 if resolved.existing_id and conflict == "overwrite":
+                    # Note: buffers the entire stream into memory.
                     data = envelope.stream.read()
                     result = client.update_content(resolved.existing_id, mime_type, data)
                 else:

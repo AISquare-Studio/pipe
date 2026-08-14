@@ -100,6 +100,19 @@ class TestPush:
         assert result.success is False
         assert "Unsupported data type" in (result.error or "")
 
+    def test_stream_with_overwrite_buffers_to_memory(self, fake_client):
+        fake_client.find_child.return_value = {"id": "old-1", "name": "big.bin"}
+        env = _envelope(data=b"", filename="big.bin", stream=io.BytesIO(b"z" * 100))
+        env.metadata["size"] = 100
+        params = PushParams(params={"conflict": "overwrite"})
+        result = GDriveSink().push(env, dict(CONFIG), params)
+        assert result.success is True
+        # update_content is called with the fully-buffered bytes, not a stream.
+        fake_client.update_content.assert_called_once()
+        assert fake_client.update_content.call_args.args[2] == b"z" * 100
+        # upload_resumable should NOT be called when overwriting an existing file.
+        fake_client.upload_resumable.assert_not_called()
+
 
 class TestConflictModes:
     def test_fail_mode_refuses_when_file_exists(self, fake_client):
