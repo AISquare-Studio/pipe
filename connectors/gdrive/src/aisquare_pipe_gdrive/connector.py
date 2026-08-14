@@ -17,7 +17,6 @@ from aisquare.pipe.core.envelope import (
     PushResult,
     RateLimit,
 )
-from aisquare.pipe.errors import ConfigValidationError
 
 from aisquare_pipe_gdrive.client import GDriveClient
 from aisquare_pipe_gdrive.constants import FOLDER_MIME, STREAM_THRESHOLD
