@@ -436,7 +436,6 @@ class GDriveClient:
                         wait,
                     )
                     time.sleep(wait)
-                    stream.seek(offset)
                     continue
 
                 if resp.status_code in (200, 201):

@@ -327,6 +327,66 @@ class TestUpload:
             )
         assert "chunk failed" in str(exc.value).lower()
 
+    def test_upload_resumable_retry_then_continue_keeps_stream_in_sync(self, sample_config, mock_session):
+        """Verify that a chunk retry followed by a 308 continues reads the correct next chunk.
+
+        This test catches the regression where stream.seek(offset) during retry rewinds
+        the stream cursor, causing the next read to re-read the same chunk with a wrong
+        Content-Range header.
+        """
+        import io
+        from unittest.mock import patch
+
+        session_resp = MagicMock(status_code=200, headers={"Location": "https://upload/x"})
+        chunk1_308 = MagicMock(status_code=308)
+        chunk2_503_retry = MagicMock(status_code=503, headers={})
+        chunk2_308 = MagicMock(status_code=308)
+        chunk3_200 = MagicMock(status_code=200)
+        chunk3_200.json.return_value = {"id": "big-1"}
+
+        # Sequence: session init (200), chunk1 (308), chunk2 retry (503), chunk2 retry (308), chunk3 (200)
+        mock_session.request.side_effect = [
+            session_resp, chunk1_308, chunk2_503_retry, chunk2_308, chunk3_200
+        ]
+
+        client = GDriveClient(sample_config)
+        # 3 chunks: b'AAAA', b'BBBB', b'CCCC' (12 bytes total)
+        payload = b"AAAABBBBCCCC"
+
+        with patch("aisquare_pipe_gdrive.client.CHUNK_SIZE", 4):
+            with patch("aisquare_pipe_gdrive.client.time.sleep"):
+                result = client.upload_resumable(
+                    "3chunk.bin", "root", "application/octet-stream",
+                    io.BytesIO(payload), len(payload)
+                )
+
+        assert result["id"] == "big-1"
+
+        # Extract all PUT calls (skip the initial POST to get Location)
+        put_calls = [c for c in mock_session.request.call_args_list if c[0][0] == "PUT"]
+        assert len(put_calls) == 4, f"Expected 4 PUT calls (3 chunks + 1 retry), got {len(put_calls)}"
+
+        # Verify Content-Range and data for each PUT:
+        # PUT 1: chunk1 (offset 0-3)
+        assert "bytes 0-3/12" in str(put_calls[0])
+        assert put_calls[0].kwargs["data"] == b"AAAA"
+
+        # PUT 2: chunk2 first attempt (offset 4-7, gets 503)
+        assert "bytes 4-7/12" in str(put_calls[1])
+        assert put_calls[1].kwargs["data"] == b"BBBB"
+
+        # PUT 3: chunk2 retry (offset 4-7, gets 308)
+        assert "bytes 4-7/12" in str(put_calls[2])
+        assert put_calls[2].kwargs["data"] == b"BBBB"
+
+        # PUT 4: chunk3 (offset 8-11, MUST be b'CCCC', not b'BBBB')
+        assert "bytes 8-11/12" in str(put_calls[3])
+        assert put_calls[3].kwargs["data"] == b"CCCC", (
+            f"After chunk2 retry, chunk3 should be b'CCCC' at range 8-11, "
+            f"but got {put_calls[3].kwargs['data']!r}. "
+            "Stream cursor desynced after retry."
+        )
+
     def test_find_child_returns_none_when_absent(self, sample_config, mock_session):
         mock_session.request.return_value = _json_response({"files": []})
         client = GDriveClient(sample_config)
