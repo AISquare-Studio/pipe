@@ -10,7 +10,7 @@ from aisquare.pipe.core.envelope import PullParams
 from aisquare.pipe.errors import ConfigValidationError
 
 from aisquare_pipe_gdrive.connector import GDriveSource
-from tests.helpers import make_file, make_folder
+from tests.helpers import make_file, make_folder, make_native
 
 CONFIG = {"access_token": "test-token"}
 
@@ -120,3 +120,68 @@ class TestPullNoCreds:
         gen = GDriveSource().pull({})
         with pytest.raises(ConfigValidationError):
             next(gen)
+
+
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+class TestNativeExport:
+    def test_google_doc_exports_to_docx_by_default(self, fake_client):
+        fake_client.export.return_value = b"docx-bytes"
+        fake_client.list_files.return_value = iter([make_native(name="Report")])
+        env = next(iter(GDriveSource().pull(dict(CONFIG))))
+        assert env.content_type == DOCX
+        assert env.data == b"docx-bytes"
+        fake_client.export.assert_called_once_with("doc-abc123", DOCX)
+
+    def test_exported_filename_gains_extension(self, fake_client):
+        fake_client.export.return_value = b"docx-bytes"
+        fake_client.list_files.return_value = iter([make_native(name="Report")])
+        env = next(iter(GDriveSource().pull(dict(CONFIG))))
+        assert env.metadata["filename"] == "Report.docx"
+
+    def test_exported_from_records_original_type(self, fake_client):
+        fake_client.export.return_value = b"docx-bytes"
+        fake_client.list_files.return_value = iter([make_native(name="Report")])
+        env = next(iter(GDriveSource().pull(dict(CONFIG))))
+        assert env.metadata["exported_from"] == "application/vnd.google-apps.document"
+
+    def test_spreadsheet_exports_to_xlsx(self, fake_client):
+        fake_client.export.return_value = b"xlsx-bytes"
+        fake_client.list_files.return_value = iter(
+            [make_native(name="Budget", mime_type="application/vnd.google-apps.spreadsheet")]
+        )
+        env = next(iter(GDriveSource().pull(dict(CONFIG))))
+        assert env.content_type == XLSX
+        assert env.metadata["filename"] == "Budget.xlsx"
+
+    def test_export_formats_override_by_short_name(self, fake_client):
+        fake_client.export.return_value = b"md-bytes"
+        fake_client.list_files.return_value = iter([make_native(name="Report")])
+        params = PullParams(params={"export_formats": {"document": "text/markdown"}})
+        env = next(iter(GDriveSource().pull(dict(CONFIG), params)))
+        assert env.content_type == "text/markdown"
+        assert env.metadata["filename"] == "Report.md"
+
+    def test_unsupported_native_type_is_skipped(self, fake_client):
+        form = make_native(name="Survey", mime_type="application/vnd.google-apps.form")
+        fake_client.list_files.return_value = iter([form, make_file(name="a.pdf")])
+        envelopes = list(GDriveSource().pull(dict(CONFIG)))
+        assert [e.metadata["filename"] for e in envelopes] == ["a.pdf"]
+        fake_client.export.assert_not_called()
+
+    def test_skip_google_native_bypasses_export(self, fake_client):
+        fake_client.list_files.return_value = iter(
+            [make_native(name="Report"), make_file(name="a.pdf")]
+        )
+        params = PullParams(params={"skip_google_native": True})
+        envelopes = list(GDriveSource().pull(dict(CONFIG), params))
+        assert [e.metadata["filename"] for e in envelopes] == ["a.pdf"]
+        fake_client.export.assert_not_called()
+
+    def test_existing_extension_is_not_doubled(self, fake_client):
+        fake_client.export.return_value = b"docx-bytes"
+        fake_client.list_files.return_value = iter([make_native(name="Report.docx")])
+        env = next(iter(GDriveSource().pull(dict(CONFIG))))
+        assert env.metadata["filename"] == "Report.docx"

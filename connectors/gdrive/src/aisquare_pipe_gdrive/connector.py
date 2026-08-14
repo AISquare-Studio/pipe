@@ -19,7 +19,14 @@ from aisquare.pipe.core.envelope import (
 )
 
 from aisquare_pipe_gdrive.client import GDriveClient
-from aisquare_pipe_gdrive.constants import FOLDER_MIME, STREAM_THRESHOLD
+from aisquare_pipe_gdrive.constants import (
+    DEFAULT_EXPORT_FORMATS,
+    EXPORT_EXTENSIONS,
+    FOLDER_MIME,
+    NATIVE_MIME_PREFIX,
+    NATIVE_SHORT_NAMES,
+    STREAM_THRESHOLD,
+)
 
 logger = logging.getLogger("aisquare.pipe.gdrive")
 
@@ -37,6 +44,19 @@ def _has_valid_auth_keys(config: dict[str, Any]) -> bool:
     if config.get("service_account_json"):
         return True
     return all(config.get(k) for k in ("client_id", "client_secret", "refresh_token"))
+
+
+def _resolve_export_formats(overrides: dict[str, str] | None) -> dict[str, str]:
+    """Merge user overrides into the default native-MIME -> target-MIME map.
+
+    Overrides are keyed by short name ("document", "spreadsheet", ...) for config
+    readability; the returned map is keyed by full native MIME type.
+    """
+    formats = dict(DEFAULT_EXPORT_FORMATS)
+    for short_name, target_mime in (overrides or {}).items():
+        native_mime = NATIVE_SHORT_NAMES.get(short_name, short_name)
+        formats[native_mime] = target_mime
+    return formats
 
 
 class GDriveSource(SourceConnector):
@@ -101,6 +121,10 @@ class GDriveSource(SourceConnector):
             if params
             else STREAM_THRESHOLD
         )
+        export_formats = _resolve_export_formats(
+            params.get("export_formats", None) if params else None
+        )
+        skip_native = params.get("skip_google_native", False) if params else False
 
         count = 0
         for item in client.list_files(
@@ -122,7 +146,9 @@ class GDriveSource(SourceConnector):
             if limit is not None and count >= limit:
                 return
 
-            envelope = self._build_envelope(client, item, stream_threshold)
+            envelope = self._build_envelope(
+                client, item, stream_threshold, export_formats, skip_native
+            )
             if envelope is None:
                 continue
 
@@ -134,9 +160,17 @@ class GDriveSource(SourceConnector):
         client: GDriveClient,
         item: dict[str, Any],
         stream_threshold: int,
+        export_formats: dict[str, str],
+        skip_native: bool,
     ) -> DataEnvelope | None:
         """Turn one Drive file resource into an envelope, or None to skip it."""
         mime_type = item.get("mimeType", "application/octet-stream")
+
+        if mime_type.startswith(NATIVE_MIME_PREFIX):
+            return self._build_exported_envelope(
+                client, item, mime_type, export_formats, skip_native
+            )
+
         size = int(item.get("size") or 0)
         metadata = self._base_metadata(item, size)
 
@@ -155,6 +189,55 @@ class GDriveSource(SourceConnector):
             source_id=self.name,
             metadata=metadata,
         )
+
+    def _build_exported_envelope(
+        self,
+        client: GDriveClient,
+        item: dict[str, Any],
+        native_mime: str,
+        export_formats: dict[str, str],
+        skip_native: bool,
+    ) -> DataEnvelope | None:
+        """Export a Google-native file, or return None when it cannot be exported.
+
+        Native files carry no bytes and report no size, so files.get?alt=media
+        fails on them. Forms, Apps Script and Shortcuts have no export path at
+        all — those are logged and skipped rather than failing the whole run.
+        """
+        if skip_native:
+            logger.debug("gdrive: skipping native file %r", item.get("name"))
+            return None
+
+        target_mime = export_formats.get(native_mime)
+        if not target_mime:
+            logger.warning(
+                "gdrive: no export format for %r (%s) — skipping",
+                item.get("name"),
+                native_mime,
+            )
+            return None
+
+        data = client.export(item["id"], target_mime)
+
+        metadata = self._base_metadata(item, len(data))
+        metadata["exported_from"] = native_mime
+        metadata["mime_type"] = target_mime
+        metadata["filename"] = self._with_extension(item.get("name", ""), target_mime)
+
+        return DataEnvelope(
+            content_type=target_mime,
+            data=data,
+            source_id=self.name,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _with_extension(name: str, target_mime: str) -> str:
+        """Append the export target's extension unless the name already has it."""
+        ext = EXPORT_EXTENSIONS.get(target_mime, "")
+        if not ext or name.lower().endswith(ext):
+            return name
+        return f"{name}{ext}"
 
     @staticmethod
     def _base_metadata(item: dict[str, Any], size: int) -> dict[str, Any]:
