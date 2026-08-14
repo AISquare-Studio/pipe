@@ -274,6 +274,59 @@ class TestUpload:
         )
         assert result["id"] == "big-1"
 
+    def test_upload_resumable_multi_chunk_308_flow(self, sample_config, mock_session):
+        import io
+        from unittest.mock import patch
+
+        session_resp = MagicMock(status_code=200, headers={"Location": "https://upload/x"})
+        chunk1_308 = MagicMock(status_code=308)
+        chunk2_200 = MagicMock(status_code=200)
+        chunk2_200.json.return_value = {"id": "big-1"}
+        mock_session.request.side_effect = [session_resp, chunk1_308, chunk2_200]
+        client = GDriveClient(sample_config)
+        payload = b"z" * 1024
+        with patch("aisquare_pipe_gdrive.client.CHUNK_SIZE", 512):
+            result = client.upload_resumable(
+                "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
+            )
+        assert result["id"] == "big-1"
+        # Verify two chunk PUTs were made (both called with PUT method)
+        chunk_calls = [c for c in mock_session.request.call_args_list if c[0][0] == "PUT"]
+        assert len(chunk_calls) == 2
+        # Verify Content-Range headers advance correctly
+        assert "bytes 0-511/1024" in str(chunk_calls[0])
+        assert "bytes 512-1023/1024" in str(chunk_calls[1])
+
+    def test_upload_resumable_retry_exhaustion_raises(self, sample_config, mock_session):
+        import io
+
+        session_resp = MagicMock(status_code=200, headers={"Location": "https://upload/x"})
+        # Simulate persistent 503 responses
+        throttled = MagicMock(status_code=503, headers={})
+        mock_session.request.side_effect = [session_resp] + [throttled] * 10
+        client = GDriveClient(sample_config)
+        payload = b"z" * 1024
+        with patch("aisquare_pipe_gdrive.client.time.sleep"):
+            with pytest.raises(PipelineError) as exc:
+                client.upload_resumable(
+                    "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
+                )
+        assert "exhausted" in str(exc.value).lower()
+
+    def test_upload_resumable_unexpected_status_raises(self, sample_config, mock_session):
+        import io
+
+        session_resp = MagicMock(status_code=200, headers={"Location": "https://upload/x"})
+        error_resp = MagicMock(status_code=400, text="invalid request")
+        mock_session.request.side_effect = [session_resp, error_resp]
+        client = GDriveClient(sample_config)
+        payload = b"z" * 1024
+        with pytest.raises(PipelineError) as exc:
+            client.upload_resumable(
+                "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
+            )
+        assert "chunk failed" in str(exc.value).lower()
+
     def test_find_child_returns_none_when_absent(self, sample_config, mock_session):
         mock_session.request.return_value = _json_response({"files": []})
         client = GDriveClient(sample_config)

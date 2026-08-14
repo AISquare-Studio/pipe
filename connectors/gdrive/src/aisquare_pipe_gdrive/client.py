@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections.abc import Iterator
 from typing import IO, Any
 
@@ -337,7 +338,7 @@ class GDriveClient:
     ) -> dict[str, Any]:
         """Upload a small file via a multipart request (metadata + content)."""
         metadata = {"name": name, "parents": [parent_id]}
-        boundary = "aisquare-pipe-gdrive-boundary"
+        boundary = f"aisquare-{uuid.uuid4().hex}"
         body = (
             f"--{boundary}\r\n"
             "Content-Type: application/json; charset=UTF-8\r\n\r\n"
@@ -406,34 +407,53 @@ class GDriveClient:
             if not chunk:
                 break
             end = offset + len(chunk) - 1
-            resp = self._session.request(
-                "PUT",
-                upload_url,
-                headers={
-                    "Content-Length": str(len(chunk)),
-                    "Content-Range": f"bytes {offset}-{end}/{size}",
-                },
-                data=chunk,
-                timeout=REQUEST_TIMEOUT,
-            )
 
-            if resp.status_code in _RETRY_STATUS:
-                retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after else INITIAL_BACKOFF
-                logger.warning("gdrive upload throttled, retrying in %.1fs", wait)
-                time.sleep(wait)
-                stream.seek(offset)
-                continue
-
-            if resp.status_code in (200, 201):
-                return resp.json()
-
-            if resp.status_code != 308:
-                raise PipelineError(
-                    f"gdrive upload chunk failed (HTTP {resp.status_code}): "
-                    f"{self._body_tail(resp)}"
+            for attempt in range(MAX_RETRIES):
+                resp = self._session.request(
+                    "PUT",
+                    upload_url,
+                    headers={
+                        "Content-Length": str(len(chunk)),
+                        "Content-Range": f"bytes {offset}-{end}/{size}",
+                    },
+                    data=chunk,
+                    timeout=REQUEST_TIMEOUT,
                 )
 
-            offset += len(chunk)
+                if resp.status_code in _RETRY_STATUS:
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = (
+                        float(retry_after)
+                        if retry_after
+                        else INITIAL_BACKOFF * (2**attempt)
+                    )
+                    logger.warning(
+                        "gdrive chunk upload throttled (HTTP %d, attempt %d/%d), "
+                        "retrying in %.1fs",
+                        resp.status_code,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    stream.seek(offset)
+                    continue
+
+                if resp.status_code in (200, 201):
+                    return resp.json()
+
+                if resp.status_code != 308:
+                    raise PipelineError(
+                        f"gdrive upload chunk failed (HTTP {resp.status_code}): "
+                        f"{self._body_tail(resp)}"
+                    )
+
+                offset += len(chunk)
+                break
+            else:
+                raise PipelineError(
+                    f"gdrive upload chunk at offset {offset} exhausted {MAX_RETRIES} "
+                    "retries and did not complete"
+                )
 
         raise PipelineError("gdrive upload session ended without a final response")
