@@ -5,11 +5,10 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
+from aisquare_pipe_gdrive.connector import GDriveSource
 
 from aisquare.pipe.core.envelope import PullParams
 from aisquare.pipe.errors import ConfigValidationError
-
-from aisquare_pipe_gdrive.connector import GDriveSource
 from tests.helpers import make_file, make_folder, make_native
 
 CONFIG = {"access_token": "test-token"}

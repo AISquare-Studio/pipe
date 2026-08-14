@@ -6,10 +6,9 @@ import io
 from unittest import mock
 
 import pytest
+from aisquare_pipe_gdrive.connector import GDriveSink
 
 from aisquare.pipe.core.envelope import DataEnvelope, PushParams
-
-from aisquare_pipe_gdrive.connector import GDriveSink
 
 CONFIG = {"access_token": "test-token"}
 

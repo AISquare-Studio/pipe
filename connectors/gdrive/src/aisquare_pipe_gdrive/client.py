@@ -9,7 +9,6 @@ Credentials never reach argv and are never logged — only their kind is.
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
@@ -24,7 +23,6 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
-
 from aisquare_pipe_gdrive.constants import (
     CHUNK_SIZE,
     DRIVE_API_BASE,
@@ -83,7 +81,7 @@ class GDriveClient:
                     )
             except ConfigValidationError:
                 raise
-            except Exception as e:  # noqa: BLE001 — message must not leak the key
+            except Exception as e:
                 raise ConfigValidationError(
                     f"gdrive service account credentials are invalid: {type(e).__name__}"
                 ) from e
@@ -345,7 +343,7 @@ class GDriveClient:
             f"{json.dumps(metadata)}\r\n"
             f"--{boundary}\r\n"
             f"Content-Type: {mime_type}\r\n\r\n"
-        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
 
         resp = self._request(
             "POST",

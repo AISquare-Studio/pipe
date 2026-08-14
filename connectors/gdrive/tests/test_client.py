@@ -5,11 +5,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-from aisquare.pipe.errors import ConfigValidationError, PipelineError
-
 from aisquare_pipe_gdrive.client import GDriveClient
 from aisquare_pipe_gdrive.constants import FOLDER_MIME
+
+from aisquare.pipe.errors import ConfigValidationError, PipelineError
 from tests.helpers import make_file, make_folder, make_list_response
 
 
@@ -111,9 +110,8 @@ class TestRequest:
             status_code=429, headers={"Retry-After": "0"}
         )
         client = GDriveClient(sample_config)
-        with patch("aisquare_pipe_gdrive.client.time.sleep"):
-            with pytest.raises(PipelineError):
-                client._request("GET", "https://example.test")
+        with patch("aisquare_pipe_gdrive.client.time.sleep"), pytest.raises(PipelineError):
+            client._request("GET", "https://example.test")
 
     def test_error_body_is_truncated(self, sample_config, mock_session):
         # 404 is not in _RETRY_STATUS, so this hits the immediate-raise path
@@ -121,9 +119,11 @@ class TestRequest:
         # what actually exercises truncation.
         mock_session.request.return_value = MagicMock(status_code=404, text="x" * 5000)
         client = GDriveClient(sample_config)
-        with patch("aisquare_pipe_gdrive.client.time.sleep"):
-            with pytest.raises(PipelineError) as exc:
-                client._request("GET", "https://example.test")
+        with (
+            patch("aisquare_pipe_gdrive.client.time.sleep"),
+            pytest.raises(PipelineError) as exc,
+        ):
+            client._request("GET", "https://example.test")
         message = str(exc.value)
         assert len(message) < 1200
         assert message.count("x") < 5000
@@ -306,11 +306,13 @@ class TestUpload:
         mock_session.request.side_effect = [session_resp] + [throttled] * 10
         client = GDriveClient(sample_config)
         payload = b"z" * 1024
-        with patch("aisquare_pipe_gdrive.client.time.sleep"):
-            with pytest.raises(PipelineError) as exc:
-                client.upload_resumable(
-                    "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
-                )
+        with (
+            patch("aisquare_pipe_gdrive.client.time.sleep"),
+            pytest.raises(PipelineError) as exc,
+        ):
+            client.upload_resumable(
+                "big.bin", "root", "application/octet-stream", io.BytesIO(payload), len(payload)
+            )
         assert "exhausted" in str(exc.value).lower()
 
     def test_upload_resumable_unexpected_status_raises(self, sample_config, mock_session):
@@ -353,12 +355,14 @@ class TestUpload:
         # 3 chunks: b'AAAA', b'BBBB', b'CCCC' (12 bytes total)
         payload = b"AAAABBBBCCCC"
 
-        with patch("aisquare_pipe_gdrive.client.CHUNK_SIZE", 4):
-            with patch("aisquare_pipe_gdrive.client.time.sleep"):
-                result = client.upload_resumable(
-                    "3chunk.bin", "root", "application/octet-stream",
-                    io.BytesIO(payload), len(payload)
-                )
+        with (
+            patch("aisquare_pipe_gdrive.client.CHUNK_SIZE", 4),
+            patch("aisquare_pipe_gdrive.client.time.sleep"),
+        ):
+            result = client.upload_resumable(
+                "3chunk.bin", "root", "application/octet-stream",
+                io.BytesIO(payload), len(payload)
+            )
 
         assert result["id"] == "big-1"
 

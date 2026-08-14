@@ -2,4 +2,4 @@
 
 from aisquare_pipe_gdrive.connector import GDriveSink, GDriveSource
 
-__all__ = ["GDriveSource", "GDriveSink"]
+__all__ = ["GDriveSink", "GDriveSource"]

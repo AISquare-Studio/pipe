@@ -20,7 +20,6 @@ from aisquare.pipe.core.envelope import (
     PushResult,
     RateLimit,
 )
-
 from aisquare_pipe_gdrive.client import GDriveClient
 from aisquare_pipe_gdrive.constants import (
     DEFAULT_EXPORT_FORMATS,
@@ -67,11 +66,11 @@ class GDriveSource(SourceConnector):
 
     name = "gdrive-source"
     version = "0.1.0"
-    output_types = ["*/*"]
+    output_types = ["*/*"]  # noqa: RUF012 — matches the base class's own plain attribute
     auth_type = AuthType.OAUTH2
     description = "Pull files from Google Drive"
     docs_url = "https://developers.google.com/drive/api/v3/reference"
-    metadata_spec = {
+    metadata_spec = {  # noqa: RUF012 — matches the base class's own plain attribute
         "filename": MetaField(type=str, required=True, description="Original filename"),
         "file_id": MetaField(type=str, required=True, description="Drive file ID"),
         "mime_type": MetaField(
@@ -286,11 +285,11 @@ class GDriveSink(SinkConnector):
 
     name = "gdrive-sink"
     version = "0.1.0"
-    input_types = ["*/*"]
+    input_types = ["*/*"]  # noqa: RUF012 — matches the base class's own plain attribute
     auth_type = AuthType.OAUTH2
     description = "Push files to Google Drive"
     docs_url = "https://developers.google.com/drive/api/v3/reference"
-    metadata_spec = {
+    metadata_spec = {  # noqa: RUF012 — matches the base class's own plain attribute
         "filename": MetaField(type=str, required=True, description="Target filename"),
     }
 
@@ -343,8 +342,10 @@ class GDriveSink(SinkConnector):
                     return PushResult(success=False, error=resolved.error)
                 if resolved.existing_id and conflict == "overwrite":
                     # Note: buffers the entire stream into memory.
-                    data = envelope.stream.read()
-                    result = client.update_content(resolved.existing_id, mime_type, data)
+                    stream_data = envelope.stream.read()
+                    result = client.update_content(
+                        resolved.existing_id, mime_type, stream_data
+                    )
                 else:
                     result = client.upload_resumable(
                         resolved.name, parent_id, mime_type, envelope.stream, size
