@@ -9,12 +9,13 @@ Credentials never reach argv and are never logged — only their kind is.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import time
 from collections.abc import Iterator
-from typing import Any
+from typing import IO, Any
 
 import requests
 from google.auth.transport.requests import AuthorizedSession
@@ -25,6 +26,7 @@ from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_gdrive.constants import (
     DRIVE_API_BASE,
+    EXPORT_SIZE_LIMIT,
     FILE_FIELDS,
     FOLDER_MIME,
     INITIAL_BACKOFF,
@@ -235,3 +237,46 @@ class GDriveClient:
 
         for subfolder_id in subfolders:
             yield from self.list_files(subfolder_id, recursive=True, query=query)
+
+    def download(self, file_id: str) -> bytes:
+        """Download a binary file's content in full."""
+        resp = self._request(
+            "GET",
+            f"{DRIVE_API_BASE}/files/{file_id}",
+            params={"alt": "media", **self._shared_drive_params()},
+        )
+        return resp.content
+
+    def download_stream(self, file_id: str) -> IO[bytes]:
+        """Download a file as a stream. The caller must close it."""
+        resp = self._request(
+            "GET",
+            f"{DRIVE_API_BASE}/files/{file_id}",
+            params={"alt": "media", **self._shared_drive_params()},
+            stream=True,
+        )
+        resp.raw.decode_content = True
+        return resp.raw
+
+    def export(self, file_id: str, target_mime: str) -> bytes:
+        """Export a Google-native file to target_mime.
+
+        Drive caps exported output at EXPORT_SIZE_LIMIT regardless of format, and
+        signals the refusal as a 403 with reason exportSizeLimitExceeded. That is
+        surfaced as a clear PipelineError rather than a bare HTTP error.
+        """
+        try:
+            resp = self._request(
+                "GET",
+                f"{DRIVE_API_BASE}/files/{file_id}/export",
+                params={"mimeType": target_mime},
+            )
+        except PipelineError as e:
+            if "exportSizeLimitExceeded" in str(e):
+                limit_mb = EXPORT_SIZE_LIMIT // (1024 * 1024)
+                raise PipelineError(
+                    f"gdrive cannot export file {file_id}: Drive caps exported "
+                    f"content at {limit_mb} MB and this document exceeds it"
+                ) from e
+            raise
+        return resp.content

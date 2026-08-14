@@ -196,3 +196,43 @@ class TestListFiles:
         assert params["corpora"] == "drive"
         assert params["includeItemsFromAllDrives"] is True
         assert params["supportsAllDrives"] is True
+
+
+class TestDownloadAndExport:
+    def test_download_returns_bytes(self, sample_config, mock_session):
+        resp = MagicMock(status_code=200, content=b"hello")
+        mock_session.request.return_value = resp
+        client = GDriveClient(sample_config)
+        assert client.download("file-1") == b"hello"
+        assert mock_session.request.call_args.kwargs["params"]["alt"] == "media"
+
+    def test_download_stream_returns_readable(self, sample_config, mock_session):
+        resp = MagicMock(status_code=200)
+        resp.raw = MagicMock()
+        mock_session.request.return_value = resp
+        client = GDriveClient(sample_config)
+        stream = client.download_stream("file-1")
+        assert hasattr(stream, "read")
+        assert mock_session.request.call_args.kwargs["stream"] is True
+
+    def test_export_returns_bytes_and_sends_target_mime(self, sample_config, mock_session):
+        resp = MagicMock(status_code=200, content=b"docx-bytes")
+        mock_session.request.return_value = resp
+        client = GDriveClient(sample_config)
+        target = (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        )
+        assert client.export("doc-1", target) == b"docx-bytes"
+        assert mock_session.request.call_args.kwargs["params"]["mimeType"] == target
+
+    def test_export_size_limit_raises_clear_pipeline_error(self, sample_config, mock_session):
+        mock_session.request.return_value = MagicMock(
+            status_code=403,
+            text='{"error": {"errors": [{"reason": "exportSizeLimitExceeded"}]}}',
+        )
+        client = GDriveClient(sample_config)
+        with pytest.raises(PipelineError) as exc:
+            client.export("doc-1", "application/pdf")
+        assert "10 MB" in str(exc.value)
+        assert "doc-1" in str(exc.value)
