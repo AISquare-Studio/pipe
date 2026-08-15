@@ -15,6 +15,8 @@ import os
 import time
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import IO, Any
 
 import requests
@@ -41,6 +43,38 @@ logger = logging.getLogger("aisquare.pipe.gdrive")
 
 _RETRY_STATUS = (429, 500, 502, 503, 504)
 _ERROR_BODY_LIMIT = 800
+#: Upper bound on an honoured Retry-After, so a hostile or clock-skewed value
+#: cannot park the whole pipeline for hours.
+_MAX_RETRY_WAIT = 300.0
+
+
+def _retry_after_seconds(value: str | None, attempt: int) -> float:
+    """Seconds to wait before a retry, from a Retry-After header.
+
+    RFC 9110 allows either delay-seconds or an HTTP-date; Drive normally sends
+    the former, but proxies and load balancers in front of it send the latter.
+    Anything unparseable falls back to exponential backoff rather than raising —
+    a malformed header must not turn a retryable response into a crash.
+    """
+    fallback = INITIAL_BACKOFF * (2**attempt)
+    if not value:
+        return fallback
+
+    try:
+        return max(0.0, min(float(value), _MAX_RETRY_WAIT))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return fallback
+    if when is None:
+        return fallback
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    delta = (when - datetime.now(UTC)).total_seconds()
+    return max(0.0, min(delta, _MAX_RETRY_WAIT))
 
 
 class GDriveClient:
@@ -136,12 +170,7 @@ class GDriveClient:
             )
 
             if resp.status_code in _RETRY_STATUS:
-                retry_after = resp.headers.get("Retry-After")
-                wait = (
-                    float(retry_after)
-                    if retry_after
-                    else INITIAL_BACKOFF * (2**attempt)
-                )
+                wait = _retry_after_seconds(resp.headers.get("Retry-After"), attempt)
                 logger.warning(
                     "gdrive throttled (HTTP %d, attempt %d/%d), retrying in %.1fs",
                     resp.status_code,
@@ -419,11 +448,8 @@ class GDriveClient:
                 )
 
                 if resp.status_code in _RETRY_STATUS:
-                    retry_after = resp.headers.get("Retry-After")
-                    wait = (
-                        float(retry_after)
-                        if retry_after
-                        else INITIAL_BACKOFF * (2**attempt)
+                    wait = _retry_after_seconds(
+                        resp.headers.get("Retry-After"), attempt
                     )
                     logger.warning(
                         "gdrive chunk upload throttled (HTTP %d, attempt %d/%d), "

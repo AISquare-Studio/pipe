@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
 from aisquare_pipe_gdrive.client import GDriveClient
-from aisquare_pipe_gdrive.constants import FOLDER_MIME
+from aisquare_pipe_gdrive.constants import FOLDER_MIME, INITIAL_BACKOFF
 
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 from tests.helpers import make_file, make_folder, make_list_response
@@ -127,6 +129,57 @@ class TestRequest:
         message = str(exc.value)
         assert len(message) < 1200
         assert message.count("x") < 5000
+
+
+class TestRetryAfterParsing:
+    """Retry-After is delay-seconds *or* an HTTP-date (RFC 9110). Drive sends
+    seconds, but proxies in front of it send dates — neither may crash."""
+
+    def test_http_date_retry_after_is_honoured(self, sample_config, mock_session):
+        when = datetime.now(UTC) + timedelta(seconds=30)
+        throttled = MagicMock(
+            status_code=429,
+            headers={"Retry-After": format_datetime(when, usegmt=True)},
+        )
+        ok = MagicMock(status_code=200)
+        mock_session.request.side_effect = [throttled, ok]
+        client = GDriveClient(sample_config)
+        with patch("aisquare_pipe_gdrive.client.time.sleep") as sleep:
+            assert client._request("GET", "https://example.test") is ok
+        assert 0 < sleep.call_args.args[0] <= 31
+
+    def test_malformed_retry_after_falls_back_to_backoff(
+        self, sample_config, mock_session
+    ):
+        throttled = MagicMock(status_code=429, headers={"Retry-After": "soon-ish"})
+        ok = MagicMock(status_code=200)
+        mock_session.request.side_effect = [throttled, ok]
+        client = GDriveClient(sample_config)
+        with patch("aisquare_pipe_gdrive.client.time.sleep") as sleep:
+            assert client._request("GET", "https://example.test") is ok
+        assert sleep.call_args.args[0] == INITIAL_BACKOFF
+
+    def test_past_http_date_does_not_sleep_negative(self, sample_config, mock_session):
+        when = datetime.now(UTC) - timedelta(hours=1)
+        throttled = MagicMock(
+            status_code=429,
+            headers={"Retry-After": format_datetime(when, usegmt=True)},
+        )
+        ok = MagicMock(status_code=200)
+        mock_session.request.side_effect = [throttled, ok]
+        client = GDriveClient(sample_config)
+        with patch("aisquare_pipe_gdrive.client.time.sleep") as sleep:
+            client._request("GET", "https://example.test")
+        assert sleep.call_args.args[0] == 0.0
+
+    def test_absurd_retry_after_is_clamped(self, sample_config, mock_session):
+        throttled = MagicMock(status_code=429, headers={"Retry-After": "999999"})
+        ok = MagicMock(status_code=200)
+        mock_session.request.side_effect = [throttled, ok]
+        client = GDriveClient(sample_config)
+        with patch("aisquare_pipe_gdrive.client.time.sleep") as sleep:
+            client._request("GET", "https://example.test")
+        assert sleep.call_args.args[0] == 300.0
 
 
 def _json_response(payload: dict) -> MagicMock:

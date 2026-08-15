@@ -112,6 +112,42 @@ class TestPush:
         # upload_resumable should NOT be called when overwriting an existing file.
         fake_client.upload_resumable.assert_not_called()
 
+    def test_stream_without_declared_size_is_buffered_and_uploaded(self, fake_client):
+        """A resumable session needs a byte count up front. Without one the
+        stream must be buffered, not handed to a session that can never
+        complete (which failed with 'session ended without a final response')."""
+        env = _envelope(data=b"", filename="s.txt", stream=io.BytesIO(b"streamed"))
+        assert "size" not in env.metadata
+
+        result = GDriveSink().push(env, dict(CONFIG))
+
+        assert result.success is True
+        fake_client.upload_resumable.assert_not_called()
+        fake_client.upload.assert_called_once()
+        assert fake_client.upload.call_args.args[3] == b"streamed"
+
+    def test_stream_with_zero_size_is_buffered(self, fake_client):
+        env = _envelope(data=b"", filename="s.txt", stream=io.BytesIO(b"late-sized"))
+        env.metadata["size"] = 0
+
+        result = GDriveSink().push(env, dict(CONFIG))
+
+        assert result.success is True
+        fake_client.upload.assert_called_once()
+        assert fake_client.upload.call_args.args[3] == b"late-sized"
+
+    def test_large_unsized_stream_still_takes_resumable_path(self, fake_client):
+        """Buffering must not downgrade a genuinely large payload to a simple
+        upload — once sized, should_chunk() routes it back to resumable."""
+        payload = b"z" * (6 * 1024 * 1024)
+        env = _envelope(data=b"", filename="big.bin", stream=io.BytesIO(payload))
+
+        result = GDriveSink().push(env, dict(CONFIG))
+
+        assert result.success is True
+        fake_client.upload_resumable.assert_called_once()
+        fake_client.upload.assert_not_called()
+
 
 class TestConflictModes:
     def test_fail_mode_refuses_when_file_exists(self, fake_client):

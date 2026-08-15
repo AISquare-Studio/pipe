@@ -309,6 +309,8 @@ class GDriveSink(SinkConnector):
         Note: A stream envelope pushed with conflict="overwrite" is buffered fully
         into memory, because Drive's update-in-place API takes bytes rather than
         a streaming session. For very large files, prefer "rename" or "fail" modes.
+        A stream envelope whose metadata declares no 'size' is likewise buffered,
+        since a resumable session cannot be opened without a total byte count.
 
         Never raises: every failure comes back as PushResult(success=False).
         """
@@ -334,25 +336,33 @@ class GDriveSink(SinkConnector):
 
             mime_type = envelope.content_type or "application/octet-stream"
 
-            # Stream envelopes always take the resumable path.
+            # A resumable session needs the total size up front for its
+            # Content-Range headers. Stream envelopes normally declare one in
+            # metadata; when they do not, buffer the stream and let the sized
+            # byte path below handle it, rather than opening a session that can
+            # never be completed.
             if envelope.stream is not None:
                 size = int(envelope.metadata.get("size") or 0)
-                resolved = self._resolve_conflict(client, filename, parent_id, conflict)
-                if resolved.error:
-                    return PushResult(success=False, error=resolved.error)
-                if resolved.existing_id and conflict == "overwrite":
-                    # Note: buffers the entire stream into memory.
-                    stream_data = envelope.stream.read()
-                    result = client.update_content(
-                        resolved.existing_id, mime_type, stream_data
+                if size > 0:
+                    resolved = self._resolve_conflict(
+                        client, filename, parent_id, conflict
                     )
-                else:
-                    result = client.upload_resumable(
-                        resolved.name, parent_id, mime_type, envelope.stream, size
-                    )
-                return self._success(result)
+                    if resolved.error:
+                        return PushResult(success=False, error=resolved.error)
+                    if resolved.existing_id and conflict == "overwrite":
+                        # Note: buffers the entire stream into memory.
+                        result = client.update_content(
+                            resolved.existing_id, mime_type, envelope.stream.read()
+                        )
+                    else:
+                        result = client.upload_resumable(
+                            resolved.name, parent_id, mime_type, envelope.stream, size
+                        )
+                    return self._success(result)
+                data: bytes | None = envelope.stream.read()
+            else:
+                data = self._coerce(envelope.data)
 
-            data = self._coerce(envelope.data)
             if data is None:
                 return PushResult(
                     success=False,
