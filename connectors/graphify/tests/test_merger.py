@@ -7,13 +7,14 @@ import json
 import pytest
 
 # Both faces need the [engine] extra — skip cleanly without it (CI validator
-# runs connectors bare).
-q = pytest.importorskip(
-    "aisquare_pipe_graphify.query", reason="[engine] extra not installed"
-)
-merge_graphs = pytest.importorskip(
-    "aisquare_pipe_graphify.merger", reason="[engine] extra not installed"
-).merge_graphs
+# runs connectors bare). Each face raises a plain ImportError naming the extra
+# (not ModuleNotFoundError), and pytest 9's importorskip no longer skips on
+# that, so a bare run errored at collection and failed `pipe validate`.
+try:
+    import aisquare_pipe_graphify.query as q
+    from aisquare_pipe_graphify.merger import merge_graphs
+except ImportError as exc:
+    pytest.skip(f"[engine] extra not installed: {exc}", allow_module_level=True)
 
 # Two repos that BOTH define a node id "config" (collision bait), both import
 # the external lib "stripe" (no source_file → dedup bait), and the web repo
