@@ -4,6 +4,7 @@ keyword ranking, argument validation, and Toolkit.call_tool semantics."""
 from __future__ import annotations
 
 import dataclasses
+import urllib.error
 
 import pytest
 
@@ -751,6 +752,12 @@ class TestScrubCoverage:
             {"credentials": {"nested": {"value": SECRET}}},
             {"auth": {"tokens": [SECRET]}},
             {"profiles": [{"api_key": SECRET}]},
+            {"key": SECRET},
+            {"id_token": SECRET},
+            {"secret_url": SECRET},
+            {"api_key_type": SECRET},
+            {"secret_sort_key": SECRET},
+            {"token_type": {"refresh_token": SECRET}},
         ],
     )
     def test_secret_values_masked(self, config):
@@ -765,3 +772,107 @@ class TestScrubCoverage:
             "RET_DO", {}, {"access_token": "abcdef123", "root_folder": "my-project-folder"}
         )
         assert "my-project-folder" in (out.error or "")
+
+    def test_credential_metadata_and_identifier_keys_untouched(self):
+        message = "Bearer auth failed at https://auth.example.test/token; sorted by created_at"
+        config = {
+            "access_token": "abcdef123",
+            "token_type": "Bearer",
+            "tokenTypeHint": "access_token",
+            "token_url": "https://auth.example.test/token",
+            "authorization_endpoint": "https://auth.example.test/authorize",
+            "sort_key": "created_at",
+            "partitionKey": "tenant-a",
+            "public_key": "ssh-ed25519-AAAAC3",
+        }
+        out = _Returns(ToolResult.fail(message)).call_tool("RET_DO", {}, config)
+        assert out.error == message
+
+
+class TestTruncationKeepsSecretsMasked:
+    """Secrets are masked before any cut, and a cut never splits a mask."""
+
+    @staticmethod
+    def _leaked(error: str) -> str | None:
+        return next((SECRET[:n] for n in range(len(SECRET), 3, -1) if SECRET[:n] in error), None)
+
+    @staticmethod
+    def _trailing_stars(error: str) -> int:
+        body = error.removesuffix("…")
+        return len(body) - len(body.rstrip("*"))
+
+    @pytest.mark.parametrize("prefix", [*range(255, 300), 5000])
+    def test_catch_all_secret_straddling_the_cut(self, prefix):
+        out = _Returns(raise_exc=RuntimeError("x" * prefix + SECRET)).call_tool(
+            "RET_DO", {}, {"access_token": SECRET}
+        )
+        error = out.error or ""
+        assert self._leaked(error) is None
+        assert self._trailing_stars(error) in (0, 3)
+        assert len(error) < 400
+
+    @pytest.mark.parametrize("prefix", range(985, 1000))
+    def test_tool_error_secret_straddling_the_cut(self, prefix):
+        out = _Returns(raise_exc=ToolError("y" * prefix + SECRET)).call_tool(
+            "RET_DO", {}, {"access_token": SECRET}
+        )
+        error = out.error or ""
+        assert self._leaked(error) is None
+        assert self._trailing_stars(error) in (0, 3)
+        assert len(error) <= 1000
+
+    @pytest.mark.parametrize("prefix", range(85, 100))
+    def test_unknown_slug_secret_straddling_the_cut(self, prefix):
+        out = _Returns().call_tool("x" * prefix + SECRET, {}, {"access_token": SECRET})
+        assert out.error_code == ERROR_UNKNOWN_TOOL
+        assert self._leaked(out.error or "") is None
+
+    def test_internal_error_label_secret_straddling_the_cut(self):
+        class Broken(_Returns):
+            def tools(self):
+                raise RuntimeError("catalog down")
+
+        out = Broken().call_tool("x" * 90 + SECRET, {}, {"access_token": SECRET})
+        assert "internal error" in (out.error or "")
+        assert self._leaked(out.error or "") is None
+
+    def test_secret_url_is_masked_before_its_query_is_dropped(self):
+        hook = "https://hooks.example.test/services/T0SECRET/B0SECRET?sig=abc123"
+        out = _Returns(raise_exc=RuntimeError(f"POST {hook} failed")).call_tool(
+            "RET_DO", {}, {"access_token": "abcdef123", "webhook_secret": hook}
+        )
+        assert "T0SECRET" not in (out.error or "")
+        assert out.error == "RET_DO failed (RuntimeError): POST *** failed"
+
+    def test_secret_split_by_whitespace_is_masked_after_collapsing(self):
+        out = _Returns(raise_exc=RuntimeError("got ab12cd\n\n  ef34gh back")).call_tool(
+            "RET_DO", {}, {"access_token": "abcdef123", "api_key": "ab12cd ef34gh"}
+        )
+        assert out.error == "RET_DO failed (RuntimeError): got *** back"
+
+
+class TestTimeoutClassification:
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            TimeoutError("read timed out"),  # also socket.timeout, an alias
+            urllib.error.URLError(TimeoutError("timed out")),  # urlopen's connect timeout
+            urllib.error.URLError(TimeoutError()),
+        ],
+        ids=["TimeoutError", "URLError(TimeoutError)", "URLError(TimeoutError())"],
+    )
+    def test_timeouts_map_to_timeout(self, exc):
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error, out.error_code) == ("RET_DO timed out", ERROR_TIMEOUT)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            urllib.error.URLError("Name or service not known"),
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        ],
+    )
+    def test_other_url_errors_stay_upstream(self, exc):
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.error_code == ERROR_UPSTREAM_ERROR
+        assert (out.error or "").startswith("RET_DO failed (URLError)")

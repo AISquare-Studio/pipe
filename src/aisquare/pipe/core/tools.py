@@ -19,6 +19,7 @@ import copy
 import logging
 import re
 import time
+import urllib.error
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -401,10 +402,23 @@ def prepare_arguments(
 # --------------------------------------------------------------------------
 
 #: Config keys whose (string) values are masked out of error messages; a
-#: nested mapping/list under such a key is masked wholesale.
+#: nested mapping/list under such a key is masked wholesale. Deliberately
+#: broad — see :func:`_is_secret_key` for the few names it lets through.
 _SECRET_CONFIG_KEYS = re.compile(
     r"token|secret|passw|credential|authorization|cookie|api[-_]?key|private[-_]?key|key$",
     re.IGNORECASE,
+)
+#: Words that keep a key secret even with a metadata suffix (``secret_url``).
+_STRONG_SECRET = re.compile(r"secret|passw|credential|cookie|api_?key|private_?key")
+#: Trailing words naming a property of a credential, not the credential
+#: itself (``token_type``, ``token_url``, ``authorization_endpoint``).
+_CREDENTIAL_METADATA = frozenset({"type", "hint", "url", "uri", "endpoint"})
+#: Qualifiers of a ``*_key`` that is an identifier, not a secret (``sort_key``).
+_NON_SECRET_KEY_KINDS = frozenset(
+    {
+        "sort", "partition", "primary", "public", "foreign", "cache", "object",
+        "row", "range", "hash", "shard", "idempotency", "dedup", "dedupe",
+    }
 )
 
 
@@ -488,7 +502,7 @@ class Toolkit(ABC):
         ``ToolResult(successful=False)`` with a human-readable error."""
         started = time.monotonic()
         config = config if isinstance(config, Mapping) else {}
-        label = _slug_label(slug)
+        label = _slug_label(slug, config)
         try:
             result = self._call_tool(slug, arguments, config)
         except Exception as e:  # noqa: BLE001 — call_tool never raises
@@ -515,7 +529,7 @@ class Toolkit(ABC):
     ) -> ToolResult:
         tool = self.get_tool(slug)
         if tool is None:
-            shown = slug[:100] if isinstance(slug, str) else type(slug).__name__
+            shown = _slug_label(slug, config) if isinstance(slug, str) else type(slug).__name__
             return ToolResult.fail(
                 f"unknown tool {shown!r} for toolkit {self.name!r} — "
                 "use search_tools() to find available tools",
@@ -549,11 +563,11 @@ class Toolkit(ABC):
             return ToolResult.fail(
                 str(e) or f"{tool.slug} failed", code=e.code, retry_after=e.retry_after
             )
-        except TimeoutError:
-            return ToolResult.fail(f"{tool.slug} timed out", code=ERROR_TIMEOUT)
         except Exception as e:  # noqa: BLE001 — surfaced to the caller, not raised
+            if _timed_out(e):
+                return ToolResult.fail(f"{tool.slug} timed out", code=ERROR_TIMEOUT)
             logger.warning("toolkit %s: %s raised %s", self.name, tool.slug, type(e).__name__)
-            detail = _redact(str(e))
+            detail = _redact(str(e), config)
             return ToolResult.fail(
                 f"{tool.slug} failed ({type(e).__name__})" + (f": {detail}" if detail else ""),
                 code=ERROR_UPSTREAM_ERROR,
@@ -663,20 +677,49 @@ class Toolkit(ABC):
 #: Longest exception text the catch-all passes through.
 _MAX_EXCEPTION_TEXT = 300
 _URL_QUERY = re.compile(r"(https?://[^\s?#'\"]+)[?#][^\s'\"]*")
+#: What a masked secret is replaced with.
+_MASK = "***"
 
 
-def _redact(text: str) -> str:
-    """Exception text made safe to return: URL query strings (which carry
-    argument values) dropped, then truncated."""
-    text = _URL_QUERY.sub(r"\1?…", " ".join(text.split()))
-    if len(text) > _MAX_EXCEPTION_TEXT:
-        text = text[: _MAX_EXCEPTION_TEXT - 1] + "…"
-    return text
+def _timed_out(e: BaseException) -> bool:
+    """A client-side timeout: ``TimeoutError`` (``socket.timeout``) itself, or
+    urllib's ``URLError`` wrapping one (how ``urlopen`` reports connect timeouts)."""
+    return isinstance(e, TimeoutError) or (
+        isinstance(e, urllib.error.URLError) and isinstance(e.reason, TimeoutError)
+    )
 
 
-def _slug_label(slug: Any) -> str:
-    """A short, safe rendering of a (possibly garbage) slug for messages/logs."""
-    return slug[:100] if isinstance(slug, str) else f"<{type(slug).__name__}>"
+def _redact(text: str, config: Mapping[str, Any]) -> str:
+    """Exception text made safe to return: whitespace collapsed, secret config
+    values masked, URL query strings (which carry argument values) dropped,
+    then truncated. Masking follows the collapse (a secret's collapsed form
+    is one of the masked forms) and precedes the query drop and the cut,
+    which only remove text — so neither can leave part of a secret behind."""
+    text = _mask(" ".join(text.split()), config)
+    return _truncate(_URL_QUERY.sub(r"\1?…", text), _MAX_EXCEPTION_TEXT)
+
+
+def _truncate(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` characters, ending in ``…`` when cut.
+    The cut never lands inside a mask — it backs off to the mask's start."""
+    if len(text) <= limit:
+        return text
+    cut = limit - 1
+    if text[cut] == "*":
+        cut = len(text[:cut].rstrip("*"))
+    return text[:cut] + "…"
+
+
+def _slug_label(slug: Any, config: Mapping[str, Any]) -> str:
+    """A short, safe rendering of a (possibly garbage) slug for messages/logs:
+    secret config values masked before the cut; only the type when the slug
+    is not a string or ``config`` cannot be scanned."""
+    if not isinstance(slug, str):
+        return f"<{type(slug).__name__}>"
+    try:
+        return _truncate(_mask(slug, config), 100)
+    except Exception:  # noqa: BLE001 — a label must never raise
+        return "<str>"
 
 
 def _normalize_failure(result: ToolResult, label: str) -> None:
@@ -702,12 +745,37 @@ def _normalize_failure(result: ToolResult, label: str) -> None:
         result.retry_after = None
 
 
+def _key_words(key: str) -> list[str]:
+    """``clientSecret`` -> ``["client", "secret"]``; ``X-API-KEY`` -> ``["x", "api", "key"]``."""
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", key)
+    return re.findall(r"[a-z0-9]+", spaced.lower())
+
+
+def _is_secret_key(key: Any) -> bool:
+    """Whether a config key names a credential. Fails closed: anything
+    :data:`_SECRET_CONFIG_KEYS` matches is secret, except a name for a
+    property of a credential (``token_type``, ``token_url`` — but not
+    ``secret_url``) and a non-secret kind of key (``sort_key``, ``public_key``)."""
+    name = str(key)
+    if not _SECRET_CONFIG_KEYS.search(name):
+        return False
+    words = _key_words(name)
+    stem = list(words)
+    while len(stem) > 1 and stem[-1] in _CREDENTIAL_METADATA:
+        stem.pop()
+    if len(stem) < len(words):
+        return bool(_STRONG_SECRET.search("_".join(stem)))
+    if len(words) > 1 and words[-1] in ("key", "keys") and words[-2] in _NON_SECRET_KEY_KINDS:
+        return bool(_SECRET_CONFIG_KEYS.search("_".join(words[:-2])))
+    return True
+
+
 def _secret_values(mapping: Mapping[Any, Any], inherited: bool = False, depth: int = 0) -> Iterator[str]:
     """String values under secret-looking keys, at any depth (bounded)."""
     if depth > 5:
         return
     for key, value in mapping.items():
-        secret = inherited or bool(_SECRET_CONFIG_KEYS.search(str(key)))
+        secret = inherited or _is_secret_key(key)
         items = value if isinstance(value, (list, tuple)) else [value]
         for item in items:
             if isinstance(item, str) and secret:
@@ -717,6 +785,11 @@ def _secret_values(mapping: Mapping[Any, Any], inherited: bool = False, depth: i
 
 
 def _scrub(message: str, config: Mapping[str, Any]) -> str:
+    """:func:`_mask`, then cut to :data:`_MAX_ERROR` characters."""
+    return _truncate(_mask(message, config), _MAX_ERROR)
+
+
+def _mask(message: str, config: Mapping[str, Any]) -> str:
     """Mask secret-looking config values that leaked into an error message —
     raw, whitespace-stripped/collapsed and escape-sequence forms, plus the
     credential part of a ``"<scheme> <credential>"`` value (``Bearer x``)."""
@@ -734,5 +807,5 @@ def _scrub(message: str, config: Mapping[str, Any]) -> str:
         if len(parts) > 1:
             variants.add(parts[-1])
     for variant in sorted((v for v in variants if len(v) >= 6), key=len, reverse=True):
-        message = message.replace(variant, "***")
-    return message[:_MAX_ERROR]
+        message = message.replace(variant, _MASK)
+    return message
