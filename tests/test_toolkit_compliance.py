@@ -124,11 +124,10 @@ def test_call_tool_succeeding_without_creds_fails():
 
 def test_network_without_creds_fails():
     class Networked(Good):
-        auth_type = AuthType.NONE
-
-        def run_tool(self, tool, arguments, config):
+        def call_tool(self, slug, arguments, config):
+            # Dials out before checking credentials.
             socket.create_connection(("api.example.com", 443))
-            return ToolResult.ok({})
+            return ToolResult.fail("unreachable")
 
     results = run_toolkit_contract_checks(Networked)
     failed = {r.id: r.message for r in failures(results)}
@@ -150,6 +149,54 @@ def test_entry_point_name_must_equal_toolkit_name():
 
 def test_non_toolkit_class_fails():
     assert failed_ids(MockSource) == {"contract.toolkit.base-class"}
+
+
+def test_oauth_extras_may_not_set_flow_params():
+    spec = OAuthSpec(
+        provider="g",
+        authorize_url="https://a.example",
+        token_url="https://t.example",
+        extra_authorize_params={"state": "fixed", "access_type": "offline"},
+    )
+    results = run_toolkit_contract_checks(type("Broken", (Good,), {"oauth": spec}))
+    failed = {r.id: r.message for r in failures(results)}
+    assert "state" in failed["contract.toolkit.oauth"]
+    assert "access_type" not in failed["contract.toolkit.oauth"]
+
+
+class _OpenKit(Good):
+    """A no-auth toolkit: tools without required args really run."""
+
+    auth_type = AuthType.NONE
+    oauth = None
+
+    def tools(self) -> list[ToolSpec]:
+        return [
+            ToolSpec("GOOD_GET", "Get a thing.", SCHEMA, read_only=True),
+            ToolSpec("GOOD_PING", "Ping.", {"type": "object", "properties": {}}, read_only=True),
+        ]
+
+
+def test_auth_none_toolkit_passes_call_no_creds():
+    assert failed_ids(_OpenKit) == set()
+
+
+def test_auth_none_toolkit_still_probes_required_args():
+    class Sloppy(_OpenKit):
+        def call_tool(self, slug, arguments, config):
+            if slug == "GOOD_GET":
+                return ToolResult.ok({})  # skips argument validation
+            return super().call_tool(slug, arguments, config)
+
+    assert "contract.toolkit.call-no-creds" in failed_ids(Sloppy)
+
+
+def test_non_canonical_error_code_fails():
+    class Odd(Good):
+        def call_tool(self, slug, arguments, config):
+            return ToolResult(successful=False, error="nope", error_code="auth_failed")
+
+    assert {"contract.toolkit.call-unknown", "contract.toolkit.call-no-creds"} <= failed_ids(Odd)
 
 
 def test_oauth2_without_spec_is_a_warning_only():

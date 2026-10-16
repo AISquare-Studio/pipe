@@ -22,6 +22,7 @@ from aisquare.pipe.core.oauth import (
     build_authorize_url,
     exchange_code,
     make_pkce_pair,
+    pkce_challenge,
     refresh_access_token,
     revoke_token,
 )
@@ -112,6 +113,7 @@ __all__ = [
     "OAuthSpec",
     "OAuthToken",
     "make_pkce_pair",
+    "pkce_challenge",
     "build_authorize_url",
     "exchange_code",
     "refresh_access_token",

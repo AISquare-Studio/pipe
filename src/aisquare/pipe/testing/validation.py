@@ -24,8 +24,8 @@ from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
-from aisquare.pipe.core.oauth import OAuthSpec
-from aisquare.pipe.core.tools import Toolkit, ToolResult, ToolSpec
+from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, OAuthSpec
+from aisquare.pipe.core.tools import ERROR_CODES, Toolkit, ToolResult, ToolSpec
 from aisquare.pipe.errors import PipeError
 from aisquare.pipe.testing.fixtures import (
     make_binary_envelope,
@@ -681,6 +681,8 @@ def _call_tool_check(cls: type, slug: str, label: str) -> str | None:
         return f"call_tool({label}, {{}}, {{}}) succeeded — empty config cannot hold credentials"
     if not result.error:
         return f"call_tool({label}, {{}}, {{}}) failed without an error message"
+    if result.error_code not in ERROR_CODES:
+        return f"call_tool({label}, {{}}, {{}}) returned non-canonical error_code {result.error_code!r}"
     return None
 
 
@@ -690,17 +692,24 @@ def check_toolkit_call_unknown(cls: type) -> list[CheckResult]:
 
 
 def check_toolkit_call_no_creds(cls: type) -> list[CheckResult]:
-    """``call_tool(slug, {}, {})`` fails cleanly for every real slug."""
+    """``call_tool(slug, {}, {})`` fails cleanly for every real slug.
+
+    An ``AuthType.NONE`` toolkit legitimately runs tools without credentials,
+    so only its tools with required arguments are probed (they must fail
+    argument validation before any I/O)."""
     check_id = "contract.toolkit.call-no-creds"
     catalog, problem = _toolkit_catalog(cls)
     if catalog is None:
         return [CheckResult(check_id, False, message=f"not evaluated — {problem}")]
+    probe = [tool for tool in catalog if isinstance(tool, ToolSpec)]
+    if cls().auth_type is AuthType.NONE:
+        probe = [
+            tool
+            for tool in probe
+            if isinstance(tool.input_schema, Mapping) and tool.input_schema.get("required")
+        ]
     problems = [
-        p
-        for tool in catalog
-        if isinstance(tool, ToolSpec)
-        for p in [_call_tool_check(cls, tool.slug, tool.slug)]
-        if p is not None
+        p for tool in probe for p in [_call_tool_check(cls, tool.slug, tool.slug)] if p is not None
     ]
     return [CheckResult(check_id, not problems, message="; ".join(problems))]
 
@@ -759,6 +768,11 @@ def check_toolkit_oauth(cls: type) -> list[CheckResult]:
                 problems.append(f"oauth.{attr} must be an https URL")
         if spec.revoke_url is not None and not _is_https(spec.revoke_url):
             problems.append("oauth.revoke_url must be an https URL")
+        reserved = sorted(set(spec.extra_authorize_params) & FLOW_AUTHORIZE_PARAMS)
+        if reserved:
+            problems.append(
+                f"oauth.extra_authorize_params may not set flow parameters: {', '.join(reserved)}"
+            )
     return [CheckResult("contract.toolkit.oauth", not problems, message="; ".join(problems))]
 
 

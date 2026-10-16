@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client as http_client
 import io
 import json
 import re
@@ -23,10 +24,12 @@ from aisquare.pipe import (
     build_authorize_url,
     exchange_code,
     make_pkce_pair,
+    pkce_challenge,
     refresh_access_token,
     revoke_token,
 )
-from aisquare.pipe.testing.mock_connectors import MockToolkit
+from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS
+from aisquare.pipe.testing.mock_connectors import MOCK_OAUTH, MockToolkit
 
 SPEC = OAuthSpec(
     provider="acme",
@@ -62,6 +65,9 @@ class FakeResponse:
     def getcode(self) -> int:
         return self.status
 
+    def close(self) -> None:
+        pass
+
     def __enter__(self):
         return self
 
@@ -69,14 +75,16 @@ class FakeResponse:
         return False
 
 
-class FakeUrlopen:
-    """Stands in for urllib.request.urlopen; records every Request."""
+class FakeOpener:
+    """Stands in for the opener urllib.request.build_opener returns; records
+    every Request and the handlers the opener was built with."""
 
     def __init__(self, *responses):
         self.responses = list(responses)
         self.requests: list[urllib.request.Request] = []
+        self.handlers: tuple = ()
 
-    def __call__(self, request, timeout=None):
+    def open(self, request, timeout=None):
         self.requests.append(request)
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
@@ -94,9 +102,14 @@ class FakeUrlopen:
 
 @pytest.fixture
 def http(monkeypatch):
-    def install(*responses) -> FakeUrlopen:
-        fake = FakeUrlopen(*responses)
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+    def install(*responses) -> FakeOpener:
+        fake = FakeOpener(*responses)
+
+        def build_opener(*handlers):
+            fake.handlers = handlers
+            return fake
+
+        monkeypatch.setattr(urllib.request, "build_opener", build_opener)
         return fake
 
     return install
@@ -123,6 +136,14 @@ class TestPkce:
 
     def test_pairs_are_unique(self):
         assert make_pkce_pair() != make_pkce_pair()
+
+    def test_rfc7636_appendix_b_known_answer(self):
+        verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        assert pkce_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+    def test_pair_challenge_matches_verifier(self):
+        verifier, challenge = make_pkce_pair()
+        assert pkce_challenge(verifier) == challenge
 
 
 def _query(url: str) -> dict[str, str]:
@@ -179,6 +200,54 @@ class TestBuildAuthorizeUrl:
         with pytest.raises(OAuthError) as info:
             build_authorize_url(spec, client_id="c", redirect_uri="https://r", state="s")
         assert info.value.error == "pkce_required"
+
+    @pytest.mark.parametrize("state", ["", "   ", None])
+    def test_blank_state_rejected(self, state):
+        with pytest.raises(OAuthError) as info:
+            build_authorize_url(SPEC, client_id="c", redirect_uri="https://r", state=state)  # type: ignore[arg-type]
+        assert info.value.error == "state_required"
+
+    def test_extras_cannot_override_flow_params(self):
+        spec = OAuthSpec(
+            provider="p",
+            authorize_url="https://a.example/auth",
+            token_url="https://a.example/token",
+            extra_authorize_params={
+                "state": "fixed",
+                "redirect_uri": "https://evil.example/cb",
+                "client_id": "other",
+                "response_type": "token",
+                "code_challenge": "attacker",
+                "code_challenge_method": "plain",
+                "prompt": "consent",
+            },
+        )
+        query = _query(build_authorize_url(spec, client_id="cid", redirect_uri="https://app/cb", state="mine"))
+        assert query == {
+            "response_type": "code",
+            "client_id": "cid",
+            "redirect_uri": "https://app/cb",
+            "state": "mine",
+            "prompt": "consent",
+        }
+
+    def test_baked_in_flow_params_dropped(self):
+        spec = OAuthSpec(
+            provider="p",
+            authorize_url="https://a.example/auth?code_challenge=baked&tenant=common",
+            token_url="https://a.example/token",
+        )
+        query = _query(build_authorize_url(spec, client_id="c", redirect_uri="https://r", state="s"))
+        assert "code_challenge" not in query and query["tenant"] == "common"
+
+    def test_flow_params_constant(self):
+        assert {"state", "redirect_uri", "client_id", "response_type", "code_challenge"} <= FLOW_AUTHORIZE_PARAMS
+
+    def test_insecure_authorize_url_rejected(self):
+        spec = OAuthSpec(provider="p", authorize_url="http://a.example/auth", token_url="https://t")
+        with pytest.raises(OAuthError) as info:
+            build_authorize_url(spec, client_id="c", redirect_uri="https://r", state="s")
+        assert info.value.error == "insecure_url"
 
 
 # --------------------------------------------------------------------------
@@ -319,6 +388,80 @@ class TestRefresh:
         token = refresh_access_token(GITHUB_LIKE, client_id="c", client_secret="s", refresh_token="ghr_old")
         assert (token.access_token, token.refresh_token) == ("ghu_new", "ghr_new")
         assert token.expires_at is not None
+
+    def test_omitted_scope_keeps_previous_scope(self, http):
+        http(FakeResponse(200, {"access_token": "a"}))
+        token = refresh_access_token(
+            SPEC, client_id="c", client_secret="s", refresh_token="r", previous_scope="read write"
+        )
+        assert token.scope == "read write"
+
+    def test_omitted_scope_prefers_requested_scopes(self, http):
+        http(FakeResponse(200, {"access_token": "a"}))
+        token = refresh_access_token(
+            SPEC, client_id="c", client_secret="s", refresh_token="r", scopes=["read"], previous_scope="read write"
+        )
+        assert token.scope == "read"
+
+    def test_returned_scope_wins(self, http):
+        http(FakeResponse(200, {"access_token": "a", "scope": "read"}))
+        token = refresh_access_token(
+            SPEC, client_id="c", client_secret="s", refresh_token="r", previous_scope="read write"
+        )
+        assert token.scope == "read"
+
+    def test_toolkit_passes_previous_scope(self, http):
+        http(FakeResponse(200, {"access_token": "a"}))
+        token = MockToolkit().refresh_access_token(
+            client_id="c", client_secret="s", refresh_token="r", previous_scope="items:read"
+        )
+        assert token.scope == "items:read"
+
+
+class TestTransportGuards:
+    def test_requests_use_a_no_redirect_opener(self, http):
+        fake = http(FakeResponse(200, {"access_token": "a"}))
+        exchange_code(SPEC, client_id="c", client_secret="s", code="x", redirect_uri="https://r")
+        assert len(fake.handlers) == 1
+        handler = fake.handlers[0]
+        assert issubclass(handler, urllib.request.HTTPRedirectHandler)
+        assert handler().redirect_request(None, None, 302, "Found", {}, "https://elsewhere") is None
+
+    def test_3xx_status_is_unexpected_redirect(self, http):
+        http(FakeResponse(302, b""))
+        with pytest.raises(OAuthError) as info:
+            exchange_code(SPEC, client_id="c", client_secret="s", code="x", redirect_uri="https://r")
+        assert (info.value.error, info.value.status) == ("unexpected_redirect", 302)
+
+    def test_http_exception_is_oauth_error(self, http):
+        http(http_client.IncompleteRead(b"partial", 480))
+        with pytest.raises(OAuthError) as info:
+            refresh_access_token(SPEC, client_id="c", client_secret="client-secret-xyz", refresh_token="refresh-old-123")
+        assert info.value.error == "network_error"
+        _assert_no_secrets(str(info.value))
+
+    def test_http_exception_reading_error_body(self, http, monkeypatch):
+        class BrokenBody(FakeResponse):
+            def read(self):
+                raise http_client.IncompleteRead(b"", 10)
+
+        fake = http(FakeResponse(400, b""))
+
+        def open_(request, timeout=None):
+            fake.requests.append(request)
+            raise urllib.error.HTTPError(request.full_url, 400, "bad", Message(), BrokenBody(400, b""))
+
+        monkeypatch.setattr(fake, "open", open_)
+        with pytest.raises(OAuthError) as info:
+            exchange_code(SPEC, client_id="c", client_secret="s", code="x", redirect_uri="https://r")
+        assert info.value.error == "network_error"
+
+    def test_pkce_exchange_requires_verifier(self, http):
+        fake = http()
+        with pytest.raises(OAuthError) as info:
+            exchange_code(MOCK_OAUTH, client_id="c", client_secret="s", code="x", redirect_uri="https://r")
+        assert info.value.error == "pkce_required"
+        assert fake.requests == []
 
 
 # --------------------------------------------------------------------------

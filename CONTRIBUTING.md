@@ -172,7 +172,16 @@ the connection (OAuth) logic for the service. It lives in the same
 own entry-point group, `aisquare_pipe.toolkits`.
 
 ```python
-from aisquare.pipe import AuthType, OAuthSpec, Toolkit, ToolError, ToolResult, ToolSpec
+from aisquare.pipe import (
+    ERROR_UPSTREAM_ERROR,
+    AuthType,
+    OAuthSpec,
+    Toolkit,
+    ToolError,
+    ToolResult,
+    ToolSpec,
+    error_code_for_status,
+)
 
 SEARCH = ToolSpec(
     slug="MYSVC_SEARCH_FILES",             # UPPER_SNAKE, starts with slug_prefix
@@ -211,9 +220,15 @@ class MyServiceToolkit(Toolkit):
 
     def run_tool(self, tool, arguments, config) -> ToolResult:
         if tool.slug == "MYSVC_SEARCH_FILES":
-            items = search(config["access_token"], arguments["query"], arguments["limit"])
-            return ToolResult.ok({"items": items})
-        raise ToolError(f"{tool.slug} is not implemented")
+            resp = search(config["access_token"], arguments["query"], arguments["limit"])
+            if resp.status_code >= 400:
+                raise ToolError(
+                    f"search failed (HTTP {resp.status_code})",
+                    code=error_code_for_status(resp.status_code),   # 401 -> "unauthorized", ...
+                    retry_after=_retry_after(resp),                 # for 429s
+                )
+            return ToolResult.ok({"items": resp.json()["items"]})
+        raise ToolError(f"{tool.slug} is not implemented", code=ERROR_UPSTREAM_ERROR)
 ```
 
 What the base class does for you:
@@ -224,8 +239,13 @@ What the base class does for you:
   dropped and top-level `default`s are filled in), checks
   `validate_config(config)`, and only then calls your `run_tool`. Every
   failure — unknown slug, bad arguments, no credentials, a `ToolError`, any
-  other exception — comes back as `ToolResult(successful=False, error=...)`.
-  Secret-looking config values are masked out of error messages.
+  other exception — comes back as `ToolResult(successful=False, error=...,
+  error_code=...)`, with `error_code` set to `unknown_tool`,
+  `invalid_arguments` or `unauthorized` (missing credentials) by the base
+  class, to the `ToolError`'s `code`, to `timeout` for a `TimeoutError`,
+  and to `upstream_error` for anything else. An unexpected exception's text
+  is redacted (URL query strings dropped, truncated), and secret-looking
+  config values are masked out of every error message.
 - **`search_tools(query, limit=6)`** ranks the catalog with a deterministic
   keyword score (+2 per query term in the slug, +1 in the description or
   tags; first-person queries favour `..._AUTHENTICATED_...` tools).
@@ -239,7 +259,14 @@ What the base class does for you:
   retention and rotation, PKCE, `client_secret_post`/`client_secret_basic`).
   Override the method for provider quirks (e.g. a non-RFC revoke endpoint).
   Failures raise `OAuthError` carrying the provider's error code — never a
-  token, code or secret.
+  token, code or secret. Endpoints must be `https` (plain `http` only for
+  loopback test fakes), and a 3xx from the token endpoint is an error
+  (`unexpected_redirect`), never followed. `build_authorize_url` requires a
+  non-blank `state`, and `extra_authorize_params` cannot override the
+  flow's own parameters. `token_expires` / `rotates_refresh_token` are
+  hints for the host's token store (see `OAuthSpec`); the flow doesn't read
+  them. Pass the stored token's scope as `previous_scope` when refreshing,
+  so a provider that omits `scope` doesn't erase it.
 
 Conventions:
 
@@ -247,10 +274,19 @@ Conventions:
   The toolkit never stores tokens; the host (e.g. pipe-as-service) does.
 - Return JSON-serializable `data`. Binary payloads (downloads) go in
   `ToolResult.files` as `DataEnvelope`s with the MIME type as `content_type`
-  and `metadata["filename"]`.
-- Raise `ToolError("human-readable message")` for expected failures (not
-  found, permission denied, rate limited). Never put tokens or the raw
-  argument payload in it, and never log them — log slugs, counts, timings.
+  and `metadata["filename"]`, and the download tool also describes the file
+  in `data` with Composio-compatible keys (e.g. `name`, `mimetype`). Hosts
+  that serve Composio-shaped results (the BE's `/fetch` import reads
+  `s3url`) stage each file in blob storage and add its `s3url` to that dict.
+- Raise `ToolError("human-readable message", code=...)` for expected
+  failures. `code` is one of the canonical `ERROR_*` constants —
+  `unauthorized` (token rejected/expired: the host refreshes, then asks the
+  user to reconnect), `forbidden`, `not_found`, `rate_limited` (pass
+  `retry_after` seconds), `invalid_arguments`, `conflict`, `timeout`, or
+  `upstream_error` (the default). `error_code_for_status(status)` maps an
+  HTTP status; override it where the provider is quirky (e.g. GitHub's
+  rate-limit 403). Never put tokens or the raw argument payload in the
+  message, and never log them — log slugs, counts, timings.
 - When porting a Composio toolkit, keep Composio's slugs and argument names
   so existing callers keep working.
 
@@ -283,7 +319,10 @@ a failed `ToolResult`, and OAuth endpoints are `https`.
 For hermetic tests of code that *hosts* toolkits, use
 `aisquare.pipe.testing.mock_connectors.MockToolkit` (registered as toolkit
 `mock`): an in-memory items store with list/get/create/delete, a file
-download and a whoami, plus `MOCK_OAUTH`.
+download and a whoami, plus `MOCK_OAUTH`. Passing `MOCK_EXPIRED_TOKEN` or
+`MOCK_RATE_LIMITED_TOKEN` as the `access_token` makes every tool fail with
+`unauthorized` or `rate_limited` (`retry_after=30`). Hosts that list
+toolkits to users should filter out `mock`.
 
 Inspect any installed toolkit from the CLI:
 

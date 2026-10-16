@@ -608,6 +608,7 @@ class Toolkit(ABC):
         client_secret: str | None,
         refresh_token: str,
         scopes: Sequence[str] | None = None,
+        previous_scope: str | None = None,
     ) -> OAuthToken:
         return refresh_access_token(
             self._require_oauth(),
@@ -615,6 +616,7 @@ class Toolkit(ABC):
             client_secret=client_secret,
             refresh_token=refresh_token,
             scopes=scopes,
+            previous_scope=previous_scope,
         )
 
     def revoke_token(
