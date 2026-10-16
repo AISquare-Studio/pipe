@@ -71,8 +71,9 @@ backoff (1 s, 2 s). Tune with `GitHubToolkit(max_retries=..., max_retry_wait=...
 
 **Time budget.** A host may set `config["timeout_seconds"]` (pipe-as-service
 does). The whole call fits inside it: each request's timeout is the smaller of
-30 s and the time left, and a retry that would sleep past it fails at once as
-`rate_limited`. A spent budget is `timeout`.
+30 s and the time left. A retry whose sleep would not leave `min(30 s, 2 s)`
+for the request fails at once as `rate_limited` (with `retry_after`), so the
+budget is never slept away. A budget spent before a request is `timeout`.
 
 **Concurrency.** A `GitHubToolkit` holds no mutable state, and each call opens
 and closes its own HTTP session. Concurrent calls, on one instance or on fresh
@@ -137,12 +138,16 @@ Writes:
   to ship the bytes. The BE's Content Vault import reads `s3url` or
   `file_content_bytes`, which pipe-as-service's `/fetch` provides.
 - `GITHUB_GET_REPOSITORY_CONTENT` decodes UTF-8 file `content` to text
-  (`encoding: "utf-8"`); binary files stay base64.
+  (`encoding: "utf-8"`); binary files stay base64. Content past 100 KB is cut
+  (text) or left out (binary) with `truncated: true`. The raw tool returns the
+  whole file.
 - `GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS` treats `content` as text unless
   `encoding="base64"` is passed (Composio guesses). The current file `sha` is
   still looked up automatically.
-- `owner`/`repo` slips (`repo="owner/name"`, a `.git` suffix) are forgiven;
-  `.`/`..` path segments are refused.
+- `owner`/`repo` slips are forgiven: `repo="owner/name"` (that owner wins),
+  `owner="owner/name"`, a `.git` suffix. An `owner` that contradicts the one
+  inside `repo` is refused (`invalid_arguments`) rather than guessed, so a
+  write never lands on a fork by accident. `.`/`..` path segments are refused.
 
 ### Connecting (GitHub OAuth App)
 
@@ -155,7 +160,7 @@ Writes:
 | default scopes | `repo read:user read:org` |
 | PKCE | on (`pkce=True`, S256; GitHub does not support `plain`). Build the authorize URL with `code_challenge`, and exchange with the matching `code_verifier`, both from core's `make_pkce_pair()`. Core refuses either step without them. The client secret is still sent, because GitHub requires it for OAuth Apps |
 | expiry | none: OAuth App tokens do not expire and carry no refresh token (`token_expires=False`) |
-| disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/grant` (HTTP Basic `client_id:client_secret`), which removes the user's whole authorization of the app |
+| disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/token` (HTTP Basic `client_id:client_secret`), which revokes only this connection's token. Revoking the whole grant (`/grant`) would also break every other AISquare connection the same GitHub user made to the app. The app stays in the user's GitHub *Authorized OAuth Apps* list until they remove it there |
 
 Run the flow with the toolkit's `build_authorize_url` / `exchange_code` /
 `revoke_token`. Core handles GitHub's form-encoded token response and its

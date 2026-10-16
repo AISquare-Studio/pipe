@@ -220,6 +220,44 @@ class TestTimeBudget:
         assert clock.sleeps == [3.0]  # the second 3s wait would pass the 5s budget
         assert len(session.calls) == 2
 
+    @pytest.mark.parametrize("retry_after", ["5", "4.9", "3.5"])
+    def test_a_sleep_must_leave_room_for_the_request(self, retry_after):
+        # budget 5: waiting 5 / 4.9 / 3.5 s would leave < min(30, 2) s for the retry.
+        client, session, clock = _budgeted(5, *_limited(429, retry_after))
+        with pytest.raises(GitHubAPIError) as exc:
+            client.request("GET", "/user")
+        assert clock.sleeps == []
+        assert len(session.calls) == 1
+        assert exc.value.retry_after == float(retry_after)
+        assert not exc.value.timed_out
+
+    def test_a_sleep_that_leaves_exactly_the_floor_is_taken(self):
+        client, session, clock = _budgeted(5, *_limited(429, "3"), response(200, {}))
+        client.request("GET", "/user")
+        assert clock.sleeps == [3.0]
+        assert session.calls[-1].timeout == 2.0
+
+    def test_floor_follows_a_short_request_timeout(self):
+        # With a 1 s request timeout the floor is 1 s, so a 3.5 s wait fits a 5 s budget.
+        client, _, clock = _budgeted(5, *_limited(429, "3.5"), response(200, {}), timeout=1.0)
+        client.request("GET", "/user")
+        assert clock.sleeps == [3.5]
+
+    def test_server_error_backoff_leaves_room_too(self):
+        client, session, clock = _budgeted(2.5, response(502, content=b""))
+        with pytest.raises(GitHubAPIError) as exc:
+            client.request("GET", "/user")
+        assert clock.sleeps == []  # 1 s backoff + 2 s floor > 2.5 s
+        assert len(session.calls) == 1
+        assert (exc.value.status, exc.value.retry_after) == (502, None)
+
+    def test_rate_limit_at_the_budget_edge_is_rate_limited_not_timeout(self):
+        h = harness(*_limited(429, "5"))
+        result = h.call("GITHUB_GET_A_REPOSITORY", REPO, config={**CONFIG, "timeout_seconds": 5})
+        assert result.error_code == "rate_limited"
+        assert result.retry_after == 5.0
+        assert h.sleeps == []
+
     def test_spent_budget_times_out_without_a_request(self):
         client, session, clock = _budgeted(5)
         clock.now = 5.0

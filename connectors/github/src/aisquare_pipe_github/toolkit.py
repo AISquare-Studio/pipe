@@ -26,13 +26,13 @@ from aisquare_pipe_github.rest import (
     DEFAULT_MAX_RETRY_WAIT,
     GitHubAPIError,
     GitHubRestClient,
-    revoke_grant,
+    revoke_access_token,
 )
 from aisquare_pipe_github.tools import HANDLERS, TOOL_SPECS, normalize_arguments
 
 #: A GitHub OAuth App. Its tokens do not expire and come without a refresh
 #: token; GitHub answers the token endpoint form-encoded unless asked for
-#: JSON, which core's flow handles. Revocation is not RFC 7009 — see
+#: JSON, which core's flow handles. Revocation is per token, not RFC 7009 — see
 #: :meth:`GitHubToolkit.revoke_token`.
 #:
 #: PKCE (S256 only; GitHub rejects ``plain``) is on: GitHub's web flow takes
@@ -190,13 +190,14 @@ class GitHubToolkit(Toolkit):
         token: str,
         token_type_hint: str = "access_token",
     ) -> bool:
-        """Disconnect: revoke the user's grant of this OAuth App
-        (``DELETE /applications/{client_id}/grant``), which invalidates every
-        token the app holds for them. GitHub has no RFC 7009 endpoint, and
-        ``token_type_hint`` does not apply. Never raises."""
+        """Disconnect: revoke this connection's access token
+        (``DELETE /applications/{client_id}/token``). Only this token dies;
+        revoking the whole grant would also break every other connection the
+        same GitHub user made to this app. GitHub has no RFC 7009 endpoint,
+        and ``token_type_hint`` does not apply. Never raises."""
         if not client_secret:
             return False
-        return revoke_grant(
+        return revoke_access_token(
             client_id=client_id,
             client_secret=client_secret,
             access_token=token,

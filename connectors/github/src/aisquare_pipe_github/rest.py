@@ -17,13 +17,15 @@ rest of an hourly window.
 
 Time budget: with ``budget`` (seconds; the host's ``config["timeout_seconds"]``)
 the whole call — every attempt and every retry sleep — fits inside it. Each
-request's timeout shrinks to what is left, a retry that would sleep past it
-fails at once, and running out raises a ``timed_out`` error.
+request's timeout shrinks to what is left; a retry whose sleep would not leave
+``min(timeout, 2s)`` for the request fails at once (a rate limit as such, with
+``retry_after``); running out before a request raises a ``timed_out`` error.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping
@@ -47,6 +49,9 @@ DEFAULT_MAX_RETRY_WAIT = 60.0
 _SECONDARY_LIMIT_WAIT = 60.0
 #: Backoff for a 502/503/504 on a GET (safe to repeat).
 _SERVER_ERROR_WAIT = 1.0
+#: Time a retried request needs after a sleep; a sleep that would leave less
+#: of the budget fails at once instead (as rate_limited, with retry_after).
+_REQUEST_FLOOR = 2.0
 _MAX_MESSAGE = 500
 
 
@@ -166,7 +171,9 @@ class GitHubRestClient:
                 )
             except requests.Timeout as e:  # before RequestException: ConnectTimeout is both
                 raise GitHubAPIError(
-                    0, f"GitHub did not answer within {timeout:g}s ({type(e).__name__})", timed_out=True
+                    0,
+                    f"GitHub did not answer within {_shown_seconds(timeout)}s ({type(e).__name__})",
+                    timed_out=True,
                 ) from None
             except requests.RequestException as e:
                 # str(e) can carry the URL (and so argument values): name the type only.
@@ -186,11 +193,14 @@ class GitHubRestClient:
             wait = limit_wait
             if wait is None and method == "GET" and response.status_code in (502, 503, 504):
                 wait = _SERVER_ERROR_WAIT * (2**attempt)
-            sleep_budget = self.max_retry_wait - waited
             remaining = self._remaining()
-            if remaining is not None:
-                sleep_budget = min(sleep_budget, remaining)
-            if wait is None or attempt >= self.max_retries or wait > sleep_budget:
+            if (
+                wait is None
+                or attempt >= self.max_retries
+                or waited + wait > self.max_retry_wait
+                # The sleep must leave room for the retried request itself.
+                or (remaining is not None and wait + min(self.timeout, _REQUEST_FLOOR) > remaining)
+            ):
                 raise GitHubAPIError(
                     response.status_code, error_message(response), retry_after=limit_wait
                 )
@@ -207,6 +217,11 @@ class GitHubRestClient:
 
     def get(self, path: str, params: Mapping[str, Any] | None = None, **kw: Any) -> requests.Response:
         return self.request("GET", path, params=params, **kw)
+
+
+def _shown_seconds(seconds: float) -> str:
+    """Seconds for a message, rounded up to a tenth (6.99999 -> '7')."""
+    return f"{math.ceil(seconds * 10) / 10:g}"
 
 
 # --------------------------------------------------------------------------
@@ -266,36 +281,45 @@ def rate_limit_wait(response: requests.Response, *, now: float) -> float | None:
 
 
 def error_message(response: requests.Response) -> str:
-    """GitHub's error ``message`` plus up to five validation ``errors``."""
+    """GitHub's error ``message`` plus up to five validation ``errors``.
+
+    Never raises, whatever the body holds (any JSON shape, or none): it runs
+    inside ``request()`` before the status is captured, so a parse error here
+    would turn a 401/422/429 into an unclassified failure."""
     try:
         body = response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 — not JSON (or not parseable at all)
         body = None
     message = ""
     details: list[str] = []
     if isinstance(body, dict):
-        message = str(body.get("message") or "")
-        for item in (body.get("errors") or [])[:5]:
+        raw_message = body.get("message")
+        message = raw_message if isinstance(raw_message, str) else ""
+        errors = body.get("errors")
+        for item in errors[:5] if isinstance(errors, list) else []:
+            text = ""
             if isinstance(item, dict):
-                text = item.get("message") or " ".join(
+                item_message = item.get("message")
+                text = item_message if isinstance(item_message, str) else ""
+                text = text or " ".join(
                     str(item[k]) for k in ("resource", "field", "code") if item.get(k)
                 )
-            else:
+            elif isinstance(item, (str, int, float)):
                 text = str(item)
             if text:
-                details.append(str(text))
-    message = message or response.reason or "HTTP error"
+                details.append(text)
+    message = message or (response.reason if isinstance(response.reason, str) else "") or "HTTP error"
     if details:
         message += f" ({'; '.join(details)})"
     return message[:_MAX_MESSAGE]
 
 
 # --------------------------------------------------------------------------
-# OAuth App grant revocation
+# OAuth App token revocation
 # --------------------------------------------------------------------------
 
 
-def revoke_grant(
+def revoke_access_token(
     *,
     client_id: str,
     client_secret: str,
@@ -304,14 +328,15 @@ def revoke_grant(
     base_url: str = API_BASE,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> bool:
-    """``DELETE /applications/{client_id}/grant``: revoke the user's whole
-    authorization of this OAuth App (every token it issued them), so the app
-    disappears from their authorized apps. Authenticated with the app's
-    client id/secret (HTTP Basic). True on 204; False on anything else.
-    Never raises."""
+    """``DELETE /applications/{client_id}/token``: revoke this one access
+    token. Other tokens the same GitHub user granted the app (another
+    AISquare account or workspace connected to the same GitHub login) keep
+    working; the app stays in the user's authorized-apps list until they
+    remove it. Authenticated with the app's client id/secret (HTTP Basic).
+    True on 204; False on anything else. Never raises."""
     http = session if session is not None else requests.Session()
     try:
-        url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/grant"
+        url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/token"
         status = http.request(
             "DELETE",
             url,
@@ -325,12 +350,12 @@ def revoke_grant(
             timeout=timeout,
         ).status_code
     except Exception as e:  # noqa: BLE001 — never raises (e.g. a non-latin-1 secret in Basic auth)
-        logger.warning("github: grant revoke failed (%s)", type(e).__name__)
+        logger.warning("github: token revoke failed (%s)", type(e).__name__)
         return False
     finally:
         if session is None:
             http.close()
     if status == 204:
         return True
-    logger.warning("github: grant revoke returned HTTP %s", status)
+    logger.warning("github: token revoke returned HTTP %s", status)
     return False

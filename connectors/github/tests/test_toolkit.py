@@ -14,7 +14,7 @@ from aisquare.pipe import AuthType, get_toolkit
 from aisquare_pipe_github import GITHUB_OAUTH, GitHubToolkit
 from aisquare_pipe_github.rest import GitHubAPIError
 from aisquare_pipe_github.toolkit import describe_error
-from aisquare_pipe_github.tools import RAW_TEXT_INLINE_MAX, slim
+from aisquare_pipe_github.tools import INLINE_CONTENT_MAX, slim
 
 from .fakes import CONFIG, RAW_CONTENT_TYPE, TOKEN, harness, response
 
@@ -166,6 +166,37 @@ class TestArguments:
         h.call("GITHUB_GET_A_REPOSITORY", {"owner": owner, "repo": repo})
         assert h.session.last.path == "/repos/octocat/Hello-World"
 
+    @pytest.mark.parametrize(
+        ("owner", "repo", "path"),
+        [
+            ("", "acme/widgets", "/repos/acme/widgets"),  # the owner inside repo wins
+            ("ACME", "acme/widgets", "/repos/acme/widgets"),  # same owner, any case
+            ("acme/widgets", "", "/repos/acme/widgets"),
+            ("acme/widgets.git", "WIDGETS", "/repos/acme/WIDGETS"),
+        ],
+    )
+    def test_the_owner_inside_repo_wins(self, owner, repo, path):
+        h = harness(response(200, {}))
+        result = h.call("GITHUB_GET_A_REPOSITORY", {"owner": owner, "repo": repo})
+        assert result.successful, result.error
+        assert h.session.last.path == path
+
+    @pytest.mark.parametrize(
+        ("owner", "repo"),
+        [
+            ("octocat", "acme/widgets"),  # a fork owner next to the upstream full name
+            ("acme/widgets", "gadgets"),
+            ("acme", "a/b/c"),
+            ("a/b/c", "widgets"),
+        ],
+    )
+    def test_conflicting_owner_is_refused_before_any_write(self, owner, repo):
+        h = harness()
+        result = h.call("GITHUB_CREATE_AN_ISSUE", {"owner": owner, "repo": repo, "title": "t"})
+        assert result.successful is False
+        assert result.error_code == "invalid_arguments"
+        assert h.session.calls == []
+
     def test_path_segments_are_encoded_but_slashes_kept(self):
         h = harness(response(200, {"type": "file", "encoding": "none", "content": ""}))
         h.call("GITHUB_GET_REPOSITORY_CONTENT", {**REPO, "path": "/docs/Q3 plan#1.md"})
@@ -246,6 +277,30 @@ class TestRepositoryContent:
         assert data["content"] == encoded
         assert data["encoding"] == "base64"
 
+    def test_large_text_is_cut_and_flagged(self):
+        text = "a" + "é" * 60_000  # 120,001 bytes; the cap falls inside a 2-byte character
+        encoded = base64.b64encode(text.encode()).decode()
+        h = harness(response(200, {"type": "file", "name": "big.md", "size": 120_001, "encoding": "base64", "content": encoded}))
+        data = h.call("GITHUB_GET_REPOSITORY_CONTENT", {**REPO, "path": "big.md"}).data
+        assert data["truncated"] is True
+        assert data["encoding"] == "utf-8"
+        assert data["content"] == "a" + "é" * (INLINE_CONTENT_MAX // 2 - 1)  # split char dropped
+        assert len(data["content"].encode()) == INLINE_CONTENT_MAX - 1
+        assert data["size"] == 120_001
+
+    def test_large_binary_is_left_out_and_flagged(self):
+        encoded = base64.b64encode(b"\xff" * (INLINE_CONTENT_MAX + 1)).decode()
+        h = harness(response(200, {"type": "file", "name": "blob.bin", "encoding": "base64", "content": encoded}))
+        data = h.call("GITHUB_GET_REPOSITORY_CONTENT", {**REPO, "path": "blob.bin"}).data
+        assert (data["content"], data["encoding"], data["truncated"]) == ("", "none", True)
+
+    def test_content_at_the_cap_is_whole(self):
+        encoded = base64.b64encode(b"x" * INLINE_CONTENT_MAX).decode()
+        h = harness(response(200, {"type": "file", "name": "a.txt", "encoding": "base64", "content": encoded}))
+        data = h.call("GITHUB_GET_REPOSITORY_CONTENT", {**REPO, "path": "a.txt"}).data
+        assert len(data["content"]) == INLINE_CONTENT_MAX
+        assert "truncated" not in data
+
     def test_directory_lists_items(self):
         listing = [{"name": "README", "path": "README", "type": "file", "sha": "a", "size": 13}]
         h = harness(response(200, listing))
@@ -287,9 +342,9 @@ class TestRawRepositoryContent:
         assert result.files[0].data == pdf
 
     def test_large_text_is_not_inlined(self):
-        _, result = self._raw(b"x" * (RAW_TEXT_INLINE_MAX + 1), path="big.txt")
+        _, result = self._raw(b"x" * (INLINE_CONTENT_MAX + 1), path="big.txt")
         assert "content" not in result.data
-        assert result.data["size"] == RAW_TEXT_INLINE_MAX + 1
+        assert result.data["size"] == INLINE_CONTENT_MAX + 1
 
     def test_unknown_extension_is_sniffed(self):
         _, text = self._raw(b"plain words", path="LICENSE")

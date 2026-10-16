@@ -1,7 +1,7 @@
 """GitHub's OAuth App spec against core's flow, with GitHub's quirks: PKCE
 (S256) on, a form-encoded token response, ``error`` inside a 200, no refresh
 token, no expiry, and grant revocation via
-``DELETE /applications/{client_id}/grant``."""
+``DELETE /applications/{client_id}/token`` (this token only)."""
 
 from __future__ import annotations
 
@@ -187,7 +187,7 @@ class TestRevoke:
         toolkit, session = self._toolkit(response(204))
         assert toolkit.revoke_token(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, token=ACCESS) is True
         call = session.last
-        assert (call.method, call.url) == ("DELETE", f"https://api.github.com/applications/{CLIENT_ID}/grant")
+        assert (call.method, call.url) == ("DELETE", f"https://api.github.com/applications/{CLIENT_ID}/token")
         assert call.auth == (CLIENT_ID, CLIENT_SECRET)
         assert call.json == {"access_token": ACCESS}
 

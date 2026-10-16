@@ -49,8 +49,10 @@ from aisquare_pipe_github.rest import (
 
 Handler = Callable[[GitHubRestClient, dict[str, Any]], ToolResult]
 
-#: UTF-8 files up to this size also come back as text in ``data["content"]``.
-RAW_TEXT_INLINE_MAX = 100_000
+#: Most file content (bytes) a result carries inline in ``data["content"]``;
+#: past it the content is cut (text) or left out (binary) and
+#: ``data["truncated"]`` is set. pipeAAS caps a whole result near this size.
+INLINE_CONTENT_MAX = 100_000
 
 _MAX_PER_PAGE = 100
 _DEFAULT_PER_PAGE = 30
@@ -138,16 +140,49 @@ SEARCH_ORDER = _string("Sort order; only used together with sort.", enum=("desc"
 # --------------------------------------------------------------------------
 
 
+def _split_full_name(value: str, name: str) -> tuple[str, str | None]:
+    """``'name'`` -> (name, None); ``'owner/name'`` -> (owner, name)."""
+    parts = value.strip().strip("/").split("/")
+    if len(parts) > 2:
+        raise ToolError(f"{name} must be a name or 'owner/name'", code=ERROR_INVALID_ARGUMENTS)
+    return (parts[0], parts[1]) if len(parts) == 2 else (parts[0], None)
+
+
 def normalize_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Forgive the common slips: ``repo='owner/name'``, ``owner='owner/name'``,
-    a ``.git`` suffix, a leading ``/`` on a file path."""
+    """Forgive the common slips: ``repo='owner/name'`` (that owner wins),
+    ``owner='owner/name'``, a ``.git`` suffix, a leading ``/`` on a file path.
+
+    An explicit ``owner`` that contradicts the owner inside ``repo`` (or a
+    ``repo`` that contradicts the name inside ``owner``) is refused as
+    ``invalid_arguments`` rather than guessed: with a fork (``me/widgets`` of
+    ``acme/widgets``) a guess would send a write to the wrong repository."""
     args = dict(arguments)
-    repo = args.get("repo")
+    owner, repo = args.get("owner"), args.get("repo")
+    repo_owner = owner_repo = None
     if isinstance(repo, str):
-        args["repo"] = repo.strip().strip("/").removesuffix(".git").rpartition("/")[2]
-    owner = args.get("owner")
+        first, second = _split_full_name(repo, "repo")
+        repo_owner, repo = (first, second) if second is not None else (None, first)
+        args["repo"] = repo = repo.removesuffix(".git")
     if isinstance(owner, str):
-        args["owner"] = owner.strip().strip("/").partition("/")[0]
+        owner, owner_repo = _split_full_name(owner, "owner")
+        args["owner"] = owner
+    if repo_owner is not None:
+        if isinstance(owner, str) and owner and owner.lower() != repo_owner.lower():
+            raise ToolError(
+                "owner conflicts with the owner given inside repo ('owner/name'); "
+                "pass the repository's owner and name once",
+                code=ERROR_INVALID_ARGUMENTS,
+            )
+        args["owner"] = repo_owner
+    if owner_repo is not None and isinstance(repo, str):
+        if not repo:
+            args["repo"] = owner_repo.removesuffix(".git")
+        elif repo.lower() != owner_repo.removesuffix(".git").lower():
+            raise ToolError(
+                "repo conflicts with the name given inside owner ('owner/name'); "
+                "pass the repository's owner and name once",
+                code=ERROR_INVALID_ARGUMENTS,
+            )
     path = args.get("path")
     if isinstance(path, str):
         args["path"] = path.strip().strip("/")
@@ -285,12 +320,22 @@ def _get_repository_content(client: GitHubRestClient, args: dict[str, Any]) -> T
     ):
         try:
             # GitHub wraps the base64 at 60 columns; b64decode skips the newlines.
-            text = _utf8(base64.b64decode(data["content"]))
+            raw: bytes | None = base64.b64decode(data["content"])
         except (binascii.Error, ValueError):
-            text = None
-        if text is not None:
-            data["content"] = text
-            data["encoding"] = "utf-8"
+            raw = None
+        if raw is not None:
+            truncated = len(raw) > INLINE_CONTENT_MAX
+            text = _utf8(raw)
+            if text is not None:
+                # Cut on bytes; drop a character split by the cut.
+                data["content"] = (
+                    raw[:INLINE_CONTENT_MAX].decode("utf-8", errors="ignore") if truncated else text
+                )
+                data["encoding"] = "utf-8"
+            elif truncated:
+                data["content"], data["encoding"] = "", "none"
+            if truncated:
+                data["truncated"] = True
     return ToolResult.ok(data)
 
 
@@ -336,7 +381,7 @@ def _get_raw_repository_content(client: GitHubRestClient, args: dict[str, Any]) 
     }
     if args.get("ref"):
         data["ref"] = args["ref"]
-    text = _utf8(content) if len(content) <= RAW_TEXT_INLINE_MAX else None
+    text = _utf8(content) if len(content) <= INLINE_CONTENT_MAX else None
     if text is not None:
         data["content"] = text
     envelope = DataEnvelope(
@@ -604,9 +649,10 @@ CATALOG: tuple[GitHubTool, ...] = (
         "GITHUB_GET_REPOSITORY_CONTENT",
         "Read a file or list a folder in a repository, at an optional ref. For a file: name, "
         "path, sha, size and content — decoded to text for UTF-8 files (encoding 'utf-8'), "
-        "left base64 for binary ones. For a folder: items with name, path, type (file/dir) "
-        "and size. Use path '' for the repository root. Files over 1 MB come back without "
-        "content; read those with GITHUB_GET_RAW_REPOSITORY_CONTENT.",
+        "left base64 for binary ones. Content past 100 KB is cut (text) or left out "
+        "(binary) with truncated: true; read the whole file with "
+        "GITHUB_GET_RAW_REPOSITORY_CONTENT. For a folder: items with name, path, type "
+        "(file/dir) and size. Use path '' for the repository root.",
         _schema(
             {
                 **REPO_ARGS,

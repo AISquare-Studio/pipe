@@ -6,6 +6,7 @@ injected, so retry waits are asserted without waiting.
 
 from __future__ import annotations
 
+import http
 import logging
 from unittest import mock
 
@@ -22,12 +23,14 @@ from aisquare_pipe_github.rest import (
     json_body,
     page_hint,
     rate_limit_wait,
-    revoke_grant,
+    revoke_access_token,
 )
 
 from .fakes import TOKEN, FakeSession, next_link, response
 
 NOW = 1_800_000_000.0
+#: http.HTTPStatus's phrase for 422 differs across Python versions.
+REASON_422 = http.HTTPStatus(422).phrase
 
 
 def _client(*responses, **kwargs) -> tuple[GitHubRestClient, FakeSession, list[float]]:
@@ -78,6 +81,40 @@ class TestRequest:
 
 
 class TestErrors:
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ({"message": "Validation Failed", "errors": {"field": "title"}}, "Validation Failed"),
+            ({"message": "Validation Failed", "errors": 3}, "Validation Failed"),
+            ({"message": "Validation Failed", "errors": "title is missing"}, "Validation Failed"),
+            ({"message": "Validation Failed", "errors": [None, ["x"], {"message": 5}, {"code": "invalid"}, 7]}, "Validation Failed (invalid; 7)"),
+            ({"message": {"nested": True}}, REASON_422),
+            ({"error": {"message": "graph-style body"}}, REASON_422),
+            (["a", "list"], REASON_422),
+            (42, REASON_422),
+            ("just a string", REASON_422),
+        ],
+    )
+    def test_error_message_tolerates_any_body_shape(self, body, expected):
+        assert error_message(response(422, body)) == expected
+
+    def test_odd_error_body_keeps_its_status(self):
+        client, _, _ = _client(response(422, {"message": "Validation Failed", "errors": {"field": "title"}}))
+        with pytest.raises(GitHubAPIError) as exc:
+            client.request("POST", "/repos/o/r/issues", json={})
+        assert exc.value.status == 422
+
+    def test_odd_rate_limit_body_is_still_a_rate_limit(self):
+        odd = response(429, {"message": None, "errors": {"x": 1}}, headers={"Retry-After": "7"})
+        client, _, _ = _client(odd, max_retries=0)
+        with pytest.raises(GitHubAPIError) as exc:
+            client.request("GET", "/user")
+        assert (exc.value.status, exc.value.retry_after) == (429, 7.0)
+
+    def test_secondary_limit_found_in_an_odd_body(self):
+        body = {"message": "You have exceeded a secondary rate limit", "errors": 1}
+        assert rate_limit_wait(response(403, body), now=NOW) == 60.0
+
     def test_non_2xx_raises_with_status_and_message(self):
         client, _, _ = _client(response(404, {"message": "Not Found"}))
         with pytest.raises(GitHubAPIError) as exc:
@@ -239,20 +276,22 @@ class TestHelpers:
             json_body(response(200, content=b"<html>"))
 
 
-class TestRevokeGrant:
+class TestRevokeAccessToken:
     def _revoke(self, *responses):
         session = FakeSession(list(responses))
-        ok = revoke_grant(
+        ok = revoke_access_token(
             client_id="Iv1.abc", client_secret="app-secret", access_token=TOKEN, session=session  # type: ignore[arg-type]
         )
         return ok, session
 
-    def test_deletes_the_grant_with_basic_auth(self):
+    def test_deletes_only_this_token_with_basic_auth(self):
         ok, session = self._revoke(response(204))
         assert ok is True
         call = session.last
         assert call.method == "DELETE"
-        assert call.url == "https://api.github.com/applications/Iv1.abc/grant"
+        # /token revokes this connection's token; /grant would revoke every
+        # token the GitHub user granted the app (other AISquare connections too).
+        assert call.url == "https://api.github.com/applications/Iv1.abc/token"
         assert call.auth == ("Iv1.abc", "app-secret")
         assert call.json == {"access_token": TOKEN}
         assert "Authorization" not in call.headers

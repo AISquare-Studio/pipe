@@ -26,6 +26,12 @@ github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.ruff.lint.isort]
+# Same import grouping whatever directory ruff runs from (the repo root sees
+# src/aisquare as first-party otherwise).
+known-first-party = ["aisquare_pipe_github"]
+known-third-party = ["aisquare"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["live: hits real APIs using env credentials; deselected by default"]

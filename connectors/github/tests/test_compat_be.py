@@ -9,8 +9,9 @@ with Composio slugs (AISquare-Studio-BE
 * download: ``GITHUB_GET_RAW_REPOSITORY_CONTENT`` with ``{"owner", "repo",
   "path"}`` split back out of that id; it needs the file bytes.
 
-The BE helpers are mirrored here verbatim (``_be_*``) so a drift on either
-side fails this file. The bytes travel in ``ToolResult.files``; the pipeAAS
+The BE helpers are copied here verbatim (``_be_*``). The copy cannot notice
+the BE changing: refresh it whenever connector_import.py's GitHub helpers
+change. A change on this side (argument names, result fields) does fail here. The bytes travel in ``ToolResult.files``; the pipeAAS
 ``/fetch`` route serializes them (``s3url`` / ``file_content_bytes`` are what
 the BE's ``_extract_bytes`` reads) — that mapping is pipeAAS's side of the
 contract.
