@@ -18,7 +18,6 @@ import subprocess  # nosec B404 — fixed argv, shell=False throughout
 import tempfile
 
 import requests
-
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 logger = logging.getLogger("aisquare.pipe.github")
@@ -84,6 +83,7 @@ class GitHubRepoClient:
             result = subprocess.run(  # nosec B603 B607
                 ["git", "ls-remote", self.clone_url, f"refs/heads/{self.branch}"],
                 capture_output=True,
+                check=False,
                 text=True,
                 timeout=_LS_REMOTE_TIMEOUT,
                 env=self._auth_env(),
@@ -119,14 +119,14 @@ class GitHubRepoClient:
                     checkout,
                 ],
                 capture_output=True,
+                check=False,
                 text=True,
                 timeout=self.clone_timeout,
                 env=self._auth_env(),
             )
         except subprocess.TimeoutExpired as exc:
-            stderr = exc.stderr or b""
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", errors="replace")
+            raw = exc.stderr or b""
+            stderr = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
             raise PipelineError(
                 f"git clone of {self.full_name} timed out after {self.clone_timeout}s; "
                 f"stderr tail: {stderr[-800:]}"
@@ -144,6 +144,7 @@ class GitHubRepoClient:
             result = subprocess.run(  # nosec B603 B607
                 ["git", "-C", checkout, "rev-parse", "HEAD"],
                 capture_output=True,
+                check=False,
                 text=True,
                 timeout=_REV_PARSE_TIMEOUT,
             )

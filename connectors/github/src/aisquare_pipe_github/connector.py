@@ -24,12 +24,12 @@ class GitHubRepoSource(SourceConnector):
     """
 
     name = "github"  # config-dict key (class attr, NOT the entry-point name)
-    version = "0.1.0"
-    output_types = [CHECKOUT_CONTENT_TYPE]
+    version = "0.2.0"
+    output_types = [CHECKOUT_CONTENT_TYPE]  # noqa: RUF012 — framework contract: class-level spec, never mutated
     auth_type = AuthType.API_KEY
     description = "Single-repo shallow checkout source for GitHub."
 
-    CONFIG_SPEC = {
+    CONFIG_SPEC = {  # noqa: RUF012 — framework contract: class-level spec, never mutated
         "full_name": MetaField(type=str, required=True, description="owner/name"),
         "token": MetaField(
             type=str, description="installation token or PAT; omit for public repos"
@@ -50,7 +50,7 @@ class GitHubRepoSource(SourceConnector):
             type=str, description="clone here instead of a tempdir (implies keep_checkout)"
         ),
     }
-    metadata_spec = {
+    metadata_spec = {  # noqa: RUF012 — framework contract: class-level spec, never mutated
         "repo_full_name": MetaField(type=str, required=True, description="owner/name"),
         "head_sha": MetaField(
             type=str, required=True, description="git rev-parse HEAD of the checkout"

@@ -45,7 +45,6 @@ def fake_client(tmp_path):
 
 class TestPull:
     def test_emits_exactly_one_checkout_envelope(self, fake_client):
-        inst, _, _ = fake_client
         envelopes = list(GitHubRepoSource().pull(dict(CONFIG)))
         assert len(envelopes) == 1
         env = envelopes[0]
