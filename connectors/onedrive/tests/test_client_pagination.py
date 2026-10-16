@@ -8,7 +8,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from aisquare_pipe_onedrive.client import OneDriveClient
-from tests.helpers import make_file_item, make_folder_item, make_graph_response
+
+from .helpers import make_file_item, make_folder_item, make_graph_response
 
 ROOT = "https://graph.microsoft.com/v1.0/me/drive/root/children"
 

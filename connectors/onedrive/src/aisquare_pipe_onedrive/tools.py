@@ -44,7 +44,12 @@ from aisquare.pipe import (
 )
 
 from aisquare_pipe_onedrive.constants import CHUNK_SIZE, SIMPLE_UPLOAD_LIMIT
-from aisquare_pipe_onedrive.rest import OneDriveAPIError, OneDriveRestClient, json_body
+from aisquare_pipe_onedrive.rest import (
+    DownloadLimitError,
+    OneDriveAPIError,
+    OneDriveRestClient,
+    json_body,
+)
 
 Handler = Callable[[OneDriveRestClient, dict[str, Any]], ToolResult]
 
@@ -58,8 +63,17 @@ _COPY_POLL_WAITS = (0.5, 1.0, 2.0)
 
 _DEFAULT_TOP = 50
 _MAX_TOP = 200
-#: Graph paths a page token may continue (a nextLink minus the API base).
-_PAGE_ROOTS = ("/me/", "/drives/", "/users/", "/sites/", "/groups/")
+#: The drive root a page token (a nextLink minus the API base) must start at.
+_PAGE_DRIVE_ROOT = re.compile(r"/(?:me/drive|drives/[^/?#]+)/")
+#: How each paged listing's path ends, so a token only continues its own
+#: kind. Functions may come back namespace-qualified ('microsoft.graph.recent()').
+_PAGE_KINDS = {
+    "children": re.compile(r"/children$"),
+    "search": re.compile(r"/(?:microsoft\.graph\.)?search\(q='[^?#]*'\)$"),
+    "recent": re.compile(r"/(?:microsoft\.graph\.)?recent(?:\(\))?$"),
+    "sharedWithMe": re.compile(r"/(?:microsoft\.graph\.)?sharedWithMe(?:\(\))?$"),
+    "permissions": re.compile(r"/permissions$"),
+}
 #: OneDrive for Business / SharePoint item IDs: '01' + 32 base32 characters.
 _BUSINESS_ITEM_ID = re.compile(r"01[A-Z0-9]{32}")
 #: A ``parentReference.path`` prefix ('/drive/root:', '/drives/b!x/root:').
@@ -287,42 +301,52 @@ def clean(value: Any) -> Any:
     return value
 
 
-def page_token_for(next_link: Any, base_url: str) -> str | None:
+def _is_page_token(token: str, kind: str) -> bool:
+    """A Graph path under a drive root (``/me/drive/...`` or
+    ``/drives/{id}/...``) whose listing is ``kind``, with no dot segments."""
+    path = token.split("?", 1)[0]
+    return (
+        _PAGE_DRIVE_ROOT.match(path) is not None
+        and _PAGE_KINDS[kind].search(path) is not None
+        and "\\" not in token
+        and not any(ch.isspace() or ord(ch) < 32 for ch in token)
+        and not any(seg in (".", "..") for seg in path.split("/"))
+    )
+
+
+def page_token_for(next_link: Any, base_url: str, kind: str) -> str | None:
     """The page token for a Graph ``@odata.nextLink``: its path and query
-    under the API base. None when there is no next page or it points
-    elsewhere."""
+    under the API base. None when there is no next page, or when it is not a
+    token the listing would accept back (see :func:`page_target`)."""
     prefix = base_url.rstrip("/")
     if not isinstance(next_link, str) or not next_link.startswith(prefix + "/"):
         return None
-    return next_link[len(prefix):]
+    token = next_link[len(prefix):]
+    return token if _is_page_token(token, kind) else None
 
 
-def page_target(token: str) -> str:
-    """Check a caller's ``page_token`` before it is requested: it must be a
-    Graph drive path this toolkit could have returned. (It is always sent to
-    the Graph base URL, so a token can never move the bearer token to
-    another host.)"""
-    path = token.split("?", 1)[0]
-    if (
-        not token.startswith(_PAGE_ROOTS)
-        or "\\" in token
-        or any(ch.isspace() or ord(ch) < 32 for ch in token)
-        or any(seg in (".", "..") for seg in path.split("/"))
-    ):
+def page_target(token: str, kind: str) -> str:
+    """Check a caller's ``page_token`` before anything is sent: it must be a
+    nextLink for a drive root (``/me/drive/...``, ``/drives/{id}/...``) of
+    this ``kind`` of listing. Anything else (``/me/messages``, a
+    ``/users/...`` path, another listing's token) is refused, so a crafted
+    token cannot point a read-only tool's bearer GET at other Graph data. It
+    is always sent to the Graph base URL, never to another host."""
+    if not _is_page_token(token, kind):
         raise _invalid(
             "page_token is not a token this tool returned — pass next_page_token back unmodified"
         )
     return token
 
 
-def _page(client: OneDriveRestClient, response: Any) -> dict[str, Any]:
+def _page(client: OneDriveRestClient, response: Any, kind: str) -> dict[str, Any]:
     body = json_body(response)
     body = body if isinstance(body, dict) else {}
     items = body.get("value")
     next_link = body.get("@odata.nextLink")
     return {
         "has_more": bool(next_link),
-        "next_page_token": page_token_for(next_link, client.base_url),
+        "next_page_token": page_token_for(next_link, client.base_url, kind),
         "items": clean(items) if isinstance(items, list) else [],
     }
 
@@ -332,16 +356,17 @@ def _paged(
     args: Mapping[str, Any],
     path: str,
     options: Mapping[str, str],
+    kind: str,
     extra: Mapping[str, Any] | None = None,
 ) -> ToolResult:
     """One page of a Graph collection: the first page from ``path`` and the
-    query options, or the page ``page_token`` names."""
+    query options, or the page ``page_token`` names (a ``kind`` listing)."""
     token = _arg(args, "page_token")
     if token:
-        response = client.get(page_target(token))
+        response = client.get(page_target(token, kind))
     else:
         response = client.get(path, {**_odata(args, options), **(extra or {})})
-    return ToolResult.ok(_page(client, response))
+    return ToolResult.ok(_page(client, response, kind))
 
 
 def _object_result(response: Any) -> ToolResult:
@@ -384,7 +409,7 @@ def _search_items(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResul
     drive = _drive(args)
     base = drive if args.get("search_scope") == "drive" else f"{drive}/root"
     literal = urllib.parse.quote(q.replace("'", "''"), safe="")
-    return _paged(client, args, f"{base}/search(q='{literal}')", _SEARCH_OPTIONS)
+    return _paged(client, args, f"{base}/search(q='{literal}')", _SEARCH_OPTIONS, "search")
 
 
 def _download_file(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
@@ -405,12 +430,15 @@ def _download_file(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResu
     if isinstance(size, int) and size > DOWNLOAD_MAX_BYTES:
         raise _invalid(f"the file is {size} bytes; downloads are limited to {limit_mb} MiB")
     fmt = args.get("format")
-    response = client.get(
-        f"{target}/content", {"format": fmt} if fmt else None, headers={"Accept": "*/*"}
-    )
-    content = response.content
-    if len(content) > DOWNLOAD_MAX_BYTES:
-        raise _invalid(f"the file is larger than the {limit_mb} MiB download limit")
+    try:
+        # Streamed: the cap holds while reading (metadata may omit the size,
+        # and a converted file's size is unknown) and the budget is checked
+        # between chunks.
+        content = client.download_bytes(
+            f"{target}/content", {"format": fmt} if fmt else None, max_bytes=DOWNLOAD_MAX_BYTES
+        )
+    except DownloadLimitError:
+        raise _invalid(f"the file is larger than the {limit_mb} MiB download limit") from None
 
     item_id = str(meta.get("id") or str(args["item_id"]).strip())
     source_name = str(meta.get("name") or item_id)
@@ -466,7 +494,7 @@ def _list_folder_children(client: OneDriveRestClient, args: dict[str, Any]) -> T
         folder = f"{drive}/items/{_segment('folder_item_id', folder_id)}"
     else:
         folder = _by_path(drive, _path("folder_path", args.get("folder_path")))
-    return _paged(client, args, f"{folder}/children", _CHILDREN_OPTIONS)
+    return _paged(client, args, f"{folder}/children", _CHILDREN_OPTIONS, "children")
 
 
 def _get_drive(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
@@ -475,16 +503,16 @@ def _get_drive(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
 
 
 def _get_recent_items(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
-    return _paged(client, args, "/me/drive/recent", {"top": "$top", "select": "$select"})
+    return _paged(client, args, "/me/drive/recent", {"top": "$top", "select": "$select"}, "recent")
 
 
 def _get_shared_items(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
     extra = {"allowexternal": "true"} if args.get("allow_external") else None
-    return _paged(client, args, "/me/drive/sharedWithMe", {"select": "$select"}, extra)
+    return _paged(client, args, "/me/drive/sharedWithMe", {"select": "$select"}, "sharedWithMe", extra)
 
 
 def _get_item_permissions(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult:
-    return _paged(client, args, f"{_item(args)}/permissions", {"select": "$select"})
+    return _paged(client, args, f"{_item(args)}/permissions", {"select": "$select"}, "permissions")
 
 
 def _decode_content(args: Mapping[str, Any]) -> bytes:
@@ -644,7 +672,7 @@ def _watch_copy(client: OneDriveRestClient, monitor: Any) -> ToolResult:
             return ToolResult.ok({"status": "completed", "percentageComplete": 100.0})
         try:
             body = response.json()
-        except ValueError:
+        except Exception:  # noqa: BLE001 — not JSON, or too deeply nested to parse
             body = None
         body = body if isinstance(body, dict) else {}
         status = body.get("status")

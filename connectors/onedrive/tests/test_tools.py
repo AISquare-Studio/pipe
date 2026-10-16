@@ -23,7 +23,7 @@ from .fakes import (
 
 ITEM_ID = "01BYE5RZ6QN3ZWBTUFOFD3GSPGOHDJD36K"
 ITEM = f"/me/drive/items/{ITEM_ID}"
-NEXT = f"/me/drive/items/{ITEM_ID}/children?$top=50&$skiptoken=UGFnZWQ9VFJVRSZwX1NvcnRCZWhhdmlvcj0x"
+SKIP = "$skiptoken=UGFnZWQ9VFJVRSZwX1NvcnRCZWhhdmlvcj0x"
 HINT_KEYS = ["has_more", "next_page_token"]
 
 
@@ -39,7 +39,12 @@ class Case:
     replies: tuple[Any, ...] = field(default_factory=tuple)
     #: (method, path) of each request after the first.
     then: tuple[tuple[str, str], ...] = ()
-    paged: bool = False
+    #: For a paged tool: the page token its own nextLink would carry.
+    next: str = ""
+
+    @property
+    def paged(self) -> bool:
+        return bool(self.next)
 
     def ok_responses(self, **kwargs: Any) -> list[Any]:
         if not self.replies:
@@ -63,7 +68,7 @@ CASES = [
         "/me/drive/root/search(q='quarterly%20report')",
         params={"$top": 50},
         replies=(response(200, listing([file_item(), folder_item()])),),
-        paged=True,
+        next=f"/me/drive/root/search(q='quarterly%20report')?$top=50&{SKIP}",
     ),
     Case(
         "ONE_DRIVE_DOWNLOAD_FILE",
@@ -95,7 +100,7 @@ CASES = [
         "/me/drive/root:/Documents:/children",
         params={"$top": 50, "$orderby": "name"},
         replies=(response(200, listing([folder_item("Reports"), file_item()])),),
-        paged=True,
+        next=f"/drives/b!drive123/items/01FOLDERDOCS/children?$top=50&{SKIP}",
     ),
     Case(
         "ONE_DRIVE_GET_DRIVE",
@@ -116,7 +121,7 @@ CASES = [
         "/me/drive/recent",
         params={"$top": 10},
         replies=(response(200, listing([file_item()])),),
-        paged=True,
+        next=f"/me/drive/recent?$top=10&{SKIP}",
     ),
     Case(
         "ONE_DRIVE_GET_SHARED_ITEMS",
@@ -125,7 +130,7 @@ CASES = [
         "/me/drive/sharedWithMe",
         params={"allowexternal": "true"},
         replies=(response(200, listing([{"id": "01SHARED", "name": "plan.docx", "remoteItem": {"id": "R1", "parentReference": {"driveId": "b!other"}}}])),),
-        paged=True,
+        next=f"/me/drive/sharedWithMe?allowexternal=true&{SKIP}",
     ),
     Case(
         "ONE_DRIVE_GET_ITEM_PERMISSIONS",
@@ -133,7 +138,7 @@ CASES = [
         "GET",
         f"{ITEM}/permissions",
         replies=(response(200, listing([{"id": "p1", "roles": ["owner"], "grantedToV2": {"user": {"displayName": "Ana"}}}])),),
-        paged=True,
+        next=f"{ITEM}/permissions?{SKIP}",
     ),
     # --------------------------------------------------------------- writes
     Case(
@@ -234,18 +239,18 @@ def test_happy_path(case: Case):
 @pytest.mark.parametrize("case", PAGED, ids=[c.id for c in PAGED])
 def test_pagination_hint(case: Case):
     body = case.replies[0].json()
-    h = harness(response(200, {**body, "@odata.nextLink": f"https://graph.microsoft.com/v1.0{NEXT}"}))
+    h = harness(response(200, {**body, "@odata.nextLink": f"https://graph.microsoft.com/v1.0{case.next}"}))
     result = h.call(case.slug, case.args)
     assert result.successful, result.error
-    assert {k: result.data[k] for k in HINT_KEYS} == {"has_more": True, "next_page_token": NEXT}
+    assert {k: result.data[k] for k in HINT_KEYS} == {"has_more": True, "next_page_token": case.next}
 
 
 @pytest.mark.parametrize("case", PAGED, ids=[c.id for c in PAGED])
 def test_page_token_fetches_that_page(case: Case):
     h = harness(response(200, listing([file_item("page2.pdf")])))
-    result = h.call(case.slug, {**case.args, "page_token": NEXT})
+    result = h.call(case.slug, {**case.args, "page_token": case.next})
     assert result.successful, result.error
-    assert h.session.last.path == NEXT
+    assert h.session.last.path == case.next
     assert h.session.last.params is None  # the token carries the query options
     assert result.data["items"][0]["name"] == "page2.pdf"
 

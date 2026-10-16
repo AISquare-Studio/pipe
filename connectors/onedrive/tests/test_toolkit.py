@@ -441,3 +441,83 @@ class TestSecrecy:
 
 def test_describe_error_without_status_is_the_message():
     assert describe_error(OneDriveAPIError(0, "network error")) == "network error"
+
+
+class _CountingBody:
+    """A response body that counts what is read from it (and can make each
+    read take time on a fake clock, or fail)."""
+
+    def __init__(self, size: int, *, clock=None, per_read: float = 0.0, fail_after: int | None = None):
+        self.left = size
+        self.read_bytes = 0
+        self.reads = 0
+        self.closed = False
+        self.clock, self.per_read, self.fail_after = clock, per_read, fail_after
+
+    def read(self, n: int = -1) -> bytes:
+        if self.fail_after is not None and self.reads >= self.fail_after:
+            import requests
+
+            raise requests.ReadTimeout("read timed out: https://public.am.files.1drv.com/y4mSECRET")
+        self.reads += 1
+        if self.clock is not None:
+            self.clock.now += self.per_read
+        chunk = b"x" * (self.left if n < 0 else min(n, self.left))
+        self.left -= len(chunk)
+        self.read_bytes += len(chunk)
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _streamed(body: _CountingBody):
+    r = response(200, content=b"", content_type="application/octet-stream")
+    r._content = False  # not read yet: .content / iter_content() pull from raw
+    r._content_consumed = False
+    r.raw = body
+    return r
+
+
+class TestStreamedDownload:
+    def test_content_is_requested_as_a_stream(self):
+        h = harness(response(200, file_item(item_id=ITEM_ID)), response(200, content=b"%PDF"))
+        h.call("ONE_DRIVE_DOWNLOAD_FILE", {"item_id": ITEM_ID})
+        assert h.session.calls[0].stream in (None, False)  # metadata
+        assert h.session.calls[1].stream is True
+
+    def test_byte_cap_stops_the_read_early(self, monkeypatch):
+        monkeypatch.setattr(tools, "DOWNLOAD_MAX_BYTES", 1024 * 1024)
+        body = _CountingBody(8 * 1024 * 1024)
+        meta = {"id": ITEM_ID, "name": "big.bin", "file": {}}  # no size: only the stream can tell
+        h = harness(response(200, meta), _streamed(body))
+        result = h.call("ONE_DRIVE_DOWNLOAD_FILE", {"item_id": ITEM_ID})
+        assert (result.successful, result.error_code) == (False, "invalid_arguments")
+        assert "download limit" in result.error
+        assert body.read_bytes <= 1024 * 1024 + 64 * 1024
+        assert body.closed
+        assert result.files == []
+
+    def test_budget_is_checked_between_chunks(self):
+        from aisquare_pipe_onedrive.rest import OneDriveRestClient
+
+        from .fakes import FakeSession
+        from .test_errors import FakeClock
+
+        clock = FakeClock()
+        body = _CountingBody(40 * 64 * 1024, clock=clock, per_read=1.0)  # one chunk a second for 40s
+        session = FakeSession([_streamed(body)])
+        client = OneDriveRestClient(TOKEN, session=session, budget=5, sleep=clock.sleep, monotonic=clock)  # type: ignore[arg-type]
+        with pytest.raises(OneDriveAPIError) as exc:
+            client.download_bytes(f"/me/drive/items/{ITEM_ID}/content", max_bytes=10**9)
+        assert exc.value.timed_out
+        assert body.reads <= 6
+        assert body.closed
+
+    def test_stalled_body_is_a_timeout(self):
+        body = _CountingBody(4 * 64 * 1024, fail_after=1)
+        h = harness(response(200, file_item(item_id=ITEM_ID, size=4 * 64 * 1024)), _streamed(body))
+        result = h.call("ONE_DRIVE_DOWNLOAD_FILE", {"item_id": ITEM_ID})
+        assert result.error_code == "timeout"
+        assert "1drv.com" not in result.error and "SECRET" not in result.error
+        assert body.closed

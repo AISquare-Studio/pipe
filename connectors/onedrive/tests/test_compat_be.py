@@ -9,8 +9,9 @@ with Composio slugs (AISquare-Studio-BE
 * download: ``ONE_DRIVE_DOWNLOAD_FILE`` with ``{"item_id", "file_name"}``
   (``file_name`` always sent); it needs the file bytes.
 
-The BE helpers are mirrored here verbatim (``_be_*``) so a drift on either
-side fails this file. The bytes travel in ``ToolResult.files``; the pipeAAS
+The BE helpers are mirrored here verbatim (``_be_*``), as of the BE's
+connector_import.py on 2026-10-16. This file catches drift on the toolkit
+side only: refresh the mirror whenever connector_import.py changes. The bytes travel in ``ToolResult.files``; the pipeAAS
 ``/fetch`` route serializes them (``s3url`` / ``file_content_bytes`` are what
 the BE's ``_extract_bytes`` reads) — that mapping is pipeAAS's side of the
 contract, simulated below with the inline ``file_content_bytes`` form.

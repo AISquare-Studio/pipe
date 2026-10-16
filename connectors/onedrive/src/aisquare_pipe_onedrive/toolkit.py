@@ -32,6 +32,7 @@ from aisquare.pipe import (
 from aisquare_pipe_onedrive.rest import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_RETRY_WAIT,
+    MAX_RETRY_AFTER,
     OneDriveAPIError,
     OneDriveRestClient,
 )
@@ -77,6 +78,14 @@ def microsoft_oauth(tenant: str | None = None, spec: OAuthSpec = MICROSOFT_OAUTH
     return dataclasses.replace(spec, **urls) if urls else spec
 
 
+def retry_seconds(seconds: float) -> float:
+    """Whole seconds to tell a caller to wait: rounded up and capped at
+    ``MAX_RETRY_AFTER`` (a non-finite value is the cap). Never raises."""
+    if not math.isfinite(seconds):
+        return float(MAX_RETRY_AFTER)
+    return float(math.ceil(min(max(seconds, 0.0), float(MAX_RETRY_AFTER))))
+
+
 def describe_error(error: OneDriveAPIError) -> str:
     """``"<status>: <Graph code>: <message>"`` plus what the caller should do."""
     if not error.status:
@@ -88,7 +97,7 @@ def describe_error(error: OneDriveAPIError) -> str:
             "revoked); the OneDrive connection must be reconnected"
         )
     if error.retry_after is not None:
-        return f"{text} — Microsoft Graph is throttling; retry in about {math.ceil(error.retry_after)}s"
+        return f"{text} — Microsoft Graph is throttling; retry in about {retry_seconds(error.retry_after):g}s"
     if error.status == 403:
         return (
             f"{text} — this OneDrive connection is not allowed to do that (missing consent "
@@ -132,7 +141,7 @@ def failure(error: OneDriveAPIError) -> ToolResult:
         describe_error(error),
         data={"status": error.status} if error.status else None,
         code=error_code(error),
-        retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
+        retry_after=retry_seconds(error.retry_after) if error.retry_after is not None else None,
     )
 
 

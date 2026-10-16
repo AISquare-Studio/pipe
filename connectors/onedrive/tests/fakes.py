@@ -10,6 +10,7 @@ opened.
 from __future__ import annotations
 
 import http
+import io
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +37,7 @@ class Call:
     headers: dict[str, str]
     timeout: Any = None
     allow_redirects: Any = None
+    stream: Any = None
 
     @property
     def path(self) -> str:
@@ -63,6 +65,7 @@ class FakeSession:
                 headers=dict(kwargs.get("headers") or {}),
                 timeout=kwargs.get("timeout"),
                 allow_redirects=kwargs.get("allow_redirects"),
+                stream=kwargs.get("stream"),
             )
         )
         if not self.responses:
@@ -96,6 +99,7 @@ def response(
         content = b"" if body is None else json.dumps(body).encode()
         content_type = content_type or ("application/json" if body is not None else None)
     r._content = content
+    r.raw = io.BytesIO(content)  # what iter_content() reads on a streamed response
     all_headers = dict(headers or {})
     if content_type:
         all_headers.setdefault("Content-Type", content_type)

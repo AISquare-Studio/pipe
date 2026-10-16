@@ -301,3 +301,152 @@ class TestConcurrency:
             for item_id, returned, path in pool.map(run, range(1, 33)):
                 assert returned == item_id
                 assert path == f"/me/drive/items/{item_id}"
+
+
+# --------------------------------------------------------------------------
+# PR #38 review round 1
+# --------------------------------------------------------------------------
+
+
+class TestSleepLeavesRoomForTheRequest:
+    """A throttling sleep must leave min(request timeout, 2s) of the budget
+    for the retried request; otherwise the call fails at once as
+    rate_limited with retry_after (never sleep the budget away)."""
+
+    def test_wait_close_to_the_budget_fails_without_sleeping(self):
+        client, session, clock = _budgeted(5, *_throttled(429, "4.5"), response(200, {}))
+        with pytest.raises(OneDriveAPIError) as exc:
+            client.request("GET", "/me/drive")
+        assert exc.value.retry_after == 4.5 and not exc.value.timed_out
+        assert clock.sleeps == []
+        assert len(session.calls) == 1
+
+    def test_wait_equal_to_the_budget_is_rate_limited_not_timeout(self):
+        client, session, clock = _budgeted(5, *_throttled(429, "5"), response(200, {}))
+        with pytest.raises(OneDriveAPIError) as exc:
+            client.request("GET", "/me/drive")
+        assert (exc.value.retry_after, exc.value.timed_out) == (5.0, False)
+        assert clock.sleeps == []
+        assert len(session.calls) == 1
+
+    def test_through_call_tool(self):
+        h = harness(*_throttled(429, "0.9"), response(200, {"id": "x"}))
+        result = h.call(*GET, config={**CONFIG, "timeout_seconds": 1})
+        assert (result.error_code, result.retry_after) == ("rate_limited", 1.0)
+        assert h.sleeps == []
+        assert len(h.session.calls) == 1
+
+    def test_a_short_timeout_needs_only_its_own_length(self):
+        # timeout 1s < the 2s floor: a 3s wait fits a 5s budget (3 + 1 <= 5).
+        client, session, clock = _budgeted(5, *_throttled(429, "3"), response(200, {}), timeout=1.0)
+        client.request("GET", "/me/drive")
+        assert clock.sleeps == [3.0]
+        assert [c.timeout for c in session.calls] == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("value", ["inf", "Infinity", "-inf", "1e400", "9" * 400, "nan", "NaN", "-5", "soon", ""])
+def test_unusable_retry_after_falls_back_to_the_default_wait(value):
+    h = harness(*_throttled(429, value, 3))
+    result = h.call(*GET)
+    assert (result.successful, result.error_code, result.retry_after) == (False, "rate_limited", 5.0)
+    assert h.sleeps == [5.0, 5.0]
+    assert "retry in about 5s" in result.error
+
+
+def test_huge_finite_retry_after_is_capped():
+    h = harness(*_throttled(429, "1e300"))
+    result = h.call(*GET)
+    assert (result.error_code, result.retry_after) == ("rate_limited", float(rest.MAX_RETRY_AFTER))
+    assert h.sleeps == []
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-1", "later"])
+def test_unusable_retry_after_on_a_503_is_an_outage(value):
+    assert rest.throttle_wait(graph_error(503, "serviceNotAvailable", "x", headers={"Retry-After": value})) is None
+
+
+def test_failure_never_raises_on_a_non_finite_retry_after():
+    from aisquare_pipe_onedrive.toolkit import failure
+
+    result = failure(OneDriveAPIError(429, "x", retry_after=float("inf")))
+    assert (result.error_code, result.retry_after) == ("rate_limited", float(rest.MAX_RETRY_AFTER))
+
+
+_DEEP_ARRAY = b"[" * 200_000 + b"]" * 200_000
+_DEEP_OBJECT = b'{"error":' * 100_000 + b"1" + b"}" * 100_000
+
+
+@pytest.mark.parametrize("body", [_DEEP_ARRAY, _DEEP_OBJECT], ids=["array", "object"])
+@pytest.mark.parametrize(
+    ("status", "headers", "code"),
+    [(401, {}, "unauthorized"), (404, {}, "not_found"), (429, {"Retry-After": "2"}, "rate_limited")],
+)
+def test_any_error_body_keeps_its_status(body, status, headers, code):
+    h = harness(*[response(status, content=body, headers=headers, content_type="application/json") for _ in range(3)])
+    result = h.call(*GET)
+    assert result.error_code == code
+    assert "RecursionError" not in result.error
+    assert result.data == {"status": status}
+
+
+def test_a_2xx_body_too_deep_to_parse_is_not_json():
+    h = harness(response(200, content=_DEEP_ARRAY, content_type="application/json"))
+    result = h.call(*GET)
+    assert result.error_code == "upstream_error"
+    assert "not JSON" in result.error
+
+
+# Page tokens: only a Graph nextLink for a drive root, of the same kind of
+# listing (manager ruling on PR #38 m4). Anything else is refused unsent.
+FOREIGN_PAGE_TOKENS = [
+    "/me/messages?$top=5",
+    "/me/",
+    "/me/events",
+    "/users/ana@contoso.com/messages",
+    "/users/ana@contoso.com/drive/root/children",
+    "/sites/contoso.sharepoint.com,1,2/drive/root/children",
+    "/groups/g-1/drive/root/children",
+    "/drives/b!d/items/01A/children/../../../../me/messages",
+    "/drives//items/01A/children",
+    "/me/drive/items/01A/permissions?$skiptoken=x",  # another listing's token
+    "/me/drive/root/search(q='x')?$skiptoken=x",
+    "https://graph.microsoft.com/v1.0/me/drive/root/children",
+]
+
+
+@pytest.mark.parametrize("token", FOREIGN_PAGE_TOKENS)
+def test_folder_listing_refuses_any_other_page_token(token):
+    h = harness()
+    result = h.call("ONE_DRIVE_LIST_FOLDER_CHILDREN", {"page_token": token})
+    assert result.error_code == "invalid_arguments"
+    assert h.session.calls == []
+
+
+@pytest.mark.parametrize(
+    ("slug", "args", "token"),
+    [
+        ("ONE_DRIVE_LIST_FOLDER_CHILDREN", {}, "/drives/b!AbC-d_E/items/01ABC/children?$top=50&$skiptoken=X"),
+        ("ONE_DRIVE_LIST_FOLDER_CHILDREN", {}, "/me/drive/root:/Documents:/children?$skiptoken=X"),
+        ("ONE_DRIVE_SEARCH_ITEMS", {"q": "x"}, "/me/drive/root/search(q='x')?$skiptoken=X"),
+        ("ONE_DRIVE_SEARCH_ITEMS", {"q": "x"}, "/drives/b!d/search(q='x')?$skiptoken=X"),
+        ("ONE_DRIVE_GET_RECENT_ITEMS", {}, "/me/drive/recent?$skiptoken=X"),
+        ("ONE_DRIVE_GET_RECENT_ITEMS", {}, "/drives/b!d/microsoft.graph.recent()?$skiptoken=X"),
+        ("ONE_DRIVE_SEARCH_ITEMS", {"q": "x"}, "/me/drive/root/microsoft.graph.search(q='x')?$skiptoken=X"),
+        ("ONE_DRIVE_GET_SHARED_ITEMS", {}, "/me/drive/sharedWithMe?$skiptoken=X"),
+        ("ONE_DRIVE_GET_ITEM_PERMISSIONS", {"item_id": ITEM_ID}, "/drives/b!d/items/01A/permissions?$skiptoken=X"),
+    ],
+)
+def test_own_kind_of_drive_token_is_accepted(slug, args, token):
+    h = harness(response(200, {"value": []}))
+    assert h.call(slug, {**args, "page_token": token}).successful
+    assert h.session.last.path == token
+
+
+@pytest.mark.parametrize(
+    "next_link",
+    ["/users/ana/drive/items/01A/children?$skiptoken=X", "/me/messages?$skiptoken=X"],
+)
+def test_a_next_link_the_tool_would_refuse_is_not_offered(next_link):
+    h = harness(response(200, {"value": [], "@odata.nextLink": f"https://graph.microsoft.com/v1.0{next_link}"}))
+    data = h.call("ONE_DRIVE_LIST_FOLDER_CHILDREN", {}).data
+    assert (data["has_more"], data["next_page_token"]) == (True, None)

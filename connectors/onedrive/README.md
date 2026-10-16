@@ -35,7 +35,7 @@ Every tool works on the connected user's own OneDrive (`/me/drive`) unless `driv
 | Slug | Kind | Graph call | Notes |
 |------|------|-----------|-------|
 | `ONE_DRIVE_SEARCH_ITEMS` | read, paged | `GET {drive}/root/search(q='…')` | Plain keywords. `search_scope='drive'` also finds items shared with the user. |
-| `ONE_DRIVE_DOWNLOAD_FILE` | read | `GET {drive}/items/{id}` then `…/content` | The bytes are returned in `ToolResult.files`. `format='pdf'\|'html'` converts the file. Small UTF-8 files also come back as `data.content`. Limit: 100 MiB. |
+| `ONE_DRIVE_DOWNLOAD_FILE` | read | `GET {drive}/items/{id}` then `…/content` | The bytes are returned in `ToolResult.files`. `format='pdf'\|'html'` converts the file. Small UTF-8 files also come back as `data.content`. The body is streamed: reading stops once it passes 100 MiB, and the time budget is checked between chunks. |
 | `ONE_DRIVE_GET_ITEM` | read | `GET {drive}/items/{id}` | Takes `select_fields` and `expand_relations`. |
 | `ONE_DRIVE_GET_ITEM_BY_PATH` | read | `GET {drive}/root:/{path}:` | |
 | `ONE_DRIVE_LIST_FOLDER_CHILDREN` | read, paged | `GET {drive}/items/{id}/children` or `root:/{path}:/children` | With no folder argument, it lists the root. |
@@ -43,7 +43,7 @@ Every tool works on the connected user's own OneDrive (`/me/drive`) unless `driv
 | `ONE_DRIVE_GET_RECENT_ITEMS` | read, paged | `GET /me/drive/recent` | Microsoft is retiring this endpoint. |
 | `ONE_DRIVE_GET_SHARED_ITEMS` | read, paged | `GET /me/drive/sharedWithMe` | Microsoft is retiring this endpoint. |
 | `ONE_DRIVE_GET_ITEM_PERMISSIONS` | read, paged | `GET {drive}/items/{id}/permissions` | |
-| `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE` | write, destructive | `PUT …:/{name}:/content`; an upload session above 4 MB | `content` is text, or base64 with `encoding='base64'`. `folder` is a path or a folder ID. `conflict_behavior='replace'` overwrites the existing file. |
+| `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE` | write, destructive | `PUT …:/{name}:/content`; an upload session above 4 MB | `content` is text, or base64 with `encoding='base64'`. `folder` is a path or a folder ID. `conflict_behavior='replace'` overwrites the existing file. An upload session that fails part-way is cancelled, not resumed; call the tool again. |
 | `ONE_DRIVE_ONEDRIVE_CREATE_FOLDER` | write | `POST {parent}/children` | `parent_folder` is a path or a folder ID. On a name clash the new folder is renamed, or the call fails. |
 | `ONE_DRIVE_MOVE_ITEM` | write | `PATCH {drive}/items/{itemId}` | Uses camelCase arguments, as Composio does: `itemId`, `parentReference: {id}`. |
 | `ONE_DRIVE_COPY_ITEM` | write, destructive | `POST {drive}/items/{id}/copy` + the async monitor | Waits up to 10 s for `completed` (with `resourceId`); otherwise returns `inProgress`. `replace` overwrites the destination. |
@@ -51,7 +51,7 @@ Every tool works on the connected user's own OneDrive (`/me/drive`) unless `driv
 | `ONE_DRIVE_DELETE_ITEM` | write, destructive | `DELETE {drive}/items/{id}` | The item goes to the recycle bin. Takes `if_match`. |
 | `ONE_DRIVE_CREATE_LINK` | write | `POST {drive}/items/{id}/createLink` | `type`: `view`, `edit` or `embed`. `scope`: `anonymous`, `organization` or `users` (`users` needs `recipients`). |
 
-**Paged tools** return one page per call, as `{"has_more", "next_page_token", "items": [...]}`. The hints come first. To get the next page, pass `next_page_token` back unchanged as `page_token`, together with the same other arguments. A page token is a Graph drive path. A token that is not one is refused, and the request always goes to the Graph base URL.
+**Paged tools** return one page per call, as `{"has_more", "next_page_token", "items": [...]}`. The hints come first. To get the next page, pass `next_page_token` back unchanged as `page_token`, together with the same other arguments. A page token is the Graph nextLink's path for the same kind of listing under a drive root (`/me/drive/…` or `/drives/{id}/…`). Any other token is refused before anything is sent, including `/me/messages`, `/users/…`, `/sites/…` and `/groups/…` paths and another listing's token. Requests always go to the Graph base URL. If Graph returns a nextLink the tool would refuse (rare; e.g. a listing addressed through `user_id`), the result has `has_more: true` and `next_page_token: null`.
 
 **What the results leave out.** All `@`-annotations are stripped from results, including `@microsoft.graph.downloadUrl`, which is a pre-authenticated link to the file's content. Upload-session URLs and copy-monitor URLs are pre-authenticated too: they are called without the bearer token and never returned.
 
@@ -71,9 +71,9 @@ A failed call returns `ToolResult(successful=False)`. Its `error` reads `"<statu
 | 403 | `forbidden` | Consent is missing, or the user has no access to the item. |
 | 404 / 410 | `not_found` | Item IDs go stale after a move or delete. |
 | 400 / 422, refused arguments | `invalid_arguments` | Includes `.`/`..` path segments, foreign page tokens, folders passed to download, and downloads over 100 MiB. |
+| 408 / 504, client timeout, spent budget, a download that stalls | `timeout` | |
 | 409 / 412 / 423 | `conflict` | A name clash, a stale eTag, or a locked item. |
-| 429, 509, or 503 with `Retry-After` | `rate_limited` | Sets `retry_after`. The call is retried up to 2 times when the wait fits inside 60 s and the time budget. |
-| 408 / 504, client timeout, spent budget | `timeout` | |
+| 429, 509, or 503 with `Retry-After` | `rate_limited` | Sets `retry_after` in whole seconds, capped at 3600. The call is retried up to 2 times while the total wait stays within 60 s and each wait leaves `min(request timeout, 2 s)` of the time budget for the retried request; otherwise it fails at once. A `Retry-After` that is not a finite, non-negative number (`inf`, `1e400`, `nan`, `-5`, a date) counts as absent: 5 s for 429/509, and a 503 is then an outage. |
 | 5xx, network errors | `upstream_error` | A GET is retried on 502/503/504. |
 
 ### Connection (OAuth)

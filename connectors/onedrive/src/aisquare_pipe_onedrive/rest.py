@@ -13,20 +13,27 @@ Graph's own error code and message; the toolkit turns that into a failed
 ``ToolResult``.
 
 Throttling: a 429 (or a 503/509 with ``Retry-After``) is retried up to
-``max_retries`` times, sleeping for what Graph asks. The total sleep per call
-is capped at ``max_retry_wait`` seconds; a longer wait fails at once (with
+``max_retries`` times, sleeping for what Graph asks (a ``Retry-After`` that is
+not a finite, non-negative number counts as absent; one above
+:data:`MAX_RETRY_AFTER` is capped). The total sleep per call is capped at
+``max_retry_wait`` seconds; a longer wait fails at once (with
 ``OneDriveAPIError.retry_after`` set). A 502/503/504 on a GET is retried with
 a short backoff.
 
 Time budget: with ``budget`` (seconds; the host's ``config["timeout_seconds"]``)
-the whole call — every attempt and every retry sleep — fits inside it. Each
-request's timeout shrinks to what is left, a retry that would sleep past it
-fails at once, and running out raises a ``timed_out`` error.
+the whole call — every attempt, every retry sleep, every downloaded chunk —
+fits inside it. Each request's timeout shrinks to what is left; a retry whose
+sleep would not leave ``min(timeout, 2s)`` for the retried request fails at
+once (as throttling, with ``retry_after``); running out raises a
+``timed_out`` error. Downloads (:meth:`OneDriveRestClient.download_bytes`)
+are streamed with a byte cap and a budget check between chunks, because a
+request timeout bounds each read, not the whole body.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from typing import Any, Self
@@ -49,6 +56,13 @@ _THROTTLE_STATUSES = (429, 503, 509)
 _THROTTLE_WAIT = 5.0
 #: Backoff for a 502/503/504 on a GET (safe to repeat).
 _SERVER_ERROR_WAIT = 1.0
+#: Time a retried request needs after a sleep; a sleep that would leave less
+#: of the budget fails at once instead (throttling, with retry_after).
+_REQUEST_FLOOR = 2.0
+#: Longest ``Retry-After`` taken at face value (seconds); larger is capped.
+MAX_RETRY_AFTER = 3600
+#: Bytes per read of a streamed download.
+_READ_CHUNK = 64 * 1024
 _MAX_MESSAGE = 500
 
 
@@ -80,6 +94,14 @@ class OneDriveAPIError(Exception):
     @property
     def rate_limited(self) -> bool:
         return self.retry_after is not None
+
+
+class DownloadLimitError(OneDriveAPIError):
+    """A download grew past the caller's byte cap (the rest was not read)."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(0, f"the file is larger than the {limit:,}-byte download limit")
+        self.limit = limit
 
 
 class OneDriveRestClient:
@@ -154,6 +176,7 @@ class OneDriveRestClient:
         headers: Mapping[str, str] | None = None,
         authenticated: bool = True,
         allow_redirects: bool = True,
+        stream: bool = False,
     ) -> requests.Response:
         """Send one request and return the 2xx/3xx response or raise
         :class:`OneDriveAPIError`. ``target`` is a path under ``base_url``
@@ -185,6 +208,7 @@ class OneDriveRestClient:
                     headers=all_headers,
                     timeout=timeout,
                     allow_redirects=allow_redirects,
+                    stream=stream,
                 )
             except requests.Timeout as e:  # before RequestException: ConnectTimeout is both
                 raise OneDriveAPIError(
@@ -210,12 +234,17 @@ class OneDriveRestClient:
             wait = limit_wait
             if wait is None and method == "GET" and response.status_code in (502, 503, 504):
                 wait = _SERVER_ERROR_WAIT * (2**attempt)
-            sleep_budget = self.max_retry_wait - waited
             remaining = self.remaining()
-            if remaining is not None:
-                sleep_budget = min(sleep_budget, remaining)
-            if wait is None or attempt >= self.max_retries or wait > sleep_budget:
+            if (
+                wait is None
+                or attempt >= self.max_retries
+                or waited + wait > self.max_retry_wait
+                # The sleep must leave room for the retried request itself.
+                or (remaining is not None and wait + min(self.timeout, _REQUEST_FLOOR) > remaining)
+            ):
                 code, message = error_detail(response)
+                if stream:
+                    response.close()
                 raise OneDriveAPIError(
                     response.status_code, message, code=code, retry_after=limit_wait
                 )
@@ -227,8 +256,47 @@ class OneDriveRestClient:
                 attempt,
                 self.max_retries,
             )
+            if stream:
+                response.close()
             self._sleep(wait)
             waited += wait
+
+    def download_bytes(
+        self,
+        target: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        """GET ``target`` as a stream and read it in chunks: more than
+        ``max_bytes`` raises :class:`DownloadLimitError` (the rest is never
+        read), and a spent time budget raises a ``timed_out`` error between
+        chunks. The response is always closed."""
+        response = self.request("GET", target, params=params, headers={"Accept": "*/*"}, stream=True)
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in response.iter_content(_READ_CHUNK):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise DownloadLimitError(max_bytes)
+                remaining = self.remaining()
+                if remaining is not None and remaining <= 0:
+                    raise OneDriveAPIError(
+                        0, f"OneDrive download ran out of its {self.budget:g}s time budget", timed_out=True
+                    )
+                chunks.append(chunk)
+        except requests.Timeout as e:  # before RequestException: ConnectTimeout is both
+            raise OneDriveAPIError(
+                0, f"OneDrive stopped sending the file ({type(e).__name__})", timed_out=True
+            ) from None
+        except requests.RequestException as e:
+            raise OneDriveAPIError(
+                0, f"network error downloading from OneDrive ({type(e).__name__})"
+            ) from None
+        finally:
+            response.close()
+        return b"".join(chunks)
 
     def get(self, target: str, params: Mapping[str, Any] | None = None, **kw: Any) -> requests.Response:
         return self.request("GET", target, params=params, **kw)
@@ -245,7 +313,7 @@ def json_body(response: requests.Response) -> Any:
         return None
     try:
         return response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 — not JSON, or too deeply nested to parse
         raise OneDriveAPIError(
             response.status_code, "Microsoft Graph returned a response that is not JSON"
         ) from None
@@ -258,32 +326,51 @@ def throttle_wait(response: requests.Response) -> float | None:
     status = response.status_code
     if status not in _THROTTLE_STATUSES:
         return None
-    retry_after = response.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return max(0.0, float(retry_after))
-        except ValueError:
-            pass
+    seconds = retry_after_seconds(response.headers.get("Retry-After"))
+    if seconds is not None:
+        return seconds
     return None if status == 503 else _THROTTLE_WAIT
+
+
+def retry_after_seconds(value: Any) -> float | None:
+    """A ``Retry-After`` header in seconds, capped at :data:`MAX_RETRY_AFTER`;
+    None when it is missing or not a finite, non-negative number (``inf``,
+    ``1e400``, ``nan``, ``-5``, an HTTP date). Never raises."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, float(MAX_RETRY_AFTER))
 
 
 def error_detail(response: requests.Response) -> tuple[str | None, str]:
     """``(code, message)`` from Graph's ``{"error": {"code", "message"}}``
-    body; the HTTP reason when the body is not that shape."""
+    body; the HTTP reason when the body is not that shape.
+
+    Never raises, whatever the body holds (any JSON shape, or none): it runs
+    inside ``request()`` before the status is captured, so a parse error here
+    would turn a 401/404/429 into an unclassified failure."""
     try:
         body = response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 — not JSON, or too deeply nested to parse
         body = None
     code: str | None = None
     message = ""
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
-        code = str(error.get("code") or "") or None
-        message = str(error.get("message") or "")
+        code = _text(error.get("code")) or None
+        message = _text(error.get("message"))
     elif isinstance(error, str):  # OAuth-style {"error": "...", "error_description": "..."}
-        code = error
-        message = str(body.get("error_description") or "") if isinstance(body, dict) else ""
+        code = error or None
+        message = _text(body.get("error_description")) if isinstance(body, dict) else ""
     message = message or response.reason or "HTTP error"
     if code:
         message = f"{code}: {message}"
     return code, message[:_MAX_MESSAGE]
+
+
+def _text(value: Any) -> str:
+    # Strings only: str() of an arbitrarily nested value can itself recurse.
+    return value if isinstance(value, str) else ""
