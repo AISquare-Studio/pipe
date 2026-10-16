@@ -24,6 +24,7 @@ from aisquare.pipe.testing.validation import (
 
 FRAMEWORK_DIST = "aisquare-pipe"
 ENTRY_POINT_GROUP = "aisquare_pipe.connectors"
+TOOLKIT_ENTRY_POINT_GROUP = "aisquare_pipe.toolkits"
 
 INSTALL_OK = "ok"
 INSTALL_BROKEN = "broken"
@@ -47,6 +48,20 @@ class ConnectorDir:
     @property
     def module_name(self) -> str:
         return f"aisquare_pipe_{self.safe_name}"
+
+    def entry_points(self, group: str) -> dict:
+        project = (self.pyproject or {}).get("project", {})
+        return project.get("entry-points", {}).get(group, {}) or {}
+
+    @property
+    def registers_toolkit(self) -> bool:
+        return bool(self.entry_points(TOOLKIT_ENTRY_POINT_GROUP))
+
+    @property
+    def registers_connector(self) -> bool:
+        """True when connector entry points are registered — or when nothing
+        is, so a bare package is still held to the connector scaffold."""
+        return bool(self.entry_points(ENTRY_POINT_GROUP)) or not self.registers_toolkit
 
 
 @dataclass
@@ -209,12 +224,13 @@ def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
             "dependencies must include a versioned requirement on aisquare-pipe (e.g. aisquare-pipe>=0.1.0)",
         )
     )
-    eps = project.get("entry-points", {}).get(ENTRY_POINT_GROUP, {})
+    eps = cdir.entry_points(ENTRY_POINT_GROUP) or cdir.entry_points(TOOLKIT_ENTRY_POINT_GROUP)
     results.append(
         _result(
             "hygiene.entry-points-registered",
             bool(eps),
-            f'[project.entry-points."{ENTRY_POINT_GROUP}"] is missing or empty',
+            f'[project.entry-points."{ENTRY_POINT_GROUP}"] (or "{TOOLKIT_ENTRY_POINT_GROUP}") '
+            "is missing or empty",
         )
     )
     return results
@@ -223,26 +239,29 @@ def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
 def _check_scaffold_files(cdir: ConnectorDir) -> list[CheckResult]:
     module_dir = cdir.path / "src" / cdir.module_name
     missing: list[str] = []
-    for rel in (
-        "README.md",
-        f"src/{cdir.module_name}/__init__.py",
-        f"src/{cdir.module_name}/connector.py",
-        "tests",
-    ):
+    required = ["README.md", f"src/{cdir.module_name}/__init__.py"]
+    if cdir.registers_connector:
+        required.append(f"src/{cdir.module_name}/connector.py")
+    required.append("tests")
+    for rel in required:
         if not (cdir.path / rel).exists():
             missing.append(rel)
 
-    compliance_ok = False
+    compliance_text = ""
     compliance_file = cdir.path / "tests" / "test_compliance.py"
     if compliance_file.is_file():
         try:
-            compliance_ok = "connector_compliance_suite(" in compliance_file.read_text(
-                encoding="utf-8"
-            )
+            compliance_text = compliance_file.read_text(encoding="utf-8")
         except OSError:
-            compliance_ok = False
-    if not compliance_ok:
-        missing.append("tests/test_compliance.py (with connector_compliance_suite(...))")
+            compliance_text = ""
+    suites = []
+    if cdir.registers_connector:
+        suites.append("connector_compliance_suite(")
+    if cdir.registers_toolkit:
+        suites.append("toolkit_compliance_suite(")
+    for suite in suites:
+        if suite not in compliance_text:
+            missing.append(f"tests/test_compliance.py (with {suite}...))")
 
     return [
         _result(

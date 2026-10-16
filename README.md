@@ -83,6 +83,8 @@ print(f"Sink received: {[e.data for e in sink.received]}")
 pipe list                            # list installed connectors
 pipe describe mock-source            # show connector details
 pipe check mock-source mock-sink     # check type compatibility
+pipe tools                           # list installed toolkits
+pipe tools mock --search "delete"    # a toolkit's tools, ranked for a query
 pipe run --source mock-source --sink mock-sink --config config.json
 pipe new-connector my-service        # scaffold a new connector plugin
 ```

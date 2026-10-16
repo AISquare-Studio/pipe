@@ -4,7 +4,7 @@
 This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for moving `DataEnvelope` objects between Source and Sink connectors. The root package provides the shared framework, CLI, test helpers, and example/mock connectors used by plugin packages.
 
 ## Repository Layout
-- `src/aisquare/pipe/core/`: core abstractions and pipeline logic (`connector.py`, `pipeline.py`, `envelope.py`, `merge.py`, `registry.py`, `types.py`)
+- `src/aisquare/pipe/core/`: core abstractions and pipeline logic (`connector.py`, `pipeline.py`, `envelope.py`, `merge.py`, `registry.py`, `types.py`), plus toolkits (`tools.py`: `ToolSpec`/`ToolResult`/`Toolkit`) and OAuth flow primitives (`oauth.py`)
 - `src/aisquare/pipe/cli/`: Click-based CLI entrypoint and commands
 - `src/aisquare/pipe/mcp/`: MCP server integration
 - `src/aisquare/pipe/testing/`: compliance helpers, fixtures, and mock connectors used by tests
