@@ -112,4 +112,4 @@ def test_bad_token_says_reconnect():
     )
     assert result.successful is False
     assert result.error.startswith("401")
-    assert result.data["reconnect_required"] is True
+    assert result.error_code == "unauthorized"

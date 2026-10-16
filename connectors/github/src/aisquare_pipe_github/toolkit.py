@@ -8,7 +8,18 @@ from collections.abc import Callable
 from typing import Any
 
 import requests
-from aisquare.pipe import AuthType, OAuthSpec, ToolError, Toolkit, ToolResult, ToolSpec
+from aisquare.pipe import (
+    ERROR_RATE_LIMITED,
+    ERROR_TIMEOUT,
+    ERROR_UPSTREAM_ERROR,
+    AuthType,
+    OAuthSpec,
+    ToolError,
+    Toolkit,
+    ToolResult,
+    ToolSpec,
+    error_code_for_status,
+)
 
 from aisquare_pipe_github.rest import (
     DEFAULT_MAX_RETRIES,
@@ -44,21 +55,51 @@ def describe_error(error: GitHubAPIError) -> str:
         )
     if error.retry_after is not None:
         return f"{text} — GitHub rate limit; retry in about {math.ceil(error.retry_after)}s"
+    if error.status == 403:
+        return (
+            f"{text} — this GitHub connection is not allowed to do that (missing scope or "
+            "permission, or the organization has not approved the app)"
+        )
     if error.status == 404:
         return f"{text} — it does not exist, or this GitHub connection cannot access it"
     return text
 
 
-def failure(error: GitHubAPIError) -> ToolResult:
-    """A failed ToolResult whose ``data`` lets callers branch without parsing
-    the message: ``status``, plus ``reconnect_required`` on a 401 and
-    ``retry_after`` (seconds) on a rate limit."""
-    data: dict[str, Any] = {"status": error.status}
-    if error.status == 401:
-        data["reconnect_required"] = True
+def error_code(error: GitHubAPIError) -> str:
+    """The canonical ``ToolResult.error_code`` for a GitHub failure: rate
+    limits (429, or a rate-limit 403) are ``rate_limited`` and client-side
+    timeouts ``timeout``; HTTP statuses map through core's
+    ``error_code_for_status`` (401 unauthorized, 403 forbidden, 404 not_found,
+    422 invalid_arguments, 409 conflict, ...); network failures and 5xx are
+    ``upstream_error``."""
     if error.retry_after is not None:
-        data["retry_after"] = math.ceil(error.retry_after)
-    return ToolResult.fail(describe_error(error), data=data)
+        return ERROR_RATE_LIMITED
+    if error.timed_out:
+        return ERROR_TIMEOUT
+    if not error.status:
+        return ERROR_UPSTREAM_ERROR
+    return error_code_for_status(error.status)
+
+
+def failure(error: GitHubAPIError) -> ToolResult:
+    """A failed ToolResult: message, canonical ``error_code``, ``retry_after``
+    (whole seconds) on a rate limit, and ``data={"status": <HTTP status>}``
+    when GitHub answered."""
+    return ToolResult.fail(
+        describe_error(error),
+        data={"status": error.status} if error.status else None,
+        code=error_code(error),
+        retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
+    )
+
+
+def time_budget(config: dict[str, Any]) -> float | None:
+    """The host's per-call budget, ``config["timeout_seconds"]`` (a positive
+    number), or None."""
+    value = config.get("timeout_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 class GitHubToolkit(Toolkit):
@@ -69,9 +110,18 @@ class GitHubToolkit(Toolkit):
     :data:`GITHUB_OAUTH` (a personal access token works too). Tool slugs and
     argument names match Composio's GitHub toolkit.
 
-    Constructor arguments are for tests and hosts: ``session`` is the
-    ``requests.Session`` every call goes through (default: a fresh one per
-    call); ``max_retries`` / ``max_retry_wait`` bound rate-limit retries.
+    ``config["timeout_seconds"]`` (optional, set by hosts) bounds a whole
+    call: request timeouts and rate-limit sleeps all fit inside it.
+
+    Failures carry a canonical ``error_code`` (see :func:`error_code`) and,
+    for ``rate_limited``, ``retry_after``.
+
+    Concurrency: the instance holds no mutable state and, by default, every
+    call opens and closes its own HTTP session, so concurrent calls on one
+    instance or on fresh instances share nothing. ``session`` (tests, or a
+    host that manages pooling) is the ``requests.Session`` every call goes
+    through instead; ``max_retries`` / ``max_retry_wait`` bound rate-limit
+    retries.
     """
 
     name = "github"
@@ -120,6 +170,7 @@ class GitHubToolkit(Toolkit):
             session=self._session,
             max_retries=self._max_retries,
             max_retry_wait=self._max_retry_wait,
+            budget=time_budget(config),
             sleep=self._sleep,
         )
 

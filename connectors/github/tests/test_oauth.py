@@ -43,18 +43,29 @@ class FakeUrlResponse:
         return False
 
 
+class FakeOpener:
+    """Stands in for the no-redirect opener core builds per token request
+    (``urllib.request.build_opener(_NoRedirect)``); records each Request."""
+
+    def __init__(self, status: int, body: str, content_type: str, seen: list[urllib.request.Request]):
+        self.status, self.body, self.content_type, self.seen = status, body, content_type, seen
+
+    def open(self, request, timeout=None):
+        self.seen.append(request)
+        if self.status >= 400:
+            raise urllib.error.HTTPError(request.full_url, self.status, "error", Message(), io.BytesIO(self.body.encode()))
+        return FakeUrlResponse(self.status, self.body, self.content_type)
+
+
 @pytest.fixture
 def token_endpoint(monkeypatch):
     requests_seen: list[urllib.request.Request] = []
 
     def install(status: int, body: str, content_type: str = "application/x-www-form-urlencoded"):
-        def urlopen(request, timeout=None):
-            requests_seen.append(request)
-            if status >= 400:
-                raise urllib.error.HTTPError(request.full_url, status, "error", Message(), io.BytesIO(body.encode()))
-            return FakeUrlResponse(status, body, content_type)
+        def build_opener(*handlers):
+            return FakeOpener(status, body, content_type, requests_seen)
 
-        monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+        monkeypatch.setattr(urllib.request, "build_opener", build_opener)
         return requests_seen
 
     return install
@@ -140,3 +151,13 @@ class TestRevoke:
     def test_network_error_is_false(self):
         toolkit, _ = self._toolkit(requests.ConnectionError("down"))
         assert toolkit.revoke_token(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, token=ACCESS) is False
+
+    @pytest.mark.parametrize(
+        ("client_id", "client_secret"),
+        [(CLIENT_ID, "sécret-ünïcode-✓"), (None, CLIENT_SECRET)],
+    )
+    def test_never_raises_on_odd_credentials(self, client_id, client_secret):
+        # A real Session: Basic auth encodes the secret as latin-1 before any
+        # socket is opened, which raised UnicodeEncodeError before the fix.
+        toolkit = GitHubToolkit(session=requests.Session())
+        assert toolkit.revoke_token(client_id=client_id, client_secret=client_secret, token=ACCESS) is False

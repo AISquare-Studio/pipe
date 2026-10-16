@@ -31,7 +31,13 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from aisquare.pipe import DataEnvelope, ToolError, ToolResult, ToolSpec
+from aisquare.pipe import (
+    ERROR_INVALID_ARGUMENTS,
+    DataEnvelope,
+    ToolError,
+    ToolResult,
+    ToolSpec,
+)
 
 from aisquare_pipe_github.rest import (
     RAW_MEDIA,
@@ -120,9 +126,10 @@ SINCE = _string("Only items updated at or after this ISO 8601 timestamp (YYYY-MM
 REF = _string(
     "Branch, tag or commit SHA to read from. Defaults to the repository's default branch."
 )
-FILE_PATH = _string(
-    "File path relative to the repository root with forward slashes, e.g. 'docs/README.md'."
-)
+FILE_PATH = {
+    **_string("File path relative to the repository root with forward slashes, e.g. 'docs/README.md'."),
+    "minLength": 1,
+}
 SEARCH_ORDER = _string("Sort order; only used together with sort.", enum=("desc", "asc"))
 
 
@@ -167,7 +174,9 @@ def expand_path(template: str, args: dict[str, Any]) -> str:
         value = str(_scalar(args[name]))
         slashed = name in _SLASHED_PARAMS
         if any(seg in (".", "..") for seg in (value.split("/") if slashed else [value])):
-            raise ToolError(f"{name} must not contain '.' or '..' path segments")
+            raise ToolError(
+                f"{name} must not contain '.' or '..' path segments", code=ERROR_INVALID_ARGUMENTS
+            )
         return urllib.parse.quote(value, safe="/" if slashed else "")
 
     return _PLACEHOLDER.sub(fill, template).rstrip("/")
@@ -299,10 +308,20 @@ def _is_directory_listing(response: Any) -> bool:
     )
 
 
+def _require_file_path(args: dict[str, Any]) -> None:
+    # The validator does not enforce minLength, and '/' normalizes to ''.
+    if not args.get("path"):
+        raise ToolError("path must name a file, not the repository root", code=ERROR_INVALID_ARGUMENTS)
+
+
 def _get_raw_repository_content(client: GitHubRestClient, args: dict[str, Any]) -> ToolResult:
+    _require_file_path(args)
     response = client.get(expand_path(_CONTENTS, args), _ref_param(args), accept=RAW_MEDIA)
     if _is_directory_listing(response):
-        raise ToolError("path is a directory, not a file — list it with GITHUB_GET_REPOSITORY_CONTENT")
+        raise ToolError(
+            "path is a directory, not a file — list it with GITHUB_GET_REPOSITORY_CONTENT",
+            code=ERROR_INVALID_ARGUMENTS,
+        )
     content = response.content
     path = args["path"]
     name = posixpath.basename(path)
@@ -344,11 +363,14 @@ def _current_file_sha(client: GitHubRestClient, path: str, branch: str | None) -
 
 
 def _create_or_update_file_contents(client: GitHubRestClient, args: dict[str, Any]) -> ToolResult:
+    _require_file_path(args)
     if args.get("encoding") == "base64":
         try:
             raw = base64.b64decode(args["content"], validate=True)
         except (binascii.Error, ValueError):
-            raise ToolError("content is not valid base64 (encoding is 'base64')") from None
+            raise ToolError(
+                "content is not valid base64 (encoding is 'base64')", code=ERROR_INVALID_ARGUMENTS
+            ) from None
     else:
         raw = str(args["content"]).encode("utf-8")
     path = expand_path(_CONTENTS, args)
@@ -382,7 +404,10 @@ _create_pull_request_call = _rest(
 
 def _create_a_pull_request(client: GitHubRestClient, args: dict[str, Any]) -> ToolResult:
     if not args.get("title") and args.get("issue") is None:
-        raise ToolError("title is required (or pass issue to turn an existing issue into the pull request)")
+        raise ToolError(
+            "title is required (or pass issue to turn an existing issue into the pull request)",
+            code=ERROR_INVALID_ARGUMENTS,
+        )
     return _create_pull_request_call(client, args)
 
 
@@ -395,7 +420,9 @@ _create_review_call = _rest(
 
 def _create_a_review(client: GitHubRestClient, args: dict[str, Any]) -> ToolResult:
     if args.get("event") in ("REQUEST_CHANGES", "COMMENT") and not args.get("body"):
-        raise ToolError(f"body is required when event is {args['event']}")
+        raise ToolError(
+            f"body is required when event is {args['event']}", code=ERROR_INVALID_ARGUMENTS
+        )
     return _create_review_call(client, args)
 
 

@@ -44,21 +44,40 @@ keep GitHub's keys (`total_count`, `items` / `workflow_runs`) and gain the same
 hints. Hypermedia `*_url` fields that point back into `api.github.com` are
 dropped to save tokens; `html_url`, `clone_url`, `download_url` etc. stay.
 
-**Errors.** A failed call's `error` is `"<status>: <GitHub's message>"` plus a
-hint, and `data` carries what a caller branches on:
+**Errors.** A failed call carries core's canonical `error_code` (branch on
+this), a human-readable `error` (`"<status>: <GitHub's message>"` plus a hint),
+`retry_after` (seconds) when rate limited, and `data={"status": <HTTP status>}`
+when GitHub answered:
 
-| Case | `error` | `data` |
+| Failure | `error_code` | `error` |
 |---|---|---|
-| 401 | `401: Bad credentials — … the GitHub connection must be reconnected` | `{"status": 401, "reconnect_required": true}` |
-| 404 | `404: Not Found — it does not exist, or this GitHub connection cannot access it` | `{"status": 404}` |
-| rate limit that outlasts the retry budget | `429: … — GitHub rate limit; retry in about 42s` | `{"status": 429, "retry_after": 42}` |
-| network failure | `network error talking to GitHub (Timeout)` | `{"status": 0}` |
+| 401 | `unauthorized` | `401: Bad credentials — … the GitHub connection must be reconnected` |
+| 429, or a rate-limit 403 that outlasts the retries/budget | `rate_limited` (+ `retry_after`) | `429: … — GitHub rate limit; retry in about 42s` |
+| other 403 | `forbidden` | `403: … — this GitHub connection is not allowed to do that (missing scope …)` |
+| 404, 410 | `not_found` | `404: Not Found — it does not exist, or this GitHub connection cannot access it` |
+| 400, 422, and arguments the toolkit refuses (`..` segments, a folder given to a file tool, bad base64, …) | `invalid_arguments` | GitHub's validation message, or the refusal |
+| 409, 412 | `conflict` | GitHub's message |
+| request timeout, 504, spent `timeout_seconds` | `timeout` | `GitHub did not answer within 30s (ReadTimeout)` |
+| 5xx, network failure | `upstream_error` | `500: …` / `network error talking to GitHub (ConnectionError)` |
+
+Core adds `unknown_tool`, `invalid_arguments` (schema) and `unauthorized`
+(no `access_token`) before `run_tool` is reached.
 
 **Rate limits.** A 429, or a 403 GitHub marks as a rate limit, is retried
 (default 2 retries) after the wait GitHub asks for (`Retry-After`, else
 `x-ratelimit-reset`). Total sleep per call is capped at 60 s; a longer wait
-fails at once with `retry_after`. A 502/503/504 on a GET is retried once with
-backoff. Tune with `GitHubToolkit(max_retries=..., max_retry_wait=...)`.
+fails at once with `retry_after`. A 502/503/504 on a GET is retried with
+backoff (1 s, 2 s). Tune with `GitHubToolkit(max_retries=..., max_retry_wait=...)`.
+
+**Time budget.** A host may set `config["timeout_seconds"]` (pipe-as-service
+does). The whole call fits inside it: each request's timeout is the smaller of
+30 s and the time left, and a retry that would sleep past it fails at once as
+`rate_limited`. A spent budget is `timeout`.
+
+**Concurrency.** A `GitHubToolkit` holds no mutable state, and each call opens
+and closes its own HTTP session. Concurrent calls, on one instance or on fresh
+ones, share nothing. Passing `session=` opts into a shared session the host
+manages.
 
 **Secrets.** The token is sent only in the `Authorization` header. It never
 appears in a URL, log line, error or repr. Logs carry method, status and timing,

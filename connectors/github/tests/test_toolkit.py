@@ -339,7 +339,8 @@ class TestCreateOrUpdateFile:
     def test_lookup_failure_other_than_404_is_reported(self):
         h = harness(response(403, {"message": "Resource not accessible by integration"}))
         result = h.call("GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", self.ARGS)
-        assert result.error == "403: Resource not accessible by integration"
+        assert result.error.startswith("403: Resource not accessible by integration")
+        assert result.error_code == "forbidden"
         assert len(h.session.calls) == 1
 
     def test_base64_content_is_passed_through(self):
@@ -425,7 +426,8 @@ class TestSecrecy:
         h = harness(requests.ConnectionError(f"https://api.github.com/search/code?q=project-x-secret token={TOKEN}"))
         result = h.call("GITHUB_SEARCH_CODE", {"q": "project-x-secret"})
         assert result.error == "network error talking to GitHub (ConnectionError)"
-        assert result.data == {"status": 0}
+        assert result.error_code == "upstream_error"
+        assert result.data is None
 
     def test_logs_carry_no_token_or_arguments(self, caplog):
         caplog.set_level(logging.DEBUG)

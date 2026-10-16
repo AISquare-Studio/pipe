@@ -325,7 +325,7 @@ def test_happy_path(case: Case):
     h = harness(case.ok_response())
     result = h.call(case.slug, case.args)
     assert result.successful, result.error
-    assert result.error is None
+    assert (result.error, result.error_code, result.retry_after) == (None, None, None)
     call = h.session.last
     assert len(h.session.calls) == 1
     assert (call.method, call.path) == (case.method, case.path)
@@ -367,6 +367,7 @@ def test_not_found(case: Case):
     h = harness(response(404, {"message": "Not Found", "documentation_url": "https://docs.github.com"}))
     result = h.call(case.slug, case.args)
     assert result.successful is False
+    assert result.error_code == "not_found"
     assert result.error.startswith("404: Not Found")
     assert "cannot access" in result.error
     assert result.data == {"status": 404}
@@ -377,9 +378,10 @@ def test_unauthorized_says_reconnect(case: Case):
     h = harness(response(401, {"message": "Bad credentials"}))
     result = h.call(case.slug, case.args)
     assert result.successful is False
+    assert result.error_code == "unauthorized"
     assert result.error.startswith("401: Bad credentials")
     assert "must be reconnected" in result.error
-    assert result.data == {"status": 401, "reconnect_required": True}
+    assert result.data == {"status": 401}
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)
@@ -388,6 +390,7 @@ def test_rate_limit_is_retried(case: Case):
     h = harness(limited, case.ok_response())
     result = h.call(case.slug, case.args)
     assert result.successful, result.error
+    assert result.error_code is None and result.retry_after is None
     assert h.sleeps == [2.0]
     assert len(h.session.calls) == 2
     assert h.session.calls[0].path == h.session.calls[1].path == case.path
@@ -399,7 +402,9 @@ def test_rate_limit_that_persists_reports_retry_after(case: Case):
     h = harness(*limited)
     result = h.call(case.slug, case.args)
     assert result.successful is False
+    assert result.error_code == "rate_limited"
+    assert result.retry_after == 2.0
     assert result.error.startswith("429: Too many requests")
     assert "retry in about 2s" in result.error
-    assert result.data == {"status": 429, "retry_after": 2}
+    assert result.data == {"status": 429}
     assert h.sleeps == [2.0, 2.0]

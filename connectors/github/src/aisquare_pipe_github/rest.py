@@ -14,6 +14,11 @@ until ``x-ratelimit-reset``). The total sleep per call is capped at
 ``max_retry_wait`` seconds; a longer wait fails at once (with
 ``GitHubAPIError.retry_after`` set) rather than holding a tool call for the
 rest of an hourly window.
+
+Time budget: with ``budget`` (seconds; the host's ``config["timeout_seconds"]``)
+the whole call — every attempt and every retry sleep — fits inside it. Each
+request's timeout shrinks to what is left, a retry that would sleep past it
+fails at once, and running out raises a ``timed_out`` error.
 """
 
 from __future__ import annotations
@@ -49,14 +54,23 @@ class GitHubAPIError(Exception):
     """A non-2xx GitHub answer (``status``) or a transport failure (``status=0``).
 
     ``message`` is GitHub's own error text (plus any validation details);
-    ``retry_after`` is set when the failure is a rate limit, in seconds.
+    ``retry_after`` is set when the failure is a rate limit, in seconds;
+    ``timed_out`` when GitHub did not answer in time (or the budget ran out).
     """
 
-    def __init__(self, status: int, message: str, *, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        timed_out: bool = False,
+    ) -> None:
         super().__init__(f"{status}: {message}" if status else message)
         self.status = status
         self.message = message
         self.retry_after = retry_after
+        self.timed_out = timed_out
 
     @property
     def rate_limited(self) -> bool:
@@ -75,8 +89,10 @@ class GitHubRestClient:
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         max_retry_wait: float = DEFAULT_MAX_RETRY_WAIT,
+        budget: float | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._token = token
         self._owns_session = session is None
@@ -87,6 +103,9 @@ class GitHubRestClient:
         self.max_retry_wait = max(0.0, max_retry_wait)
         self._sleep = sleep
         self._clock = clock
+        self._monotonic = monotonic
+        self.budget = budget if budget is not None and budget > 0 else None
+        self._deadline = monotonic() + self.budget if self.budget is not None else None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(base_url={self.base_url!r})"
@@ -100,6 +119,12 @@ class GitHubRestClient:
     def close(self) -> None:
         if self._owns_session:
             self._session.close()
+
+    def _remaining(self) -> float | None:
+        """Seconds left in the budget (None: unbounded)."""
+        if self._deadline is None:
+            return None
+        return self._deadline - self._monotonic()
 
     # ------------------------------------------------------------------ http
 
@@ -123,6 +148,12 @@ class GitHubRestClient:
         waited = 0.0
         attempt = 0
         while True:
+            remaining = self._remaining()
+            if remaining is not None and remaining <= 0:
+                raise GitHubAPIError(
+                    0, f"GitHub call ran out of its {self.budget:g}s time budget", timed_out=True
+                )
+            timeout = self.timeout if remaining is None else min(self.timeout, remaining)
             started = time.monotonic()
             try:
                 response = self._session.request(
@@ -131,8 +162,12 @@ class GitHubRestClient:
                     params=dict(params) if params else None,
                     json=json,
                     headers=headers,
-                    timeout=self.timeout,
+                    timeout=timeout,
                 )
+            except requests.Timeout as e:  # before RequestException: ConnectTimeout is both
+                raise GitHubAPIError(
+                    0, f"GitHub did not answer within {timeout:g}s ({type(e).__name__})", timed_out=True
+                ) from None
             except requests.RequestException as e:
                 # str(e) can carry the URL (and so argument values): name the type only.
                 raise GitHubAPIError(
@@ -151,11 +186,11 @@ class GitHubRestClient:
             wait = limit_wait
             if wait is None and method == "GET" and response.status_code in (502, 503, 504):
                 wait = _SERVER_ERROR_WAIT * (2**attempt)
-            if (
-                wait is None
-                or attempt >= self.max_retries
-                or waited + wait > self.max_retry_wait
-            ):
+            sleep_budget = self.max_retry_wait - waited
+            remaining = self._remaining()
+            if remaining is not None:
+                sleep_budget = min(sleep_budget, remaining)
+            if wait is None or attempt >= self.max_retries or wait > sleep_budget:
                 raise GitHubAPIError(
                     response.status_code, error_message(response), retry_after=limit_wait
                 )
@@ -274,10 +309,10 @@ def revoke_grant(
     disappears from their authorized apps. Authenticated with the app's
     client id/secret (HTTP Basic). True on 204; False on anything else.
     Never raises."""
-    url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/grant"
     http = session if session is not None else requests.Session()
     try:
-        response = http.request(
+        url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/grant"
+        status = http.request(
             "DELETE",
             url,
             auth=(client_id, client_secret),
@@ -288,14 +323,14 @@ def revoke_grant(
                 "User-Agent": USER_AGENT,
             },
             timeout=timeout,
-        )
-    except requests.RequestException as e:
+        ).status_code
+    except Exception as e:  # noqa: BLE001 — never raises (e.g. a non-latin-1 secret in Basic auth)
         logger.warning("github: grant revoke failed (%s)", type(e).__name__)
         return False
     finally:
         if session is None:
             http.close()
-    if response.status_code == 204:
+    if status == 204:
         return True
-    logger.warning("github: grant revoke returned HTTP %s", response.status_code)
+    logger.warning("github: grant revoke returned HTTP %s", status)
     return False
