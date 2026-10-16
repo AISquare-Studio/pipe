@@ -1,6 +1,7 @@
-"""GitHub's OAuth App spec against core's flow, with GitHub's quirks: a
-form-encoded token response, ``error`` inside a 200, no refresh token, no
-expiry, and grant revocation via ``DELETE /applications/{client_id}/grant``."""
+"""GitHub's OAuth App spec against core's flow, with GitHub's quirks: PKCE
+(S256) on, a form-encoded token response, ``error`` inside a 200, no refresh
+token, no expiry, and grant revocation via
+``DELETE /applications/{client_id}/grant``."""
 
 from __future__ import annotations
 
@@ -12,13 +13,15 @@ from email.message import Message
 
 import pytest
 import requests
-from aisquare.pipe import OAuthError
+from aisquare.pipe import OAuthError, make_pkce_pair, pkce_challenge
 
 from aisquare_pipe_github import GITHUB_OAUTH, GitHubToolkit
 
 from .fakes import FakeSession, response
 
 CLIENT_ID = "Ov23liExampleClientId"
+VERIFIER, CHALLENGE = make_pkce_pair()
+REDIRECT = "https://pipe.example/v1/connections/callback"
 CLIENT_SECRET = "github-app-secret-value"
 ACCESS = "gho_newAccessToken0123456789"
 
@@ -80,9 +83,12 @@ class TestSpec:
         assert GITHUB_OAUTH.token_expires is False
         assert GITHUB_OAUTH.revoke_url is None  # not RFC 7009; revoke_token is overridden
 
-    def test_authorize_url(self):
+    def test_pkce_is_on(self):
+        assert GITHUB_OAUTH.pkce is True
+
+    def test_authorize_url_carries_an_s256_challenge(self):
         url = GitHubToolkit().build_authorize_url(
-            client_id=CLIENT_ID, redirect_uri="https://pipe.example/v1/connections/callback", state="st4te"
+            client_id=CLIENT_ID, redirect_uri=REDIRECT, state="st4te", code_challenge=CHALLENGE
         )
         parts = urllib.parse.urlsplit(url)
         assert f"{parts.scheme}://{parts.netloc}{parts.path}" == GITHUB_OAUTH.authorize_url
@@ -90,17 +96,31 @@ class TestSpec:
         assert query == {
             "response_type": "code",
             "client_id": CLIENT_ID,
-            "redirect_uri": "https://pipe.example/v1/connections/callback",
+            "redirect_uri": REDIRECT,
             "state": "st4te",
             "scope": "repo read:user read:org",
+            "code_challenge": CHALLENGE,
+            "code_challenge_method": "S256",  # GitHub supports S256 only
         }
+        # GitHub: "a 43 character SHA-256 hash of a random string".
+        assert len(query["code_challenge"]) == 43
+        assert pkce_challenge(VERIFIER) == CHALLENGE
+
+    def test_authorize_url_without_a_challenge_is_refused(self):
+        with pytest.raises(OAuthError) as exc:
+            GitHubToolkit().build_authorize_url(client_id=CLIENT_ID, redirect_uri=REDIRECT, state="st4te")
+        assert exc.value.error == "pkce_required"
 
 
 class TestExchange:
     def test_form_encoded_token_response(self, token_endpoint):
         seen = token_endpoint(200, f"access_token={ACCESS}&scope=repo%2Cread%3Aorg%2Cread%3Auser&token_type=bearer")
         token = GitHubToolkit().exchange_code(
-            client_id=CLIENT_ID, client_secret=CLIENT_SECRET, code="code123", redirect_uri="https://pipe.example/cb"
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            code="code123",
+            redirect_uri=REDIRECT,
+            code_verifier=VERIFIER,
         )
         assert token.access_token == ACCESS
         assert token.refresh_token is None
@@ -109,8 +129,36 @@ class TestExchange:
         assert token.scope == "repo,read:org,read:user"
         form = dict(urllib.parse.parse_qsl(seen[0].data.decode()))
         assert form["client_id"] == CLIENT_ID
-        assert form["client_secret"] == CLIENT_SECRET
+        assert form["client_secret"] == CLIENT_SECRET  # GitHub still requires it with PKCE
+        assert form["code_verifier"] == VERIFIER
+        assert form["redirect_uri"] == REDIRECT
         assert seen[0].full_url == GITHUB_OAUTH.token_url
+
+    def test_exchange_without_the_verifier_is_refused_before_any_request(self, token_endpoint):
+        seen = token_endpoint(200, f"access_token={ACCESS}&token_type=bearer")
+        with pytest.raises(OAuthError) as exc:
+            GitHubToolkit().exchange_code(
+                client_id=CLIENT_ID, client_secret=CLIENT_SECRET, code="code123", redirect_uri=REDIRECT
+            )
+        assert exc.value.error == "pkce_required"
+        assert seen == []
+
+    def test_verifier_mismatch_is_reported(self, token_endpoint):
+        # What GitHub answers when a code is redeemed with another flow's verifier.
+        token_endpoint(
+            200,
+            "error=invalid_grant&error_description=The+code_verifier+does+not+match+the+code_challenge",
+        )
+        other_flows_verifier, _ = make_pkce_pair()
+        with pytest.raises(OAuthError) as exc:
+            GitHubToolkit().exchange_code(
+                client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+                code="code123",
+                redirect_uri=REDIRECT,
+                code_verifier=other_flows_verifier,
+            )
+        assert exc.value.error == "invalid_grant"
 
     def test_error_inside_a_200(self, token_endpoint):
         token_endpoint(
@@ -120,7 +168,11 @@ class TestExchange:
         )
         with pytest.raises(OAuthError) as exc:
             GitHubToolkit().exchange_code(
-                client_id=CLIENT_ID, client_secret=CLIENT_SECRET, code="stale", redirect_uri="https://pipe.example/cb"
+                client_id=CLIENT_ID,
+                client_secret=CLIENT_SECRET,
+                code="stale",
+                redirect_uri=REDIRECT,
+                code_verifier=VERIFIER,
             )
         assert exc.value.error == "bad_verification_code"
         assert CLIENT_SECRET not in str(exc.value)

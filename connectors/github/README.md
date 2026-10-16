@@ -153,12 +153,26 @@ Writes:
 | authorize | `https://github.com/login/oauth/authorize` |
 | token | `https://github.com/login/oauth/access_token` |
 | default scopes | `repo read:user read:org` |
+| PKCE | on (`pkce=True`, S256; GitHub does not support `plain`). Build the authorize URL with `code_challenge`, and exchange with the matching `code_verifier`, both from core's `make_pkce_pair()`. Core refuses either step without them. The client secret is still sent, because GitHub requires it for OAuth Apps |
 | expiry | none: OAuth App tokens do not expire and carry no refresh token (`token_expires=False`) |
 | disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/grant` (HTTP Basic `client_id:client_secret`), which removes the user's whole authorization of the app |
 
 Run the flow with the toolkit's `build_authorize_url` / `exchange_code` /
 `revoke_token`. Core handles GitHub's form-encoded token response and its
-`error`-in-a-200 replies.
+`error`-in-a-200 replies. Keep each flow's `code_verifier` with its `state` on
+the server side. The verifier binds the code to the flow that requested it, so
+a code intercepted or replayed under another pending `state` fails at GitHub
+with `invalid_grant`.
+
+```python
+from aisquare.pipe import make_pkce_pair
+
+verifier, challenge = make_pkce_pair()            # store verifier with state
+url = github.build_authorize_url(client_id=..., redirect_uri=..., state=state, code_challenge=challenge)
+# ... callback with ?code=&state= ...
+token = github.exchange_code(client_id=..., client_secret=..., code=code,
+                             redirect_uri=..., code_verifier=verifier)
+```
 
 Setting up the app (one per environment):
 

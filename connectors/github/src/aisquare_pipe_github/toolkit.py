@@ -34,11 +34,19 @@ from aisquare_pipe_github.tools import HANDLERS, TOOL_SPECS, normalize_arguments
 #: token; GitHub answers the token endpoint form-encoded unless asked for
 #: JSON, which core's flow handles. Revocation is not RFC 7009 — see
 #: :meth:`GitHubToolkit.revoke_token`.
+#:
+#: PKCE (S256 only; GitHub rejects ``plain``) is on: GitHub's web flow takes
+#: ``code_challenge`` / ``code_challenge_method`` and checks ``code_verifier``
+#: at the token endpoint, which binds each code to the flow that requested it
+#: so a code cannot be redeemed under another pending ``state``. Core then
+#: requires a challenge to build the authorize URL and the verifier to
+#: exchange. The client secret is still sent: GitHub requires it for OAuth Apps.
 GITHUB_OAUTH = OAuthSpec(
     provider="github",
     authorize_url="https://github.com/login/oauth/authorize",
     token_url="https://github.com/login/oauth/access_token",
     default_scopes=("repo", "read:user", "read:org"),
+    pkce=True,
     token_expires=False,
 )
 
