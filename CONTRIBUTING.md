@@ -1,6 +1,8 @@
 # Contributing: Building a Connector Plugin
 
-This guide explains how to build a connector plugin for `aisquare.pipe`.
+This guide explains how to build a connector plugin for `aisquare.pipe` —
+its data-moving connectors and, optionally, its agent-facing toolkit
+(see [Building a Toolkit](#building-a-toolkit)).
 
 ## Quick Start
 
@@ -161,6 +163,137 @@ class TestMyServiceSource(connector_compliance_suite(MyServiceSource)):
 
 Run with: `pytest tests/test_compliance.py -v`
 
+## Building a Toolkit
+
+A **toolkit** is the agent-facing side of a connector: a catalog of named
+tools an LLM can call (each with a JSON-Schema input), their execution, and
+the connection (OAuth) logic for the service. It lives in the same
+`connectors/<name>/` package as the connector and is discovered through its
+own entry-point group, `aisquare_pipe.toolkits`.
+
+```python
+from aisquare.pipe import AuthType, OAuthSpec, Toolkit, ToolError, ToolResult, ToolSpec
+
+SEARCH = ToolSpec(
+    slug="MYSVC_SEARCH_FILES",             # UPPER_SNAKE, starts with slug_prefix
+    description="Search files by name.",   # 1..1024 chars — the model reads this
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Name substring."},
+            "limit": {"type": "integer", "default": 10},
+        },
+        "required": ["query"],
+    },
+    read_only=True,                        # destructive=True for deletes/overwrites
+    tags=("files",),
+)
+
+
+class MyServiceToolkit(Toolkit):
+    name = "mysvc"                         # == entry-point name
+    version = "0.1.0"                      # == pyproject version
+    display_name = "My Service"
+    description = "Files in My Service"
+    auth_type = AuthType.OAUTH2
+    # slug_prefix defaults to name.upper() + "_"  ->  "MYSVC_"
+    oauth = OAuthSpec(
+        provider="mysvc",
+        authorize_url="https://mysvc.example/oauth/authorize",
+        token_url="https://mysvc.example/oauth/token",
+        revoke_url="https://mysvc.example/oauth/revoke",
+        default_scopes=("files.read",),
+        pkce=True,
+    )
+
+    def tools(self) -> list[ToolSpec]:
+        return [SEARCH]                    # never touch the network here
+
+    def run_tool(self, tool, arguments, config) -> ToolResult:
+        if tool.slug == "MYSVC_SEARCH_FILES":
+            items = search(config["access_token"], arguments["query"], arguments["limit"])
+            return ToolResult.ok({"items": items})
+        raise ToolError(f"{tool.slug} is not implemented")
+```
+
+What the base class does for you:
+
+- **`call_tool(slug, arguments, config)` never raises.** It resolves the slug,
+  validates `arguments` against `input_schema` (required keys, primitive
+  types, enums, nested objects/arrays; `null` for an optional argument is
+  dropped and top-level `default`s are filled in), checks
+  `validate_config(config)`, and only then calls your `run_tool`. Every
+  failure — unknown slug, bad arguments, no credentials, a `ToolError`, any
+  other exception — comes back as `ToolResult(successful=False, error=...)`.
+  Secret-looking config values are masked out of error messages.
+- **`search_tools(query, limit=6)`** ranks the catalog with a deterministic
+  keyword score (+2 per query term in the slug, +1 in the description or
+  tags; first-person queries favour `..._AUTHENTICATED_...` tools).
+- **`validate_config(config)`** defaults to "has a non-empty
+  `access_token`" (or always true for `AuthType.NONE`). Override it for
+  other credential shapes, but keep it offline — `call_tool` runs it on
+  every call.
+- **OAuth**: `build_authorize_url`, `exchange_code`, `refresh_access_token`
+  and `revoke_token` run the standard authorization-code flow from `oauth`
+  over stdlib `urllib` (JSON or form-encoded token responses, refresh-token
+  retention and rotation, PKCE, `client_secret_post`/`client_secret_basic`).
+  Override the method for provider quirks (e.g. a non-RFC revoke endpoint).
+  Failures raise `OAuthError` carrying the provider's error code — never a
+  token, code or secret.
+
+Conventions:
+
+- `config` carries `access_token` plus connector-specific non-secret keys.
+  The toolkit never stores tokens; the host (e.g. pipe-as-service) does.
+- Return JSON-serializable `data`. Binary payloads (downloads) go in
+  `ToolResult.files` as `DataEnvelope`s with the MIME type as `content_type`
+  and `metadata["filename"]`.
+- Raise `ToolError("human-readable message")` for expected failures (not
+  found, permission denied, rate limited). Never put tokens or the raw
+  argument payload in it, and never log them — log slugs, counts, timings.
+- When porting a Composio toolkit, keep Composio's slugs and argument names
+  so existing callers keep working.
+
+Register it next to the connector's entry points:
+
+```toml
+[project.entry-points."aisquare_pipe.toolkits"]
+mysvc = "aisquare_pipe_mysvc.toolkit:MyServiceToolkit"
+```
+
+and add the toolkit compliance suite to `tests/test_compliance.py` —
+`pipe validate` requires it for any package that registers a toolkit:
+
+```python
+from aisquare.pipe.testing.compliance import toolkit_compliance_suite
+from aisquare_pipe_mysvc.toolkit import MyServiceToolkit
+
+class TestMyServiceToolkit(toolkit_compliance_suite(MyServiceToolkit)):
+    pass
+```
+
+The suite (and the contract layer of `pipe validate`) checks, without
+credentials or network: zero-arg instantiation, name + semver version, the
+entry-point name equals `name`, slugs are unique and carry `slug_prefix`,
+every `input_schema` is `{"type": "object", "properties": {...}}` with
+`required` ⊆ `properties`, descriptions are non-empty and ≤ 1024 chars,
+`call_tool` of an unknown slug and of every real slug with `({}, {})` returns
+a failed `ToolResult`, and OAuth endpoints are `https`.
+
+For hermetic tests of code that *hosts* toolkits, use
+`aisquare.pipe.testing.mock_connectors.MockToolkit` (registered as toolkit
+`mock`): an in-memory items store with list/get/create/delete, a file
+download and a whoami, plus `MOCK_OAUTH`.
+
+Inspect any installed toolkit from the CLI:
+
+```bash
+pipe tools                              # installed toolkits
+pipe tools mysvc                        # every slug + description
+pipe tools mysvc --search "find a file" # ranked, top 6
+pipe tools mysvc --json                 # full ToolSpecs
+```
+
 ## Live Tests (optional)
 
 Everything above is hermetic by design. If you also want to catch real
@@ -224,6 +357,7 @@ twine upload dist/*
 - Package name: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
 - Connector name attribute: `{service}` (e.g., `"s3"`)
 - Entry point name: `{service}` or `{service}-source` / `{service}-sink`
+- Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`)
 
 ## Which Tier?
 

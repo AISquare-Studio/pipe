@@ -16,12 +16,30 @@ from aisquare.pipe.core.envelope import (
     Resource,
 )
 from aisquare.pipe.core.merge import MergeStrategy
+from aisquare.pipe.core.oauth import (
+    OAuthSpec,
+    OAuthToken,
+    build_authorize_url,
+    exchange_code,
+    make_pkce_pair,
+    refresh_access_token,
+    revoke_token,
+)
 from aisquare.pipe.core.pipeline import CompatibilityReport, Pipeline, PipelineResult
 from aisquare.pipe.core.registry import (
     discover_connectors,
     discover_converters,
+    discover_toolkits,
     get_connector,
     get_converter,
+    get_toolkit,
+)
+from aisquare.pipe.core.tools import (
+    Toolkit,
+    ToolResult,
+    ToolSpec,
+    rank_tools,
+    validate_arguments,
 )
 from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
 from aisquare.pipe.errors import (
@@ -29,8 +47,11 @@ from aisquare.pipe.errors import (
     ConnectorNotFoundError,
     ConverterError,
     EnvelopeValidationError,
+    OAuthError,
     PipeError,
     PipelineError,
+    ToolError,
+    ToolkitNotFoundError,
     TypeMismatchError,
 )
 
@@ -59,11 +80,27 @@ __all__ = [
     "MatchLevel",
     # Merge
     "MergeStrategy",
+    # Toolkits
+    "Toolkit",
+    "ToolSpec",
+    "ToolResult",
+    "rank_tools",
+    "validate_arguments",
+    # OAuth
+    "OAuthSpec",
+    "OAuthToken",
+    "make_pkce_pair",
+    "build_authorize_url",
+    "exchange_code",
+    "refresh_access_token",
+    "revoke_token",
     # Registry
     "discover_connectors",
     "discover_converters",
+    "discover_toolkits",
     "get_connector",
     "get_converter",
+    "get_toolkit",
     # Errors
     "PipeError",
     "ConnectorNotFoundError",
@@ -72,4 +109,7 @@ __all__ = [
     "EnvelopeValidationError",
     "PipelineError",
     "ConverterError",
+    "ToolkitNotFoundError",
+    "ToolError",
+    "OAuthError",
 ]
