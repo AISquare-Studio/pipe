@@ -15,7 +15,15 @@ from aisquare.pipe.core.envelope import (
     PushResult,
 )
 from aisquare.pipe.core.oauth import OAuthSpec
-from aisquare.pipe.core.tools import Toolkit, ToolResult, ToolSpec
+from aisquare.pipe.core.tools import (
+    ERROR_NOT_FOUND,
+    ERROR_RATE_LIMITED,
+    ERROR_UNAUTHORIZED,
+    ERROR_UPSTREAM_ERROR,
+    Toolkit,
+    ToolResult,
+    ToolSpec,
+)
 from aisquare.pipe.core.types import TypeConverter
 from aisquare.pipe.errors import ToolError
 
@@ -201,9 +209,16 @@ _SEED_ITEMS: dict[str, dict[str, Any]] = {
 }
 
 
+#: ``access_token`` values that make every MockToolkit tool fail the way a
+#: provider would — for exercising a host's refresh / reconnect / 429 paths.
+MOCK_EXPIRED_TOKEN = "mock-expired-token"  # -> error_code "unauthorized"
+MOCK_RATE_LIMITED_TOKEN = "mock-rate-limited-token"  # -> "rate_limited", retry_after=30
+
+
 class MockToolkit(Toolkit):
     """In-memory toolkit for hermetic tests: items CRUD, a file download and
-    a ``whoami``. Any non-empty ``access_token`` authenticates."""
+    a ``whoami``. Any non-empty ``access_token`` authenticates, except the
+    ``MOCK_EXPIRED_TOKEN`` / ``MOCK_RATE_LIMITED_TOKEN`` failure triggers."""
 
     name = "mock"
     version = "0.1.0"
@@ -220,6 +235,11 @@ class MockToolkit(Toolkit):
     def run_tool(
         self, tool: ToolSpec, arguments: dict[str, Any], config: dict[str, Any]
     ) -> ToolResult:
+        token = config.get("access_token")
+        if token == MOCK_EXPIRED_TOKEN:
+            raise ToolError("access token expired or revoked", code=ERROR_UNAUTHORIZED)
+        if token == MOCK_RATE_LIMITED_TOKEN:
+            raise ToolError("rate limit exceeded", code=ERROR_RATE_LIMITED, retry_after=30.0)
         if tool.slug == "MOCK_LIST_ITEMS":
             query = str(arguments.get("query", "")).lower()
             found = [
@@ -239,7 +259,7 @@ class MockToolkit(Toolkit):
 
         item = self.items.get(str(arguments["item_id"]))
         if item is None:
-            raise ToolError("item not found")
+            raise ToolError("item not found", code=ERROR_NOT_FOUND)
         if tool.slug == "MOCK_GET_ITEM":
             return ToolResult.ok(item)
         if tool.slug == "MOCK_DELETE_ITEM":
@@ -254,8 +274,9 @@ class MockToolkit(Toolkit):
                 source_id=self.name,
                 metadata={"filename": filename, "item_id": item["id"]},
             )
+            # Composio-compatible description; the bytes ride in ``files``.
             return ToolResult.ok(
-                {"filename": filename, "mime_type": "text/plain", "size": len(content)},
+                {"name": filename, "mimetype": "text/plain", "size": len(content)},
                 files=[envelope],
             )
-        raise ToolError(f"{tool.slug} is not implemented")
+        raise ToolError(f"{tool.slug} is not implemented", code=ERROR_UPSTREAM_ERROR)

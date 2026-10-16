@@ -8,18 +8,34 @@ import dataclasses
 import pytest
 
 from aisquare.pipe import (
+    ERROR_CODES,
+    ERROR_CONFLICT,
+    ERROR_FORBIDDEN,
+    ERROR_INVALID_ARGUMENTS,
+    ERROR_NOT_FOUND,
+    ERROR_RATE_LIMITED,
+    ERROR_TIMEOUT,
+    ERROR_UNAUTHORIZED,
+    ERROR_UNKNOWN_TOOL,
+    ERROR_UPSTREAM_ERROR,
     AuthType,
     DataEnvelope,
     OAuthError,
     Toolkit,
     ToolResult,
     ToolSpec,
+    error_code_for_status,
     rank_tools,
     validate_arguments,
 )
 from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments, query_terms
 from aisquare.pipe.errors import ToolError
-from aisquare.pipe.testing.mock_connectors import MOCK_OAUTH, MockToolkit
+from aisquare.pipe.testing.mock_connectors import (
+    MOCK_EXPIRED_TOKEN,
+    MOCK_OAUTH,
+    MOCK_RATE_LIMITED_TOKEN,
+    MockToolkit,
+)
 
 EMPTY_SCHEMA = {"type": "object", "properties": {}}
 TOKEN = {"access_token": "tok-secret-123456"}
@@ -75,15 +91,73 @@ class TestToolResult:
     def test_to_dict_excludes_files(self):
         envelope = DataEnvelope(content_type="text/plain", data=b"hi", source_id="x")
         result = ToolResult.ok({"size": 2}, files=[envelope])
-        assert result.to_dict() == {"successful": True, "data": {"size": 2}, "error": None}
+        assert result.to_dict() == {
+            "successful": True,
+            "data": {"size": 2},
+            "error": None,
+            "error_code": None,
+            "retry_after": None,
+        }
         assert result.files == [envelope]
 
-    def test_fail(self):
+    def test_fail_defaults_to_upstream_error(self):
         assert ToolResult.fail("boom").to_dict() == {
             "successful": False,
             "data": None,
             "error": "boom",
+            "error_code": "upstream_error",
+            "retry_after": None,
         }
+
+    def test_fail_with_code(self):
+        result = ToolResult.fail("slow down", code=ERROR_RATE_LIMITED, retry_after=12.5)
+        assert (result.error_code, result.retry_after) == ("rate_limited", 12.5)
+
+
+class TestErrorCodes:
+    def test_canonical_set(self):
+        assert ERROR_CODES == {
+            "unauthorized",
+            "forbidden",
+            "not_found",
+            "rate_limited",
+            "invalid_arguments",
+            "unknown_tool",
+            "conflict",
+            "upstream_error",
+            "timeout",
+        }
+
+    @pytest.mark.parametrize(
+        ("status", "code"),
+        [
+            (400, ERROR_INVALID_ARGUMENTS),
+            (401, ERROR_UNAUTHORIZED),
+            (403, ERROR_FORBIDDEN),
+            (404, ERROR_NOT_FOUND),
+            (408, ERROR_TIMEOUT),
+            (409, ERROR_CONFLICT),
+            (410, ERROR_NOT_FOUND),
+            (412, ERROR_CONFLICT),
+            (422, ERROR_INVALID_ARGUMENTS),
+            (429, ERROR_RATE_LIMITED),
+            (500, ERROR_UPSTREAM_ERROR),
+            (502, ERROR_UPSTREAM_ERROR),
+            (504, ERROR_TIMEOUT),
+            (418, ERROR_UPSTREAM_ERROR),
+        ],
+    )
+    def test_error_code_for_status(self, status, code):
+        assert error_code_for_status(status) == code
+
+    def test_tool_error_carries_code(self):
+        err = ToolError("gone", code=ERROR_NOT_FOUND)
+        assert (str(err), err.code, err.retry_after) == ("gone", "not_found", None)
+        assert ToolError("x").code == ERROR_UPSTREAM_ERROR
+
+    def test_tool_error_rejects_non_canonical_code(self):
+        with pytest.raises(ValueError, match="not one of"):
+            ToolError("x", code="auth_failed")
 
 
 # --------------------------------------------------------------------------
@@ -309,6 +383,11 @@ class _Base(Toolkit):
             spec("ACME_LEAK"),
             spec("ACME_WRONG_RETURN"),
             spec("ACME_FAIL_NO_MESSAGE"),
+            spec("ACME_RATE_LIMITED"),
+            spec("ACME_TIMEOUT"),
+            spec("ACME_URL_ERROR"),
+            spec("ACME_ODD_CODE"),
+            spec("ACME_EMPTY_EXCEPTION"),
         ]
 
     def run_tool(self, tool, arguments, config):
@@ -318,11 +397,23 @@ class _Base(Toolkit):
         if tool.slug == "ACME_BOOM":
             raise RuntimeError("upstream exploded")
         if tool.slug == "ACME_TOOL_ERROR":
-            raise ToolError("resource not found")
+            raise ToolError("resource not found", code=ERROR_NOT_FOUND)
         if tool.slug == "ACME_LEAK":
             raise RuntimeError(f"401 for token {config['access_token']}")
         if tool.slug == "ACME_WRONG_RETURN":
             return {"successful": True}
+        if tool.slug == "ACME_RATE_LIMITED":
+            raise ToolError("slow down", code=ERROR_RATE_LIMITED, retry_after=42.0)
+        if tool.slug == "ACME_TIMEOUT":
+            raise TimeoutError("read timed out after 30s")
+        if tool.slug == "ACME_URL_ERROR":
+            raise RuntimeError(
+                "404 Client Error for url: https://api.acme.example/search?q=private+memo&page=2"
+            )
+        if tool.slug == "ACME_ODD_CODE":
+            return ToolResult(successful=False, error="odd", error_code="weird")
+        if tool.slug == "ACME_EMPTY_EXCEPTION":
+            raise RuntimeError()
         return ToolResult(successful=False)
 
 
@@ -372,17 +463,28 @@ class TestCallTool:
         result = kit.call_tool("ACME_GET", {"id": "7"}, TOKEN)
         assert result.successful and result.data == {"id": "7", "limit": 5}
 
+    def test_success_has_no_error_code(self):
+        result = _Base().call_tool("ACME_GET", {"id": "7"}, TOKEN)
+        assert result.error_code is None and result.retry_after is None
+
     def test_unknown_slug(self):
         result = _Base().call_tool("ACME_NOPE", {}, TOKEN)
         assert not result.successful
         assert "unknown tool 'ACME_NOPE'" in (result.error or "")
+        assert result.error_code == ERROR_UNKNOWN_TOOL
 
     def test_invalid_arguments_do_not_run(self):
         kit = _Base()
         result = kit.call_tool("ACME_GET", {"id": 7}, TOKEN)
         assert not result.successful
         assert result.error == "invalid arguments for ACME_GET: 'id' must be string, got integer"
+        assert result.error_code == ERROR_INVALID_ARGUMENTS
         assert kit.calls == []
+
+    def test_integral_float_coerced_for_integer_argument(self):
+        result = _Base().call_tool("ACME_GET", {"id": "7", "limit": 3.0}, TOKEN)
+        assert result.successful and result.data["limit"] == 3
+        assert type(result.data["limit"]) is int
 
     def test_non_object_arguments(self):
         result = _Base().call_tool("ACME_GET", "id=7", TOKEN)  # type: ignore[arg-type]
@@ -393,6 +495,7 @@ class TestCallTool:
         kit = _Base()
         result = kit.call_tool("ACME_GET", {"id": "7"}, config)
         assert not result.successful and "not connected" in (result.error or "")
+        assert result.error_code == ERROR_UNAUTHORIZED
         assert kit.calls == []
 
     def test_validate_config_crash_means_not_connected(self):
@@ -406,11 +509,47 @@ class TestCallTool:
     def test_exception_is_caught(self):
         result = _Base().call_tool("ACME_BOOM", {}, TOKEN)
         assert not result.successful
-        assert result.error == "ACME_BOOM failed: RuntimeError: upstream exploded"
+        assert result.error == "ACME_BOOM failed (RuntimeError): upstream exploded"
+        assert result.error_code == ERROR_UPSTREAM_ERROR
 
-    def test_tool_error_message_passes_through(self):
+    def test_exception_text_drops_url_query(self):
+        result = _Base().call_tool("ACME_URL_ERROR", {}, TOKEN)
+        assert "private" not in (result.error or "") and "page=2" not in (result.error or "")
+        assert "https://api.acme.example/search?…" in (result.error or "")
+
+    def test_exception_without_text(self):
+        result = _Base().call_tool("ACME_EMPTY_EXCEPTION", {}, TOKEN)
+        assert result.error == "ACME_EMPTY_EXCEPTION failed (RuntimeError)"
+
+    def test_exception_text_truncated(self):
+        class Verbose(_Base):
+            def run_tool(self, tool, arguments, config):
+                raise RuntimeError("x" * 5000)
+
+        result = Verbose().call_tool("ACME_GET", {"id": "7"}, TOKEN)
+        assert len(result.error or "") < 400
+
+    def test_timeout_maps_to_timeout_code(self):
+        result = _Base().call_tool("ACME_TIMEOUT", {}, TOKEN)
+        assert (result.error, result.error_code) == ("ACME_TIMEOUT timed out", ERROR_TIMEOUT)
+
+    def test_tool_error_message_and_code_pass_through(self):
         result = _Base().call_tool("ACME_TOOL_ERROR", {}, TOKEN)
-        assert result.to_dict() == {"successful": False, "data": None, "error": "resource not found"}
+        assert result.to_dict() == {
+            "successful": False,
+            "data": None,
+            "error": "resource not found",
+            "error_code": "not_found",
+            "retry_after": None,
+        }
+
+    def test_tool_error_retry_after(self):
+        result = _Base().call_tool("ACME_RATE_LIMITED", {}, TOKEN)
+        assert (result.error_code, result.retry_after) == (ERROR_RATE_LIMITED, 42.0)
+
+    def test_non_canonical_result_code_normalized(self):
+        result = _Base().call_tool("ACME_ODD_CODE", {}, TOKEN)
+        assert result.error_code == ERROR_UPSTREAM_ERROR
 
     def test_secrets_scrubbed_from_errors(self):
         result = _Base().call_tool("ACME_LEAK", {}, TOKEN)
@@ -420,10 +559,12 @@ class TestCallTool:
     def test_wrong_return_type(self):
         result = _Base().call_tool("ACME_WRONG_RETURN", {}, TOKEN)
         assert not result.successful and "expected ToolResult" in (result.error or "")
+        assert result.error_code == ERROR_UPSTREAM_ERROR
 
     def test_failure_without_message_gets_one(self):
         result = _Base().call_tool("ACME_FAIL_NO_MESSAGE", {}, TOKEN)
         assert result.error == "ACME_FAIL_NO_MESSAGE failed"
+        assert result.error_code == ERROR_UPSTREAM_ERROR
 
     def test_get_tool_crash_never_raises(self):
         class Broken(_Base):
@@ -432,6 +573,7 @@ class TestCallTool:
 
         result = Broken().call_tool("ACME_GET", {"id": "7"}, TOKEN)
         assert not result.successful and "internal error" in (result.error or "")
+        assert result.error_code == ERROR_UPSTREAM_ERROR
 
     def test_run_tool_gets_copies(self):
         kit = _Base()
@@ -456,14 +598,27 @@ class TestMockToolkit:
         assert [i["title"] for i in listed.data["items"]] == ["Third"]
         assert kit.call_tool("MOCK_DELETE_ITEM", {"item_id": created.data["id"]}, TOKEN).successful
         missing = kit.call_tool("MOCK_GET_ITEM", {"item_id": created.data["id"]}, TOKEN)
-        assert missing.to_dict() == {"successful": False, "data": None, "error": "item not found"}
+        assert (missing.error, missing.error_code) == ("item not found", ERROR_NOT_FOUND)
 
     def test_download_returns_file_envelope(self):
         result = MockToolkit().call_tool("MOCK_DOWNLOAD_FILE", {"item_id": "1"}, TOKEN)
         assert result.successful
         (envelope,) = result.files
         assert envelope.data == b"First item\n"
-        assert envelope.metadata["filename"] == result.data["filename"] == "item-1.txt"
+        assert envelope.metadata["filename"] == result.data["name"] == "item-1.txt"
+        assert result.data["mimetype"] == envelope.content_type == "text/plain"
+
+    def test_expired_token_trigger(self):
+        result = MockToolkit().call_tool(
+            "MOCK_GET_AUTHENTICATED_USER", {}, {"access_token": MOCK_EXPIRED_TOKEN}
+        )
+        assert (result.successful, result.error_code) == (False, ERROR_UNAUTHORIZED)
+
+    def test_rate_limited_token_trigger(self):
+        result = MockToolkit().call_tool(
+            "MOCK_LIST_ITEMS", {}, {"access_token": MOCK_RATE_LIMITED_TOKEN}
+        )
+        assert (result.error_code, result.retry_after) == (ERROR_RATE_LIMITED, 30.0)
 
     def test_instances_do_not_share_state(self):
         first = MockToolkit()
