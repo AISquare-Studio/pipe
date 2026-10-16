@@ -245,14 +245,18 @@ What the base class does for you:
   class, to the `ToolError`'s `code`, to `timeout` for a `TimeoutError`,
   and to `upstream_error` for anything else. An unexpected exception's text
   is redacted (URL query strings dropped, truncated), and secret-looking
-  config values are masked out of every error message.
+  config values — at any nesting depth, including stripped, escaped and
+  `Bearer`-prefixed forms — are masked out of every error message. A
+  malformed result (non-string `error`, unknown `error_code`) is normalized
+  rather than raised.
 - **`search_tools(query, limit=6)`** ranks the catalog with a deterministic
   keyword score (+2 per query term in the slug, +1 in the description or
   tags; first-person queries favour `..._AUTHENTICATED_...` tools).
 - **`validate_config(config)`** defaults to "has a non-empty
-  `access_token`" (or always true for `AuthType.NONE`). Override it for
-  other credential shapes, but keep it offline — `call_tool` runs it on
-  every call.
+  `access_token` with no inner whitespace" (or always true for
+  `AuthType.NONE`). `run_tool` receives the token with surrounding
+  whitespace stripped. Override it for other credential shapes, but keep it
+  offline — `call_tool` runs it on every call.
 - **OAuth**: `build_authorize_url`, `exchange_code`, `refresh_access_token`
   and `revoke_token` run the standard authorization-code flow from `oauth`
   over stdlib `urllib` (JSON or form-encoded token responses, refresh-token

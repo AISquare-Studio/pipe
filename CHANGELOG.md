@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `error_code` and `retry_after`, plus binary `files` as `DataEnvelope`s),
   and the `Toolkit` base class with `tools()`, `get_tool()`,
   `search_tools()` (deterministic keyword ranking), `call_tool()` (never
-  raises; validates arguments against the schema) and `validate_config()`.
+  raises, even on malformed toolkit results; validates arguments against
+  the schema; masks secret config values out of errors) and
+  `validate_config()`.
   Helpers `rank_tools()`, `validate_arguments()` and
   `error_code_for_status()`.
 - Canonical tool failure kinds as `ERROR_*` constants (`ERROR_CODES`):

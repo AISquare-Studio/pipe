@@ -641,3 +641,127 @@ class TestToolkitOAuthMethods:
         )
         assert url.startswith(MOCK_OAUTH.authorize_url + "?")
         assert "code_challenge=ch" in url
+
+
+# --------------------------------------------------------------------------
+# Hardening (tester findings F1, F2, F4)
+# --------------------------------------------------------------------------
+
+
+class _Returns(Toolkit):
+    """Returns whatever ``result`` it was built with."""
+
+    name = "ret"
+    version = "1.0.0"
+
+    def __init__(self, result=None, raise_exc=None) -> None:
+        self.result = result
+        self.raise_exc = raise_exc
+        self.seen_config: dict | None = None
+
+    def tools(self) -> list[ToolSpec]:
+        return [spec("RET_DO")]
+
+    def run_tool(self, tool, arguments, config):
+        self.seen_config = config
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.result
+
+
+class _BadStr(Exception):
+    def __str__(self):
+        raise RuntimeError("str() exploded")
+
+
+class TestMalformedResultsNeverRaise:
+    @pytest.mark.parametrize(
+        "result",
+        [
+            ToolResult(successful=False, error=ValueError("boom")),  # type: ignore[arg-type]
+            ToolResult(successful=False, error=404),  # type: ignore[arg-type]
+            ToolResult(successful=False, error={"code": 404}),  # type: ignore[arg-type]
+            ToolResult(successful=False, error="x", error_code=["rate_limited"]),  # type: ignore[arg-type]
+            ToolResult(successful=False, error="x", error_code={"a": 1}),  # type: ignore[arg-type]
+            ToolResult(successful=False, error="x", error_code=404),  # type: ignore[arg-type]
+            ToolResult(successful=False, error="x", retry_after="soon"),  # type: ignore[arg-type]
+        ],
+    )
+    def test_failed_result_is_normalized(self, result):
+        out = _Returns(result).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.successful is False
+        assert isinstance(out.error, str) and out.error
+        assert out.error_code in ERROR_CODES
+        assert out.retry_after is None or isinstance(out.retry_after, float)
+
+    def test_non_str_error_message_names_type_only(self):
+        out = _Returns(ToolResult(successful=False, error={"secret": "x"})).call_tool(  # type: ignore[arg-type]
+            "RET_DO", {}, {"access_token": "abcdef123"}
+        )
+        assert out.error == "RET_DO failed (dict)"
+
+    def test_success_drops_stray_code_and_delay(self):
+        result = ToolResult(successful=True, data=1, error_code="not_found", retry_after=3.0)
+        out = _Returns(result).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.successful, out.error_code, out.retry_after) == (True, None, None)
+
+    def test_exception_with_raising_str(self):
+        out = _Returns(raise_exc=_BadStr()).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.successful is False and out.error_code == ERROR_UPSTREAM_ERROR
+
+    @pytest.mark.parametrize("slug", [None, 42, ["RET_DO"], "X" * 10_000])
+    def test_garbage_slugs(self, slug):
+        out = _Returns().call_tool(slug, {}, {"access_token": "abcdef123"})  # type: ignore[arg-type]
+        assert out.error_code == ERROR_UNKNOWN_TOOL and len(out.error or "") < 400
+
+
+SECRET = "ghp_SUPERSECRETtoken1234567890"
+
+
+class TestTokenWhitespace:
+    def test_run_tool_gets_stripped_token(self):
+        kit = _Returns(ToolResult.ok(1))
+        assert kit.call_tool("RET_DO", {}, {"access_token": f"  {SECRET}\n"}).successful
+        assert kit.seen_config == {"access_token": SECRET}
+
+    @pytest.mark.parametrize("token", [f"{SECRET[:10]} {SECRET[10:]}", "a\nb-token", "\t\n"])
+    def test_inner_whitespace_is_not_a_valid_token(self, token):
+        out = _Returns(ToolResult.ok(1)).call_tool("RET_DO", {}, {"access_token": token})
+        assert out.error_code == ERROR_UNAUTHORIZED
+
+    def test_header_style_leak_is_masked(self):
+        leak = ValueError(f"Invalid header value b'Bearer {SECRET}\\n'")
+        out = _Returns(raise_exc=leak).call_tool("RET_DO", {}, {"access_token": SECRET + "\n"})
+        assert SECRET not in (out.error or "")
+        assert "***" in (out.error or "")
+
+
+class TestScrubCoverage:
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"x-api-key": SECRET},
+            {"X-API-KEY": SECRET},
+            {"private_key": SECRET},
+            {"privateKey": SECRET},
+            {"signing_key": SECRET},
+            {"Authorization": f"Bearer {SECRET}"},
+            {"session_cookie": SECRET},
+            {"credentials": {"access_token": SECRET}},
+            {"credentials": {"nested": {"value": SECRET}}},
+            {"auth": {"tokens": [SECRET]}},
+            {"profiles": [{"api_key": SECRET}]},
+        ],
+    )
+    def test_secret_values_masked(self, config):
+        config = {"access_token": "abcdef123", **config}
+        out = _Returns(raise_exc=RuntimeError(f"failed with {SECRET} and Bearer {SECRET}")).call_tool(
+            "RET_DO", {}, config
+        )
+        assert SECRET not in (out.error or "")
+
+    def test_non_secret_values_untouched(self):
+        out = _Returns(raise_exc=RuntimeError("folder my-project-folder missing")).call_tool(
+            "RET_DO", {}, {"access_token": "abcdef123", "root_folder": "my-project-folder"}
+        )
+        assert "my-project-folder" in (out.error or "")

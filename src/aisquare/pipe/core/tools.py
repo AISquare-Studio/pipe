@@ -20,7 +20,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -400,7 +400,12 @@ def prepare_arguments(
 # Toolkit
 # --------------------------------------------------------------------------
 
-_SECRET_CONFIG_KEYS = re.compile(r"token|secret|password|api_key|apikey|credential", re.IGNORECASE)
+#: Config keys whose (string) values are masked out of error messages; a
+#: nested mapping/list under such a key is masked wholesale.
+_SECRET_CONFIG_KEYS = re.compile(
+    r"token|secret|passw|credential|authorization|cookie|api[-_]?key|private[-_]?key|key$",
+    re.IGNORECASE,
+)
 
 
 def default_slug_prefix(name: str) -> str:
@@ -483,17 +488,23 @@ class Toolkit(ABC):
         ``ToolResult(successful=False)`` with a human-readable error."""
         started = time.monotonic()
         config = config if isinstance(config, Mapping) else {}
+        label = _slug_label(slug)
         try:
             result = self._call_tool(slug, arguments, config)
         except Exception as e:  # noqa: BLE001 — call_tool never raises
-            result = ToolResult.fail(f"{slug}: internal error ({type(e).__name__})")
-        _normalize_failure(result, slug)
-        if result.error:
-            result.error = _scrub(result.error, config)
+            result = ToolResult.fail(f"{label}: internal error ({type(e).__name__})")
+        try:
+            _normalize_failure(result, label)
+            if result.error:
+                result.error = _scrub(result.error, config)
+        except Exception as e:  # noqa: BLE001 — a malformed result must not escape either
+            result = ToolResult.fail(
+                f"{label}: internal error ({type(e).__name__})", code=ERROR_UPSTREAM_ERROR
+            )
         logger.debug(
             "toolkit %s: %s successful=%s in %.0fms",
             getattr(self, "name", type(self).__name__),
-            slug if isinstance(slug, str) else type(slug).__name__,
+            label,
             result.successful,
             (time.monotonic() - started) * 1000,
         )
@@ -526,8 +537,14 @@ class Toolkit(ABC):
                 "config is missing valid credentials",
                 code=ERROR_UNAUTHORIZED,
             )
+        run_config = dict(config)
+        token = run_config.get("access_token")
+        if isinstance(token, str):
+            # A stored token with stray whitespace (a trailing newline) must not
+            # reach a header verbatim — http.client would echo it in its error.
+            run_config["access_token"] = token.strip()
         try:
-            result = self.run_tool(tool, prepared, dict(config))
+            result = self.run_tool(tool, prepared, run_config)
         except ToolError as e:
             return ToolResult.fail(
                 str(e) or f"{tool.slug} failed", code=e.code, retry_after=e.retry_after
@@ -550,11 +567,16 @@ class Toolkit(ABC):
 
     def validate_config(self, config: dict[str, Any]) -> bool:
         """Cheap, offline shape check (no network): True when ``config`` can
-        authenticate. Default: no auth needed, or a non-empty ``access_token``."""
+        authenticate. Default: no auth needed, or a non-empty ``access_token``
+        without inner whitespace (surrounding whitespace is stripped before
+        ``run_tool`` sees it)."""
         if self.auth_type is AuthType.NONE:
             return True
         token = config.get("access_token") if isinstance(config, Mapping) else None
-        return isinstance(token, str) and bool(token.strip())
+        if not isinstance(token, str):
+            return False
+        token = token.strip()
+        return bool(token) and not any(ch.isspace() for ch in token)
 
     # -- connection (OAuth) ------------------------------------------------
 
@@ -652,23 +674,65 @@ def _redact(text: str) -> str:
     return text
 
 
-def _normalize_failure(result: ToolResult, slug: Any) -> None:
-    """Every failure leaves ``call_tool`` with a message and a canonical
-    ``error_code``; a success carries neither."""
+def _slug_label(slug: Any) -> str:
+    """A short, safe rendering of a (possibly garbage) slug for messages/logs."""
+    return slug[:100] if isinstance(slug, str) else f"<{type(slug).__name__}>"
+
+
+def _normalize_failure(result: ToolResult, label: str) -> None:
+    """Every result leaving ``call_tool`` is well-formed: a failure has a
+    ``str`` message and a canonical ``error_code`` (``retry_after`` a number
+    or None); a success carries neither code nor delay."""
+    result.successful = bool(result.successful)
     if result.successful:
         result.error_code = None
+        result.retry_after = None
         return
+    if result.error is not None and not isinstance(result.error, str):
+        result.error = f"{label} failed ({type(result.error).__name__})"
     if not result.error:
-        result.error = f"{slug} failed"
-    if result.error_code not in ERROR_CODES:
-        if result.error_code is not None:
-            logger.warning("non-canonical error_code %r from %s", result.error_code, slug)
+        result.error = f"{label} failed"
+    code = result.error_code
+    if not (isinstance(code, str) and code in ERROR_CODES):
+        if code is not None:
+            logger.warning("non-canonical error_code (%s) from %s", type(code).__name__, label)
         result.error_code = ERROR_UPSTREAM_ERROR
+    retry = result.retry_after
+    if isinstance(retry, bool) or not isinstance(retry, (int, float)):
+        result.retry_after = None
+
+
+def _secret_values(mapping: Mapping[Any, Any], inherited: bool = False, depth: int = 0) -> Iterator[str]:
+    """String values under secret-looking keys, at any depth (bounded)."""
+    if depth > 5:
+        return
+    for key, value in mapping.items():
+        secret = inherited or bool(_SECRET_CONFIG_KEYS.search(str(key)))
+        items = value if isinstance(value, (list, tuple)) else [value]
+        for item in items:
+            if isinstance(item, str) and secret:
+                yield item
+            elif isinstance(item, Mapping):
+                yield from _secret_values(item, secret, depth + 1)
 
 
 def _scrub(message: str, config: Mapping[str, Any]) -> str:
-    """Mask any secret-looking config value that leaked into an error message."""
-    for key, value in config.items():
-        if isinstance(value, str) and len(value) >= 6 and _SECRET_CONFIG_KEYS.search(str(key)):
-            message = message.replace(value, "***")
+    """Mask secret-looking config values that leaked into an error message —
+    raw, whitespace-stripped/collapsed and escape-sequence forms, plus the
+    credential part of a ``"<scheme> <credential>"`` value (``Bearer x``)."""
+    variants: set[str] = set()
+    for value in _secret_values(config):
+        parts = value.split()
+        variants.update(
+            {
+                value,
+                value.strip(),
+                " ".join(parts),
+                value.encode("unicode_escape").decode("ascii"),
+            }
+        )
+        if len(parts) > 1:
+            variants.add(parts[-1])
+    for variant in sorted((v for v in variants if len(v) >= 6), key=len, reverse=True):
+        message = message.replace(variant, "***")
     return message[:_MAX_ERROR]
