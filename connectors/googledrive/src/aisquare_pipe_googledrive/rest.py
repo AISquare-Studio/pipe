@@ -27,7 +27,8 @@ fails at once, and running out raises a ``timed_out`` error.
 Uploads: :meth:`GoogleDriveRestClient.upload` sends up to
 :data:`MULTIPART_MAX` bytes as one ``multipart/related`` request and anything
 larger (or a stream of unknown size) through a resumable session in
-:data:`CHUNK_SIZE` chunks.
+:data:`CHUNK_SIZE` chunks. A chunk that fails with a 5xx or a dropped
+connection is resumed: back off, ask Google how much it holds, continue.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from __future__ import annotations
 import io
 import json as jsonlib
 import logging
+import math
 import secrets
 import time
 import urllib.parse
@@ -438,8 +440,15 @@ class GoogleDriveRestClient:
             last = not ahead
             total = str(offset + len(chunk)) if last else (str(size) if size is not None else "*")
             stalls = 0
+            failures = 0
             while True:
-                response = self._put_chunk(session_url, chunk, offset, total)
+                resumed = False
+                try:
+                    response = self._put_chunk(session_url, chunk, offset, total)
+                except GoogleDriveAPIError as e:
+                    failures += 1
+                    response, failures = self._resume(session_url, total, e, failures)
+                    resumed = True
                 if response.status_code in (200, 201):
                     return _object(response)
                 # 308 Resume Incomplete: Range says how many bytes Google holds.
@@ -448,7 +457,7 @@ class GoogleDriveRestClient:
                     raise GoogleDriveAPIError(
                         0, "Google Drive upload session lost track of the upload; retry the upload"
                     )
-                if received == offset:
+                if received == offset and not resumed:
                     stalls += 1
                     if stalls > self.max_retries:
                         raise GoogleDriveAPIError(
@@ -463,6 +472,35 @@ class GoogleDriveRestClient:
                     0, "Google Drive upload session ended without returning the file"
                 )
             chunk = ahead
+
+    def _resume(
+        self, session_url: str, total: str, error: GoogleDriveAPIError, failures: int
+    ) -> tuple[requests.Response, int]:
+        """After a chunk PUT failed with a 5xx or a dropped connection: back
+        off, then ask Google how much of the upload it holds (an empty PUT with
+        ``Content-Range: bytes */<total>``) so the upload carries on from
+        there. Bounded by ``max_retries`` per chunk and by the time budget;
+        returns the status answer and the failure count so far."""
+        while True:
+            if not _resumable(error) or failures > self.max_retries:
+                raise error
+            wait = _BACKOFF_BASE * (2 ** (failures - 1))
+            remaining = self._remaining()
+            if remaining is not None and wait + min(MEDIA_TIMEOUT, _REQUEST_ROOM) > remaining:
+                raise error
+            logger.warning(
+                "googledrive: upload chunk failed (HTTP %s), resuming in %.0fs (retry %d/%d)",
+                error.status,
+                wait,
+                failures,
+                self.max_retries,
+            )
+            self._sleep(wait)
+            try:
+                return self._put_chunk(session_url, b"", 0, total), failures
+            except GoogleDriveAPIError as e:
+                error = e
+                failures += 1
 
     def _put_chunk(self, session_url: str, chunk: bytes, offset: int, total: str) -> requests.Response:
         if chunk:
@@ -538,6 +576,14 @@ def _received_bytes(response: requests.Response) -> int:
         return 0
 
 
+def _resumable(error: GoogleDriveAPIError) -> bool:
+    """A chunk failure worth resuming after: a 5xx, or a transport failure
+    (connection reset, read timeout). Rate limits were already retried."""
+    return error.retry_after is None and (
+        error.status == 0 or error.status in _RETRYABLE_SERVER_ERRORS
+    )
+
+
 def _check_upload_session(url: str) -> None:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or (parts.hostname or "").lower() not in _UPLOAD_HOSTS:
@@ -555,7 +601,7 @@ def json_body(response: requests.Response) -> Any:
         return None
     try:
         return response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 — ValueError, or RecursionError on absurd nesting
         raise GoogleDriveAPIError(
             response.status_code, "Google Drive returned a response that is not JSON"
         ) from None
@@ -564,7 +610,7 @@ def json_body(response: requests.Response) -> Any:
 def _error_payload(response: requests.Response) -> dict[str, Any]:
     try:
         body = response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 — any unparseable body (RecursionError included) has no details
         return {}
     error = body.get("error") if isinstance(body, dict) else None
     return error if isinstance(error, dict) else {}
@@ -598,16 +644,50 @@ def is_rate_limited(response: requests.Response) -> bool:
 
 def retry_wait(response: requests.Response, attempt: int) -> float:
     """Seconds to wait before retry ``attempt + 1``: ``Retry-After`` when
-    Google sends one, else exponential backoff (1s, 2s, 4s, ...)."""
+    Google sends a finite one, else exponential backoff (1s, 2s, 4s, ...)."""
     header = response.headers.get("Retry-After")
     if header:
         try:
-            return max(0.0, float(header))
+            seconds = float(header)
         except ValueError:
-            pass
+            seconds = math.nan
+        if math.isfinite(seconds):  # inf / 1e309 / nan would overflow callers' arithmetic
+            return max(0.0, seconds)
     return _BACKOFF_BASE * (2**attempt)
 
 
 def escape_query(value: str) -> str:
     """A value for a single-quoted string in a Drive ``q`` query."""
     return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def group_query(clause: str) -> str:
+    """A caller's Drive query clause as one parenthesised group, safe to AND
+    with a scope (``'<folder>' in parents``). Refused (ValueError) when its
+    parentheses outside quoted strings do not balance, close the group early,
+    or a quoted string is left open — any of which would let the clause
+    escape the group and the scope with it."""
+    depth = 0
+    quoted = False
+    escaped = False
+    for ch in clause:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "'":
+                quoted = False
+        elif ch == "'":
+            quoted = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("query closes a parenthesis it never opened")
+    if quoted:
+        raise ValueError("query leaves a quoted string open")
+    if depth:
+        raise ValueError("query leaves a parenthesis open")
+    return f"({clause})"

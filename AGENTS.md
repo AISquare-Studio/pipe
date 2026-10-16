@@ -73,7 +73,7 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 ## Connector Tiers
 All connectors live in the same `connectors/<name>/` directory; the tier signal is encoded in `pyproject.toml` extras bundles, not in folder location.
 
-- **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`. Installed via `pip install "aisquare-pipe[popular]"`.
+- **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`, `googledrive`. Installed via `pip install "aisquare-pipe[popular]"`.
 - **`[full]`** — Everything in `[popular]` plus the long-tail / enterprise / client-specific connectors. Currently adds `salesforce`, `docusign`. Installed via `pip install "aisquare-pipe[full]"`.
 - **Direct install** — `pip install aisquare-pipe-<name>` always works for any connector regardless of tier.
 

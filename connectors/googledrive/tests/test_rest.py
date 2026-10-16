@@ -451,3 +451,97 @@ class TestReviewFollowUps:
             c.download_bytes("abc", max_bytes=10)
         assert exc.value.timed_out is timed_out
         assert "abc" not in exc.value.message
+
+
+class TestResumeAfterChunkFailure:
+    """PR #39 review m2: a 5xx or a dropped connection on a chunk does not end
+    the upload — the client asks Google how much it holds and carries on."""
+
+    def test_503_on_chunk_two_resumes(self, small_chunks):
+        c, session, sleeps = client(
+            _started(),
+            _incomplete(4),
+            drive_error(503, "Backend Error", "backendError"),
+            _incomplete(4),
+            _incomplete(8),
+            response(200, {"id": "big"}),
+        )
+        assert c.upload(b"0123456789", metadata={}, content_type="text/plain") == {"id": "big"}
+        puts = session.calls[1:]
+        assert [p.headers["Content-Range"] for p in puts] == [
+            "bytes 0-3/10",
+            "bytes 4-7/10",
+            "bytes */10",
+            "bytes 4-7/10",
+            "bytes 8-9/10",
+        ]
+        assert puts[2].data == b""
+        assert all("Authorization" not in p.headers and p.allow_redirects is False for p in puts)
+        assert sleeps == [1.0]
+
+    def test_connection_reset_resumes_from_what_google_holds(self, small_chunks):
+        c, session, sleeps = client(
+            _started(), requests.ConnectionError("reset by peer"), _incomplete(2), _incomplete(4), _incomplete(8), response(201, {"id": "x"})
+        )
+        c.upload(b"0123456789", metadata={}, content_type="text/plain")
+        assert [p.headers["Content-Range"] for p in session.calls[1:]] == [
+            "bytes 0-3/10",
+            "bytes */10",
+            "bytes 2-3/10",
+            "bytes 4-7/10",
+            "bytes 8-9/10",
+        ]
+        assert sleeps == [1.0]
+
+    def test_unknown_size_status_query_says_so(self, small_chunks):
+        c, session, _ = client(_started(), drive_error(502, "Bad Gateway", "backendError"), _incomplete(4), _incomplete(8), response(200, {"id": "s"}))
+        c.upload(io.BytesIO(b"0123456789"), metadata={}, content_type="text/plain")
+        assert [p.headers["Content-Range"] for p in session.calls[1:3]] == ["bytes 0-3/*", "bytes */*"]
+
+    def test_upload_that_completed_despite_the_error_returns_the_file(self, small_chunks):
+        c, session, _ = client(_started(), _incomplete(4), _incomplete(8), requests.ReadTimeout("slow"), response(200, {"id": "done"}))
+        assert c.upload(b"0123456789", metadata={}, content_type="text/plain") == {"id": "done"}
+        assert session.last.headers["Content-Range"] == "bytes */10"
+
+    def test_resumes_are_bounded_by_max_retries(self, small_chunks):
+        failure = drive_error(503, "Backend Error", "backendError")
+        c, session, sleeps = client(_started(), failure, failure, failure, failure)
+        with pytest.raises(GoogleDriveAPIError) as exc:
+            c.upload(b"0123456789", metadata={}, content_type="text/plain")
+        assert exc.value.status == 503
+        assert sleeps == [1.0, 2.0, 4.0]
+        assert len(session.calls) == 5
+
+    def test_progress_resets_the_failure_count(self, small_chunks):
+        failure = drive_error(503, "Backend Error", "backendError")
+        c, _, sleeps = client(
+            _started(),
+            failure, _incomplete(4),  # chunk 1 fails once, then lands
+            failure, _incomplete(8),  # chunk 2 fails once, then lands
+            failure, response(200, {"id": "x"}),  # chunk 3 fails, the query finds it done
+        )
+        assert c.upload(b"0123456789", metadata={}, content_type="text/plain") == {"id": "x"}
+        assert sleeps == [1.0, 1.0, 1.0]
+
+    @pytest.mark.parametrize("status", [400, 403, 404])
+    def test_client_errors_are_not_resumed(self, small_chunks, status):
+        c, session, sleeps = client(_started(), drive_error(status, "no", "badRequest"))
+        with pytest.raises(GoogleDriveAPIError) as exc:
+            c.upload(b"0123456789", metadata={}, content_type="text/plain")
+        assert (exc.value.status, sleeps, len(session.calls)) == (status, [], 2)
+
+    def test_no_resume_when_the_budget_cannot_fit_it(self, small_chunks):
+        clock = {"now": 0.0}
+        session = FakeSession([_started(), drive_error(503, "Backend Error", "backendError")])
+        sleeps: list[float] = []
+        c = GoogleDriveRestClient(TOKEN, session=session, budget=2.5, sleep=sleeps.append, monotonic=lambda: clock["now"])  # type: ignore[arg-type]
+        with pytest.raises(GoogleDriveAPIError) as exc:
+            c.upload(b"0123456789", metadata={}, content_type="text/plain")
+        assert exc.value.status == 503
+        assert sleeps == []
+
+    def test_query_answer_behind_the_confirmed_offset_is_an_error(self, small_chunks):
+        c, _, _ = client(_started(), _incomplete(4), drive_error(503, "x", "backendError"), _incomplete(2))
+        with pytest.raises(GoogleDriveAPIError) as exc:
+            c.upload(b"0123456789", metadata={}, content_type="text/plain")
+        assert "lost track" in exc.value.message

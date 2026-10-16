@@ -257,3 +257,34 @@ class TestConfigAndResources:
         src, _, _ = source()
         with pytest.raises(ConfigValidationError):
             src.list_resources({})
+
+
+class TestReviewRound:
+    def test_non_finite_retry_after_is_a_pipeline_error(self):
+        limited = [drive_error(429, "slow", "rateLimitExceeded", headers={"Retry-After": "inf"}) for _ in range(4)]
+        src, _, sleeps = source(*limited)
+        with pytest.raises(PipelineError, match="retry in about 8s"):
+            pull(src)
+        assert sleeps == [1.0, 2.0, 4.0]
+
+    def test_query_is_anded_as_one_group(self):
+        src, session, _ = source(files())
+        pull(src, folder_id="FOLDER_A", query="(mimeType = 'application/pdf') or (name contains 'secret')")
+        assert session.last.params["q"] == files_q(
+            "FOLDER_A", "((mimeType = 'application/pdf') or (name contains 'secret'))"
+        )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "mimeType = 'application/pdf') or (name contains 'secret'",
+            "name contains 'a'))",
+            "(name contains 'a'",
+            "name contains 'unterminated",
+        ],
+    )
+    def test_query_that_escapes_its_group_is_refused(self, query):
+        src, session, _ = source()
+        with pytest.raises(ValueError, match="query"):
+            pull(src, folder_id="FOLDER_A", query=query)
+        assert session.calls == []

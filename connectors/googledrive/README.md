@@ -38,6 +38,13 @@ revokes the user's whole grant to your OAuth client: Google has no narrower
 per-token revocation, so two connections made by the same Google user for the
 same OAuth client end together.
 
+**Other Google toolkits need their own OAuth client.** `include_granted_scopes=true`
+merges every scope a user has granted to an OAuth client into each new token.
+So if a future Gmail or Google Calendar port reused this Drive client, a Drive
+token would carry their scopes, and a Drive disconnect (a grant-wide revoke)
+would end those connections too. Give each Google toolkit its own OAuth client,
+or drop `include_granted_scopes` there.
+
 **Scope and Google verification.** The default `drive` scope (full access to
 every file) is a Google **restricted** scope. A production app that requests it
 must pass Google's OAuth app verification *and* an annual third-party security
@@ -93,7 +100,11 @@ unless `fields` asks for others.
 (`name contains 'roadmap' and trashed = false`). Plain words become a
 full-text search and a bare email an owner search. Searches cover My Drive,
 shared-with-me and every shared drive (`corpora=allDrives`); `driveId`
-narrows to one shared drive.
+narrows to one shared drive. With `folder_id` / `folderId` the caller's `q`
+is ANDed with the folder scope as one parenthesised group. A `q` that could
+escape that group fails with `invalid_arguments` before any request: unbalanced
+parentheses outside quoted strings, a `)` that closes early, or an unclosed
+quote. A `q` without a folder is sent verbatim.
 
 **Downloads.** `GOOGLEDRIVE_DOWNLOAD_FILE` and
 `GOOGLEDRIVE_EXPORT_GOOGLE_WORKSPACE_FILE` put the bytes in `ToolResult.files`
@@ -109,7 +120,11 @@ Google caps exports at 10 MB.
 **Uploads.** `GOOGLEDRIVE_UPLOAD_FILE` takes the bytes base64-encoded in
 `file_to_upload.file_content_bytes`. Composio's `s3key` names Composio's own
 storage and is not supported. Up to 5 MB goes as one multipart request, more
-through a resumable session.
+through a resumable session in 8 MiB chunks. A chunk that fails with a
+500/502/503/504 or a dropped connection does not end the upload. The client
+backs off (1 s, 2 s, 4 s; up to 3 times per chunk, within the time budget),
+asks Google how much it holds (`Content-Range: bytes */<total>`), and carries
+on from there.
 
 **Errors.** A failed call carries core's canonical `error_code` (branch on
 this), a human-readable `error` (`"<status>: <Google's message>"` plus a
@@ -132,7 +147,9 @@ Core adds `unknown_tool`, `invalid_arguments` (schema) and `unauthorized`
 (no `access_token`) before a request is made.
 
 **Rate limits and retries.** Rate limits (above) are retried up to 3 times
-with exponential backoff (1 s, 2 s, 4 s; `Retry-After` when Google sends one),
+with exponential backoff (1 s, 2 s, 4 s; or Google's `Retry-After` when it is a
+finite number of seconds; `inf`, `nan` or an overflowing value falls back to
+the backoff),
 on any method, since Google did not process the request. A 500/502/503/504 is
 retried the same way on GETs only. Total sleep per call is capped at 60 s; a
 longer wait fails at once with `retry_after`. Tune with

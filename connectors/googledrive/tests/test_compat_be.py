@@ -13,8 +13,10 @@ with Composio slugs (AISquare-Studio-BE
 * download: ``GOOGLEDRIVE_DOWNLOAD_FILE`` with ``{"file_id": <id>}`` plus
   ``"mime_type": <export mime>`` for Google-native files; it needs the bytes.
 
-The BE helpers are mirrored here verbatim (``_be_*``) so a drift on either
-side fails this file. The bytes travel in ``ToolResult.files``; the pipeAAS
+The BE helpers are copied here verbatim (``_be_*``), as of the BE revision
+read for this PR. This file fails when the toolkit stops accepting those
+arguments or stops returning those fields. It cannot see a later BE change,
+so update the copies when ``connector_import.py`` changes. The bytes travel in ``ToolResult.files``; the pipeAAS
 ``/fetch`` route serializes them (``s3url`` / ``file_content_bytes`` are what
 the BE's ``_extract_bytes`` reads) — that mapping is pipeAAS's side of the
 contract.

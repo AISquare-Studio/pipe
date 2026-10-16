@@ -73,7 +73,9 @@ def describe_error(error: GoogleDriveAPIError) -> str:
             "refresh it, or the Google Drive connection must be reconnected"
         )
     if error.retry_after is not None:
-        return f"{text} — Google Drive rate limit; retry in about {math.ceil(error.retry_after)}s"
+        seconds = whole_seconds(error.retry_after)
+        when = f"in about {seconds:.0f}s" if seconds is not None else "later"
+        return f"{text} — Google Drive rate limit; retry {when}"
     if error.status == 403:
         return (
             f"{text} — this Google Drive connection is not allowed to do that (missing scope, "
@@ -101,6 +103,14 @@ def error_code(error: GoogleDriveAPIError) -> str:
     return error_code_for_status(error.status)
 
 
+def whole_seconds(value: float | None) -> float | None:
+    """``value`` rounded up to whole seconds; None when absent or not finite
+    (``math.ceil`` of inf raises)."""
+    if value is None or not math.isfinite(value):
+        return None
+    return float(math.ceil(value))
+
+
 def failure(error: GoogleDriveAPIError) -> ToolResult:
     """A failed ToolResult: message, canonical ``error_code``, ``retry_after``
     (whole seconds) on a rate limit, and ``data={"status", "reason"}`` when
@@ -114,7 +124,7 @@ def failure(error: GoogleDriveAPIError) -> ToolResult:
         describe_error(error),
         data=data,
         code=error_code(error),
-        retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
+        retry_after=whole_seconds(error.retry_after),
     )
 
 

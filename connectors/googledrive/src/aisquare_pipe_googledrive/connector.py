@@ -39,6 +39,7 @@ from aisquare_pipe_googledrive.rest import (
     GoogleDriveAPIError,
     GoogleDriveRestClient,
     escape_query,
+    group_query,
     json_body,
 )
 from aisquare_pipe_googledrive.toolkit import describe_error, error_code
@@ -227,7 +228,7 @@ class GoogleDriveSource(_Connector, SourceConnector):
         if options.get("modified_after"):
             filters.append(f"modifiedTime > '{escape_query(str(options['modified_after']))}'")
         if options.get("query"):
-            filters.append(f"({options['query']})")
+            filters.append(group_query(str(options["query"])))
 
         count = 0
         with self._client(token) as client:

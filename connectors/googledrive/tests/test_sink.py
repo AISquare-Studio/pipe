@@ -211,3 +211,14 @@ class TestPushFailures:
         assert snk.validate_config({}) is False
         assert snk.validate_config(CONFIG) is True
         assert session.calls == []
+
+
+class TestReviewRound:
+    @pytest.mark.parametrize("value", ["inf", "1e309", "nan"])
+    def test_non_finite_retry_after_never_raises(self, value):
+        limited = [drive_error(429, "slow", "rateLimitExceeded", headers={"Retry-After": value}) for _ in range(4)]
+        snk, _, sleeps = sink(*limited)
+        result = push(snk)
+        assert result.success is False
+        assert result.metadata == {"status": 429, "error_code": "rate_limited", "retry_after": 8.0}
+        assert sleeps == [1.0, 2.0, 4.0]

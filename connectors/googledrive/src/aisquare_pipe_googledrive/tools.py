@@ -56,6 +56,7 @@ from aisquare_pipe_googledrive.rest import (
     GoogleDriveAPIError,
     GoogleDriveRestClient,
     escape_query,
+    group_query,
     json_body,
     quote_id,
 )
@@ -88,9 +89,12 @@ DRIVE_FIELDS = "id,name,createdTime,hidden"
 #: Text content becomes these Google types on upload (Drive converts on import).
 _TEXT_IMPORTS = {DOCUMENT: "text/plain", SPREADSHEET: "text/csv"}
 
-# A Drive query (vs. bare search text): a comparison or a Drive operator.
+# A Drive query (vs. bare search text): a comparison or an operator in its
+# Drive form (contains '…', has { … }, '…' in parents) — the bare words
+# "has" / "contains" in search text do not count.
 _QUERY_SYNTAX = re.compile(
-    r"[=<>]|\b(contains|has)\b|\bin\s+(parents|owners|writers|readers)\b", re.IGNORECASE
+    r"[=<>]|\bcontains\s*'|\bhas\s*\{|'\s*in\s+(parents|owners|writers|readers)\b",
+    re.IGNORECASE,
 )
 _EMAIL = re.compile(r"^[^@\s'\"\\]+@[^@\s'\"\\]+\.[^@\s'\"\\]+$")
 # Ids inside Drive/Docs URLs: /d/<id>, /folders/<id>, ?id=<id>.
@@ -285,10 +289,16 @@ def _list_fields(fields: Any, collection: str, default: str, *, extra: str = "")
 
 
 def _and(*clauses: str) -> str:
-    present = [c for c in clauses if c]
-    if len(present) == 1:
-        return present[0]
-    return " and ".join(f"({c})" if " or " in c.lower() else c for c in present)
+    """Our own clauses joined; a caller's query goes through :func:`_scoped` first."""
+    return " and ".join(c for c in clauses if c)
+
+
+def _scoped(q: str) -> str:
+    """A caller's ``q`` as one group, so ANDing a folder scope binds to all of it."""
+    try:
+        return group_query(q)
+    except ValueError as e:
+        raise _invalid(f"q cannot be limited to the folder: {e}") from None
 
 
 def search_query(q: Any) -> str:
@@ -364,6 +374,8 @@ def _list_call(client: GoogleDriveRestClient, args: dict[str, Any], q: str, *, f
     folder = args.get(folder_key)
     clauses = [q or "trashed = false"]
     if folder:
+        if q:
+            clauses = [_scoped(q)]
         clauses.append(f"'{escape_query(folder)}' in parents")
     params: dict[str, Any] = {
         "q": _and(*clauses),

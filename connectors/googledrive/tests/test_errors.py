@@ -346,3 +346,46 @@ class TestConcurrency:
             for i, name, path in pool.map(run, range(1, 33)):
                 assert name == f"n{i}"
                 assert path == f"/files/file{i:04d}"
+
+
+# --------------------------------------------------------------------------
+# PR #39 review round: hostile Retry-After values and error bodies
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["inf", "1e309", "Infinity", "-inf", "nan", "1" * 400])
+def test_non_finite_retry_after_falls_back_to_backoff(value):
+    h = harness(*_retry_after(4, value))
+    result = h.call(*GET)
+    assert result.error_code == "rate_limited"
+    assert result.retry_after == 8.0
+    assert h.sleeps == [1.0, 2.0, 4.0]
+    assert "retry in about 8s" in result.error
+    assert result.data == {"status": 429, "reason": "rateLimitExceeded"}
+
+
+DEEP = b"[" * 200_000 + b"]" * 200_000
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(401, "unauthorized"), (404, "not_found"), (403, "forbidden"), (500, "upstream_error")],
+)
+def test_deeply_nested_error_body_keeps_its_status(status, code):
+    h = harness(response(status, content=DEEP, content_type="application/json"))
+    result = h.call(*POST)
+    assert result.error_code == code
+    assert result.error.startswith(f"{status}: ")
+    assert result.data == {"status": status}
+
+
+def test_deeply_nested_429_is_still_rate_limited():
+    h = harness(*[response(429, content=DEEP, content_type="application/json") for _ in range(4)])
+    result = h.call(*GET)
+    assert (result.error_code, result.retry_after) == ("rate_limited", 8.0)
+
+
+def test_deeply_nested_success_body_is_a_clean_upstream_error():
+    result = harness(response(200, content=DEEP, content_type="application/json")).call(*GET)
+    assert result.error_code == "upstream_error"
+    assert "not JSON" in result.error

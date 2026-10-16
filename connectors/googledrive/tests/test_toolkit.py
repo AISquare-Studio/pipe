@@ -17,7 +17,7 @@ from aisquare_pipe_googledrive.rest import (
     SHORTCUT_MIME,
     GoogleDriveAPIError,
 )
-from aisquare_pipe_googledrive.toolkit import describe_error
+from aisquare_pipe_googledrive.toolkit import describe_error, failure
 from aisquare_pipe_googledrive.tools import (
     INLINE_TEXT_MAX,
     apply_aliases,
@@ -472,3 +472,71 @@ class TestDownloadCap:
         result = h.call("GOOGLEDRIVE_DOWNLOAD_FILE", {"fileId": "file123"})
         assert result.error_code == "invalid_arguments"
         assert len(h.session.calls) == 1
+
+
+class TestQueryIsolation:
+    """A caller's q is ANDed with the folder scope as one group, and a q that
+    could break out of its group is refused before any request."""
+
+    @pytest.mark.parametrize(
+        ("slug", "folder_arg"), [("GOOGLEDRIVE_FIND_FILE", "folder_id"), ("GOOGLEDRIVE_LIST_FILES", "folderId")]
+    )
+    @pytest.mark.parametrize("sep", [" ", "\n", "\t"])
+    def test_or_query_stays_inside_the_folder(self, slug, folder_arg, sep):
+        q = f"name contains 'a'{sep}or{sep}name contains 'b'"
+        h = harness(response(200, {"files": []}))
+        h.call(slug, {"q": q, folder_arg: "FOLDER_A1234"})
+        assert h.session.last.params["q"] == f"({q}) and 'FOLDER_A1234' in parents"
+
+    @pytest.mark.parametrize(
+        "q",
+        [
+            "name contains 'a') or (name contains 'b'",
+            "name contains 'a'))",
+            "((name contains 'a'",
+            "name contains 'unterminated",
+            "name = 'it\\'s",
+        ],
+    )
+    def test_query_that_escapes_its_group_is_refused(self, q):
+        h = harness()
+        result = h.call("GOOGLEDRIVE_FIND_FILE", {"q": q, "folder_id": "FOLDER_A1234"})
+        assert result.error_code == "invalid_arguments"
+        assert "q" in result.error
+        assert h.session.calls == []
+
+    def test_parentheses_inside_quotes_do_not_count(self):
+        h = harness(response(200, {"files": []}))
+        h.call("GOOGLEDRIVE_FIND_FILE", {"q": "name contains ')(' and name contains 'it\\'s ('", "folder_id": "F1234567890"})
+        assert h.session.last.params["q"] == "(name contains ')(' and name contains 'it\\'s (') and 'F1234567890' in parents"
+
+    def test_query_alone_is_sent_verbatim(self):
+        h = harness(response(200, {"files": []}))
+        h.call("GOOGLEDRIVE_FIND_FILE", {"q": "name contains 'a' or name contains 'b'"})
+        assert h.session.last.params["q"] == "name contains 'a' or name contains 'b'"
+
+    @pytest.mark.parametrize(
+        ("q", "expected"),
+        [
+            ("what has changed", "fullText contains 'what has changed' and trashed = false"),
+            ("contains budget", "fullText contains 'contains budget' and trashed = false"),
+            ("files in parents folder", "fullText contains 'files in parents folder' and trashed = false"),
+            ("name contains 'x'", "name contains 'x'"),
+            ("properties has { key='a' and value='b' }", "properties has { key='a' and value='b' }"),
+            ("'abc' in parents", "'abc' in parents"),
+            ("trashed=false", "trashed=false"),
+        ],
+    )
+    def test_only_operator_forms_count_as_a_query(self, q, expected):
+        assert search_query(q) == expected
+
+
+class TestWholeSeconds:
+    def test_non_finite_retry_after_is_reported_without_a_number(self):
+        error = GoogleDriveAPIError(429, "slow", retry_after=float("inf"))
+        assert describe_error(error).endswith("Google Drive rate limit; retry later")
+        result = failure(error)
+        assert (result.error_code, result.retry_after) == ("rate_limited", None)
+
+    def test_finite_retry_after_rounds_up(self):
+        assert failure(GoogleDriveAPIError(429, "slow", retry_after=2.1)).retry_after == 3.0
