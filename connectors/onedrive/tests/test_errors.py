@@ -450,3 +450,75 @@ def test_a_next_link_the_tool_would_refuse_is_not_offered(next_link):
     h = harness(response(200, {"value": [], "@odata.nextLink": f"https://graph.microsoft.com/v1.0{next_link}"}))
     data = h.call("ONE_DRIVE_LIST_FOLDER_CHILDREN", {}).data
     assert (data["has_more"], data["next_page_token"]) == (True, None)
+
+
+# Round 2 (tester seq 1642, ruling seq 1645): a token is judged on its
+# percent-DECODED path. requests turns %2e back into '.', and drops a
+# '#fragment', so neither may sneak a traversal past the drive-root and
+# listing-kind checks.
+ENCODED_PAGE_TOKENS = [
+    "/me/drive/%2e%2e/%2e%2e/me/messages#/children",
+    "/drives/x/%2e%2e/%2e%2e/users/ana@contoso.com/messages#/children",
+    "/me/drive/%2E%2E/%2e%2E/me/messages/children",  # a real /children end, traversal before it
+    "/me/drive/.%2e/.%2e/me/messages/children",
+    "/me/drive/%2e/root/children",
+    "/me/drive/items/x%2F..%2F..%2F..%2Fme%2Fmessages%2Fchildren",  # encoded slashes
+    "/me/drive/items%2F01A/children",
+    "/me/drive/%252e%252e/%252e%252e/me/messages/children",  # double-encoded dots
+    "/me/drive/items/01A%5C..%5C..%5Cme/children",  # encoded backslashes
+    "/me/drive/items/01A%3F/children",  # an encoded '?' in the path
+    "/me/drive/items/01A%00/children",  # a control character
+    "#/children",
+    "/me/drive/root/children#",
+    "/me/drive/root/children?$skiptoken=a#b",
+    "//graph.example.net/me/drive/root/children",
+]
+
+
+@pytest.mark.parametrize("token", ENCODED_PAGE_TOKENS)
+def test_encoded_traversal_and_fragments_are_refused(token):
+    h = harness()
+    result = h.call("ONE_DRIVE_LIST_FOLDER_CHILDREN", {"page_token": token})
+    assert result.error_code == "invalid_arguments"
+    assert h.session.calls == []
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "/me/drive/root/search(q='a%20b')?$skiptoken=X",
+        "/me/drive/root/search(q='Ana%27%27s%20plan')?$top=5&$skiptoken=X",
+        "/drives/b!d/root/search(q='r%C3%A9sum%C3%A9')?$skiptoken=X",
+    ],
+)
+def test_search_tokens_with_an_encoded_query_still_work(token):
+    h = harness(response(200, {"value": []}))
+    assert h.call("ONE_DRIVE_SEARCH_ITEMS", {"q": "x", "page_token": token}).successful
+    assert h.session.last.path == token
+
+
+def test_search_token_with_an_encoded_hash_or_question_mark_is_refused():
+    # Ruling seq 1645: no decoded '?' or '#' anywhere in the path.
+    for token in ("/me/drive/root/search(q='a%23b')?$skiptoken=X", "/me/drive/root/search(q='a%3Fb')?$skiptoken=X"):
+        h = harness()
+        assert h.call("ONE_DRIVE_SEARCH_ITEMS", {"q": "x", "page_token": token}).error_code == "invalid_arguments"
+        assert h.session.calls == []
+
+
+def test_encoded_search_round_trips():
+    next_link = "https://graph.microsoft.com/v1.0/me/drive/root/search(q='quarterly%20report')?$top=2&$skiptoken=X"
+    h = harness(response(200, {"value": [], "@odata.nextLink": next_link}), response(200, {"value": []}))
+    first = h.call("ONE_DRIVE_SEARCH_ITEMS", {"q": "quarterly report", "top": 2}).data
+    assert first["next_page_token"] == next_link.removeprefix("https://graph.microsoft.com/v1.0")
+    assert h.call("ONE_DRIVE_SEARCH_ITEMS", {"q": "quarterly report", "page_token": first["next_page_token"]}).successful
+    assert h.session.last.url == next_link
+
+
+@pytest.mark.parametrize(
+    ("seconds", "shown"),
+    [(float("inf"), 3600.0), (float("-inf"), 3600.0), (float("nan"), 3600.0), (-3.0, 0.0), (2.1, 3.0), (1e9, 3600.0)],
+)
+def test_retry_seconds_never_raises(seconds, shown):
+    from aisquare_pipe_onedrive.toolkit import retry_seconds
+
+    assert retry_seconds(seconds) == shown

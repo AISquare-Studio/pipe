@@ -65,6 +65,8 @@ _DEFAULT_TOP = 50
 _MAX_TOP = 200
 #: The drive root a page token (a nextLink minus the API base) must start at.
 _PAGE_DRIVE_ROOT = re.compile(r"/(?:me/drive|drives/[^/?#]+)/")
+#: A decoded path that still encodes a separator or dot (double encoding).
+_STILL_ENCODED = re.compile(r"%(?:2e|2f|5c|3f|23)", re.IGNORECASE)
 #: How each paged listing's path ends, so a token only continues its own
 #: kind. Functions may come back namespace-qualified ('microsoft.graph.recent()').
 _PAGE_KINDS = {
@@ -303,14 +305,30 @@ def clean(value: Any) -> Any:
 
 def _is_page_token(token: str, kind: str) -> bool:
     """A Graph path under a drive root (``/me/drive/...`` or
-    ``/drives/{id}/...``) whose listing is ``kind``, with no dot segments."""
-    path = token.split("?", 1)[0]
+    ``/drives/{id}/...``) whose listing is ``kind``, optionally with a query.
+
+    Every check runs on the percent-DECODED path, because that is what the
+    server acts on: requests turns ``%2e`` back into ``.`` and drops a
+    ``#fragment``, so ``/me/drive/%2e%2e/%2e%2e/me/messages#/children`` would
+    otherwise pass as a folder listing and fetch mail. Refused: a fragment
+    (any ``#``), a scheme or host, an encoded ``/`` (the decoded path has
+    more segments than the raw one), empty, ``.`` or ``..`` segments,
+    backslashes, decoded ``?`` / ``#`` / control characters, and a second
+    layer of encoding (``%252e``)."""
+    if "#" in token or "\\" in token or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in token):
+        return False
+    parts = urllib.parse.urlsplit(token)
+    if parts.scheme or parts.netloc or not parts.path.startswith("/"):
+        return False
+    path = urllib.parse.unquote(parts.path)
+    segments = path.split("/")[1:]
     return (
-        _PAGE_DRIVE_ROOT.match(path) is not None
+        len(segments) == len(parts.path.split("/")[1:])
+        and all(seg and seg not in (".", "..") for seg in segments)
+        and not any(ch in "\\?#" or ord(ch) < 32 or ord(ch) == 127 for ch in path)
+        and _STILL_ENCODED.search(path) is None
+        and _PAGE_DRIVE_ROOT.match(path) is not None
         and _PAGE_KINDS[kind].search(path) is not None
-        and "\\" not in token
-        and not any(ch.isspace() or ord(ch) < 32 for ch in token)
-        and not any(seg in (".", "..") for seg in path.split("/"))
     )
 
 
