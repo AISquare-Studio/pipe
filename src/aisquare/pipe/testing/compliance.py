@@ -148,6 +148,9 @@ def toolkit_compliance_suite(toolkit_class: type) -> type:
         def test_search_tools(self):
             _assert_checks(self, validation.check_toolkit_search(self.toolkit_cls))
 
+        def test_available_tools(self):
+            _assert_checks(self, validation.check_toolkit_available_tools(self.toolkit_cls))
+
         def test_call_unknown_tool(self):
             _assert_checks(self, validation.check_toolkit_call_unknown(self.toolkit_cls))
 

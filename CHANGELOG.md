@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Toolkit.available_tools(config=None)`: the tools a connection with that
+  config may call, so hosts can list only those to a model. It returns
+  every tool (`tools()`) unless a toolkit overrides it.
+  `search_tools(query, limit, *, config=None)` now ranks
+  `available_tools(config)`. Existing calls without `config` behave as before.
+  `get_tool` and `call_tool` are unchanged, and `call_tool` still enforces
+  on its own. A toolkit that overrides `search_tools` must accept
+  `*, config=None`. An `available_tools` override returns a subset of
+  `tools()` and never raises; for an unreadable config it returns `[]`. The
+  new contract check `contract.toolkit.available-tools` (run by
+  `pipe validate` and the toolkit compliance suite) verifies this for
+  `None` and `{}`.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added

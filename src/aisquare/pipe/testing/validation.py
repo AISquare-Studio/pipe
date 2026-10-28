@@ -738,6 +738,38 @@ def check_toolkit_search(cls: type) -> list[CheckResult]:
     ]
 
 
+def check_toolkit_available_tools(cls: type) -> list[CheckResult]:
+    """``available_tools(None)`` and ``available_tools({})`` run offline,
+    don't raise, and return a list of ToolSpec drawn from the catalog (each
+    one resolvable through ``get_tool``)."""
+    check_id = "contract.toolkit.available-tools"
+    inst = cls()
+    problems: list[str] = []
+    for label, config in (("None", None), ("{}", {})):
+        error: Exception | None = None
+        listed: Any = None
+        with no_network() as log:
+            try:
+                listed = inst.available_tools(config)
+            except Exception as e:  # noqa: BLE001 — reported below
+                error = e
+        if log.attempts:  # before the error: the guard raises on a blocked dial
+            problems.append(f"network in available_tools({label}): {log.attempts[0]}")
+            continue
+        if error is not None:
+            problems.append(f"available_tools({label}) raised {type(error).__name__}: {error}")
+            continue
+        if not isinstance(listed, list) or not all(isinstance(t, ToolSpec) for t in listed):
+            problems.append(f"available_tools({label}) must return a list of ToolSpec")
+            continue
+        stray = [t.slug for t in listed if inst.get_tool(t.slug) != t]
+        if stray:
+            problems.append(
+                f"available_tools({label}) lists tools outside the catalog: {', '.join(map(str, stray[:5]))}"
+            )
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
 def _is_https(url: Any) -> bool:
     return isinstance(url, str) and url.startswith("https://") and len(url) > len("https://")
 
@@ -808,6 +840,7 @@ def _run_toolkit_contract_checks(cls: type, entry_point_name: str | None) -> lis
     results += check_toolkit_schemas(cls)
     results += check_toolkit_descriptions(cls)
     results += check_toolkit_search(cls)
+    results += check_toolkit_available_tools(cls)
     results += check_toolkit_call_unknown(cls)
     results += check_toolkit_call_no_creds(cls)
     results += check_toolkit_validate_config(cls)
