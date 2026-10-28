@@ -271,6 +271,10 @@ def resolve_channel(call: SlackCall, value: Any, *, archived: bool = False) -> s
         {"types": "public_channel,private_channel", "exclude_archived": not archived},
     ):
         matches += [str(c["id"]) for c in page if c.get("name") == name and c.get("id")]
+    if not matches and _ID.match(text):
+        # An all-caps value with no channel of that name is an ID — even when
+        # the scan was capped, since channel names are never uppercase.
+        return text
     if cursor is not None:
         # The scan stopped at its cap: a later page could hold another
         # '#name' (Enterprise Grid), so even one match is not an answer.
@@ -284,8 +288,6 @@ def resolve_channel(call: SlackCall, value: Any, *, archived: bool = False) -> s
             "(find it with SLACK_FIND_CHANNELS)"
         )
     if not matches:
-        if _ID.match(text):
-            return text
         raise ToolError(
             f"no channel named '#{name}' among the channels this Slack connection can see — check "
             "the name or pass the channel ID (SLACK_FIND_CHANNELS)",
@@ -669,8 +671,14 @@ def _find_users(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     query = arguments.get("search_query")
     locale = arguments.get("include_locale")
     if email:
-        payload = call.call("users.lookupByEmail", {"email": email})
-        user = payload.get("user")
+        # Nobody with that email is "found nobody" (members []), the same
+        # shape as an unknown ID or an unmatched name.
+        try:
+            user = call.call("users.lookupByEmail", {"email": email}).get("user")
+        except SlackAPIError as e:
+            if e.error not in ("users_not_found", "user_not_found"):
+                raise
+            user = None
         return ToolResult.ok({"has_more": False, "next_cursor": None, "members": [user] if user else []})
     if not isinstance(query, str) or not query.strip():
         raise _invalid("pass search_query (a name, display name or user ID) or email")

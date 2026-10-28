@@ -459,6 +459,23 @@ class TestChannelNames:
         assert h.session.methods == ["conversations.list", "chat.postMessage"]
         assert h.session.last.args["channel"] == C
 
+    def test_a_capped_scan_still_takes_an_unmatched_id(self):
+        # More than 2,000 visible channels and no '#cabcdefgh': the caller did
+        # pass an ID, so it is used.
+        pages = [channels_page({"id": f"C0{i}XXXXX", "name": f"c{i}"}, cursor=f"n{i}") for i in range(10)]
+        h = harness(*pages, ok())
+        assert h.call("SLACK_SEND_MESSAGE", {"channel": "CABCDEFGH", "markdown_text": "hi"}).successful
+        assert h.session.methods == ["conversations.list"] * 10 + ["chat.postMessage"]
+        assert h.session.last.args["channel"] == "CABCDEFGH"
+
+    def test_a_capped_scan_with_a_match_still_refuses_an_all_caps_value(self):
+        pages = [channels_page({"id": "C1AAAAAA1", "name": "general"}, cursor="n0")] + [
+            channels_page({"id": f"C0{i}XXXXX", "name": f"c{i}"}, cursor=f"n{i}") for i in range(1, 10)
+        ]
+        result = harness(*pages).call("SLACK_SEND_MESSAGE", {"channel": "GENERAL", "markdown_text": "hi"})
+        assert result.error_code == "invalid_arguments"
+        assert "could not check every channel" in result.error
+
     def test_an_all_caps_value_that_names_no_channel_is_an_id(self):
         # Slack doesn't promise a digit in IDs; channel names are never uppercase.
         h = harness(channels_page({"id": C, "name": "general"}), ok())
@@ -566,6 +583,26 @@ class TestComposites:
         assert h.session.methods == ["users.list", "users.info"]
         assert h.session.last.args == {"user": "USLACKBOT"}
         assert result.data["members"] == [slackbot]
+
+    @pytest.mark.parametrize(
+        "args, replies",
+        [
+            ({"email": "nobody@acme.test"}, [slack_error("users_not_found")]),
+            ({"search_query": "U0NOPE123"}, [slack_error("user_not_found")]),
+            ({"search_query": "UNOBODYXX"}, [ok(members=[]), slack_error("user_not_found")]),
+            ({"search_query": "zelda"}, [ok(members=[{"id": "U0123456", "name": "sam"}])]),
+        ],
+        ids=["email", "id", "digitless-id", "name"],
+    )
+    def test_find_users_reports_nobody_one_way(self, args, replies):
+        result = harness(*replies).call("SLACK_FIND_USERS", args)
+        assert result.successful, result.error
+        assert result.data == {"has_more": False, "next_cursor": None, "members": []}
+
+    def test_find_users_by_email_still_surfaces_other_failures(self):
+        assert harness(slack_error("invalid_auth")).call("SLACK_FIND_USERS", {"email": "a@b.test"}).error_code == (
+            "unauthorized"
+        )
 
     def test_find_users_unknown_digitless_id_finds_nobody(self):
         h = harness(ok(members=[]), slack_error("user_not_found"))
