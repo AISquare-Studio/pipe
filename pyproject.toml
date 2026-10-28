@@ -40,6 +40,7 @@ popular = [
     "aisquare-pipe-local",
     "aisquare-pipe-dropbox",
     "aisquare-pipe-onedrive",
+    "aisquare-pipe-googledrive",
 ]
 full = [
     "aisquare-pipe[popular]",
