@@ -614,7 +614,9 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
   signature (`HMAC-SHA256` over `v0:<ts>:<raw body>`, with `<ts>` the header exactly
   as sent, compared in constant time) in one call,
   so a host can't skip the replay check. Headers are matched case-insensitively
-  (a mapping, or ASGI-style `(name, value)` pairs). It raises
+  in a mapping, anything with `items()` (`http.server`'s `http.client.HTTPMessage`,
+  `email.message.Message`, multi-dicts), or ASGI-style `(name, value)` pairs; a
+  headers object that fails to read counts as missing headers. It raises
   `SlackSignatureError` with a `reason`: `missing_timestamp`, `missing_signature`,
   `bad_timestamp`, `stale_timestamp`, `bad_signature`, `bad_body`,
   `no_signing_secret`. Pass the **raw** body bytes: a re-serialized JSON body no

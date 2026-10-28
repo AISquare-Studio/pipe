@@ -238,6 +238,36 @@ class TestVerifyRequest:
         message["x-slack-signature"] = "v0=" + "0" * 64  # a second, different value
         assert self._reason(message, body) == "missing_signature"
 
+    class _Broken:
+        """A headers object that fails to read: items() raises, or needs args."""
+
+        def __init__(self, error: Exception) -> None:
+            self.error = error
+
+        def items(self):
+            raise self.error
+
+    class _BrokenAttribute:
+        @property
+        def items(self):
+            raise RuntimeError("boom")
+
+    @pytest.mark.parametrize(
+        "given",
+        [_Broken(RuntimeError("boom")), _Broken(TypeError("items() takes 2 arguments")), _BrokenAttribute(),
+         [("X-Slack-Signature", type("Bad", (), {"__str__": lambda self: 1 / 0})())]],
+        ids=["items-raises", "items-needs-args", "items-property-raises", "value-str-raises"],
+    )
+    def test_unreadable_headers_fail_closed(self, given):
+        # Never a raw exception (a 500): a 401 like any request Slack didn't sign.
+        body = body_of("app_mention")
+        assert events.header(given, "X-Slack-Signature") is None
+        with pytest.raises(SlackSignatureError):
+            verify_request(given, body, SECRET, now=NOW)
+        with pytest.raises(SlackSignatureError):
+            parse_request(given, body, SECRET, now=NOW)
+        assert parse_event(body, given).retry_num is None
+
     def test_conflicting_duplicate_headers_fail_closed(self):
         body = body_of("app_mention")
         good = headers(body)

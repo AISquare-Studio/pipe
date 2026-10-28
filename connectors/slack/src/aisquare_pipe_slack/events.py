@@ -197,12 +197,14 @@ def header(headers: Mapping[str, Any] | Iterable[tuple[Any, Any]], name: str) ->
     when it appears more than once with different values (fail closed).
     Takes a mapping, anything with ``items()`` (``http.server``'s and
     ``email``'s message headers, multi-dicts), or ``(name, value)`` pairs;
-    byte names and values (ASGI) are read as Latin-1."""
-    items = getattr(headers, "items", None)
-    pairs: Iterable[Any] = items() if callable(items) else headers
+    byte names and values (ASGI) are read as Latin-1. Never raises: a
+    headers object that fails to read reads as absent, so verification
+    fails closed with :class:`SlackSignatureError`."""
     wanted = name.lower()
     found: set[str] = set()
     try:
+        items = getattr(headers, "items", None)
+        pairs: Iterable[Any] = items() if callable(items) else headers
         for pair in pairs:
             key, value = pair
             if _latin1(key).lower() == wanted:
@@ -210,7 +212,7 @@ def header(headers: Mapping[str, Any] | Iterable[tuple[Any, Any]], name: str) ->
                     found.update(_latin1(v) for v in value)
                 else:
                     found.add(_latin1(value))
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 — whatever the host's headers object does
         return None
     return found.pop().strip() if len(found) == 1 else None
 
