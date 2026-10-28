@@ -14,8 +14,8 @@ import aisquare.pipe.testing.hygiene as hygiene_mod
 from aisquare.pipe.cli.main import cli
 from aisquare.pipe.cli.validate import SuiteResult
 from aisquare.pipe.testing.hygiene import DistInfo
-from aisquare.pipe.testing.mock_connectors import MockSink, MockSource
-from aisquare.pipe.testing.validation import DiscoveredConnector
+from aisquare.pipe.testing.mock_connectors import MockSink, MockSource, MockToolkit
+from aisquare.pipe.testing.validation import TOOLKIT_ENTRY_POINT_GROUP, DiscoveredConnector
 
 from tests.test_hygiene import build_connector, build_repo
 
@@ -212,3 +212,88 @@ class TestInstalledOnlyMode:
         monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
         result = CliRunner().invoke(cli, ["validate", "composio"])
         assert result.exit_code == 2
+
+
+class _GoodKit(MockToolkit):
+    name = "good"
+    slug_prefix = "MOCK_"  # keep the inherited MOCK_* slugs valid under the new name
+
+
+def _toolkit_ep(ep_name: str, cls: type, dist_name: str = "aisquare-pipe-good") -> DiscoveredConnector:
+    return DiscoveredConnector(
+        ep_name=ep_name,
+        ep_value=f"aisquare_pipe_good.toolkit:{cls.__name__}",
+        dist_name=dist_name,
+        dist_version="0.1.0",
+        cls=cls,
+        load_error=None,
+        group=TOOLKIT_ENTRY_POINT_GROUP,
+    )
+
+
+class TestToolkitEntryPoints:
+    def test_framework_row_runs_toolkit_contract(self, fake_repo):
+        result = CliRunner().invoke(cli, ["validate", "--json", "--skip-tests"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        framework = next(c for c in payload["connectors"] if c["name"] == "framework")
+        assert "mock" in framework["entry_points"]
+        check_ids = {c["id"] for c in framework["layers"]["contract"]["checks"]}
+        assert "contract.toolkit.call-no-creds@mock" in check_ids
+
+    def test_connector_package_toolkit_passes(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod, "discover_toolkit_entry_points", lambda: [_toolkit_ep("good", _GoodKit)]
+        )
+        result = CliRunner().invoke(cli, ["validate", "good", "--json", "--skip-tests"])
+        assert result.exit_code == 0, result.output
+        good = next(c for c in json.loads(result.output)["connectors"] if c["name"] == "good")
+        assert "good" in good["entry_points"]
+        assert "contract.toolkit.slugs@good" in {c["id"] for c in good["layers"]["contract"]["checks"]}
+
+    def test_misnamed_toolkit_entry_point_fails(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod, "discover_toolkit_entry_points", lambda: [_toolkit_ep("good-kit", _GoodKit)]
+        )
+        result = CliRunner().invoke(cli, ["validate", "good", "--skip-tests"])
+        assert result.exit_code == 1
+        assert "contract.toolkit.entry-point-name@good-kit" in result.output
+
+    def test_installed_only_mode_includes_toolkits(self, monkeypatch):
+        monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
+        monkeypatch.setattr(validate_mod, "discover_connector_entry_points", list)
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_toolkit_entry_points",
+            lambda: [_toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe")],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json"])
+        assert result.exit_code == 0, result.output
+        (report,) = json.loads(result.output)["connectors"]
+        assert report["entry_points"] == ["mock"]
+        assert report["layers"]["contract"]["status"] == "pass"
+
+
+VALID_TOOLKIT_FILE = '''\
+from aisquare.pipe import Toolkit, ToolResult, ToolSpec
+
+
+class TempToolkit(Toolkit):
+    name = "temp"
+    version = "0.1.0"
+
+    def tools(self):
+        return [ToolSpec("TEMP_PING", "Ping.", {"type": "object", "properties": {}}, read_only=True)]
+
+    def run_tool(self, tool, arguments, config):
+        return ToolResult.ok("pong")
+'''
+
+
+def test_legacy_file_mode_validates_toolkits(tmp_path):
+    path = tmp_path / "kit.py"
+    path.write_text(VALID_TOOLKIT_FILE, encoding="utf-8")
+    result = CliRunner().invoke(cli, ["validate", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "Validating TempToolkit" in result.output
+    assert "Validating Toolkit" not in result.output  # the abstract base is skipped

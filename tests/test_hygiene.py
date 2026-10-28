@@ -206,6 +206,73 @@ class TestScaffoldFiles:
         assert not _ok(run(root, "bad"), "hygiene.module-name")
 
 
+TOOLKIT_ONLY_PYPROJECT = """\
+[project]
+name = "aisquare-pipe-kit"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["aisquare-pipe>=0.2.0"]
+
+[project.entry-points."aisquare_pipe.toolkits"]
+kit = "aisquare_pipe_kit.toolkit:KitToolkit"
+"""
+
+BOTH_PYPROJECT = GOOD_PYPROJECT.replace("good", "both") + """
+[project.entry-points."aisquare_pipe.toolkits"]
+both = "aisquare_pipe_both.toolkit:BothToolkit"
+"""
+
+TOOLKIT_COMPLIANCE = "from x import toolkit_compliance_suite\ntoolkit_compliance_suite(object)\n"
+
+
+def _errors(results: dict) -> list:
+    return [r for r in results.values() if not r.passed and r.severity is Severity.ERROR]
+
+
+class TestToolkitPackages:
+    def test_toolkit_only_package_passes_without_connector_py(self, tmp_path):
+        root = build_repo(tmp_path)
+        cdir = build_connector(
+            root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT, compliance=TOOLKIT_COMPLIANCE
+        )
+        (cdir / "src" / "aisquare_pipe_kit" / "connector.py").unlink()
+        results = run(root, "kit", DistInfo(found=True, version="0.1.0"))
+        assert _errors(results) == []
+        assert _ok(results, "hygiene.entry-points-registered")
+
+    def test_toolkit_package_needs_toolkit_compliance_suite(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT)  # connector suite only
+        result = run(root, "kit")["hygiene.scaffold-files"]
+        assert not result.passed and "toolkit_compliance_suite" in result.message
+
+    def test_connector_and_toolkit_need_both_suites(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "both", pyproject=BOTH_PYPROJECT)
+        result = run(root, "both")["hygiene.scaffold-files"]
+        assert not result.passed
+        assert "toolkit_compliance_suite" in result.message
+        assert "connector_compliance_suite" not in result.message
+
+        both_suites = (
+            "from x import connector_compliance_suite, toolkit_compliance_suite\n"
+            "connector_compliance_suite(object)\ntoolkit_compliance_suite(object)\n"
+        )
+        (root / "connectors" / "both" / "tests" / "test_compliance.py").write_text(
+            both_suites, encoding="utf-8"
+        )
+        assert _ok(run(root, "both"), "hygiene.scaffold-files")
+
+    def test_package_without_any_entry_points_keeps_connector_rules(self, tmp_path):
+        root = build_repo(tmp_path)
+        bad = GOOD_PYPROJECT.replace("good", "bad").split("[project.entry-points")[0]
+        cdir = build_connector(root, "bad", pyproject=bad)
+        (cdir / "src" / "aisquare_pipe_bad" / "connector.py").unlink()
+        results = run(root, "bad")
+        assert not _ok(results, "hygiene.entry-points-registered")
+        assert "connector.py" in results["hygiene.scaffold-files"].message
+
+
 class TestSourceCode:
     def test_cross_connector_import(self, tmp_path):
         root = build_repo(tmp_path)

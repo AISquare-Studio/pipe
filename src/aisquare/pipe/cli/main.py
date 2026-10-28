@@ -12,7 +12,13 @@ import click
 from aisquare.pipe.core.connector import SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import PullParams, PushParams
 from aisquare.pipe.core.pipeline import Pipeline
-from aisquare.pipe.core.registry import discover_connectors, get_connector
+from aisquare.pipe.core.registry import (
+    discover_connectors,
+    discover_toolkits,
+    get_connector,
+    get_toolkit,
+)
+from aisquare.pipe.core.tools import Toolkit, ToolSpec
 from aisquare.pipe.core.types import TypeMatcher
 
 
@@ -73,6 +79,91 @@ def describe(name: str) -> None:
         for key, spec in inst.metadata_spec.items():
             req = " (required)" if spec.required else ""
             click.echo(f"  {key}: {spec.type.__name__}{req} — {spec.description}")
+
+
+def _tool_access(tool: ToolSpec) -> str:
+    if tool.destructive:
+        return "destructive"
+    return "read" if tool.read_only else "write"
+
+
+def _one_line(text: str, width: int) -> str:
+    line = " ".join(text.split())
+    return line if len(line) <= width else line[: width - 1] + "…"
+
+
+@cli.command("tools")
+@click.argument("toolkit", required=False)
+@click.option("--search", "-s", "query", default=None, help="Rank tools by relevance to this query.")
+@click.option(
+    "--limit", "-n", type=int, default=None,
+    help="Maximum tools to show (default: all; 6 with --search).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON (full ToolSpecs).")
+def tools_cmd(toolkit: str | None, query: str | None, limit: int | None, as_json: bool) -> None:
+    """List a toolkit's tools (slugs + descriptions), or all toolkits."""
+    if toolkit is None:
+        _list_toolkits(as_json)
+        return
+    try:
+        inst = get_toolkit(toolkit)()
+    except Exception as e:  # noqa: BLE001 — reported to the user, exit 1
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    if query:
+        specs = inst.search_tools(query, limit=6 if limit is None else limit)
+    else:
+        catalog = inst.tools()
+        specs = catalog if limit is None else catalog[:limit]
+
+    if as_json:
+        click.echo(json.dumps([spec.to_dict() for spec in specs], indent=2))
+        return
+    if not specs:
+        click.echo("No tools found.")
+        return
+    width = max(len(spec.slug) for spec in specs)
+    click.echo(f"{'Slug':<{width}}  {'Access':<11}  Description")
+    click.echo("-" * (width + 2 + 11 + 2 + 60))
+    for spec in specs:
+        click.echo(f"{spec.slug:<{width}}  {_tool_access(spec):<11}  {_one_line(spec.description, 100)}")
+
+
+def _list_toolkits(as_json: bool) -> None:
+    toolkits = discover_toolkits()
+    rows = []
+    for name, cls in sorted(toolkits.items()):
+        try:
+            inst: Toolkit = cls()
+            rows.append(
+                {
+                    "name": name,
+                    "version": inst.version,
+                    "auth": inst.auth_type.value,
+                    "tools": len(inst.tools()),
+                    "oauth": inst.oauth.provider if inst.oauth else None,
+                    "description": inst.description,
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — one broken toolkit must not hide the rest
+            rows.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No toolkits found. Install toolkit plugins or run: pip install -e .")
+        return
+    click.echo(f"{'Name':<20} {'Version':<10} {'Auth':<10} {'Tools':<6} {'OAuth':<12}")
+    click.echo("-" * 60)
+    for row in rows:
+        if "error" in row:
+            click.echo(f"{row['name']:<20} failed to load: {row['error']}")
+            continue
+        click.echo(
+            f"{row['name']:<20} {row['version']:<10} {row['auth']:<10} "
+            f"{row['tools']:<6} {row['oauth'] or '-':<12}"
+        )
 
 
 @cli.command()
@@ -189,25 +280,30 @@ def _validate_file(path: str) -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    from aisquare.pipe.testing.compliance import connector_compliance_suite
+    from aisquare.pipe.testing.compliance import (
+        connector_compliance_suite,
+        toolkit_compliance_suite,
+    )
 
     found = False
     for attr_name in dir(module):
         attr = getattr(module, attr_name)
-        if (
-            isinstance(attr, type)
-            and (issubclass(attr, SourceConnector) or issubclass(attr, SinkConnector))
-            and attr not in (SourceConnector, SinkConnector)
-        ):
-            found = True
-            click.echo(f"\nValidating {attr_name}...")
+        if not isinstance(attr, type) or attr in (SourceConnector, SinkConnector, Toolkit):
+            continue
+        if issubclass(attr, SourceConnector) or issubclass(attr, SinkConnector):
             suite_cls = connector_compliance_suite(attr)
-            suite = unittest.TestLoader().loadTestsFromTestCase(suite_cls)
-            runner = unittest.TextTestRunner(verbosity=2)
-            runner.run(suite)
+        elif issubclass(attr, Toolkit):
+            suite_cls = toolkit_compliance_suite(attr)
+        else:
+            continue
+        found = True
+        click.echo(f"\nValidating {attr_name}...")
+        suite = unittest.TestLoader().loadTestsFromTestCase(suite_cls)
+        runner = unittest.TextTestRunner(verbosity=2)
+        runner.run(suite)
 
     if not found:
-        click.echo("No connector classes found in the file.", err=True)
+        click.echo("No connector classes (or toolkits) found in the file.", err=True)
         sys.exit(1)
 
 
