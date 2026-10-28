@@ -211,7 +211,7 @@ TOOLKIT_ONLY_PYPROJECT = """\
 name = "aisquare-pipe-kit"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["aisquare-pipe>=0.2.0"]
+dependencies = ["aisquare-pipe>=0.3.0"]
 
 [project.entry-points."aisquare_pipe.toolkits"]
 kit = "aisquare_pipe_kit.toolkit:KitToolkit"

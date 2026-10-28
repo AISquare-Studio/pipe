@@ -386,7 +386,7 @@ the only thing that runs them (`SKIP (no creds)` when the env is absent).
 ## Publishing to PyPI
 
 1. Name your package: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-google-drive`)
-2. Add `aisquare-pipe>=0.1.0` as a dependency
+2. Add `aisquare-pipe>=0.1.0` as a dependency (`>=0.3.0` if the package registers a toolkit)
 3. Register entry points as shown above
 4. Build and publish:
 

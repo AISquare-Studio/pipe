@@ -4,7 +4,7 @@ Graphify knowledge-graph transform for [aisquare.pipe](../../README.md): turns a
 code tree into `GRAPH_REPORT.md` (plain-language digest: god nodes, Leiden
 communities, cross-module edges) + `graph.json` (machine-readable graph), via
 the [graphify](https://github.com/safishamsi/graphify) CLI (PyPI `graphifyy`,
-pinned `==0.8.36`).
+pinned `==0.9.72`).
 
 One engine, **two faces**:
 
@@ -25,7 +25,7 @@ scrubbed-minimal so stray ambient keys can never hijack backend detection.
 ```bash
 cd connectors/graphify
 pip install -e ".[dev]"
-pip install -e ".[engine]"   # installs graphifyy==0.8.36 (or bring your own pipx install)
+pip install -e ".[engine]"   # installs graphifyy==0.9.72 (or bring your own pipx install)
 ```
 
 ## Quickstart (no API key — free AST tier)

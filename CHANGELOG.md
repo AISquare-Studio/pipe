@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-15
+## [0.3.0] - 2026-10-15
 
 ### Added
 
@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Root `pyproject.toml` configures mypy for the `src/` namespace layout, so
   `mypy src` works with an editable install.
 - The GitHub, OneDrive and Google Drive packages require
-  `aisquare-pipe>=0.2.0`.
+  `aisquare-pipe>=0.3.0`.
 - `aisquare-pipe-graphify` 0.2.1: the `[engine]` extra pins
   `graphifyy==0.9.72` (was 0.8.36).
 - CI uses `actions/setup-python@v7`.
@@ -93,6 +93,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   modules raise `ModuleNotFoundError` and their unit tests skip explicitly.
   Under pytest 9 they errored at collection, so a bare `pipe validate`
   failed.
+
+## [0.2.0] - 2026-07-10
+
+A connector-only release: the framework (`aisquare-pipe`) stayed at 0.1.1.
+
+### Added
+
+- `aisquare-pipe-github` 0.1.0 (first publish): the `GitHubRepoSource`
+  connector.
+- `aisquare-pipe-graphify` 0.2.0 (first publish): `GraphifyConverter`, plus
+  an `[engine]` extra with in-process graph query verbs. Covers the
+  enriched-tier fix, the query face, `GraphMerger` and incremental state.
+- The publish matrix and `RELEASING.md` carry both packages.
 
 ## [0.1.1] - 2026-06-29
 
@@ -121,7 +134,8 @@ Initial public release.
 - Install extras: `[popular]`, `[full]`, and per-connector packages
   (`aisquare-pipe-<service>`).
 
-[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AISquare-Studio/pipe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/AISquare-Studio/pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/AISquare-Studio/pipe/releases/tag/v0.1.0
