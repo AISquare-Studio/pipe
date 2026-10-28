@@ -12,8 +12,9 @@ import pytest
 
 # The query face needs the [engine] extra (graphifyy + networkx) — environments
 # without it (e.g. the bare CI validator) skip cleanly instead of erroring at
-# collection. The face raises a plain ImportError naming the extra, which
-# pytest 9's importorskip no longer skips on, hence the explicit guard.
+# collection. The face raises ModuleNotFoundError naming the extra; the
+# explicit guard also covers a plain ImportError, which pytest 9's
+# importorskip no longer skips on.
 try:
     import aisquare_pipe_graphify.query as q
 except ImportError as exc:
