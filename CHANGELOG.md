@@ -47,17 +47,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mock` for hermetic downstream tests (with `MOCK_EXPIRED_TOKEN` /
   `MOCK_RATE_LIMITED_TOKEN` failure triggers).
 - CLI: `pipe tools [<toolkit>] [--search Q] [--limit N] [--json]`.
+- **Native connector toolkits**, built on the core above, so hosts can serve
+  these services without Composio. Tool slugs and argument names follow
+  Composio's; each toolkit registers under `aisquare_pipe.toolkits` and
+  ships an `OAuthSpec`:
+  - **GitHub** (`aisquare-pipe-github` 0.2.0): `GitHubToolkit` (`github`,
+    31 tools: 23 read, 8 write) and `GITHUB_OAUTH` (OAuth App with PKCE;
+    tokens do not expire; `revoke_token` revokes only this connection's
+    token).
+  - **OneDrive** (`aisquare-pipe-onedrive` 0.2.0): `OneDriveToolkit`
+    (`onedrive`, 16 tools) and `MICROSOFT_OAUTH` / `microsoft_oauth(tenant)`
+    (PKCE, rotating refresh tokens). `revoke_token` sends nothing, because
+    Microsoft has no per-app revoke endpoint.
+  - **Google Drive**: new package `aisquare-pipe-googledrive` 0.2.0 with
+    `googledrive-source` (folder pulls with filters; Google-native files are
+    exported), `googledrive-sink` (uploads with name-conflict policies),
+    `GoogleDriveToolkit` (`googledrive`, 23 tools) and `GOOGLEDRIVE_OAUTH`
+    (PKCE, offline access).
+- Install extras: `aisquare-pipe-googledrive` joins `[popular]` (and so
+  `[full]`); `aisquare-pipe-github` joins `[full]`.
 
 ### Changed
 
 - `pipe validate` legacy file mode also validates `Toolkit` subclasses.
 - Root `pyproject.toml` configures mypy for the `src/` namespace layout, so
   `mypy src` works with an editable install.
+- The GitHub, OneDrive and Google Drive packages require
+  `aisquare-pipe>=0.2.0`.
+- `aisquare-pipe-graphify`'s `[engine]` extra pins `graphifyy==0.9.72`
+  (was 0.8.36).
+- CI uses `actions/setup-python@v7`.
 
 ### Fixed
 
 - Type annotations in `merge_batch` / `merge_concat` (mypy errors; no
   behavior change).
+- OneDrive: `OneDriveClient.list_folder(recursive=True)` collected
+  subfolders from the first page of a listing only. It now collects them
+  from every page and paginates each subfolder.
+- `pipe validate` hygiene now converts `file://` URLs from editable-install
+  metadata into real paths. On Windows, every editable connector was
+  reported as a broken install. On every platform, a path containing a
+  percent-escape (such as `%20` for a space) never matched.
+- `aisquare-pipe-graphify`: without the `[engine]` extra, the graph modules
+  raise `ModuleNotFoundError` and their unit tests skip explicitly. Under
+  pytest 9 they errored at collection, so a bare `pipe validate` failed.
 
 ## [0.1.1] - 2026-06-29
 
