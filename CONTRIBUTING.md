@@ -252,9 +252,15 @@ What the base class does for you:
   escaped and `Bearer`-prefixed forms — are masked out of every error
   message. A malformed result (non-string `error`, unknown `error_code`) is
   normalized rather than raised.
-- **`search_tools(query, limit=6)`** ranks the catalog with a deterministic
-  keyword score (+2 per query term in the slug, +1 in the description or
-  tags; first-person queries favour `..._AUTHENTICATED_...` tools).
+- **`available_tools(config=None)`** is what a host lists to a model for one
+  connection. The default is every tool (`tools()`). Override it when config
+  switches tools off (for example, risk tiers). Keep it offline. Listing is
+  advisory, so `call_tool` must still refuse a switched-off tool. Hosts should
+  list and search through it, not through `tools()`.
+- **`search_tools(query, limit=6, *, config=None)`** ranks
+  `available_tools(config)` with a deterministic keyword score (+2 per query
+  term in the slug, +1 in the description or tags; first-person queries
+  favour `..._AUTHENTICATED_...` tools).
 - **`validate_config(config)`** defaults to "has a non-empty
   `access_token` with no inner whitespace" (or always true for
   `AuthType.NONE`). `run_tool` receives the token with surrounding
