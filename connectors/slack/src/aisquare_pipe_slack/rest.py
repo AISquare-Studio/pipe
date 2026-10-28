@@ -1,7 +1,9 @@
 """Slack Web API client for :class:`~aisquare_pipe_slack.toolkit.SlackToolkit`.
 
-This module is the toolkit's only HTTP boundary (tests mock the
-``requests.Session`` handed to it). One :class:`SlackWebClient` serves one tool
+This module is the toolkit's only HTTP boundary for Web API calls and file
+bytes (tests mock the ``requests.Session`` handed to it); the one other
+request, the OAuth token exchange made before there is a token, is in
+:mod:`aisquare_pipe_slack.oauth`. One :class:`SlackWebClient` serves one tool
 call with one token. The token rides the ``Authorization`` header only: it
 never appears in a body, a URL, a log line, an exception message or a repr.
 
@@ -89,7 +91,9 @@ class SlackAPIError(Exception):
     none, a synthetic one: ``http_<status>``, ``invalid_response``,
     ``network_error`` or ``timeout``. ``status`` is the HTTP status (0 when
     Slack never answered). ``retry_after`` (seconds) is set on rate limits;
-    ``needed`` carries the scope(s) a ``missing_scope`` asks for.
+    ``needed`` carries the scope(s) a ``missing_scope`` asks for, and
+    ``errors`` Slack's per-item errors (``conversations.invite`` lists one per
+    user), sanitized to ``{"user", "error"}``.
     """
 
     def __init__(
@@ -101,6 +105,7 @@ class SlackAPIError(Exception):
         retry_after: float | None = None,
         timed_out: bool = False,
         needed: str | None = None,
+        errors: list[dict[str, str]] | None = None,
     ) -> None:
         super().__init__(f"{method}: {error}")
         self.method = method
@@ -109,6 +114,7 @@ class SlackAPIError(Exception):
         self.retry_after = retry_after
         self.timed_out = timed_out
         self.needed = needed
+        self.errors = errors or []
 
 
 class SlackWebClient:
@@ -293,6 +299,7 @@ def _outcome(
             code,
             status=status,
             needed=needed if isinstance(needed, str) and _SAFE_SCOPES.fullmatch(needed) else None,
+            errors=item_errors(payload.get("errors")),
         )
         retry_wait = _SERVER_ERROR_WAIT * (2**attempt) if server_error and idempotent else None
         return payload, error, retry_wait
@@ -435,6 +442,34 @@ def _upload(client: SlackWebClient, upload_url: str, data: bytes) -> None:
             raise SlackAPIError(method, f"http_{response.status_code}", status=response.status_code)
     finally:
         response.close()
+
+
+#: An ID Slack puts in an ``errors[]`` item.
+_ITEM_ID = re.compile(r"[A-Z0-9]{2,40}")
+#: Most ``errors[]`` items passed on.
+MAX_ITEM_ERRORS = 50
+
+
+def item_errors(value: Any) -> list[dict[str, str]]:
+    """Slack's ``errors[]`` (one per user on ``conversations.invite``), kept
+    only where they look like Slack's own: ``{"user": <ID>, "error": <code>}``.
+    Anything else is dropped — it reaches ``ToolResult.data``, which core does
+    not scrub."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value[:MAX_ITEM_ERRORS]:
+        if not isinstance(item, Mapping):
+            continue
+        code = item.get("error")
+        if not (isinstance(code, str) and SAFE_CODE.fullmatch(code)):
+            continue
+        entry = {"error": code}
+        user = item.get("user")
+        if isinstance(user, str) and _ITEM_ID.fullmatch(user):
+            entry["user"] = user
+        out.append(entry)
+    return out
 
 
 def parse_body(response: requests.Response) -> Any:

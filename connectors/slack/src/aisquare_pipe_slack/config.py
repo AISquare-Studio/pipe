@@ -3,7 +3,9 @@
 A host passes these next to ``access_token`` in the ``config`` of every
 ``call_tool``. Every key is optional; the defaults are the safe ones (act as
 the user, read + send only — send only as the bot — and "Sent by pipe" on the
-user's messages). Values
+user's messages). A token that is positively a bot's (``xoxb-…``) with no
+identity set acts as the bot; with identity ``"user"`` it is a config error.
+Values
 are checked strictly: a typo in a tier name fails the call with a message
 naming the key, instead of silently changing what an agent may do.
 """
@@ -70,11 +72,19 @@ def settings_from_config(config: Mapping[str, Any]) -> SlackSettings:
     """Read the toolkit's options from ``config``; raise
     :class:`SlackConfigError` for a value it cannot use."""
     identity = config.get(CONFIG_IDENTITY)
+    bot_token = is_bot_token(config.get("access_token"))
     if identity is None:
-        identity = IDENTITY_USER
+        # Fail safe: a token that is positively a bot's acts as the bot, with
+        # the bot's send-only defaults — never with the user's read access.
+        identity = IDENTITY_BOT if bot_token else IDENTITY_USER
     if identity not in IDENTITIES:
         raise SlackConfigError(
             f"config[{CONFIG_IDENTITY!r}] must be {' or '.join(repr(i) for i in IDENTITIES)}"
+        )
+    if identity == IDENTITY_USER and bot_token:
+        raise SlackConfigError(
+            f"config[{CONFIG_IDENTITY!r}] is 'user' but access_token is a bot token (xoxb-…); "
+            f"set config[{CONFIG_IDENTITY!r}] to 'bot'"
         )
     tiers = _names(config, CONFIG_ENABLED_TIERS)
     if tiers is None:

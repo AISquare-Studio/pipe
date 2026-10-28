@@ -69,7 +69,7 @@ from aisquare_pipe_slack.tools import SlackCall, SlackTool
 
 _KINDS: dict[str, frozenset[str]] = {
     ERROR_UNAUTHORIZED: frozenset(
-        {"not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired"}
+        {"not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired", "invalid_token"}
     ),
     ERROR_FORBIDDEN: frozenset(
         {
@@ -97,6 +97,11 @@ _KINDS: dict[str, frozenset[str]] = {
             # Slack Lists and remote files.
             "lists_disabled_user_team", "over_list_file_maximum", "bot_user_required",
             "no_bot_user_for_app", "file_under_review",
+            # Final review: posting, threads, org and Slack Connect rules.
+            "access_denied", "app_access_restricted", "org_login_required", "send_on_behalf_not_allowed",
+            "restricted_action_thread_only_channel", "restricted_action_thread_locked",
+            "restricted_action_non_threadable_channel", "slack_connect_file_link_sharing_blocked",
+            "slack_connect_lists_sharing_blocked",
         }
     ),
     ERROR_NOT_FOUND: frozenset(
@@ -106,6 +111,7 @@ _KINDS: dict[str, frozenset[str]] = {
             "canvas_not_found", "bookmark_not_found", "no_such_subteam", "team_not_found",
             "not_found", "invalid_scheduled_message_id", "no_pin", "user_not_visible",
             # S2
+            "duplicate_channel_not_found", "duplicate_message_not_found",
             "bot_not_found", "bots_not_found", "file_deleted", "canvas_deleted", "not_visible",
             "template_not_visible",
             # Slack Lists.
@@ -123,9 +129,12 @@ _KINDS: dict[str, frozenset[str]] = {
             # S2: already there, or a Slack limit in the way
             "name_already_exists", "handle_already_exists", "file_already_added", "too_many_bookmarks",
             "too_many_tabs", "free_team_canvas_tab_already_exists", "not_in_dnd", "subteam_max_users_exceeded",
+            # chat.scheduleMessage: over 30 scheduled in one 5-minute window per
+            # channel. Waiting doesn't help; another post_at does.
+            "restricted_too_many",
         }
     ),
-    ERROR_RATE_LIMITED: frozenset({*RATE_LIMIT_ERRORS, *RETRY_SOON_ERRORS, "restricted_too_many"}),
+    ERROR_RATE_LIMITED: frozenset({*RATE_LIMIT_ERRORS, *RETRY_SOON_ERRORS}),
     ERROR_INVALID_ARGUMENTS: frozenset(
         {
             "invalid_arguments", "invalid_arg_name", "invalid_array_arg", "invalid_cursor",
@@ -149,6 +158,9 @@ _KINDS: dict[str, frozenset[str]] = {
             "alt_txt_too_large", "bad_handle", "forbidden_handle", "description_too_long",
             "name_too_long", "missing_subteam_name", "invalid_channel_provided", "no_users_provided",
             "channels_limit_exceeded", "invalid_parameters", "invalid_channel", "canvas_too_large",
+            "cannot_reply_to_message", "metadata_too_large", "metadata_must_be_sent_from_app",
+            "as_user_not_supported", "too_many_contact_cards", "attachment_payload_limit_exceeded",
+            "missing_file_data", "method_not_supported_for_channel_type",
             "file_too_large",
             # Slack Lists and remote files.
             "invalid_args", "missing_arguments", "too_many_ids", "bad_title", "invalid_title",
@@ -196,6 +208,10 @@ _HINTS = {
     "no_item_specified": "pass channel + timestamp (or file / file_comment)",
     "cant_invite_self": "leave the connection's own user out of users",
     # S2
+    "restricted_too_many": (
+        "over 30 messages are scheduled in that 5-minute window for this channel; pick another "
+        "post_at or delete some scheduled messages"
+    ),
     "file_deleted": "the file was deleted",
     "canvas_deleted": "the canvas was deleted",
     "name_already_exists": "a user group with that name exists; pick another name",
@@ -307,9 +323,12 @@ def describe_error(error: SlackAPIError, settings: SlackSettings | None = None) 
 def failure(error: SlackAPIError, settings: SlackSettings | None = None) -> ToolResult:
     """A failed ToolResult: message, canonical ``error_code``, ``retry_after``
     (whole seconds) on a rate limit, and ``data={"slack_error", "status"}``."""
+    data: dict[str, Any] = {"slack_error": error.error, "status": error.status}
+    if error.errors:
+        data["errors"] = error.errors
     return ToolResult.fail(
         describe_error(error, settings),
-        data={"slack_error": error.error, "status": error.status},
+        data=data,
         code=error_code(error),
         retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
     )
@@ -344,17 +363,21 @@ def gate(tool: SlackTool, settings: SlackSettings) -> ToolResult | None:
 
 
 class SlackToolkit(Toolkit):
-    """Slack messages, history and threads, search, channels and DMs,
-    reactions, pins, people and presence, over the Web API.
+    """Slack over the Web API: messages, history and threads, search,
+    channels and DMs, reactions, pins, people and presence, files, canvases,
+    bookmarks, Do Not Disturb, reminders, user groups, Slack Lists and remote
+    files.
 
     ``config``:
 
     * ``access_token`` (required) — the token for the chosen identity: a user
       token (``xoxp-…``) or the app's bot token (``xoxb-…``);
     * ``identity`` — ``"user"`` (default: act as the person who connected)
-      or ``"bot"`` (post as the app's bot user);
+      or ``"bot"`` (post as the app's bot user); unset with a bot token
+      (``xoxb-…``) means ``"bot"``;
     * ``enabled_tiers`` — tiers this connection may call (default
-      ``["read", "send"]``); add ``"write"`` / ``"destructive"`` explicitly;
+      ``["read", "send"]``; bot: ``["send"]``); add ``"write"`` /
+      ``"destructive"`` explicitly;
     * ``enabled_tools`` — extra tool slugs enabled one by one;
     * ``attribution_name`` — the ``<name>`` in the "Sent by <name>" line on
       messages (default ``"pipe"``); always shown for the user identity;
@@ -378,7 +401,8 @@ class SlackToolkit(Toolkit):
     display_name = "Slack"
     description = (
         "Slack messages, channel history and threads, search, channels and DMs, reactions, "
-        "pins, people and presence — as the connected user or as the app's bot."
+        "pins, people and presence, files, canvases, bookmarks, Do Not Disturb, reminders, "
+        "user groups, Slack Lists and remote files — as the connected user or as the app's bot."
     )
     auth_type = AuthType.OAUTH2
     oauth = SLACK_OAUTH
@@ -406,9 +430,12 @@ class SlackToolkit(Toolkit):
         """The tools ``config`` lets this connection call (enabled tier or
         slug, and runnable under its identity) — what a host should list to
         a model. No config means the defaults: read + send, as the user.
-        Empty for a config the toolkit cannot use."""
+        Empty for a config the toolkit cannot use (including one that is not
+        a mapping)."""
+        if config is not None and not isinstance(config, Mapping):
+            return []
         try:
-            settings = settings_from_config(config if isinstance(config, Mapping) else {})
+            settings = settings_from_config(config or {})
         except SlackConfigError:
             return []
         return [TOOLS[spec.slug].spec for spec in TOOL_SPECS if gate(TOOLS[spec.slug], settings) is None]
@@ -440,14 +467,19 @@ class SlackToolkit(Toolkit):
     def call_tool(
         self, slug: str, arguments: Mapping[str, Any] | None, config: Mapping[str, Any] | None
     ) -> ToolResult:
-        """Core's ``call_tool``, with the tier and identity gate checked
-        first: a tool the connection may not run fails as ``forbidden``
-        before its arguments are looked at."""
+        """Core's ``call_tool``, with the config and the tier and identity
+        gate checked first: an unusable config, or a tool the connection may
+        not run, fails as ``forbidden`` before the arguments are looked at."""
         blocked: ToolResult | None = None
         try:
-            spec = self.get_tool(slug)
-            if spec is not None and isinstance(config, Mapping):
-                blocked = gate(TOOLS[spec.slug], settings_from_config(config))
+            if isinstance(config, Mapping):
+                try:
+                    settings = settings_from_config(config)
+                except SlackConfigError as e:
+                    return ToolResult.fail(_config_failure(e), code=ERROR_FORBIDDEN)
+                spec = self.get_tool(slug)
+                if spec is not None:
+                    blocked = gate(TOOLS[spec.slug], settings)
         except Exception:  # noqa: BLE001 — never raises; run_tool repeats the check
             blocked = None
         if blocked is not None:
@@ -465,10 +497,7 @@ class SlackToolkit(Toolkit):
         except SlackConfigError as e:
             # forbidden, not upstream_error: a host's misconfiguration is not a
             # Slack failure, and retrying it changes nothing.
-            raise ToolError(
-                f"invalid Slack toolkit config, nothing is allowed until the host fixes it: {e}",
-                code=ERROR_FORBIDDEN,
-            ) from None
+            raise ToolError(_config_failure(e), code=ERROR_FORBIDDEN) from None
         blocked = gate(row, settings)
         if blocked is not None:
             return blocked
@@ -608,6 +637,10 @@ class SlackToolkit(Toolkit):
         decision: if Slack hands the same user token to two connections of
         one person, revoking it from one breaks the other. Never raises."""
         return revoke_user_token(token, session=self._session)
+
+
+def _config_failure(error: SlackConfigError) -> str:
+    return f"invalid Slack toolkit config, nothing is allowed until the host fixes it: {error}"
 
 
 def _pick(installation: SlackInstallation, identity: str | None) -> OAuthToken:

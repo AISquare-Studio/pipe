@@ -17,7 +17,9 @@ PKCE stays off: turning it on in Slack marks the app a public client for good
 
 from __future__ import annotations
 
+import base64
 import logging
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -26,7 +28,12 @@ import requests
 from aisquare.pipe import OAuthError, OAuthSpec, OAuthToken
 
 from aisquare_pipe_slack.constants import API_BASE, TOKEN_ROTATION, USER_AGENT
-from aisquare_pipe_slack.rest import SAFE_CODE, parse_body
+from aisquare_pipe_slack.rest import (
+    SAFE_CODE,
+    SlackAPIError,
+    SlackWebClient,
+    parse_body,
+)
 from aisquare_pipe_slack.scopes import USER_SCOPES
 
 logger = logging.getLogger("aisquare.pipe.slack")
@@ -47,7 +54,9 @@ SLACK_OAUTH = OAuthSpec(
     # token (persist it). Off: tokens never expire and there is no refresh token.
     token_expires=TOKEN_ROTATION,
     rotates_refresh_token=TOKEN_ROTATION,
-    token_auth_method="client_secret_post",
+    # Slack's oauth.v2.access recommends HTTP Basic for the client
+    # credentials ("POST parameters are possible but discouraged").
+    token_auth_method="client_secret_basic",
 )
 
 #: Slack codes reported as OAuth's ``invalid_grant`` (a dead grant).
@@ -105,6 +114,12 @@ def parse_installation(payload: Mapping[str, Any]) -> SlackInstallation:
     )
 
 
+def _basic_auth(client_id: str, client_secret: str) -> str:
+    """RFC 6749 §2.3.1 HTTP Basic: both parts form-encoded, then base64."""
+    raw = f"{urllib.parse.quote(client_id, safe='')}:{urllib.parse.quote(client_secret, safe='')}"
+    return "Basic " + base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
 def token_request(
     form: Mapping[str, str],
     *,
@@ -114,19 +129,23 @@ def token_request(
     session: requests.Session | None = None,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """POST to ``oauth.v2.access`` (client credentials in the body, as every
-    Slack example does; redirects never followed) and return the payload,
-    or raise :class:`OAuthError` with Slack's error code."""
-    body = {**form, "client_id": client_id}
-    if client_secret is not None:
-        body["client_secret"] = client_secret
+    """POST to ``oauth.v2.access`` and return the payload, or raise
+    :class:`OAuthError` with Slack's error code. The client credentials go
+    as HTTP Basic, which Slack recommends (``client_id`` in the body only
+    for a client without a secret); redirects are never followed."""
+    body = dict(form)
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    if client_secret is None:
+        body["client_id"] = client_id
+    else:
+        headers["Authorization"] = _basic_auth(client_id, client_secret)
     http = session if session is not None else requests.Session()
     try:
         response = http.request(
             "POST",
             SLACK_OAUTH.token_url,
             data=body,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            headers=headers,
             timeout=timeout,
             allow_redirects=False,
         )
@@ -176,29 +195,22 @@ def revoke_user_token(
     one person disconnecting must not switch the app's bot off for all of
     them. ``auth.test`` decides which kind the token is — prefixes have
     changed before. Only this token dies; ``apps.uninstall`` is never called.
-    True only for ``ok`` + ``revoked``. Never raises."""
-    http = session if session is not None else requests.Session()
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+    Both calls go through :class:`~aisquare_pipe_slack.rest.SlackWebClient`,
+    without retries. True only for ``ok`` + ``revoked``. Never raises."""
     try:
-        who = parse_body(
-            http.request("POST", f"{API_BASE}/auth.test", headers=headers, timeout=timeout, allow_redirects=False)
-        )
-        if not isinstance(who, dict) or who.get("ok") is not True:
-            logger.warning("slack: token revoke skipped — auth.test failed")
-            return False
-        if who.get("bot_id"):
-            logger.warning("slack: token revoke refused for a bot token (shared by the workspace)")
-            return False
-        answer = parse_body(
-            http.request("POST", f"{API_BASE}/auth.revoke", headers=headers, timeout=timeout, allow_redirects=False)
-        )
+        with SlackWebClient(token, session=session, timeout=timeout, max_retries=0) as client:
+            who = client.call("auth.test", retry=False)
+            if who.get("bot_id"):
+                logger.warning("slack: token revoke refused for a bot token (shared by the workspace)")
+                return False
+            answer = client.call("auth.revoke", retry=False)
+    except SlackAPIError as e:
+        logger.warning("slack: token revoke failed (%s)", e.error)
+        return False
     except Exception as e:  # noqa: BLE001 — never raises (e.g. a non-latin-1 token in a header)
         logger.warning("slack: token revoke failed (%s)", type(e).__name__)
         return False
-    finally:
-        if session is None:
-            http.close()
-    if isinstance(answer, dict) and answer.get("ok") is True and answer.get("revoked") is True:
+    if answer.get("revoked") is True:
         return True
     logger.warning("slack: auth.revoke did not revoke the token")
     return False

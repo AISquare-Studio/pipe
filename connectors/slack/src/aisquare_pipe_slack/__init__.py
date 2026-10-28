@@ -10,6 +10,7 @@ from aisquare_pipe_slack.config import (
 from aisquare_pipe_slack.connector import SlackMessageSink
 from aisquare_pipe_slack.constants import (
     DEFAULT_ATTRIBUTION_NAME,
+    DEFAULT_BOT_TIERS,
     DEFAULT_TIERS,
     IDENTITY_BOT,
     IDENTITY_USER,
@@ -21,12 +22,19 @@ from aisquare_pipe_slack.constants import (
 )
 from aisquare_pipe_slack.oauth import SLACK_OAUTH, SlackInstallation
 from aisquare_pipe_slack.rest import SlackAPIError, SlackWebClient
-from aisquare_pipe_slack.scopes import BOT_SCOPES, SCOPE_GROUPS, USER_SCOPES, scopes_for
+from aisquare_pipe_slack.scopes import (
+    BOT_SCOPES,
+    SCOPE_GROUPS,
+    USER_SCOPES,
+    resolve_scopes,
+    scopes_for,
+)
 from aisquare_pipe_slack.toolkit import SlackToolkit
 
 __all__ = [
     "BOT_SCOPES",
     "DEFAULT_ATTRIBUTION_NAME",
+    "DEFAULT_BOT_TIERS",
     "DEFAULT_TIERS",
     "IDENTITY_BOT",
     "IDENTITY_USER",
@@ -46,6 +54,7 @@ __all__ = [
     "SlackToolkit",
     "SlackWebClient",
     "events",
+    "resolve_scopes",
     "scopes_for",
     "settings_from_config",
 ]

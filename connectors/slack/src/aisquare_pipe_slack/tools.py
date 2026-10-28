@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aisquare.pipe import (
+    ERROR_CONFLICT,
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_FOUND,
     ERROR_UPSTREAM_ERROR,
@@ -362,6 +363,26 @@ def attribution_block(name: str) -> dict[str, Any]:
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": mrkdwn_marker(name)}]}
 
 
+def mark_text(text: str | None, attribution: str | None) -> str | None:
+    """mrkdwn ``text`` with the "Sent by <attribution>" marker as an italic
+    last line (the marker alone when there is no text); unchanged without an
+    attribution. Messages, /me messages, file shares and the sink all use it."""
+    if not attribution:
+        return text
+    marker = f"_{mrkdwn_marker(attribution)}_"
+    return f"{text}\n{marker}" if text else marker
+
+
+def mark_blocks(blocks: list[Any], attribution: str | None) -> list[Any]:
+    """``blocks`` with the marker as a context block after them; unchanged
+    without an attribution. Leaves room for it under Slack's block cap."""
+    if not attribution:
+        return blocks
+    if len(blocks) >= MAX_BLOCKS:
+        raise _invalid(f"at most {MAX_BLOCKS - 1} blocks: one of Slack's {MAX_BLOCKS} is the attribution")
+    return [*blocks, attribution_block(attribution)]
+
+
 def compose_message(args: Mapping[str, Any], attribution: str | None, *, text_arg: str) -> dict[str, Any]:
     """Slack's content fields for a message tool: exactly one of
     ``markdown_text``, or ``blocks`` (with ``text_arg`` as the notification
@@ -387,17 +408,11 @@ def compose_message(args: Mapping[str, Any], attribution: str | None, *, text_ar
             )
         return {"markdown_text": content}
     if blocks is not None:
-        if attribution:
-            if len(blocks) >= MAX_BLOCKS:
-                raise _invalid(
-                    f"at most {MAX_BLOCKS - 1} blocks: one of Slack's {MAX_BLOCKS} is the attribution"
-                )
-            blocks.append(attribution_block(attribution))
-        content_fields: dict[str, Any] = {"blocks": blocks}
+        content_fields: dict[str, Any] = {"blocks": mark_blocks(blocks, attribution)}
         if text is not None:
             content_fields["text"] = text
         return content_fields
-    return {"text": f"{text}\n_{mrkdwn_marker(attribution)}_" if attribution else text}
+    return {"text": mark_text(text, attribution)}
 
 
 # --------------------------------------------------------------------------
@@ -836,6 +851,31 @@ def _open_dm(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     }
     data.update({k: payload[k] for k in _DM_RESULT_FIELDS if k in payload})
     return ToolResult.ok(data)
+
+
+_invite_call = _rpc("conversations.invite", ("channel", "users", "force"), id_lists=("users",))
+
+
+def _invite(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
+    """``conversations.invite``. Slack invites all of the users or none of
+    them unless ``force``, so with several users an ``already_in_channel``
+    must not read as "no change needed": the others may not be in."""
+    try:
+        return _invite_call(call, arguments)
+    except SlackAPIError as e:
+        several = len(_id_list(arguments.get("users") or "", "users").split(",")) > 1
+        if e.error != "already_in_channel" or not several:
+            raise
+        data: dict[str, Any] = {"slack_error": e.error, "status": e.status}
+        if e.errors:
+            data["errors"] = e.errors
+        return ToolResult.fail(
+            "conversations.invite: already_in_channel — at least one of the users is already in "
+            "the channel; Slack invites all or none unless force is true, so nobody may have been "
+            "invited (see errors); retry with force: true, or without those users",
+            data=data,
+            code=ERROR_CONFLICT,
+        )
 
 
 def _api_test(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -1387,7 +1427,7 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
             },
             ["channel", "users"],
         ),
-        _rpc("conversations.invite", ("channel", "users", "force"), id_lists=("users",)),
+        _invite,
         user=("channels:write.invites", "groups:write.invites", *LOOKUP),
         bot=("channels:write.invites", "groups:write.invites", *LOOKUP),
         tags=("invite", "add", "people", "channel", "members"),

@@ -4,77 +4,125 @@ message must never carry."""
 
 from __future__ import annotations
 
+from collections import Counter
+
 import pytest
 
 from aisquare_pipe_slack.config import SlackSettings
 from aisquare_pipe_slack.rest import SlackAPIError
-from aisquare_pipe_slack.toolkit import describe_error, error_code, failure
+from aisquare_pipe_slack.toolkit import (
+    _KIND_OF,
+    _KINDS,
+    describe_error,
+    error_code,
+    failure,
+)
 
 from .fakes import USER_TOKEN, harness, ok, response, slack_error
 
+#: Every mapped code, by class: a frozen copy of toolkit._KINDS (mn11), so a
+#: code can't change class, or sit in two, without a test noticing.
 TABLE = {
-    "unauthorized": ["not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired"],
+    "unauthorized": [
+        "account_inactive", "invalid_auth", "invalid_token", "not_authed", "token_expired", "token_revoked"
+    ],
     "forbidden": [
-        "missing_scope", "no_permission", "not_allowed_token_type", "restricted_action", "not_authorized",
-        "ekm_access_denied", "team_access_not_granted", "enterprise_is_restricted", "accesslimited",
-        "two_factor_setup_required", "cant_update_message", "cant_delete_message", "not_in_channel",
-        "plan_upgrade_required", "paid_only", "permission_denied", "edit_window_closed",
-        "message_limit_exceeded", "messages_tab_disabled",
-        # S2
-        "cant_delete_file", "cant_delete", "delete_not_allowed", "file_deleting_disabled",
-        "canvas_deleting_disabled", "canvas_disabled_user_team", "canvas_disabled_file_team",
-        "canvas_globally_disabled", "free_teams_cannot_create_standalone_canvases",
-        "free_teams_cannot_edit_standalone_canvases", "team_tier_cannot_create_channel_canvases",
-        "paid_teams_only", "not_allowed", "public_file_type_not_allowed", "public_video_not_allowed",
-        "file_uploads_disabled", "file_uploads_except_images_disabled", "file_type_not_allowed",
-        "file_upload_size_restricted", "storage_limit_reached", "posting_to_channel_denied",
-        "user_is_external_guest", "cannot_bookmark_from_external_org",
-        "cannot_bookmark_restricted_sharing_enabled", "slack_connect_canvas_sharing_blocked",
-        "slack_connect_file_upload_sharing_blocked", "slack_connect_blocked_file_type",
-        "cannot_modify_role_admin", "use_skills_api",
+        "access_denied", "accesslimited", "app_access_restricted", "bot_user_required",
+        "cannot_bookmark_from_external_org", "cannot_bookmark_restricted_sharing_enabled",
+        "cannot_modify_role_admin", "cant_archive_general", "cant_delete", "cant_delete_file",
+        "cant_delete_message", "cant_kick_from_general", "cant_kick_self", "cant_leave_general",
+        "cant_update_message", "canvas_deleting_disabled", "canvas_disabled_file_team",
+        "canvas_disabled_user_team", "canvas_globally_disabled", "delete_not_allowed", "edit_window_closed",
+        "ekm_access_denied", "enterprise_is_restricted", "file_deleting_disabled", "file_type_not_allowed",
+        "file_under_review", "file_upload_size_restricted", "file_uploads_disabled",
+        "file_uploads_except_images_disabled", "free_teams_cannot_create_standalone_canvases",
+        "free_teams_cannot_edit_standalone_canvases", "lists_disabled_user_team", "message_limit_exceeded",
+        "messages_tab_disabled", "missing_scope", "no_bot_user_for_app", "no_permission", "not_allowed",
+        "not_allowed_token_type", "not_authorized", "not_in_channel", "org_login_required",
+        "over_list_file_maximum", "paid_only", "paid_teams_only", "permission_denied", "plan_upgrade_required",
+        "posting_to_channel_denied", "public_file_type_not_allowed", "public_video_not_allowed",
+        "restricted_action", "restricted_action_non_threadable_channel", "restricted_action_read_only_channel",
+        "restricted_action_thread_locked", "restricted_action_thread_only_channel",
+        "send_on_behalf_not_allowed", "slack_connect_blocked_file_type", "slack_connect_canvas_sharing_blocked",
+        "slack_connect_file_link_sharing_blocked", "slack_connect_file_upload_sharing_blocked",
+        "slack_connect_lists_sharing_blocked", "storage_limit_reached", "team_access_not_granted",
+        "team_tier_cannot_create_channel_canvases", "two_factor_setup_required", "use_skills_api",
+        "user_is_external_guest", "user_is_restricted"
     ],
     "not_found": [
-        "channel_not_found", "user_not_found", "users_not_found", "message_not_found", "thread_not_found",
-        "file_not_found", "canvas_not_found", "bookmark_not_found", "no_such_subteam", "team_not_found",
-        "not_found",
-        "bot_not_found", "bots_not_found", "file_deleted", "canvas_deleted", "not_visible", "template_not_visible",
+        "bookmark_not_found", "bot_not_found", "bots_not_found", "canvas_deleted", "canvas_not_found",
+        "channel_not_found", "column_not_found", "duplicate_channel_not_found", "duplicate_message_not_found",
+        "duplicated_item_not_found", "file_comment_not_found", "file_deleted", "file_not_found",
+        "invalid_scheduled_message_id", "list_not_found", "message_not_found", "no_pin", "no_such_subteam",
+        "not_found", "not_visible", "record_deleted", "record_not_found", "row_not_found", "team_not_found",
+        "template_not_visible", "thread_not_found", "user_not_found", "user_not_visible", "users_not_found"
     ],
     "conflict": [
-        "already_reacted", "no_reaction", "already_pinned", "not_pinned", "name_taken", "is_archived",
-        "already_archived", "not_archived", "already_in_channel", "channel_canvas_already_exists",
-        "is_inactive", "too_many_pins", "too_many_reactions",
-        "name_already_exists", "handle_already_exists", "file_already_added", "too_many_bookmarks",
-        "too_many_tabs", "free_team_canvas_tab_already_exists", "not_in_dnd", "subteam_max_users_exceeded",
+        "already_archived", "already_in_channel", "already_pinned", "already_reacted",
+        "channel_canvas_already_exists", "file_already_added", "free_team_canvas_tab_already_exists",
+        "handle_already_exists", "is_archived", "is_inactive", "name_already_exists", "name_taken",
+        "no_reaction", "not_archived", "not_in_dnd", "not_pinned", "over_row_maximum", "restricted_too_many",
+        "subteam_max_users_exceeded", "too_many_bookmarks", "too_many_pins", "too_many_reactions",
+        "too_many_tabs"
     ],
-    "rate_limited": ["ratelimited", "rate_limited", "restricted_too_many", "too_many_requests",
-                     "canvas_editing_locked"],
+    "rate_limited": [
+        "canvas_editing_locked", "rate_limited", "ratelimited", "too_many_requests"
+    ],
     "invalid_arguments": [
-        "invalid_arguments", "invalid_arg_name", "invalid_cursor", "invalid_ts_latest", "invalid_ts_oldest",
-        "msg_too_long", "msg_blocks_too_long", "no_text", "invalid_blocks", "invalid_name",
-        "invalid_name_punctuation", "time_in_past", "time_too_far", "too_many_users", "user_not_in_channel",
-        "invalid_user", "snippet_too_large", "invalid_charset", "invalid_form_data", "invalid_post_type",
-        "missing_post_type", "markdown_text_conflict", "bad_timestamp", "no_item_specified",
-        "cant_invite_self",
-        "invalid_timestamp", "invalid_link", "invalid_emoji", "invalid_bookmark_type", "invalid_entity_id",
-        "bad_image", "too_large", "too_many_frames", "missing_duration", "missing_argument", "cannot_parse",
-        "cannot_add_others", "cannot_add_others_recurring", "cannot_add_bot", "cannot_add_slackbot",
-        "unknown_type", "unknown_snippet_type", "alt_txt_too_large", "bad_handle", "forbidden_handle",
-        "description_too_long", "name_too_long", "missing_subteam_name", "invalid_channel_provided",
-        "no_users_provided", "channels_limit_exceeded", "invalid_parameters", "invalid_channel",
-        "canvas_too_large", "file_too_large",
+        "alt_txt_too_large", "archive_not_supported", "as_user_not_supported",
+        "attachment_payload_limit_exceeded", "bad_handle", "bad_image", "bad_timestamp", "bad_title",
+        "cannot_add_bot", "cannot_add_others", "cannot_add_others_recurring", "cannot_add_slackbot",
+        "cannot_parse", "cannot_reply_to_message", "cant_invite_self", "canvas_too_large",
+        "channels_limit_exceeded", "column_id_not_provided", "description_too_long", "file_too_large",
+        "forbidden_handle", "invalid_arg_name", "invalid_args", "invalid_arguments", "invalid_array_arg",
+        "invalid_attachment", "invalid_auth_type", "invalid_blocks", "invalid_blocks_format",
+        "invalid_bookmark_type", "invalid_channel", "invalid_channel_provided", "invalid_charset",
+        "invalid_column_id", "invalid_column_type", "invalid_copy_and_schema_args", "invalid_cursor",
+        "invalid_date", "invalid_email", "invalid_emoji", "invalid_entity_id", "invalid_external_id",
+        "invalid_form_data", "invalid_input_type", "invalid_limit", "invalid_link", "invalid_message",
+        "invalid_metadata_format", "invalid_metadata_schema", "invalid_name", "invalid_name_emoji",
+        "invalid_name_maxlength", "invalid_name_or_value", "invalid_name_punctuation", "invalid_name_required",
+        "invalid_name_specials", "invalid_option_id", "invalid_parameters", "invalid_phone_number",
+        "invalid_post_at", "invalid_post_type", "invalid_presence", "invalid_primary_column", "invalid_profile",
+        "invalid_row_id", "invalid_schema", "invalid_text_block", "invalid_time", "invalid_timestamp",
+        "invalid_title", "invalid_ts_latest", "invalid_ts_oldest", "invalid_type", "invalid_types",
+        "invalid_url", "invalid_user", "invalid_users", "invalid_view_metadata", "invalid_vote_value",
+        "markdown_text_conflict", "metadata_must_be_sent_from_app", "metadata_too_large",
+        "method_not_supported_for_channel_type", "missing_arg_copy_from_list_id", "missing_argument",
+        "missing_arguments", "missing_duration", "missing_file_data", "missing_post_type",
+        "missing_subteam_name", "msg_blocks_too_long", "msg_too_long", "name_too_long", "no_item_specified",
+        "no_reaction_name", "no_text", "no_user", "no_users_provided", "not_enough_users",
+        "over_cell_fields_limit", "over_column_maximum", "over_title_length_maximum", "row_id_not_provided",
+        "snippet_too_large", "time_in_past", "time_too_far", "too_large", "too_long", "too_many_attachments",
+        "too_many_contact_cards", "too_many_emoji", "too_many_frames", "too_many_ids", "too_many_users",
+        "uneditable_column", "unexpected_description_blocks_arg", "unknown_snippet_type", "unknown_type",
+        "user_not_in_channel"
     ],
     "upstream_error": [
-        "fatal_error", "internal_error", "service_unavailable", "request_timeout", "something_new_from_slack",
-        "canvas_creation_failed", "canvas_editing_failed", "canvas_tab_creation_failed", "file_update_failed",
-        "snooze_failed", "snooze_end_failed",
+        "canvas_creation_failed", "canvas_editing_failed", "canvas_tab_creation_failed", "fatal_error",
+        "file_update_failed", "internal_error", "request_timeout", "service_unavailable", "snooze_end_failed",
+        "snooze_failed"
     ],
 }
-ROWS = [(code, kind) for kind, codes in TABLE.items() for code in codes]
+#: Codes Slack might send that no table lists: upstream_error, the fallback.
+UNKNOWN = ["something_new_from_slack", "brand_new_code"]
+ROWS = [(code, kind) for kind, codes in TABLE.items() for code in codes] + [(c, "upstream_error") for c in UNKNOWN]
 
 
 def _error(code: str = "x", **kwargs) -> SlackAPIError:
     kwargs.setdefault("status", 200)
     return SlackAPIError("chat.postMessage", code, **kwargs)
+
+
+def test_the_table_pins_every_mapped_code():
+    pinned = [code for codes in TABLE.values() for code in codes]
+    assert len(pinned) == len(set(pinned)), "a code is listed twice"
+    assert set(pinned) == set(_KIND_OF)
+
+
+def test_no_code_is_in_two_classes():
+    seen = Counter(code for codes in _KINDS.values() for code in codes)
+    assert [code for code, n in seen.items() if n > 1] == []
 
 
 @pytest.mark.parametrize("code, kind", ROWS, ids=[c for c, _ in ROWS])
@@ -142,7 +190,7 @@ def test_transport_and_http_status_come_first(error, kind):
         (_error("no_text"), "check the arguments"),
         (_error("internal_error"), "Slack had a problem"),
         (_error("ratelimited", retry_after=61.2), "retry in about 62s"),
-        (_error("restricted_too_many"), "wait before retrying"),
+        (_error("restricted_too_many"), "pick another post_at"),
         (_error("no_permission"), "not allowed to do that"),
         (_error("brand_new_code"), "chat.postMessage: brand_new_code"),
     ],

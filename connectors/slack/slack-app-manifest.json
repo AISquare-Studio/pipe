@@ -61,7 +61,6 @@
         "reminders:read",
         "reminders:write",
         "remote_files:read",
-        "remote_files:share",
         "search:read",
         "team:read",
         "usergroups:read",

@@ -3,8 +3,8 @@ user groups, profile photo, read cursor and a few more.
 
 Rows are built with :mod:`aisquare_pipe_slack.tools`' helpers and use the
 same tier, identity and attribution machinery as the core tools. Most of
-them change state, so most are opt-in (write or destructive tiers). The PR
-body justifies every row's tier.
+them change state, so most are opt-in (write or destructive tiers); each
+row's tier follows the owner's rule (README, "Risk tiers").
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from aisquare_pipe_slack.constants import (
     HISTORY_MAX_LIMIT,
     LIST_DEFAULT_LIMIT,
     LIST_MAX_LIMIT,
-    MAX_BLOCKS,
     RESULT_CHAR_CAP,
     TIER_DESTRUCTIVE,
     TIER_READ,
@@ -39,6 +38,7 @@ from aisquare_pipe_slack.tools import (
     USERS_LIST,
     SlackCall,
     SlackTool,
+    _blocks,
     _boolean,
     _clamp,
     _cursor_page,
@@ -55,9 +55,9 @@ from aisquare_pipe_slack.tools import (
     _string,
     _strings_schema,
     _tool,
-    attribution_block,
     cap_messages,
-    mrkdwn_marker,
+    mark_blocks,
+    mark_text,
     resolve_channel,
 )
 
@@ -65,6 +65,8 @@ from aisquare_pipe_slack.tools import (
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 #: Largest text an upload accepts from the model.
 MAX_UPLOAD_CONTENT = 50 * 1024 * 1024
+#: Slack's cap on a snippet (an upload with a filetype).
+MAX_SNIPPET_BYTES = 1024 * 1024
 
 FILE_ID = _string("File ID, e.g. 'F0123ABCD'.")
 CANVAS_ID = _string("Canvas ID, e.g. 'F07ABCDEFGH' (a canvas is a file).")
@@ -107,17 +109,6 @@ def _markdown_doc(value: Any, name: str) -> dict[str, Any] | None:
     raise _invalid(f"{name} must be markdown text, or {{\"type\": \"markdown\", \"markdown\": \"…\"}}")
 
 
-def _json_call(method: str, names: tuple[str, ...], *, channels: tuple[str, ...] = ()) -> Any:
-    """Handler for a JSON-bodied method: ``names`` 1:1; ``channels`` resolved."""
-
-    def handler(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
-        values = _resolve(call, arguments, [c for c in channels if c in arguments])
-        body = {n: values[n] for n in names if n in values}
-        return ToolResult.ok(_payload(call.call(method, body, json_body=True)))
-
-    return handler
-
-
 def _page_hints(payload: Mapping[str, Any]) -> dict[str, Any]:
     """``has_more`` / ``next_page`` from a ``paging`` object (files.list)."""
     paging = payload.get("paging")
@@ -136,8 +127,7 @@ def _send_me_message(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     text = str(arguments["text"])
     if not text.strip():
         raise _invalid("text is empty")
-    if call.attribution:
-        text = f"{text}\n_{mrkdwn_marker(call.attribution)}_"  # S1's text path: an italic last line
+    text = mark_text(text, call.attribution) or text
     channel = resolve_channel(call, arguments["channel"])
     return ToolResult.ok(_payload(call.call("chat.meMessage", {"channel": channel, "text": text})))
 
@@ -226,33 +216,27 @@ def _upload(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     data = content.encode("utf-8")
     if len(data) > MAX_UPLOAD_CONTENT:
         raise _invalid(f"content is over {MAX_UPLOAD_CONTENT // (1024 * 1024)} MiB")
-    blocks = arguments.get("blocks")
-    if isinstance(blocks, str):
-        try:
-            blocks = json.loads(blocks)
-        except ValueError:
-            raise _invalid("blocks is not valid JSON") from None
-    if blocks is not None and (not isinstance(blocks, list) or not all(isinstance(b, dict) for b in blocks)):
-        raise _invalid("blocks must be an array of Block Kit block objects")
+    blocks = _blocks(arguments.get("blocks"))
     comment = arguments.get("initial_comment")
     if blocks and comment:
         # Slack: "If the initial_comment field is provided, the blocks field is ignored".
         raise _invalid("pass initial_comment or blocks for the share message, not both")
     names = [c.strip() for c in str(arguments.get("channels") or "").split(",") if c.strip()]
+    if not names:
+        # Uploading is a send: it posts into conversations. A private-only
+        # upload would post nothing, so it isn't offered (owner Q6).
+        raise _invalid("channels is required: the conversations to share the file in (IDs or names)")
     if arguments.get("thread_ts") and len(names) > 1:
         raise _invalid("thread_ts works with one channel only; pass a single channel to reply in its thread")
-    channels = ",".join(resolve_channel(call, c) for c in names) or None
-    if channels and call.attribution:
-        # The share is a message under the connection's name: mark it, in the
-        # same form as a message (a context block after blocks, else an
-        # italic last line of the comment).
-        if blocks:
-            if len(blocks) >= MAX_BLOCKS:
-                raise _invalid(f"at most {MAX_BLOCKS - 1} blocks: one of Slack's {MAX_BLOCKS} is the attribution")
-            blocks = [*blocks, attribution_block(call.attribution)]
-        else:
-            marker = f"_{mrkdwn_marker(call.attribution)}_"
-            comment = f"{comment}\n{marker}" if comment else marker
+    if arguments.get("filetype") and len(data) > MAX_SNIPPET_BYTES:
+        raise _invalid("a snippet (filetype) is capped at 1 MB by Slack; leave filetype out to upload it as a file")
+    channels = ",".join(resolve_channel(call, c) for c in names)
+    # The share is a message under the connection's name: mark it, in the same
+    # form as a message (a context block after blocks, else an italic last line).
+    if blocks:
+        blocks = mark_blocks(blocks, call.attribution)
+    else:
+        comment = mark_text(comment, call.attribution)
     uploaded = upload_file(
         call.client,
         data,
@@ -264,7 +248,7 @@ def _upload(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         snippet_type=arguments.get("filetype"),
         blocks=blocks or None,
     )
-    return ToolResult.ok({"file": uploaded, "shared_to": channels.split(",") if channels else []})
+    return ToolResult.ok({"file": uploaded, "shared_to": channels.split(",")})
 
 
 def _download(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -631,16 +615,19 @@ BREADTH_CATALOG: tuple[SlackTool, ...] = (
         "SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK", TIER_SEND, "files",
         ("files.getUploadURLExternal", "files.completeUploadExternal"),
         "Upload text as a file or snippet (content, filename, optional title and filetype) and "
-        "share it into channels (IDs or names, comma-separated; optionally in a thread) with an "
-        "initial_comment. Without channels the file stays private to the uploader. Shares made "
-        "as the user carry a 'Sent by <name>' line.",
+        "share it into channels (required: IDs or names, comma-separated; optionally in a thread "
+        "of one channel) with an initial_comment or blocks. Shares made as the user carry a "
+        "'Sent by <name>' line.",
         _schema(
             {
                 "content": _string("The text to upload."),
                 "filename": _string("File name, e.g. 'notes.md' (default 'snippet.txt')."),
                 "title": _string("Title shown in Slack."),
-                "filetype": _string("Snippet type, e.g. 'python', 'markdown' (optional)."),
-                "channels": _string("Comma-separated channel IDs or names to share it in."),
+                "filetype": _string(
+                    "Snippet type, e.g. 'python', 'markdown' (optional). Makes it a snippet, which "
+                    "Slack caps at 1 MB."
+                ),
+                "channels": _string("Comma-separated channel IDs or names to share it in (required)."),
                 "initial_comment": _string("Message posted with the file."),
                 "thread_ts": _string("Share it as a reply in this thread (parent ts)."),
                 "blocks": {
@@ -649,7 +636,8 @@ BREADTH_CATALOG: tuple[SlackTool, ...] = (
                     "description": "Block Kit blocks for the share message (instead of initial_comment).",
                 },
                 "file": _string("Reserved: host-staged files are not supported yet; use content."),
-            }
+            },
+            ["channels"],
         ),
         _upload,
         user=("files:write", *LOOKUP),

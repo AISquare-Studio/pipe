@@ -636,6 +636,7 @@ CASES += [
         "files.remote.share",
         {"file": REMOTE, "channels": f"{C},D0123456"},
         reply={"file": {"id": REMOTE}},
+        config=BOT_CONFIG,
     ),
 ]
 

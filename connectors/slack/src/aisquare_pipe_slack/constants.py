@@ -17,7 +17,9 @@ IDENTITIES = (IDENTITY_USER, IDENTITY_BOT)
 
 #: No side effects.
 TIER_READ = "read"
-#: Posts a new message: post, reply, DM, ephemeral, scheduled.
+#: Posts into a conversation: a message, reply, DM (opening the DM included),
+#: ephemeral, scheduled or /me message, or a file uploaded into chosen
+#: conversations.
 TIER_SEND = "send"
 #: Changes state but deletes nothing: edits, reactions, pins, channel admin,
 #: profile and presence.

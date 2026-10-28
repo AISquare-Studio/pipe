@@ -7,7 +7,8 @@ consent, no re-consent later, since Slack scopes only ever add up), and the
 named groups are the unions over a slice of it:
 
 * by area — ``messages``, ``history``, ``search``, ``conversations``,
-  ``dms``, ``reactions``, ``pins``, ``users``, ``workspace``, ``lists``,
+  ``dms``, ``reactions``, ``pins``, ``users``, ``workspace``, ``bookmarks``,
+  ``dnd``, ``files``, ``canvases``, ``reminders``, ``usergroups``, ``lists``,
   ``remote_files``;
 * by risk tier — ``read``, ``send``, ``write``, ``destructive`` (so a host
   that enables only read + send can ask for only what those tools need);

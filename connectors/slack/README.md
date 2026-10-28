@@ -61,8 +61,12 @@ safe choices.
 | `timeout_seconds` | number | none | Set by hosts. It bounds the whole call, including retries and rate-limit sleeps. |
 
 A value the toolkit can't use (an unknown tier such as `"destrucive"`, an identity
-of `"app"`, …) fails every call with `forbidden`, and the message names the key.
-The toolkit never guesses what you meant. `forbidden` was chosen over
+of `"app"`, a bot token with identity `"user"`, …) fails every call with
+`forbidden`, before its arguments are looked at, and the message names the key.
+`available_tools` / `search_tools` list nothing for such a config. The toolkit never
+guesses what you meant:
+- an unknown slug in `enabled_tools` enables nothing;
+- an unusable `timeout_seconds` is ignored, as core's `time_budget` does. `forbidden` was chosen over
 `upstream_error`, because a host may retry the latter and this is the host's
 misconfiguration, not a Slack failure. It was chosen over `invalid_arguments`
 because the model can't fix it by changing its arguments.
@@ -103,9 +107,10 @@ values) and `SLACK_UPDATE_REMOTE_FILE` (the file's URL and searchable text) are 
 flagged `destructive`. They still sit in the `write` tier, because the owner put
 edits there. Renames, topics and descriptions are not flagged.
 
-Sharing a remote file into a conversation (`SLACK_SHARE_REMOTE_FILE`) posts it, but
-it is `write`, not `send`: a share has no text, so it can't carry the "Sent by" line
-that every `send` tool adds for the user identity.
+Sharing a remote file into a conversation (`SLACK_SHARE_REMOTE_FILE`) posts it, so it
+is **bot-only**, like the other remote-file writes. Remote files are the app's, and a
+share as the user would appear under the user's name with no room for the "Sent by"
+line that every posting `send` tool adds. It is `write`, so opt-in.
 
 ### Identity
 
@@ -116,7 +121,7 @@ that every `send` tool adds for the user identity.
 | Default tiers | read + send | **send only** |
 | Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
 | User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack: Slack accepts only user tokens for them. The two unread tools are user-only by design, because they read the user's own read position. `available_tools` leaves them out. |
-| Bot-only tools | `SLACK_ADD_REMOTE_FILE`, `SLACK_UPDATE_REMOTE_FILE`, `SLACK_REMOVE_REMOTE_FILE` fail as `forbidden` without calling Slack (remote files belong to the app, so Slack accepts only its bot token). `available_tools` leaves them out. | all available (with `write` / `destructive` enabled) |
+| Bot-only tools | `SLACK_ADD_REMOTE_FILE`, `SLACK_UPDATE_REMOTE_FILE`, `SLACK_REMOVE_REMOTE_FILE` (Slack accepts only the bot token for them) and `SLACK_SHARE_REMOTE_FILE` (by owner decision: a share as the user would post without the "Sent by" line) fail as `forbidden` without calling Slack. `available_tools` leaves them out. | all available (with `write` / `destructive` enabled) |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
 
 > **Warning: reading as the bot crosses users.** One bot token serves the whole
@@ -132,11 +137,15 @@ that every `send` tool adds for the user identity.
 and tier. Composio's `return_im` is not accepted, because the full DM object carries
 the latest message and read state.
 
-`identity` comes from config. The token's own kind isn't checked, because Slack has
-changed token prefixes before. Where the two can disagree, the toolkit fails safe:
-the "Sent by" marker is dropped only when the token is positively a bot token
-(`xoxb-…`, `xoxe.xoxb-…`). A user token configured as `bot` still marks its
-messages, since they still appear under the user's name.
+`identity` comes from config. Tokens aren't validated by prefix, because Slack has
+changed prefixes before. A token that is *positively* a bot token (`xoxb-…`,
+`xoxe.xoxb-…`) is used to fail safe:
+- **with `identity` unset, it acts as the bot**: send-only defaults, never the user's
+  read access;
+- **with `identity: "user"`, it is a config error**: calls fail as `forbidden`, and
+  listing returns nothing;
+- **the "Sent by" marker is dropped only for such a token.** A user token configured
+  as `bot` still marks its messages, since they still appear under the user's name.
 
 ### Attribution
 
@@ -213,8 +222,8 @@ Files travel as real bytes (plan §4.8).
   2. POST the bytes to it, with no token, `https` `*.slack.com` only;
   3. complete the upload exactly once.
 
-  Without `channels`, the file stays private to the uploader. A share as the user
-  carries the "Sent by" line:
+  `channels` is **required**: uploading is a send, so it must post somewhere. A
+  private-only upload isn't offered. A share as the user carries the "Sent by" line:
   - with `blocks`, as a context block, and then no `initial_comment` is sent, because
     Slack ignores blocks when there is one;
   - otherwise, as an italic last line of `initial_comment`.
@@ -305,7 +314,7 @@ because retrying won't help. The live test checks a channel and an optional DM.
 ## Scopes
 
 Every tool declares the scopes it needs for each identity, so the scope lists are
-derived from the catalog rather than kept by hand. `USER_SCOPES` (45) and
+derived from the catalog rather than kept by hand. `USER_SCOPES` (44) and
 `BOT_SCOPES` (43) are the full unions, and they are what a consent asks for by
 default: one consent screen, and no re-consent later, because Slack scopes only
 ever add up. `BOT_SCOPES` also holds `app_mentions:read`, which no tool uses but the
@@ -317,8 +326,11 @@ names, raw Slack scopes, or both:
 - By area: `messages`, `history`, `search`, `conversations`, `dms`, `reactions`,
   `pins`, `users`, `workspace`, `bookmarks`, `dnd`, `files`, `canvases`, `reminders`,
   `usergroups`, `lists`, `remote_files`.
-- By tier: `read`, `send`, `write`, `destructive`. For example, `["read", "send"]`
-  asks for exactly what the default tiers need.
+- By tier: `read`, `send`, `write`, `destructive`. For example,
+  `scopes_for(["read", "send"], "user")` is exactly what the user's default tiers
+  need. The bot's default is `["send"]`, and `scopes_for(["send", "events"], "bot")`
+  adds what receiving events needs. Under the default `identity="both"`, a group
+  applies to both token kinds.
 - `events`: the bot scopes the subscribed events need (`app_mentions:read`,
   `im:history`, `reactions:read`).
 
@@ -509,7 +521,7 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_UPDATE_USER_GROUP_MEMBERS` | destructive | `usergroups.users.update` | user, bot |
 | **workspace** | | | |
 | `SLACK_LIST_AUTH_TEAMS` | read | `auth.teams.list` | user, bot |
-| **lists** (paid workspaces) | | | |
+| **lists** | | | |
 | `SLACK_CREATE_SLACK_LIST` | write | `slackLists.create` | user, bot |
 | `SLACK_UPDATE_SLACK_LIST` | write | `slackLists.update` | user, bot |
 | `SLACK_CREATE_SLACK_LIST_ITEM` | write | `slackLists.items.create` | user, bot |
@@ -520,21 +532,13 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS` | destructive | `slackLists.items.deleteMultiple` | user, bot |
 | `SLACK_SET_SLACK_LIST_ACCESS` | write | `slackLists.access.set` | user, bot |
 | `SLACK_DELETE_SLACK_LIST_ACCESS` | destructive | `slackLists.access.delete` | user, bot |
-| **remote files** | | | |
+| **remote_files** | | | |
 | `SLACK_ADD_REMOTE_FILE` | write | `files.remote.add` | bot |
 | `SLACK_UPDATE_REMOTE_FILE` | write | `files.remote.update` | bot |
 | `SLACK_REMOVE_REMOTE_FILE` | destructive | `files.remote.remove` | bot |
 | `SLACK_GET_REMOTE_FILE` | read | `files.remote.info` | user, bot |
 | `SLACK_LIST_REMOTE_FILES` | read | `files.remote.list` | user, bot |
-| `SLACK_SHARE_REMOTE_FILE` | write | `files.remote.share` | user, bot |
-
-Slack Lists text cells and descriptions are Block Kit `rich_text`. As in Composio, a
-plain string is wrapped for you: a cell may be `{"column_id": "Col…", "text": "Ship
-it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both:
-`files.remote.info` refuses both (`too_many_ids`), and the others need only one, so
-the toolkit asks for exactly one everywhere rather than guess which Slack would use.
-Composio's `preview_image` is not offered: Slack takes it only as a multipart image
-upload.
+| `SLACK_SHARE_REMOTE_FILE` | write | `files.remote.share` | bot |
 
 ## Message sink
 
@@ -559,7 +563,7 @@ result.success, result.ref  # ref: the new message's ts
 | Envelope | Goes to | `PushResult.ref` |
 |---|---|---|
 | `str` with `text/plain` (Slack mrkdwn) or `text/markdown` (standard markdown) | `chat.postMessage` | `ts` |
-| `dict` with `application/json`: `text`, `markdown_text` and/or `blocks` (`metadata["blocks"]` overrides) | `chat.postMessage` | `ts` |
+| `dict` with `application/json`: `text` and/or `blocks`, or `markdown_text` alone (`metadata["blocks"]` overrides) | `chat.postMessage` | `ts` |
 | either of the above, with `params["ephemeral_user"]` | `chat.postEphemeral` | `message_ts` |
 | anything else: `bytes`, a `stream`, a `str` of another type (JSON text, CSV…), a `dict` of another type | v2 file upload into the channel (or thread) | file ID |
 
@@ -627,7 +631,8 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
   returns a typed object: `UrlVerification` (`challenge`), `AppRateLimited`, or an
   `EventCallback` — `AppMention`, `Message` (`message.im`, and the channel variants
   if subscribed), `Reaction` (`reaction_added` / `reaction_removed`),
-  `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for anything else.
+  `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for any other event
+  type. An unknown outer type gives a plain `SlackEvent`.
   `event_id` is the dedupe key; `retry_num` / `retry_reason` come from Slack's retry
   headers. **Skip `is_from_this_app` messages and mentions** (the app's own posts,
   as Bolt's `ignoreSelf` does), or the bot answers itself in a loop. Other bots'
@@ -645,9 +650,10 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
   | `channel_created` | `SLACK_CHANNEL_CREATED` |
   | `app_mention` | `SLACK_APP_MENTION_RECEIVED` (pipe's; Composio has none) |
 
-  The app's own posts, edits, deletions and other message subtypes, messages with
-  any other `channel_type` (such as `app_home`), and reactions to files carry no
-  trigger (`None`). `data` is the trigger payload in Composio's field names.
+  Only new messages trigger: plain messages and the subtypes `bot_message`,
+  `file_share`, `thread_broadcast` and `me_message`. The app's own posts, edits,
+  deletions and every other subtype, messages with any other `channel_type` (such as
+  `app_home`), and reactions to files carry no trigger (`None`). `data` is the trigger payload in Composio's field names.
 
 **Host duties** ([Slack's Events API docs](https://docs.slack.dev/apis/events-api)):
 
@@ -668,5 +674,5 @@ live checks are opt-in and post to, then delete from, a dedicated test channel:
 ```bash
 cd connectors/slack
 pytest                                   # unit + compliance (no network, no credentials)
-SLACK_TEST_USER_TOKEN=xoxp-… SLACK_TEST_CHANNEL=C… [SLACK_TEST_BOT_TOKEN=xoxb-…] pytest -m live
+SLACK_TEST_USER_TOKEN=xoxp-… SLACK_TEST_CHANNEL=C… [SLACK_TEST_BOT_TOKEN=xoxb-…] [SLACK_TEST_DM=D…] pytest -m live
 ```

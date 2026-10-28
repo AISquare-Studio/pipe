@@ -3,6 +3,7 @@ exchange (every response shape), refresh, and revoke."""
 
 from __future__ import annotations
 
+import base64
 from typing import ClassVar
 
 import pytest
@@ -176,11 +177,22 @@ class TestExchange:
             "grant_type": "authorization_code",
             "code": "c0de",
             "redirect_uri": EXCHANGE["redirect_uri"],
-            "client_id": "123.456",
-            "client_secret": "s3cret-client",
         }
         assert call.allow_redirects is False
-        assert "Authorization" not in call.headers
+        # HTTP Basic, which Slack recommends; the secret never goes in the body.
+        assert call.headers["Authorization"] == "Basic " + base64.b64encode(b"123.456:s3cret-client").decode()
+
+    def test_a_client_without_a_secret_sends_its_id_in_the_body(self):
+        toolkit, session = _toolkit(response(200, USER_ONLY))
+        toolkit.exchange_code(**{**EXCHANGE, "client_secret": None})
+        assert session.last.data["client_id"] == "123.456"
+        assert "Authorization" not in session.last.headers
+
+    def test_basic_auth_form_encodes_both_parts(self):
+        toolkit, session = _toolkit(response(200, USER_ONLY))
+        toolkit.exchange_code(**{**EXCHANGE, "client_id": "a:b", "client_secret": "p&ss word"})
+        raw = base64.b64decode(session.last.headers["Authorization"].removeprefix("Basic "))
+        assert raw == b"a%3Ab:p%26ss%20word"
 
     @pytest.mark.parametrize("payload", [USER_ONLY, USER_TOP, BOTH])
     def test_the_user_token_by_default(self, payload):
@@ -271,7 +283,9 @@ class TestRevoke:
         assert session.methods == ["auth.test", "auth.revoke"]
         for call in session.calls:
             assert call.headers["Authorization"] == f"Bearer {USER_TOKEN}"
-            assert call.data is None
+            assert call.data == {}
+        # One request each, no retries.
+        assert len(session.calls) == 2
 
     def test_never_revokes_a_bot_token(self):
         toolkit, session = _toolkit(ok(user_id="U0BOT1234", bot_id="B0123"))

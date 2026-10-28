@@ -183,8 +183,8 @@ REMOTE_FILES_CATALOG: tuple[SlackTool, ...] = (
     _tool(
         "SLACK_SHARE_REMOTE_FILE", TIER_WRITE, AREA, "files.remote.share",
         "Share a remote file (by file or external_id) into conversations: channels is a "
-        "comma-separated list of channel or DM IDs. It shows as a file message from this "
-        "connection.",
+        "comma-separated list of channel or DM IDs. It shows as a file message from the app's "
+        "bot. Bot identity only.",
         _schema(
             {
                 "file": FILE,
@@ -198,7 +198,9 @@ REMOTE_FILES_CATALOG: tuple[SlackTool, ...] = (
             ["channels"],
         ),
         _by_file_or_external_id("files.remote.share", ("file", "external_id", "channels")),
-        user=SHARE_SCOPES,
+        # Bot-only: remote files are the app's, and a share as the user would
+        # post under the user's name with no room for the "Sent by" line (Q7).
+        user=None,
         bot=SHARE_SCOPES,
         tags=("remote", "external", "file", "share", "post", "channel"),
     ),

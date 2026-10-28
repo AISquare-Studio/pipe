@@ -59,11 +59,27 @@ class TestUpload:
         }
         assert result.data == {"file": {"id": "F0UP12345", "name": "notes.md", "title": "Notes"}, "shared_to": [C]}
 
-    def test_without_channels_the_file_stays_private_and_unmarked(self):
+    @pytest.mark.parametrize("channels", [None, "", " , "])
+    def test_an_upload_must_name_channels(self, channels):
+        # Decision 4782 (mn4): uploading is a send — it must post somewhere.
+        h = harness()
+        args = {"content": "draft"} if channels is None else {"content": "draft", "channels": channels}
+        result = h.call(UPLOAD, args)
+        assert result.error_code == "invalid_arguments" and "channels" in result.error
+        assert h.session.calls == []
+
+    def test_the_default_filename(self):
         h = harness(*_upload_replies())
-        assert h.call(UPLOAD, {"content": "draft"}).data["shared_to"] == []
-        assert h.session.last.args == {"files": [{"id": "F0UP12345"}]}
+        h.call(UPLOAD, {"content": "draft", "channels": C}, BOT_CONFIG)
         assert h.session.calls[0].args["filename"] == "snippet.txt"
+
+    def test_a_snippet_over_1_mb_is_refused_before_uploading(self):
+        h = harness()
+        result = h.call(UPLOAD, {"content": "x" * (1024 * 1024 + 1), "filetype": "python", "channels": C})
+        assert result.error_code == "invalid_arguments" and "1 MB" in result.error
+        assert h.session.calls == []
+        big = harness(*_upload_replies())
+        assert big.call(UPLOAD, {"content": "x" * (1024 * 1024 + 1), "channels": C}).successful
 
     def test_the_bot_shares_without_a_marker(self):
         h = harness(*_upload_replies())
@@ -131,14 +147,14 @@ class TestUpload:
     )
     def test_bad_input_fails_before_any_request(self, args, expected):
         h = harness()
-        result = h.call(UPLOAD, args)
+        result = h.call(UPLOAD, {"channels": C, **args})
         assert result.error_code == "invalid_arguments"
         assert expected in result.error
         assert h.session.calls == []
 
     def test_a_non_slack_upload_url_is_refused_before_posting(self):
         h = harness(ok(upload_url="https://evil.test/up", file_id="F0UP12345"))
-        result = h.call(UPLOAD, {"content": "x"})
+        result = h.call(UPLOAD, {"content": "x", "channels": C})
         assert result.successful is False
         assert result.data["slack_error"] == "invalid_upload_url"
         assert len(h.session.calls) == 1
@@ -160,7 +176,7 @@ class TestUpload:
 
     def test_a_rate_limited_ticket_is_retried(self):
         h = harness(response(429, headers={"Retry-After": "1"}), *_upload_replies())
-        assert h.call(UPLOAD, {"content": "x"}).successful
+        assert h.call(UPLOAD, {"content": "x", "channels": C}).successful
         assert h.sleeps == [1.0]
 
     def test_complete_is_not_retried_on_a_server_error(self):

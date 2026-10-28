@@ -10,70 +10,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
-  (`slack`, 51 tools — messages, history and threads, search, channels and
-  DMs, reactions, pins, people and presence, workspace) and `SLACK_OAUTH`.
-  - **One toolkit for both identities.** `config["identity"]` is `"user"`
-    (act as the person who connected) or `"bot"` (post as the app's bot).
-    By default one consent mints both tokens
+  (`slack`, 111 tools: 47 read, 6 send, 38 write, 20 destructive),
+  `SLACK_OAUTH`, `SlackMessageSink` (`slack-message-sink`) and Events API
+  helpers. Slugs and argument names follow Composio's Slack toolkit.
+  - **Areas.** Messages, history and threads, search, channels and DMs,
+    reactions, pins, people and presence, files, canvases, bookmarks, Do Not
+    Disturb, reminders, user groups, Slack Lists, remote files and workspace
+    info.
+  - **Identity.** One toolkit serves both identities. `config["identity"]` is
+    `"user"` (act as the person who connected) or `"bot"` (post as the app's
+    bot user). A bot token (`xoxb-…`) with no identity set acts as the bot; with
+    `"user"`, it is a config error. By default one consent mints both tokens
     (`build_authorize_url(identity="both")`, `exchange_installation()`).
-  - **Risk tiers.** Every tool has a tier: read, send, write or destructive.
-    The defaults are read + send for the user and send only for the bot,
-    because a shared bot token would expose other people's conversations.
-    Anything more needs `config["enabled_tiers"]` / `config["enabled_tools"]`.
+  - **Risk tiers.** Every tool is read, send, write or destructive.
+    - The defaults are read + send for the user (53 tools) and send only for
+      the bot (6 tools), because a shared bot token would expose other
+      people's conversations.
+    - Anything more needs `config["enabled_tiers"]` or
+      `config["enabled_tools"]`.
+    - 17 tools are user-only and 4 bot-only. The gate refuses a tool before
+      any request.
   - **Listing.** `available_tools(config)` and `search_tools(..., config=...)`
     list only what a connection may call; with no config, that is the default
-    exposure. An invalid config fails as `forbidden`.
+    exposure. An invalid config lists no tools, and calls fail as
+    `forbidden`.
   - **Attribution.** Messages sent as the user carry a visible "Sent by <name>"
-    line (`config["attribution_name"]`, default `pipe`; opt-in for the bot).
-    The line is dropped only for a token that is positively a bot token.
-  - **Scopes.** Named scope groups (by area and by tier) select what a consent
-    asks for; the default is every scope.
-  - Joins `[full]`.
-- **Slack breadth tools**: 44 more `SlackToolkit` tools (95 in all) for files,
-  canvases, bookmarks, Do Not Disturb, reminders and user groups, plus `/me`
-  messages, unread-from-user, the read cursor, team profile, profile photo,
-  bot info and auth teams.
-  - **Tiers.** They use the same tiers, identity gate and attribution as the
-    core tools. Most are opt-in (write or destructive). Making a file public,
-    editing a canvas, disabling a user group and replacing its members are
-    destructive.
-  - **Files** travel as bytes. Downloads return a `DataEnvelope` in
-    `ToolResult.files`, and the token is sent only to `files.slack.com`.
-    Uploads use Slack's v2 flow (`aisquare_pipe_slack.files.upload_file`).
-  - **Scopes.** User scopes go from 29 to 41, and bot scopes from 28 to 37.
-- **Slack inbound, sink and Lists**: 16 more `SlackToolkit` tools (111 in
-  all), `SlackMessageSink` and Events API helpers.
-  - **Slack Lists and remote files**: Lists, their items and access
-    (`slackLists.*`), and remote files (`files.remote.*`; add / update /
-    remove are bot-only, as Slack requires). Reads are `read`, the rest
-    opt-in `write` / `destructive`.
-  - **`SlackMessageSink`** (`slack-message-sink`): posts envelopes as
-    messages, ephemeral messages or v2 file uploads, with the toolkit's
-    identity, attribution and send gate. `PushResult.ref` is the `ts`,
-    `message_ts` or file ID.
-  - **Events API helpers** (`aisquare_pipe_slack.events`): the v0 signature
-    check and the replay window in one call (`verify_request` /
-    `parse_request`); typed parsing of `url_verification`, `app_mention`,
-    `message.im`, `reaction_added` / `reaction_removed`, `tokens_revoked` and
-    `app_uninstalled`; `event_to_envelope` with Composio's trigger names. The
-    app's own posts (`is_from_this_app`) get no trigger, so a router can't
-    loop on them. The endpoint and the Signing Secret are the host's.
-  - **Scopes.** User scopes go from 41 to 45, and bot scopes from 37 to 43,
-    including `app_mentions:read` for the `app_mention` event. The manifest
-    subscribes the bot to six events and turns its Messages tab on.
-
-- `Toolkit.available_tools(config=None)`: the tools a connection with that
-  config may call, so hosts can list only those to a model. It returns
-  every tool (`tools()`) unless a toolkit overrides it.
-  `search_tools(query, limit, *, config=None)` now ranks
-  `available_tools(config)`. Existing calls without `config` behave as before.
-  `get_tool` and `call_tool` are unchanged, and `call_tool` still enforces
-  on its own. A toolkit that overrides `search_tools` must accept
-  `*, config=None`. An `available_tools` override returns a subset of
-  `tools()` and never raises; for an unreadable config it returns `[]`. The
-  new contract check `contract.toolkit.available-tools` (run by
-  `pipe validate` and the toolkit compliance suite) verifies this for
-  `None` and `{}`.
+    line (`config["attribution_name"]`, default `pipe`). It covers posts,
+    replies, DMs, ephemeral, scheduled and `/me` messages, edits, file shares
+    and sink pushes. It is opt-in for the bot.
+  - **Scopes.** 44 user and 43 bot scopes, derived from the tools, including
+    the events-only `app_mentions:read`. The default consent asks for all of
+    them. Named scope groups (by area, by tier, and `events`) select a subset.
+  - **Files.** Downloads return a `DataEnvelope` in `ToolResult.files`. The
+    token goes only to `files.slack.com` (the host is checked the way
+    requests resolves it), with a 100 MiB cap. Uploads use Slack's v2 flow
+    (`aisquare_pipe_slack.files.upload_file`).
+  - **Errors.** Slack's `ok: false` codes map to the canonical `error_code`s,
+    with hints. Retry-After is honoured within the host's time budget, and
+    server errors are retried only for reads.
+  - **`SlackMessageSink`.** It posts envelopes as messages, ephemeral messages
+    or v2 file uploads, with the toolkit's identity, attribution and send
+    gate. `PushResult.ref` is the `ts`, `message_ts` or file ID.
+  - **Events API helpers** (`aisquare_pipe_slack.events`).
+    - `verify_request` / `parse_request` check the v0 signature and the
+      replay window in one call.
+    - Typed parsing of `url_verification`, `app_mention`, `message.im`,
+      `reaction_added` / `reaction_removed`, `tokens_revoked` and
+      `app_uninstalled`.
+    - `event_to_envelope` maps events to Composio's trigger names. The app's
+      own posts get no trigger.
+  - **Packaging.** It requires `aisquare-pipe>=0.3.0`, `requests` and
+    `urllib3`. It ships an app manifest template and joins `[full]`.
 
 ## [0.3.0] - 2026-10-15
 
@@ -139,6 +126,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (PKCE, offline access).
 - Install extras: `aisquare-pipe-googledrive` joins `[popular]` (and so
   `[full]`); `aisquare-pipe-github` joins `[full]`.
+
+- `Toolkit.available_tools(config=None)`: the tools a connection with that
+  config may call, so hosts can list only those to a model. It returns
+  every tool (`tools()`) unless a toolkit overrides it.
+  `search_tools(query, limit, *, config=None)` now ranks
+  `available_tools(config)`. Existing calls without `config` behave as before.
+  `get_tool` and `call_tool` are unchanged, and `call_tool` still enforces
+  on its own. A toolkit that overrides `search_tools` must accept
+  `*, config=None`. An `available_tools` override returns a subset of
+  `tools()` and never raises; for an unreadable config it returns `[]`. The
+  new contract check `contract.toolkit.available-tools` (run by
+  `pipe validate` and the toolkit compliance suite) verifies this for
+  `None` and `{}`.
 
 ### Changed
 

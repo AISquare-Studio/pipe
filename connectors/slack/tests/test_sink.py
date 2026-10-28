@@ -10,7 +10,9 @@ from typing import Any
 import pytest
 from aisquare.pipe import DataEnvelope, PushParams, PushResult, get_connector
 
-from aisquare_pipe_slack import SlackMessageSink, connector
+from aisquare_pipe_slack import SlackMessageSink, connector, settings_from_config
+from aisquare_pipe_slack.catalog import TOOLS
+from aisquare_pipe_slack.toolkit import gate
 
 from .fakes import (
     BOT_CONFIG,
@@ -287,6 +289,23 @@ class TestGateAndFailures:
         assert result.metadata["error_code"] == "forbidden"
         assert "config['enabled_tiers']" in (result.error or "")
         assert "'SLACK_SEND_MESSAGE' to config['enabled_tools']" in (result.error or "")
+        assert session.calls == []
+
+    @pytest.mark.parametrize(
+        "content, slug, extra",
+        [
+            ("hi", "SLACK_SEND_MESSAGE", {}),
+            ("hi", "SLACK_SEND_EPHEMERAL_MESSAGE", {"ephemeral_user": "U0123456"}),
+            (b"%PDF", "SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK", {}),
+        ],
+    )
+    def test_the_sink_uses_the_toolkits_own_gate(self, content, slug, extra):
+        # mn6: one gate, so the sink can't drift from the tools' tiers/identities.
+        config = {**USER_CONFIG, "enabled_tiers": ["read"]}
+        env = envelope(content, "application/pdf") if isinstance(content, bytes) else envelope(content)
+        result, session, _ = push(env, config=config, **extra)
+        expected = gate(TOOLS[slug], settings_from_config(config))
+        assert expected is not None and result.error == expected.error
         assert session.calls == []
 
     def test_one_slug_enables_its_kind_of_push(self):

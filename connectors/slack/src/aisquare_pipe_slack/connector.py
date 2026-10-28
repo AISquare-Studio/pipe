@@ -11,7 +11,8 @@ Routing, by the envelope:
 
 * a message — ``str`` data as ``text/plain`` (Slack mrkdwn) or
   ``text/markdown`` (standard markdown), or ``dict`` data as
-  ``application/json`` with ``text``, ``markdown_text`` and/or ``blocks`` —
+  ``application/json`` with ``text`` and/or ``blocks``, or ``markdown_text``
+  alone —
   goes to ``chat.postMessage``, or to ``chat.postEphemeral`` with
   ``params["ephemeral_user"]``;
 * anything else — ``bytes``, a ``stream``, ``str`` of another type (JSON
@@ -52,15 +53,11 @@ from aisquare.pipe import (
     time_budget,
 )
 
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.config import (
     SlackConfigError,
     SlackSettings,
     settings_from_config,
-)
-from aisquare_pipe_slack.constants import (
-    CONFIG_ENABLED_TIERS,
-    CONFIG_ENABLED_TOOLS,
-    TIER_SEND,
 )
 from aisquare_pipe_slack.files import upload_file
 from aisquare_pipe_slack.rest import (
@@ -69,11 +66,11 @@ from aisquare_pipe_slack.rest import (
     SlackAPIError,
     SlackWebClient,
 )
-from aisquare_pipe_slack.toolkit import describe_error, error_code
+from aisquare_pipe_slack.toolkit import describe_error, error_code, gate
 from aisquare_pipe_slack.tools import (
     SlackCall,
     compose_message,
-    mrkdwn_marker,
+    mark_text,
     resolve_channel,
 )
 
@@ -190,13 +187,11 @@ class SlackMessageSink(SinkConnector):
             if ephemeral_user and is_file:
                 raise _PushError("a file can't be sent as an ephemeral message; drop ephemeral_user")
             slug = UPLOAD_SLUG if is_file else EPHEMERAL_SLUG if ephemeral_user else SEND_SLUG
-            if not settings.allows(slug, TIER_SEND):
-                raise _PushError(
-                    f"posting is a 'send' action and is not enabled for this Slack connection: the "
-                    f"host enables it by adding 'send' to config[{CONFIG_ENABLED_TIERS!r}] or "
-                    f"{slug!r} to config[{CONFIG_ENABLED_TOOLS!r}]",
-                    ERROR_FORBIDDEN,
-                )
+            # The same gate as the toolkit's: the tier of the matching tool and
+            # whether this identity may run it.
+            blocked = gate(TOOLS[slug], settings)
+            if blocked is not None:
+                raise _PushError(blocked.error or f"{slug} is not enabled", ERROR_FORBIDDEN)
             with self._client(token, config) as client:
                 call = SlackCall(client, settings, attribution=attribution)
                 channel_id = resolve_channel(call, channel)
@@ -365,10 +360,7 @@ def _push_file(
 ) -> PushResult:
     filename = _text(options.get("filename")) or _text(envelope.metadata.get("filename")) or _default_name(envelope)
     title = _text(options.get("title")) or _text(envelope.metadata.get("title"))
-    comment = _text(options.get("initial_comment"))
-    if call.attribution:
-        marker = f"_{mrkdwn_marker(call.attribution)}_"
-        comment = f"{comment}\n{marker}" if comment else marker
+    comment = mark_text(_text(options.get("initial_comment")), call.attribution)
     uploaded = upload_file(
         call.client,
         content,

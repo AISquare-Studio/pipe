@@ -99,7 +99,9 @@ DESTRUCTIVE |= {
     "SLACK_DELETE_SLACK_LIST_ACCESS", "SLACK_REMOVE_REMOTE_FILE",
 }
 #: Slack accepts only the app's bot token for these (remote files belong to the app).
-BOT_ONLY = {"SLACK_ADD_REMOTE_FILE", "SLACK_UPDATE_REMOTE_FILE", "SLACK_REMOVE_REMOTE_FILE"}
+BOT_ONLY = {
+    "SLACK_ADD_REMOTE_FILE", "SLACK_UPDATE_REMOTE_FILE", "SLACK_REMOVE_REMOTE_FILE", "SLACK_SHARE_REMOTE_FILE",
+}
 #: Writes that replace content: destructive by core's definition, but in the
 #: opt-in write tier by the owner's.
 OVERWRITES = {"SLACK_UPDATES_A_SLACK_MESSAGE", "SLACK_UPDATE_SLACK_LIST_ITEM", "SLACK_UPDATE_REMOTE_FILE"}
@@ -223,6 +225,24 @@ class TestTiers:
         assert h.session.calls == []
         assert SlackToolkit().tools_for({**USER_CONFIG, "enabled_tiers": tiers}) == []
 
+    def test_an_invalid_config_is_refused_before_the_arguments(self):
+        # mn7: the model can't fix config through its arguments, so it must
+        # not be sent off to fix them first.
+        h = harness()
+        result = h.call("SLACK_SEND_MESSAGE", {"bogus": 1}, enabled_tiers=["destrucive"])
+        assert result.error_code == "forbidden"
+        assert "config['enabled_tiers']" in result.error
+        unknown = h.call("SLACK_NOPE", {}, enabled_tiers=["destrucive"])
+        assert unknown.error_code == "forbidden"
+
+    @pytest.mark.parametrize("config", ["x", 5, ["read"], b"read"])
+    def test_a_config_that_is_not_a_mapping_lists_nothing(self, config):
+        assert SlackToolkit().available_tools(config) == []  # type: ignore[arg-type]
+
+    def test_unknown_enabled_tools_enable_nothing(self):
+        config = {**USER_CONFIG, "enabled_tools": ["SLACK_NOT_A_TOOL", "*"]}
+        assert {t.slug for t in SlackToolkit().available_tools(config)} == READ | SEND
+
     @pytest.mark.parametrize(
         "key, value", [("enabled_tiers", 3), ("enabled_tools", [1]), ("bot_attribution", "yes"), ("identity", "app")]
     )
@@ -312,6 +332,31 @@ class TestIdentity:
 
     def test_open_dm_has_no_return_im_argument(self):
         assert "return_im" not in TOOLS["SLACK_OPEN_DM"].spec.input_schema["properties"]
+
+    @pytest.mark.parametrize("token", [BOT_TOKEN, "xoxe.xoxb-1-rotated"])
+    def test_a_bot_token_without_identity_acts_as_the_bot(self, token):
+        # Decision 4782 (MJ1): fail safe — a positively-bot token never gets
+        # the user's read defaults.
+        config = {"access_token": token}
+        assert {t.slug for t in SlackToolkit().available_tools(config)} == SEND
+        h = harness()
+        result = h.call("SLACK_FETCH_CONVERSATION_HISTORY", {"channel": C}, config)
+        assert result.error_code == "forbidden"
+        assert "Read is off by default for the bot" in result.error
+        assert h.session.calls == []
+        posted = harness(ok(channel=C, ts=TS))
+        assert posted.call("SLACK_SEND_MESSAGE", SEND_ARGS, config).successful
+        assert posted.session.last.args["markdown_text"] == "hello"  # the bot's: no marker
+
+    def test_a_bot_token_with_identity_user_is_a_config_error(self):
+        config = {"access_token": BOT_TOKEN, "identity": "user"}
+        assert SlackToolkit().available_tools(config) == []
+        h = harness()
+        result = h.call("SLACK_SEARCH_MESSAGES", {"query": "x"}, config)
+        assert result.error_code == "forbidden"
+        assert "config['identity'] is 'user' but access_token is a bot token" in result.error
+        assert BOT_TOKEN not in result.error
+        assert h.session.calls == []
 
     def test_the_user_keeps_read_and_send(self):
         assert {t.slug for t in SlackToolkit().available_tools({**USER_CONFIG, "identity": "user"})} == READ | SEND
@@ -688,6 +733,27 @@ class TestComposites:
     def test_who_am_i_surfaces_other_team_info_failures(self):
         result = harness(ok(user="sam"), slack_error("invalid_auth")).call("SLACK_WHO_AM_I", {})
         assert result.error_code == "unauthorized"
+
+    def test_a_multi_user_invite_is_not_reported_as_no_change(self):
+        # n8: Slack invites all or none unless force; with several users an
+        # already_in_channel may mean nobody was invited.
+        errors = [{"user": "U01111111", "ok": False, "error": "already_in_channel"}, {"user": "<x>", "error": "bad code"}]
+        h = harness(slack_error("already_in_channel", errors=errors))
+        result = h.call("SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL", {"channel": C, "users": "U01111111,U02222222"},
+                        enabled_tiers=ALL_TIERS)
+        assert result.error_code == "conflict"
+        assert "no change needed" not in result.error and "nobody may have been invited" in result.error
+        assert result.data == {
+            "slack_error": "already_in_channel",
+            "status": 200,
+            "errors": [{"error": "already_in_channel", "user": "U01111111"}],
+        }
+
+    def test_a_single_user_invite_already_in_is_no_change(self):
+        h = harness(slack_error("already_in_channel"))
+        result = h.call("SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL", {"channel": C, "users": "U01111111"},
+                        enabled_tiers=ALL_TIERS)
+        assert result.error_code == "conflict" and "no change needed" in result.error
 
     def test_open_dm_takes_an_array_and_needs_someone(self):
         h = harness(ok(channel={"id": "G0123456"}))

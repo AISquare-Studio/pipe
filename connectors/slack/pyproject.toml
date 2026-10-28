@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aisquare-pipe-slack"
 version = "0.1.0"
-description = "Slack toolkit (messages, history, search, channels, DMs, reactions, pins, users, Lists), message sink and Events API helpers for aisquare.pipe, acting as a user or as the app's bot"
+description = "Slack toolkit (messages, history, search, channels, DMs, reactions, pins, people, files, canvases, bookmarks, DnD, reminders, user groups, Lists, remote files), message sink and Events API helpers for aisquare.pipe, acting as a user or as the app's bot"
+readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "A-Square"}]
