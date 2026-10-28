@@ -1,11 +1,19 @@
 # aisquare-pipe-slack
 
 Slack for [aisquare.pipe](../../README.md): `SlackToolkit`, registered as toolkit
-`slack` (`aisquare_pipe.toolkits`). It has 95 LLM-callable tools over Slack's Web API —
+`slack` (`aisquare_pipe.toolkits`). It has 111 LLM-callable tools over Slack's Web API —
 messages, history and threads, search, channels and DMs, reactions, pins, people and
 presence, plus files (upload and download), canvases, bookmarks, Do Not Disturb,
-reminders and user groups — and Slack's OAuth v2 spec. It acts **as the user** who connected, or
-**as the app's bot**. Which one is a config option.
+reminders, user groups, Slack Lists and remote files — and Slack's OAuth v2 spec. It
+acts **as the user** who connected, or **as the app's bot**. Which one is a config
+option.
+
+Two more pieces use the same connection config:
+
+- [`SlackMessageSink`](#message-sink), registered as connector `slack-message-sink`
+  (`aisquare_pipe.connectors`): a pipeline sink that posts messages and files.
+- [`aisquare_pipe_slack.events`](#inbound-events-events-api): pure helpers for a
+  host's Events API endpoint — signature check, replay window, typed events.
 
 pipe is app-agnostic. The host registers one Slack app and passes its client ID and
 secret, and its choices, into pipe. Which app that is (prod, staging, …) is the
@@ -67,8 +75,8 @@ Every tool has exactly one tier:
 |---|---|:-:|
 | `read` | No side effects | ✓ |
 | `send` | Posting into a conversation: a message, reply, DM (incl. opening the DM), ephemeral, scheduled or `/me` message; uploading a file into chosen conversations (it reaches nobody else) | ✓ |
-| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, the read cursor, bookmarks, canvases (create, give access), profile/status/photo, presence, DnD, reminders, user groups (create, update, enable), turning a file's public link off | |
-| `destructive` | Things the caller can't undo, or that reach beyond Slack: deleting a message, scheduled message, file, file comment, canvas, canvas access, bookmark, reminder or profile photo; archiving a channel, removing someone, leaving a channel; editing a canvas (an edit can replace or delete content); disabling a user group or replacing its members; making a file public | |
+| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, the read cursor, bookmarks, canvases (create, give access), profile/status/photo, presence, DnD, reminders, user groups (create, update, enable), turning a file's public link off, Slack Lists (create, edit items, share), remote files (add, update, share into conversations) | |
+| `destructive` | Things the caller can't undo, or that reach beyond Slack: deleting a message, scheduled message, file, file comment, canvas, canvas access, bookmark, reminder or profile photo; archiving a channel, removing someone, leaving a channel; editing a canvas (an edit can replace or delete content); disabling a user group or replacing its members; making a file public; deleting List items, removing access to a List, removing a remote file | |
 
 If a connection calls a tool whose tier it hasn't enabled, the call fails with
 `forbidden` **before any request is made**. The message names the setting that
@@ -89,10 +97,15 @@ on an older core. Only `tools()` returns the full catalog, for browsing.
 `SlackToolkit.tier_of(slug)` gives a tool's tier.
 
 `ToolSpec.read_only` is true exactly for the `read` tier, and `destructive` is true
-for the `destructive` tier. There is one exception:
-`SLACK_UPDATES_A_SLACK_MESSAGE` is also flagged `destructive`, because an edit
-overwrites the message. It still sits in the `write` tier, because the owner put
-edits there.
+for the `destructive` tier. The exceptions are the writes that overwrite content:
+`SLACK_UPDATES_A_SLACK_MESSAGE` (the message), `SLACK_UPDATE_SLACK_LIST_ITEM` (cell
+values) and `SLACK_UPDATE_REMOTE_FILE` (the file's URL and searchable text) are also
+flagged `destructive`. They still sit in the `write` tier, because the owner put
+edits there. Renames, topics and descriptions are not flagged.
+
+Sharing a remote file into a conversation (`SLACK_SHARE_REMOTE_FILE`) posts it, but
+it is `write`, not `send`: a share has no text, so it can't carry the "Sent by" line
+that every `send` tool adds for the user identity.
 
 ### Identity
 
@@ -103,6 +116,7 @@ edits there.
 | Default tiers | read + send | **send only** |
 | Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
 | User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack: Slack accepts only user tokens for them. The two unread tools are user-only by design, because they read the user's own read position. `available_tools` leaves them out. |
+| Bot-only tools | `SLACK_ADD_REMOTE_FILE`, `SLACK_UPDATE_REMOTE_FILE`, `SLACK_REMOVE_REMOTE_FILE` fail as `forbidden` without calling Slack (remote files belong to the app, so Slack accepts only its bot token). `available_tools` leaves them out. | all available (with `write` / `destructive` enabled) |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
 
 > **Warning: reading as the bot crosses users.** One bot token serves the whole
@@ -291,19 +305,22 @@ because retrying won't help. The live test checks a channel and an optional DM.
 ## Scopes
 
 Every tool declares the scopes it needs for each identity, so the scope lists are
-derived from the catalog rather than kept by hand. `USER_SCOPES` (41) and
-`BOT_SCOPES` (37) are the full unions, and they are what a consent asks for by
+derived from the catalog rather than kept by hand. `USER_SCOPES` (45) and
+`BOT_SCOPES` (43) are the full unions, and they are what a consent asks for by
 default: one consent screen, and no re-consent later, because Slack scopes only
-ever add up.
+ever add up. `BOT_SCOPES` also holds `app_mentions:read`, which no tool uses but the
+`app_mention` event subscription needs (`events.EVENTS_ONLY_BOT_SCOPES`).
 
 To ask for less, pass `scopes` to `build_authorize_url`. It takes **scope group**
 names, raw Slack scopes, or both:
 
 - By area: `messages`, `history`, `search`, `conversations`, `dms`, `reactions`,
   `pins`, `users`, `workspace`, `bookmarks`, `dnd`, `files`, `canvases`, `reminders`,
-  `usergroups`.
+  `usergroups`, `lists`, `remote_files`.
 - By tier: `read`, `send`, `write`, `destructive`. For example, `["read", "send"]`
   asks for exactly what the default tiers need.
+- `events`: the bot scopes the subscribed events need (`app_mentions:read`,
+  `im:history`, `reactions:read`).
 
 ```python
 from aisquare_pipe_slack import SCOPE_GROUPS, scopes_for
@@ -356,14 +373,19 @@ installation = slack.exchange_installation(client_id=…, client_secret=…, cod
 ## The Slack app
 
 [`slack-app-manifest.json`](slack-app-manifest.json) is an app manifest template:
-user and bot scopes, the bot user, PKCE off, token rotation off. pipe is
-app-agnostic, so first replace the placeholders `YOUR_APP_NAME`, `your-app-bot` and
-`https://YOUR_HOST/v1/connections/callback` with your app's values. Then go to
+user and bot scopes, the bot user (with its Messages tab on, so people can DM it),
+the bot event subscriptions, PKCE off, token rotation off. pipe is app-agnostic, so
+first replace the placeholders `YOUR_APP_NAME`, `your-app-bot`,
+`https://YOUR_HOST/v1/connections/callback` and the Events request URL
+`https://YOUR_HOST/v1/slack/events` with your app's values. Then go to
 <https://api.slack.com/apps?new_app=1>, choose **From a manifest**, and use the JSON
-tab.
-`tests/test_manifest.py` keeps its scopes equal to what the tools declare. It also
-checks every declared scope against Slack's own method docs, frozen in
-`tests/fixtures/slack_method_scopes.json`.
+tab. Slack asks you to verify the request URL (the `url_verification` handshake,
+see [Inbound events](#inbound-events-events-api)) once the host's endpoint is up;
+until then, delete `settings.event_subscriptions` or leave it unverified — the tools
+and the sink don't need it.
+`tests/test_manifest.py` keeps its scopes equal to what the tools and the event
+subscriptions declare. It also checks every declared scope against Slack's own method
+docs, frozen in `tests/fixtures/slack_method_scopes.json`.
 
 Other workspaces can't install the app until you turn on **Manage Distribution →
 Activate Public Distribution**. Until then, installs fail with
@@ -487,6 +509,141 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_UPDATE_USER_GROUP_MEMBERS` | destructive | `usergroups.users.update` | user, bot |
 | **workspace** | | | |
 | `SLACK_LIST_AUTH_TEAMS` | read | `auth.teams.list` | user, bot |
+| **lists** (paid workspaces) | | | |
+| `SLACK_CREATE_SLACK_LIST` | write | `slackLists.create` | user, bot |
+| `SLACK_UPDATE_SLACK_LIST` | write | `slackLists.update` | user, bot |
+| `SLACK_CREATE_SLACK_LIST_ITEM` | write | `slackLists.items.create` | user, bot |
+| `SLACK_GET_SLACK_LIST_ITEM` | read | `slackLists.items.info` | user, bot |
+| `SLACK_LIST_SLACK_LIST_ITEMS` | read | `slackLists.items.list` | user, bot |
+| `SLACK_UPDATE_SLACK_LIST_ITEM` | write | `slackLists.items.update` | user, bot |
+| `SLACK_DELETE_SLACK_LIST_ITEM` | destructive | `slackLists.items.delete` | user, bot |
+| `SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS` | destructive | `slackLists.items.deleteMultiple` | user, bot |
+| `SLACK_SET_SLACK_LIST_ACCESS` | write | `slackLists.access.set` | user, bot |
+| `SLACK_DELETE_SLACK_LIST_ACCESS` | destructive | `slackLists.access.delete` | user, bot |
+| **remote files** | | | |
+| `SLACK_ADD_REMOTE_FILE` | write | `files.remote.add` | bot |
+| `SLACK_UPDATE_REMOTE_FILE` | write | `files.remote.update` | bot |
+| `SLACK_REMOVE_REMOTE_FILE` | destructive | `files.remote.remove` | bot |
+| `SLACK_GET_REMOTE_FILE` | read | `files.remote.info` | user, bot |
+| `SLACK_LIST_REMOTE_FILES` | read | `files.remote.list` | user, bot |
+| `SLACK_SHARE_REMOTE_FILE` | write | `files.remote.share` | user, bot |
+
+Slack Lists text cells and descriptions are Block Kit `rich_text`. As in Composio, a
+plain string is wrapped for you: a cell may be `{"column_id": "Col…", "text": "Ship
+it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both
+(Slack refuses both). Composio's `preview_image` is not offered: Slack takes it only
+as a multipart image upload.
+
+## Message sink
+
+`SlackMessageSink` (connector `slack-message-sink`) posts a pipeline's envelopes. Its
+`config` is the toolkit's (`access_token`, `identity`, `attribution_name`,
+`bot_attribution`, `enabled_tiers` / `enabled_tools`, `timeout_seconds`), so one
+stored connection serves both.
+
+```python
+from aisquare.pipe import DataEnvelope, PushParams
+from aisquare_pipe_slack import SlackMessageSink
+
+sink = SlackMessageSink()
+result = sink.push(
+    DataEnvelope(content_type="text/markdown", data="**Build green** :white_check_mark:", source_id="ci"),
+    {"access_token": "xoxb-…", "identity": "bot"},
+    PushParams({"channel": "#deploys", "thread_ts": "1761312000.004100"}),
+)
+result.success, result.ref  # ref: the new message's ts
+```
+
+| Envelope | Goes to | `PushResult.ref` |
+|---|---|---|
+| `str` with `text/plain` (Slack mrkdwn) or `text/markdown` (standard markdown) | `chat.postMessage` | `ts` |
+| `dict` with `application/json`: `text`, `markdown_text` and/or `blocks` (`metadata["blocks"]` overrides) | `chat.postMessage` | `ts` |
+| either of the above, with `params["ephemeral_user"]` | `chat.postEphemeral` | `message_ts` |
+| `bytes`, a `stream`, or any other content type | v2 file upload into the channel (or thread) | file ID |
+
+- **`params`:** `channel` (required; an ID or a name), `thread_ts`,
+  `reply_broadcast`, `ephemeral_user`, `unfurl_links`, `unfurl_media`; for files
+  `filename`, `title` and `initial_comment` (`envelope.metadata["filename"]` /
+  `["title"]` work too).
+- **Attribution** is the toolkit's: as the user, every message gets the "Sent by
+  <name>" line, and a file's `initial_comment` gets it as its last line.
+- **Tiers:** a push is a `send` action. If a host's config leaves `send` out of
+  `enabled_tiers`, the push fails as `forbidden` before any request, unless the
+  matching tool (`SLACK_SEND_MESSAGE`, `SLACK_SEND_EPHEMERAL_MESSAGE`,
+  `SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK`) is in `enabled_tools`.
+- **Failures** never raise: `success=False`, an `error` that names no secret, and
+  `metadata["error_code"]` (the same `ERROR_*` codes as the tools; `retry_after`
+  for `rate_limited`). Files are capped at 100 MiB.
+- `validate_config` is an offline shape check (a usable `access_token` and readable
+  options); it calls nothing.
+
+## Inbound events (Events API)
+
+pipe ships **pure helpers**; the host owns the HTTP route, the app's **Signing
+Secret**, the dedupe ledger and the 3-second ack. In `aisquare_pipe_slack.events`:
+
+```python
+from aisquare_pipe_slack.events import (
+    EventCallback, SlackEventError, SlackSignatureError, UrlVerification,
+    event_to_envelope, parse_request,
+)
+
+def slack_events(request):                       # the host's POST /v1/slack/events
+    try:
+        event = parse_request(request.headers, request.raw_body, SIGNING_SECRET)
+    except SlackSignatureError:                  # not Slack's, or replayed: e.reason says why
+        return 401
+    except SlackEventError:                      # signed, but not an Events API body
+        return 400
+    if isinstance(event, UrlVerification):
+        return 200, event.response()             # {"challenge": "..."}
+    if isinstance(event, EventCallback) and not ledger.seen(event.event_id):
+        queue.put(event_to_envelope(event))      # do the work after acking
+    return 200
+```
+
+- **`verify_request(headers, raw_body, signing_secret, now=None)`** checks the
+  timestamp (whole seconds, within 300 s either way) and the v0 signature
+  (`HMAC-SHA256` over `v0:<ts>:<raw body>`, compared in constant time) in one call,
+  so a host can't skip the replay check. Headers are matched case-insensitively
+  (a mapping, or ASGI-style `(name, value)` pairs). It raises
+  `SlackSignatureError` with a `reason`: `missing_timestamp`, `missing_signature`,
+  `bad_timestamp`, `stale_timestamp`, `bad_signature`, `bad_body`,
+  `no_signing_secret`. Pass the **raw** body bytes: a re-serialized JSON body no
+  longer matches. `verify_slack_signature` and `timestamp_in_window` are the two
+  checks on their own (both return a bool and never raise).
+- **`parse_event(body, headers=None)`** (and `parse_request`, which verifies first)
+  returns a typed object: `UrlVerification` (`challenge`), `AppRateLimited`, or an
+  `EventCallback` — `AppMention`, `Message` (`message.im`, and the channel variants
+  if subscribed), `Reaction` (`reaction_added` / `reaction_removed`),
+  `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for anything else.
+  `event_id` is the dedupe key; `retry_num` / `retry_reason` come from Slack's retry
+  headers. Ignore `Message.is_from_bot` messages, or the bot answers itself.
+- **`event_to_envelope(event)`** gives a pipeline a `DataEnvelope` whose
+  `metadata["trigger_slug"]` uses Composio's trigger names, so existing
+  subscriptions keep their vocabulary:
+
+  | Event | `trigger_slug` |
+  |---|---|
+  | `message` in a DM (`message.im`) | `SLACK_DIRECT_MESSAGE_RECEIVED` |
+  | `message` in a channel, private channel or group DM | `SLACK_CHANNEL_MESSAGE_RECEIVED` |
+  | `reaction_added` / `reaction_removed` on a message | `SLACK_MESSAGE_REACTION_ADDED` / `_REMOVED` |
+  | `channel_created` | `SLACK_CHANNEL_CREATED` |
+  | `app_mention` | `SLACK_APP_MENTION_RECEIVED` (pipe's; Composio has none) |
+
+  Edits, deletions and other message subtypes, and reactions to files, carry no
+  trigger (`None`). `data` is the trigger payload in Composio's field names.
+
+**Host duties** ([Slack's Events API docs](https://docs.slack.dev/apis/events-api)):
+
+- answer within **3 seconds**, then do the work;
+- Slack **retries** an unanswered event 3 times (at once, after 1 min, after 5 min)
+  with the same `event_id`, so dedupe on it;
+- event deliveries are **disabled** when more than 95% fail within an hour;
+- Slack sends at most **30,000 events per workspace per app per hour**
+  (`app_rate_limited` tells you when it starts dropping);
+- on **`tokens_revoked`** delete the listed users' stored tokens, and on
+  **`app_uninstalled`** every token stored for that workspace.
 
 ## Tests
 

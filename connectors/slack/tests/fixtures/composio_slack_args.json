@@ -2,7 +2,7 @@
   "source": "https://docs.composio.dev/toolkits/slack.md",
   "composio_toolkit_version": "20261023_00",
   "fetched": "2026-10-28",
-  "notes": "Params trimmed to <=160 chars. 'enum' added where the docs table lists allowed values. SLACK_TEST_AUTH and SLACK_WHO_AM_I have no Input Parameters section (zero args).",
+  "notes": "Params trimmed to <=160 chars. 'enum' added where the docs table lists allowed values. SLACK_TEST_AUTH and SLACK_WHO_AM_I have no Input Parameters section (zero args). The Slack Lists and remote-file rows (S3) were added from the same page and version.",
   "tools": {
     "SLACK_SEND_MESSAGE": {
       "params": [
@@ -2239,6 +2239,436 @@
           "type": "boolean",
           "required": false,
           "description": "When true, the response returns URIs to the avatar images that represent each workspace."
+        }
+      ]
+    },
+    "SLACK_CREATE_SLACK_LIST": {
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "The name (title) of the Slack List to create, e.g. 'Sprint Tasks'. This is shown as the List's title in Slack and is required."
+        },
+        {
+          "name": "schema",
+          "type": "array",
+          "required": false,
+          "description": "Column definitions for the List. Each entry is a column object describing a typed column (its `name`, `type`, and any type-specific options such as `select`..."
+        },
+        {
+          "name": "todo_mode",
+          "type": "boolean",
+          "required": false,
+          "description": "Set to true to create the List in to-do mode, which adds Slack's built-in task-tracking columns (such as assignee, due date, and completion status) so the Li..."
+        },
+        {
+          "name": "copy_from_list_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of an existing Slack List to copy the structure from, e.g. 'F0123456789'. When provided, the new List is created with the same columns as that List. Use `..."
+        },
+        {
+          "name": "description_blocks",
+          "type": "string",
+          "required": false,
+          "description": "Rich text describing the List, shown beneath the title. Slack stores this as Block Kit `rich_text` blocks. For convenience you may pass a plain string (it is..."
+        },
+        {
+          "name": "include_copied_list_records",
+          "type": "boolean",
+          "required": false,
+          "description": "When copying from another List via `copy_from_list_id`, set to true to also copy that List's existing items (rows) into the new List. Has no effect unless `c..."
+        }
+      ]
+    },
+    "SLACK_UPDATE_SLACK_LIST": {
+      "params": [
+        {
+          "name": "id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List to update, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list. NOTE: the parameter is named `id` (not `list_id`)..."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": false,
+          "description": "New name (title) for the List. Omit to leave the List name unchanged."
+        },
+        {
+          "name": "todo_mode",
+          "type": "boolean",
+          "required": false,
+          "description": "Whether the List is in to-do mode (rows behave like checkable tasks). Set true to enable to-do mode or false to disable it. Omit to leave it unchanged."
+        },
+        {
+          "name": "description_blocks",
+          "type": "string",
+          "required": false,
+          "description": "New description for the List. List descriptions are always rich text (Block Kit `rich_text`). For convenience you may supply a plain string and it will be wr..."
+        }
+      ]
+    },
+    "SLACK_CREATE_SLACK_LIST_ITEM": {
+      "params": [
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List to add the item (row) to, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        },
+        {
+          "name": "initial_fields",
+          "type": "array",
+          "required": false,
+          "description": "Initial cell values for the new row. Each entry is a cell object with a `column_id` and a typed value. Text columns must use Block Kit `rich_text` (the plain..."
+        },
+        {
+          "name": "parent_item_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of an existing item (row) to attach the new row to as a subtask. When provided, the new row is created as a sub-item of that parent."
+        },
+        {
+          "name": "duplicated_item_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of an existing item (row) in this List to copy. When provided, the new row is created as a duplicate of that item; `initial_fields` may still be supplied..."
+        }
+      ]
+    },
+    "SLACK_GET_SLACK_LIST_ITEM": {
+      "params": [
+        {
+          "name": "id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the item (row) to fetch from the List, e.g. 'Rec0123456789'. This is the `id` of a row previously returned by create_slack_list_item or a List-items li..."
+        },
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List that contains the item (row) to fetch, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        },
+        {
+          "name": "include_is_subscribed",
+          "type": "boolean",
+          "required": false,
+          "description": "When true, the returned row's `record` includes an `is_subscribed` flag indicating whether the calling user is subscribed to that item. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_LIST_SLACK_LIST_ITEMS": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of rows (items) to return per page; fewer may be returned if the end of the List is reached. Recommended to set a value (e.g., 100) for large..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor for fetching subsequent pages. Set to `next_cursor` from a previous response's `response_metadata`. Omit for the first page. You MUST pagin..."
+        },
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List whose rows (items) to fetch, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        },
+        {
+          "name": "archived",
+          "type": "boolean",
+          "required": false,
+          "description": "When true, return ARCHIVED rows instead of the active (non-archived) rows. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_UPDATE_SLACK_LIST_ITEM": {
+      "params": [
+        {
+          "name": "cells",
+          "type": "array",
+          "required": true,
+          "description": "The cells to write. Each cell object identifies a single cell by its `row_id` and `column_id` and carries a typed value for that column. Text columns must us..."
+        },
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List that contains the row(s) to update, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        }
+      ]
+    },
+    "SLACK_DELETE_SLACK_LIST_ITEM": {
+      "params": [
+        {
+          "name": "id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the item (row) to delete from the List, e.g. 'Rec0123456789'. This is the item ID returned by create_slack_list_item or when listing the List's items...."
+        },
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List that contains the item (row) to delete, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        }
+      ]
+    },
+    "SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS": {
+      "params": [
+        {
+          "name": "ids",
+          "type": "array",
+          "required": true,
+          "description": "Array of item (row) IDs to delete from the List in a single call, e.g. ['Rec0123456789', 'Rec9876543210']. IMPORTANT: this operation is ALL-OR-NOTHING. Slack..."
+        },
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List to delete items (rows) from, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list. All of the `ids` must belong to..."
+        }
+      ]
+    },
+    "SLACK_SET_SLACK_LIST_ACCESS": {
+      "params": [
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List to set sharing access on, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        },
+        {
+          "name": "user_ids",
+          "type": "array",
+          "required": false,
+          "description": "IDs of the users to grant access to. Mutually exclusive with `channel_ids`: EXACTLY ONE of `channel_ids` or `user_ids` is required — supplying both or neithe..."
+        },
+        {
+          "name": "channel_ids",
+          "type": "array",
+          "required": false,
+          "description": "IDs of the channels to grant access to. Mutually exclusive with `user_ids`: EXACTLY ONE of `channel_ids` or `user_ids` is required — supplying both or neithe..."
+        },
+        {
+          "name": "access_level",
+          "type": "string",
+          "required": true,
+          "description": "The access level to grant on the List. One of `read`, `write`, or `owner`. `read` grants view-only access; `write` grants edit access. `owner` is USER-ONLY:..."
+        }
+      ]
+    },
+    "SLACK_DELETE_SLACK_LIST_ACCESS": {
+      "params": [
+        {
+          "name": "list_id",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack List to revoke sharing access on, e.g. 'F0123456789'. This is the List file ID returned by create_slack_list."
+        },
+        {
+          "name": "user_ids",
+          "type": "array",
+          "required": false,
+          "description": "IDs of the users to revoke access from, e.g. ['U0123456789']. Mutually exclusive with `channel_ids`: provide EXACTLY ONE of `user_ids` or `channel_ids`. Supp..."
+        },
+        {
+          "name": "channel_ids",
+          "type": "array",
+          "required": false,
+          "description": "IDs of the channels to revoke access from, e.g. ['C0123456789']. Mutually exclusive with `user_ids`: provide EXACTLY ONE of `channel_ids` or `user_ids`. Supp..."
+        }
+      ]
+    },
+    "SLACK_ADD_REMOTE_FILE": {
+      "params": [
+        {
+          "name": "title",
+          "type": "string",
+          "required": true,
+          "description": "Title of the remote file to be displayed in Slack."
+        },
+        {
+          "name": "filetype",
+          "type": "string",
+          "required": false,
+          "description": "File type (e.g., 'pdf', 'docx', 'png') to help Slack display appropriate icons or previews."
+        },
+        {
+          "name": "external_id",
+          "type": "string",
+          "required": true,
+          "description": "Unique identifier for the file, defined by the calling application, used for future API references (e.g., updating, deleting)."
+        },
+        {
+          "name": "external_url",
+          "type": "string",
+          "required": true,
+          "description": "Publicly accessible or permissioned URL of the remote file, used by Slack to access its content or metadata."
+        },
+        {
+          "name": "preview_image",
+          "type": "string",
+          "required": false,
+          "description": "Base64-encoded image (e.g., PNG, JPEG) used as the file's preview in Slack."
+        },
+        {
+          "name": "indexable_file_contents",
+          "type": "string",
+          "required": false,
+          "description": "Plain text content of the file, indexed by Slack for search."
+        }
+      ]
+    },
+    "SLACK_UPDATE_REMOTE_FILE": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "Slack's unique identifier for the remote file (e.g., `F12345678`). Used to identify the file if `external_id` is not provided. One of `file` or `external_id`..."
+        },
+        {
+          "name": "title",
+          "type": "string",
+          "required": false,
+          "description": "New title for the remote file. If omitted, the current title remains unchanged."
+        },
+        {
+          "name": "token",
+          "type": "string",
+          "required": false,
+          "description": "Authentication token for authorizing the API request to Slack."
+        },
+        {
+          "name": "filetype",
+          "type": "string",
+          "required": false,
+          "description": "New filetype for the remote file. This typically describes the kind of file, e.g., `pdf`, `gdoc`, `image`, `text`. See Slack API documentation for specific s..."
+        },
+        {
+          "name": "external_id",
+          "type": "string",
+          "required": false,
+          "description": "Creator-defined Globally Unique Identifier (GUID) for the remote file. Used to identify the file if `file` ID is not provided. One of `file` or `external_id`..."
+        },
+        {
+          "name": "external_url",
+          "type": "string",
+          "required": false,
+          "description": "New publicly accessible URL for the remote file. If provided, this updates the link associated with the file in Slack."
+        },
+        {
+          "name": "preview_image",
+          "type": "string",
+          "required": false,
+          "description": "A string that references the new preview image for the document. The referenced image data will be sent as `multipart/form-data`. This could be a local file..."
+        },
+        {
+          "name": "indexable_file_contents",
+          "type": "string",
+          "required": false,
+          "description": "Plain text content extracted from the remote file, used by Slack to improve searchability. This can be a summary or the full text. Maximum 1MB. If provided,..."
+        }
+      ]
+    },
+    "SLACK_REMOVE_REMOTE_FILE": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "Slack-specific file ID."
+        },
+        {
+          "name": "token",
+          "type": "string",
+          "required": false,
+          "description": "Authentication token."
+        },
+        {
+          "name": "external_id",
+          "type": "string",
+          "required": false,
+          "description": "Creator-defined, globally unique ID (GUID) for the file."
+        }
+      ]
+    },
+    "SLACK_GET_REMOTE_FILE": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "Specify a file by providing its ID."
+        },
+        {
+          "name": "external_id",
+          "type": "string",
+          "required": false,
+          "description": "Creator defined GUID for the file."
+        }
+      ]
+    },
+    "SLACK_LIST_REMOTE_FILES": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "The maximum number of items to return."
+        },
+        {
+          "name": "ts_to",
+          "type": "number",
+          "required": false,
+          "description": "Filter files created before this timestamp (inclusive)."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Paginate through collections of data by setting the cursor parameter to a next_cursor attribute returned by a previous request's response_metadata. Default v..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "Filter files appearing in a specific channel, indicated by its ID."
+        },
+        {
+          "name": "ts_from",
+          "type": "number",
+          "required": false,
+          "description": "Filter files created after this timestamp (inclusive)."
+        }
+      ]
+    },
+    "SLACK_SHARE_REMOTE_FILE": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "The unique ID of the remote file registered with Slack. Either this `file` field or the `external_id` field (or both) is required to identify the file."
+        },
+        {
+          "name": "channels",
+          "type": "string",
+          "required": true,
+          "description": "A comma-separated list of channel IDs where the remote file will be shared. These can include public channel IDs, private channel IDs, or direct message chan..."
+        },
+        {
+          "name": "external_id",
+          "type": "string",
+          "required": false,
+          "description": "The globally unique identifier (GUID) for the remote file, as provided by the app that registered it with Slack. Either this `external_id` field or the `file..."
         }
       ]
     }

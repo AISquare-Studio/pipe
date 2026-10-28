@@ -87,6 +87,22 @@ USER_ONLY = {
     "SLACK_SET_DND_DURATION", "SLACK_END_DND", "SLACK_END_SNOOZE", "SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE",
     "SLACK_CREATE_A_REMINDER", "SLACK_GET_REMINDER", "SLACK_LIST_REMINDERS", "SLACK_DELETE_REMINDER",
 }
+# Slack Lists and remote files.
+READ |= {"SLACK_GET_SLACK_LIST_ITEM", "SLACK_LIST_SLACK_LIST_ITEMS", "SLACK_GET_REMOTE_FILE", "SLACK_LIST_REMOTE_FILES"}
+WRITE |= {
+    "SLACK_CREATE_SLACK_LIST", "SLACK_UPDATE_SLACK_LIST", "SLACK_CREATE_SLACK_LIST_ITEM",
+    "SLACK_UPDATE_SLACK_LIST_ITEM", "SLACK_SET_SLACK_LIST_ACCESS", "SLACK_ADD_REMOTE_FILE",
+    "SLACK_UPDATE_REMOTE_FILE", "SLACK_SHARE_REMOTE_FILE",
+}
+DESTRUCTIVE |= {
+    "SLACK_DELETE_SLACK_LIST_ITEM", "SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS",
+    "SLACK_DELETE_SLACK_LIST_ACCESS", "SLACK_REMOVE_REMOTE_FILE",
+}
+#: Slack accepts only the app's bot token for these (remote files belong to the app).
+BOT_ONLY = {"SLACK_ADD_REMOTE_FILE", "SLACK_UPDATE_REMOTE_FILE", "SLACK_REMOVE_REMOTE_FILE"}
+#: Writes that replace content: destructive by core's definition, but in the
+#: opt-in write tier by the owner's.
+OVERWRITES = {"SLACK_UPDATES_A_SLACK_MESSAGE", "SLACK_UPDATE_SLACK_LIST_ITEM", "SLACK_UPDATE_REMOTE_FILE"}
 SEND_ARGS = {"channel": C, "markdown_text": "hello"}
 
 
@@ -97,7 +113,7 @@ class TestCatalog:
     def test_identity(self):
         toolkit = SlackToolkit()
         assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("slack", "0.1.0", "SLACK_")
-        assert len(toolkit.tools()) == 95
+        assert len(toolkit.tools()) == 111
 
     def test_every_tool_is_in_its_tier(self):
         assert READ | SEND | WRITE | DESTRUCTIVE == set(TOOLS)
@@ -107,13 +123,13 @@ class TestCatalog:
     def test_flags_follow_the_tiers(self):
         for slug, tool in TOOLS.items():
             assert tool.spec.read_only is (tool.tier == "read"), slug
-            # An edit overwrites content: destructive by core's definition, but
-            # in the opt-in write tier by the owner's.
-            overwrites = slug == "SLACK_UPDATES_A_SLACK_MESSAGE"
-            assert tool.spec.destructive is (tool.tier == "destructive" or overwrites), slug
+            assert tool.spec.destructive is (tool.tier == "destructive" or slug in OVERWRITES), slug
 
     def test_user_only_tools(self):
         assert {s for s, t in TOOLS.items() if t.identities == ("user",)} == USER_ONLY
+
+    def test_bot_only_tools(self):
+        assert {s for s, t in TOOLS.items() if t.identities == ("bot",)} == BOT_ONLY
 
     def test_tier_of(self):
         assert SlackToolkit.tier_of("slack_archive_conversation") == "destructive"
@@ -151,7 +167,7 @@ class TestTiers:
         deleted = h.call("SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", {"channel": C, "ts": TS}, enabled_tiers=tiers)
         assert deleted.error_code == "forbidden"
         assert {t.slug for t in SlackToolkit().tools_for({**USER_CONFIG, "enabled_tiers": tiers})} == (
-            READ | SEND | WRITE
+            (READ | SEND | WRITE) - BOT_ONLY
         )
 
     def test_opt_in_by_slug(self):
@@ -172,12 +188,12 @@ class TestTiers:
         toolkit = SlackToolkit()
         assert {t.slug for t in toolkit.available_tools()} == READ | SEND
         assert toolkit.available_tools(None) == toolkit.available_tools({}) == toolkit.tools_for(None)
-        assert len(toolkit.tools()) == 95  # tools() stays the full catalog, for browsing
+        assert len(toolkit.tools()) == 111  # tools() stays the full catalog, for browsing
 
     @pytest.mark.parametrize("query", ["delete message", "archive channel", "remove user kick", "leave channel",
                                        "edit message", "pin", "react emoji", "set status"])
     def test_search_without_a_config_offers_no_write_or_destructive_tool(self, query):
-        found = {t.slug for t in SlackToolkit().search_tools(query, limit=51)}
+        found = {t.slug for t in SlackToolkit().search_tools(query, limit=len(TOOLS))}
         assert found and found <= READ | SEND
         assert not found & (WRITE | DESTRUCTIVE)
 
@@ -191,7 +207,7 @@ class TestTiers:
 
     def test_comma_separated_names_are_accepted(self):
         config = {**USER_CONFIG, "enabled_tiers": "read, write"}
-        assert {t.slug for t in SlackToolkit().tools_for(config)} == READ | WRITE
+        assert {t.slug for t in SlackToolkit().tools_for(config)} == (READ | WRITE) - BOT_ONLY
 
     def test_enabled_tiers_replaces_the_default(self):
         h = harness()
@@ -303,6 +319,19 @@ class TestIdentity:
     def test_bot_listing_drops_user_only_tools(self):
         listed = {t.slug for t in SlackToolkit().tools_for({**BOT_CONFIG, "enabled_tiers": ALL_TIERS})}
         assert listed == set(TOOLS) - USER_ONLY
+
+    def test_user_listing_drops_bot_only_tools(self):
+        listed = {t.slug for t in SlackToolkit().tools_for({**USER_CONFIG, "enabled_tiers": ALL_TIERS})}
+        assert listed == set(TOOLS) - BOT_ONLY
+
+    @pytest.mark.parametrize("slug", sorted(BOT_ONLY))
+    def test_bot_only_tool_under_the_user_is_forbidden_without_a_request(self, slug):
+        h = harness()
+        result = h.call(slug, {"file": "F0123456", "external_id": "doc-1"}, enabled_tiers=ALL_TIERS)
+        assert result.error_code == "forbidden"
+        assert "needs the bot identity" in result.error
+        assert "Slack only accepts bot tokens" in result.error
+        assert h.session.calls == []
 
     def test_wrong_token_type_names_the_identity_key(self):
         h = harness(slack_error("not_allowed_token_type"))

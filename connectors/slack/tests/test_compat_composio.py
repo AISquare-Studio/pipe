@@ -19,6 +19,9 @@ from aisquare_pipe_slack.catalog import TOOLS
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "composio_slack_args.json").read_text())
 COMPOSIO = FIXTURE["tools"]
 
+CREDENTIAL = "a credential argument: the token comes from the connection's config only"
+PREVIEW_IMAGE = "Slack takes it as a multipart image upload, which a tool argument can't carry"
+
 #: Composio arguments deliberately not accepted, and why.
 DROPPED: dict[str, dict[str, str]] = {
     "SLACK_UPDATES_A_SLACK_MESSAGE": {"as_user": "legacy: classic apps only"},
@@ -34,6 +37,9 @@ DROPPED: dict[str, dict[str, str]] = {
     "SLACK_SCHEDULE_MESSAGE": {"attachments": "legacy secondary attachments; use blocks"},
     "SLACK_SEARCH_MESSAGES": {"auto_paginate": "one page per call, with next_page / next_cursor hints"},
     "SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK": {"token": "a credential argument is never accepted"},
+    "SLACK_ADD_REMOTE_FILE": {"preview_image": PREVIEW_IMAGE},
+    "SLACK_UPDATE_REMOTE_FILE": {"preview_image": PREVIEW_IMAGE, "token": CREDENTIAL},
+    "SLACK_REMOVE_REMOTE_FILE": {"token": CREDENTIAL},
     "SLACK_OPEN_DM": {
         "return_im": "returns the DM's latest message and read state, which is reading; OPEN_DM is "
         "send tier, so it returns the channel ID only (manager ruling)"

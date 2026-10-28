@@ -91,12 +91,20 @@ class TestRequest:
         assert (error.status, error.error) == (302, "http_302")
         assert session.last.allow_redirects is False
 
-    @pytest.mark.parametrize("method", ["../oauth.v2.access", "auth.test?x=1", "https://evil.test/a.b", "auth"])
+    @pytest.mark.parametrize(
+        "method", ["../oauth.v2.access", "auth.test?x=1", "https://evil.test/a.b", "auth", "SlackLists.create", "a.b/c"]
+    )
     def test_method_names_are_checked(self, method):
         client, session, _ = _client()
         with pytest.raises(ValueError):
             client.call(method)
         assert session.calls == []
+
+    @pytest.mark.parametrize("method", ["slackLists.items.list", "files.remote.add", "users.profile.get"])
+    def test_camel_case_method_names_are_allowed(self, method):
+        client, session, _ = _client(ok())
+        client.call(method)
+        assert session.last.url == f"https://slack.com/api/{method}"
 
     def test_owned_session_is_closed(self):
         with mock.patch.object(requests, "Session") as session_cls, SlackWebClient(USER_TOKEN):

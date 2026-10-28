@@ -94,6 +94,9 @@ _KINDS: dict[str, frozenset[str]] = {
             "cannot_bookmark_restricted_sharing_enabled", "slack_connect_canvas_sharing_blocked",
             "slack_connect_file_upload_sharing_blocked", "slack_connect_blocked_file_type",
             "cannot_modify_role_admin", "use_skills_api",
+            # Slack Lists and remote files.
+            "lists_disabled_user_team", "over_list_file_maximum", "bot_user_required",
+            "no_bot_user_for_app", "file_under_review",
         }
     ),
     ERROR_NOT_FOUND: frozenset(
@@ -105,6 +108,9 @@ _KINDS: dict[str, frozenset[str]] = {
             # S2
             "bot_not_found", "bots_not_found", "file_deleted", "canvas_deleted", "not_visible",
             "template_not_visible",
+            # Slack Lists.
+            "list_not_found", "record_not_found", "record_deleted", "row_not_found",
+            "column_not_found", "duplicated_item_not_found",
         }
     ),
     ERROR_CONFLICT: frozenset(
@@ -113,7 +119,7 @@ _KINDS: dict[str, frozenset[str]] = {
             *("already_archived", "not_archived", "already_in_channel"),
             # Nothing happened: the channel's state or a Slack limit is in the way.
             "is_archived", "is_inactive", "name_taken", "channel_canvas_already_exists",
-            "too_many_reactions", "too_many_pins",
+            "too_many_reactions", "too_many_pins", "over_row_maximum",
             # S2: already there, or a Slack limit in the way
             "name_already_exists", "handle_already_exists", "file_already_added", "too_many_bookmarks",
             "too_many_tabs", "free_team_canvas_tab_already_exists", "not_in_dnd", "subteam_max_users_exceeded",
@@ -144,6 +150,16 @@ _KINDS: dict[str, frozenset[str]] = {
             "name_too_long", "missing_subteam_name", "invalid_channel_provided", "no_users_provided",
             "channels_limit_exceeded", "invalid_parameters", "invalid_channel", "canvas_too_large",
             "file_too_large",
+            # Slack Lists and remote files.
+            "invalid_args", "missing_arguments", "too_many_ids", "bad_title", "invalid_title",
+            "invalid_url", "invalid_external_id", "invalid_type", "invalid_schema", "invalid_column_type",
+            "invalid_column_id", "invalid_primary_column", "invalid_row_id", "invalid_option_id",
+            "invalid_input_type", "invalid_text_block", "invalid_date", "invalid_phone_number",
+            "invalid_vote_value", "invalid_message", "invalid_attachment", "invalid_view_metadata",
+            "invalid_copy_and_schema_args", "missing_arg_copy_from_list_id", "row_id_not_provided",
+            "column_id_not_provided", "unexpected_description_blocks_arg", "uneditable_column",
+            "over_cell_fields_limit", "over_column_maximum", "over_title_length_maximum",
+            "archive_not_supported",
         }
     ),
     # Slack's "request_timeout" means "POST data missing or truncated", not a
@@ -196,6 +212,12 @@ _HINTS = {
     "paid_teams_only": "this needs a paid Slack plan",
     "not_allowed": "the workspace doesn't allow this",
     "storage_limit_reached": "the workspace has reached its file storage limit",
+    "over_row_maximum": "the List has reached Slack's limit on items",
+    "over_list_file_maximum": "the workspace has reached Slack's limit on Lists",
+    "lists_disabled_user_team": "Slack Lists are turned off for this workspace (they need a paid plan)",
+    "bot_user_required": "only the app's bot token can do this: remote files belong to the app",
+    "no_bot_user_for_app": "the Slack app has no bot user; add one in the app's settings",
+    "too_many_ids": "pass file or external_id, not both",
 }
 
 #: The tool that fixes ``not_in_channel``.
@@ -312,8 +334,9 @@ def gate(tool: SlackTool, settings: SlackSettings) -> ToolResult | None:
             code=ERROR_FORBIDDEN,
         )
     if settings.identity not in tool.identities:
+        needed = tool.identities[0]
         return ToolResult.fail(
-            f"{slug} needs the user identity — Slack only accepts user tokens for it; this "
+            f"{slug} needs the {needed} identity — Slack only accepts {needed} tokens for it; this "
             f"connection acts as the {settings.identity} (config[{CONFIG_IDENTITY!r}])",
             code=ERROR_FORBIDDEN,
         )

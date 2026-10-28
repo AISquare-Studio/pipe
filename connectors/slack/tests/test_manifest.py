@@ -11,6 +11,7 @@ from pathlib import Path
 from aisquare_pipe_slack import BOT_SCOPES, USER_SCOPES
 from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.constants import TOKEN_ROTATION
+from aisquare_pipe_slack.events import BOT_EVENTS, EVENTS_ONLY_BOT_SCOPES
 
 MANIFEST = json.loads((Path(__file__).parent.parent / "slack-app-manifest.json").read_text())
 #: Each method's scopes as docs.slack.dev's page header lists them (frozen
@@ -32,13 +33,32 @@ SCOPE_NAME = re.compile(r"^[a-z_]+(\.[a-z_]+)?:[a-z_]+(\.[a-z_]+)?$")
 
 
 def test_user_scopes_equal_what_the_tools_declare():
-    declared = {s for tool in TOOLS.values() for s in tool.user_scopes}
+    declared = {s for tool in TOOLS.values() for s in tool.user_scopes or ()}
     assert SCOPES["user"] == sorted(declared) == list(USER_SCOPES)
 
 
-def test_bot_scopes_equal_what_the_tools_declare():
+def test_bot_scopes_equal_what_the_tools_and_events_declare():
+    # Plan §6.2 test_manifest (c): the tools' bot scopes plus the scopes only
+    # an event subscription needs — and nothing else.
     declared = {s for tool in TOOLS.values() for s in tool.bot_scopes or ()}
-    assert SCOPES["bot"] == sorted(declared) == list(BOT_SCOPES)
+    assert SCOPES["bot"] == sorted(declared | set(EVENTS_ONLY_BOT_SCOPES)) == list(BOT_SCOPES)
+
+
+def test_events_only_scopes_are_needed_by_an_event_and_by_no_tool():
+    for scope in EVENTS_ONLY_BOT_SCOPES:
+        assert any(scope in needed for needed in BOT_EVENTS.values()), scope
+        assert all(scope not in (tool.bot_scopes or ()) for tool in TOOLS.values()), scope
+
+
+def test_event_subscriptions_match_what_pipe_parses():
+    subscriptions = MANIFEST["settings"]["event_subscriptions"]
+    assert subscriptions["bot_events"] == list(BOT_EVENTS)
+    assert "user_events" not in subscriptions
+    for event, needed in BOT_EVENTS.items():
+        assert set(needed) <= set(SCOPES["bot"]), event
+    # message.im reaches the bot only if people can DM it.
+    assert MANIFEST["features"]["app_home"]["messages_tab_enabled"] is True
+    assert MANIFEST["features"]["app_home"]["messages_tab_read_only_enabled"] is False
 
 
 def test_scope_names_are_well_formed():
@@ -59,6 +79,7 @@ def test_the_manifest_is_an_app_agnostic_template():
     assert MANIFEST["display_information"]["name"] == "YOUR_APP_NAME"
     assert MANIFEST["features"]["bot_user"]["display_name"] == "your-app-bot"
     assert MANIFEST["oauth_config"]["redirect_urls"] == ["https://YOUR_HOST/v1/connections/callback"]
+    assert MANIFEST["settings"]["event_subscriptions"]["request_url"] == "https://YOUR_HOST/v1/slack/events"
     assert "AISquare" not in json.dumps(MANIFEST)
 
 
@@ -90,7 +111,7 @@ def test_every_declared_scope_is_documented_for_its_methods():
         methods = list(tool.methods)
         if CHANNEL_ARGS & set(tool.spec.input_schema["properties"]):
             methods.append(LOOKUP_METHOD)
-        for side, declared in (("user", tool.user_scopes), ("bot", tool.bot_scopes or ())):
+        for side, declared in (("user", tool.user_scopes or ()), ("bot", tool.bot_scopes or ())):
             documented = {scope for m in methods for scope in DOCS["methods"][m][side]}
             for scope in declared:
                 if scope not in documented and (slug, side, scope) not in FEATURE_SCOPES:
@@ -100,7 +121,7 @@ def test_every_declared_scope_is_documented_for_its_methods():
 
 def test_feature_scopes_are_still_needed():
     for slug, side, scope in FEATURE_SCOPES:
-        declared = TOOLS[slug].user_scopes if side == "user" else TOOLS[slug].bot_scopes or ()
+        declared = (TOOLS[slug].user_scopes if side == "user" else TOOLS[slug].bot_scopes) or ()
         assert scope in declared, (slug, side, scope)
         documented = {s for m in TOOLS[slug].methods for s in DOCS["methods"][m][side]}
         assert scope not in documented, (slug, side, scope)

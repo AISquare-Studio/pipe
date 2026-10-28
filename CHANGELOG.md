@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     The line is dropped only for a token that is positively a bot token.
   - **Scopes.** Named scope groups (by area and by tier) select what a consent
     asks for; the default is every scope.
+  - **Slack Lists and remote files** (16 tools): Lists CRUD, items and access
+    (`slackLists.*`), and remote files (`files.remote.*`; add / update / remove
+    are bot-only, as Slack requires). Reads are `read`, the rest opt-in
+    `write` / `destructive`.
+  - **`SlackMessageSink`** (`slack-message-sink`): posts envelopes as messages,
+    ephemeral messages or v2 file uploads, with the toolkit's identity,
+    attribution and send gate. `PushResult.ref` is the `ts`, `message_ts` or
+    file ID.
+  - **Events API helpers** (`aisquare_pipe_slack.events`): v0 signature check
+    and replay window in one call (`verify_request` / `parse_request`), typed
+    parsing of `url_verification`, `app_mention`, `message.im`,
+    `reaction_added` / `reaction_removed`, `tokens_revoked`, `app_uninstalled`,
+    and `event_to_envelope` with Composio's trigger names. The endpoint and
+    the Signing Secret are the host's.
   - Joins `[full]`.
 - **Slack breadth tools**: 44 more `SlackToolkit` tools (95 in all) for files,
   canvases, bookmarks, Do Not Disturb, reminders and user groups, plus `/me`

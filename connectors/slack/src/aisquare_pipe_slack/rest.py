@@ -62,8 +62,8 @@ MAX_RETRY_AFTER = 3600.0
 _SERVER_ERROR_WAIT = 1.0
 #: Time a retried request needs after a sleep (see the module docstring).
 _REQUEST_FLOOR = 2.0
-#: ``chat.postMessage``, ``users.profile.get``, ``api.test``.
-_METHOD = re.compile(r"^[a-z]+(\.[a-zA-Z]+)+$")
+#: ``chat.postMessage``, ``users.profile.get``, ``api.test``, ``slackLists.items.list``.
+_METHOD = re.compile(r"^[a-z][a-zA-Z]*(\.[a-zA-Z]+)+$")
 
 #: What a Slack error code looks like. Anything else in ``error`` (or
 #: ``needed``) is not passed on: it reaches messages and ``ToolResult.data``,
