@@ -43,6 +43,8 @@ from collections.abc import Callable, Mapping
 from typing import Any, Self
 
 import requests
+import urllib3.exceptions
+import urllib3.util
 
 from aisquare_pipe_slack.constants import API_BASE, USER_AGENT
 
@@ -71,6 +73,11 @@ _SAFE_SCOPES = re.compile(r"[a-z0-9_.:,]+")
 
 #: ``ok: false`` codes that are rate limits.
 RATE_LIMIT_ERRORS = frozenset({"ratelimited", "rate_limited"})
+#: ``ok: false`` codes Slack asks to retry shortly ("too many concurrent
+#: requests", "canvas editing locked, retry after a short delay"): rate
+#: limits too, with a short default wait instead of a minute.
+RETRY_SOON_ERRORS = frozenset({"too_many_requests", "canvas_editing_locked"})
+RETRY_SOON_WAIT = 2.0
 #: ``ok: false`` codes that are Slack-side failures (retried for reads only).
 SERVER_ERRORS = frozenset({"fatal_error", "internal_error", "service_unavailable"})
 
@@ -268,6 +275,9 @@ def _outcome(
     slack_error = payload.get("error")
     code = slack_error if isinstance(slack_error, str) and SAFE_CODE.fullmatch(slack_error) else None
 
+    if code in RETRY_SOON_ERRORS:
+        wait = retry_after_seconds(response) if response.headers.get("Retry-After") else RETRY_SOON_WAIT
+        return payload, SlackAPIError(method, code, status=status, retry_after=wait), wait
     if status == 429 or (code in RATE_LIMIT_ERRORS):
         wait = retry_after_seconds(response)
         return payload, SlackAPIError(method, code or "ratelimited", status=status, retry_after=wait), wait
@@ -302,14 +312,33 @@ DOWNLOAD_CHUNK = 64 * 1024
 
 
 def _https_host(url: Any) -> str | None:
-    """The lower-cased host of an ``https`` URL, else None."""
-    if not isinstance(url, str):
+    """The host an ``https`` URL will really be sent to, lower-cased, or
+    None when that isn't certain.
+
+    The token's destination is decided the way requests decides it
+    (``urllib3.util.parse_url``), and the URL is refused when the stdlib
+    parser disagrees. ``https://evil.example\\@files.slack.com/x`` is
+    ``files.slack.com`` to ``urlsplit`` but ``evil.example`` to urllib3. Also
+    refused: any backslash, whitespace or control character, userinfo
+    (``user@host``), and a port other than 443."""
+    if not isinstance(url, str) or "\\" in url or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
         return None
     try:
-        parts = urllib.parse.urlsplit(url)
-    except ValueError:
+        split = urllib.parse.urlsplit(url)
+        parsed = urllib3.util.parse_url(url)
+        split_port = split.port
+    except (ValueError, urllib3.exceptions.LocationParseError):
         return None
-    return (parts.hostname or "").lower() or None if parts.scheme == "https" else None
+    if split.scheme.lower() != "https" or (parsed.scheme or "").lower() != "https":
+        return None
+    if split.username is not None or split.password is not None or parsed.auth:
+        return None
+    if split_port not in (None, 443) or parsed.port not in (None, 443):
+        return None
+    host = (split.hostname or "").lower()
+    if not host or host != (parsed.host or "").lower():
+        return None
+    return host
 
 
 def is_slack_upload_url(url: Any) -> bool:
@@ -352,20 +381,37 @@ def _download(
             if not 200 <= response.status_code < 300:
                 raise SlackAPIError(method, f"http_{response.status_code}", status=response.status_code)
             content_type = str(response.headers.get("Content-Type") or "")
-            chunks: list[bytes] = []
-            size = 0
-            for chunk in response.iter_content(DOWNLOAD_CHUNK):
-                size += len(chunk)
-                if size > max_bytes:
-                    raise SlackAPIError(method, "file_too_large", status=response.status_code)
-                chunks.append(chunk)
-                remaining = client._remaining()
-                if remaining is not None and remaining <= 0:
-                    raise SlackAPIError(method, "timeout", timed_out=True)
-            return b"".join(chunks), content_type
+            return _read_capped(client, method, response, max_bytes), content_type
         finally:
             response.close()
     raise SlackAPIError(method, "too_many_redirects", status=302)
+
+
+def _read_capped(client: SlackWebClient, method: str, response: requests.Response, max_bytes: int) -> bytes:
+    """The streamed body: the byte cap enforced while reading, the budget
+    checked between reads, and a transport failure mid-stream (a broken
+    chunked encoding, a dropped connection, a read timeout — requests wraps
+    that last one in ``ConnectionError``) reported as ``network_error`` /
+    ``timeout``, never as a raw requests exception."""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        for chunk in response.iter_content(DOWNLOAD_CHUNK):
+            size += len(chunk)
+            if size > max_bytes:
+                raise SlackAPIError(method, "file_too_large", status=response.status_code)
+            chunks.append(chunk)
+            remaining = client._remaining()
+            if remaining is not None and remaining <= 0:
+                raise SlackAPIError(method, "timeout", timed_out=True)
+    except requests.RequestException as e:
+        if isinstance(e, requests.Timeout) or any(
+            isinstance(arg, urllib3.exceptions.ReadTimeoutError) for arg in e.args
+        ):
+            raise SlackAPIError(method, "timeout", timed_out=True) from None
+        logger.warning("slack: %s failed mid-stream (%s)", method, type(e).__name__)
+        raise SlackAPIError(method, "network_error", status=response.status_code) from None
+    return b"".join(chunks)
 
 
 def _upload(client: SlackWebClient, upload_url: str, data: bytes) -> None:

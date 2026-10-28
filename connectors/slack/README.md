@@ -102,7 +102,7 @@ edits there.
 | Posts appear as | the user, with "Sent by <name>" | the app's bot (marker only with `bot_attribution`) |
 | Default tiers | read + send | **send only** |
 | Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
-| User-only tools | all available | `SLACK_SEARCH_*`, the two unread tools, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack (Slack's method docs list no bot scope for them). `available_tools` leaves them out. |
+| User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack: Slack accepts only user tokens for them. The two unread tools are user-only by design, because they read the user's own read position. `available_tools` leaves them out. |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
 
 > **Warning: reading as the bot crosses users.** One bot token serves the whole
@@ -199,10 +199,30 @@ Files travel as real bytes (plan §4.8).
   2. POST the bytes to it, with no token, `https` `*.slack.com` only;
   3. complete the upload exactly once.
 
-  Without `channels`, the file stays private to the uploader. Host-staged `file`
-  arguments are not supported yet. `aisquare_pipe_slack.files.upload_file` is the
-  same helper, for sinks.
+  Without `channels`, the file stays private to the uploader. A share as the user
+  carries the "Sent by" line:
+  - with `blocks`, as a context block, and then no `initial_comment` is sent, because
+    Slack ignores blocks when there is one;
+  - otherwise, as an italic last line of `initial_comment`.
+
+  `initial_comment` and `blocks` together are refused, as is `thread_ts` with more
+  than one channel. Host-staged `file` arguments are not supported yet.
+  `aisquare_pipe_slack.files.upload_file` is the same helper, for sinks.
+- **Downloads and HTML:** an HTML answer counts as the file only when the file is
+  HTML and its length matches what `files.info` declared. Otherwise it is Slack's
+  sign-in page (`forbidden`).
+- **URLs:** every file URL must be one where urllib3 (what requests uses) and the
+  stdlib agree on the host. Backslashes, userinfo, odd ports and whitespace are
+  refused, so a URL can't name `files.slack.com` to one parser and another host to
+  the other.
 - **`SLACK_SET_PROFILE_PHOTO`** takes the image as `{"base64": …, "mimetype": …}`.
+- **Canvases:**
+  - `SLACK_GET_CANVAS_CONTENT` cuts a canvas over 100,000 characters
+    (`truncated: true`, `total_length`); read parts of it via
+    `SLACK_LOOKUP_CANVAS_SECTIONS`.
+  - Access: `SLACK_SET_CANVAS_ACCESS` takes 1–20 IDs, and
+    `SLACK_DELETE_CANVAS_ACCESS` takes exactly one. Both limits are checked before
+    the call.
 
 ## Errors
 

@@ -22,6 +22,8 @@ from aisquare_pipe_slack.constants import (
     HISTORY_MAX_LIMIT,
     LIST_DEFAULT_LIMIT,
     LIST_MAX_LIMIT,
+    MAX_BLOCKS,
+    RESULT_CHAR_CAP,
     TIER_DESTRUCTIVE,
     TIER_READ,
     TIER_SEND,
@@ -52,6 +54,7 @@ from aisquare_pipe_slack.tools import (
     _string,
     _strings_schema,
     _tool,
+    attribution_block,
     cap_messages,
     mrkdwn_marker,
     resolve_channel,
@@ -133,7 +136,7 @@ def _send_me_message(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     if not text.strip():
         raise _invalid("text is empty")
     if call.attribution:
-        text = f"{text}\n{mrkdwn_marker(call.attribution)}"
+        text = f"{text}\n_{mrkdwn_marker(call.attribution)}_"  # S1's text path: an italic last line
     channel = resolve_channel(call, arguments["channel"])
     return ToolResult.ok(_payload(call.call("chat.meMessage", {"channel": channel, "text": text})))
 
@@ -222,21 +225,33 @@ def _upload(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     data = content.encode("utf-8")
     if len(data) > MAX_UPLOAD_CONTENT:
         raise _invalid(f"content is over {MAX_UPLOAD_CONTENT // (1024 * 1024)} MiB")
-    channels = None
-    if arguments.get("channels"):
-        ids = [resolve_channel(call, c) for c in str(arguments["channels"]).split(",") if c.strip()]
-        channels = ",".join(ids) or None
-    comment = arguments.get("initial_comment")
-    if channels and call.attribution:
-        # The share is a message under the connection's name: mark it.
-        marker = mrkdwn_marker(call.attribution)
-        comment = f"{comment}\n{marker}" if comment else marker
     blocks = arguments.get("blocks")
     if isinstance(blocks, str):
         try:
             blocks = json.loads(blocks)
         except ValueError:
             raise _invalid("blocks is not valid JSON") from None
+    if blocks is not None and (not isinstance(blocks, list) or not all(isinstance(b, dict) for b in blocks)):
+        raise _invalid("blocks must be an array of Block Kit block objects")
+    comment = arguments.get("initial_comment")
+    if blocks and comment:
+        # Slack: "If the initial_comment field is provided, the blocks field is ignored".
+        raise _invalid("pass initial_comment or blocks for the share message, not both")
+    names = [c.strip() for c in str(arguments.get("channels") or "").split(",") if c.strip()]
+    if arguments.get("thread_ts") and len(names) > 1:
+        raise _invalid("thread_ts works with one channel only; pass a single channel to reply in its thread")
+    channels = ",".join(resolve_channel(call, c) for c in names) or None
+    if channels and call.attribution:
+        # The share is a message under the connection's name: mark it, in the
+        # same form as a message (a context block after blocks, else an
+        # italic last line of the comment).
+        if blocks:
+            if len(blocks) >= MAX_BLOCKS:
+                raise _invalid(f"at most {MAX_BLOCKS - 1} blocks: one of Slack's {MAX_BLOCKS} is the attribution")
+            blocks = [*blocks, attribution_block(call.attribution)]
+        else:
+            marker = f"_{mrkdwn_marker(call.attribution)}_"
+            comment = f"{comment}\n{marker}" if comment else marker
     uploaded = upload_file(
         call.client,
         data,
@@ -246,7 +261,7 @@ def _upload(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         initial_comment=comment,
         thread_ts=arguments.get("thread_ts"),
         snippet_type=arguments.get("filetype"),
-        blocks=blocks if isinstance(blocks, list) else None,
+        blocks=blocks or None,
     )
     return ToolResult.ok({"file": uploaded, "shared_to": channels.split(",") if channels else []})
 
@@ -319,12 +334,19 @@ def _lookup_sections(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     return ToolResult.ok(_payload(call.call("canvases.sections.lookup", body, json_body=True)))
 
 
-def _canvas_access(method: str, *, needs_level: bool) -> Any:
+def _canvas_access(method: str, *, needs_level: bool, max_ids: int) -> Any:
+    """canvases.access.set takes 1–20 IDs; canvases.access.delete exactly 1
+    (Slack: "min 1, max 1"). Checked here, before the call."""
+
     def handler(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         channel_ids = arguments.get("channel_ids")
         user_ids = arguments.get("user_ids")
         if bool(channel_ids) == bool(user_ids):
             raise _invalid("pass channel_ids or user_ids (one of them)")
+        ids = channel_ids or user_ids or []
+        if len(ids) > max_ids:
+            which = "channel_ids" if channel_ids else "user_ids"
+            raise _invalid(f"{which} takes at most {max_ids} ID{'s' if max_ids > 1 else ''} per call")
         body: dict[str, Any] = {"canvas_id": arguments["canvas_id"]}
         if channel_ids:
             body["channel_ids"] = [resolve_channel(call, c) for c in channel_ids]
@@ -337,6 +359,24 @@ def _canvas_access(method: str, *, needs_level: bool) -> Any:
         return ToolResult.ok(_payload(call.call(method, body, json_body=True)))
 
     return handler
+
+
+def _canvas_content(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
+    """canvases.getContent returns the whole canvas in one string (up to
+    1 MiB): cut at :data:`RESULT_CHAR_CAP`, flagged, with the total length."""
+    sent: dict[str, Any] = {n: arguments[n] for n in ("canvas_id", "content_type") if n in arguments}
+    data = _payload(call.call("canvases.getContent", sent))
+    content = data.get("content")
+    if isinstance(content, str) and len(content) > RESULT_CHAR_CAP:
+        rest = {k: v for k, v in data.items() if k != "content"}
+        data = {
+            "truncated": True,
+            "total_length": len(content),
+            "hint": "the canvas is longer than one result; find sections with SLACK_LOOKUP_CANVAS_SECTIONS",
+            **rest,
+            "content": content[:RESULT_CHAR_CAP],
+        }
+    return ToolResult.ok(data)
 
 
 def _num_minutes(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -769,12 +809,14 @@ BREADTH_CATALOG: tuple[SlackTool, ...] = (
     ),
     _tool(
         "SLACK_GET_CANVAS_CONTENT", TIER_READ, "canvases", "canvases.getContent",
-        "Read a whole canvas as markdown (or HTML with content_type).",
+        "Read a whole canvas as markdown (or HTML with content_type). A canvas longer than "
+        "100,000 characters is cut (truncated: true, total_length); read parts of it by finding "
+        "sections with SLACK_LOOKUP_CANVAS_SECTIONS.",
         _schema(
             {"canvas_id": CANVAS_ID, "content_type": _string("markdown (default) or html.", enum=("markdown", "html"))},
             ["canvas_id"],
         ),
-        _rpc("canvases.getContent", ("canvas_id", "content_type"), channels=()),
+        _canvas_content,
         user=("canvases:read",),
         bot=("canvases:read",),
         tags=("canvas", "read", "content", "document", "open"),
@@ -793,33 +835,33 @@ BREADTH_CATALOG: tuple[SlackTool, ...] = (
     ),
     _tool(
         "SLACK_SET_CANVAS_ACCESS", TIER_WRITE, "canvases", "canvases.access.set",
-        "Give channels or people read/write access to a canvas (owner: people only). Paid plans.",
+        "Give up to 20 channels or people read/write access to a canvas (owner: people only). Paid plans.",
         _schema(
             {
                 "canvas_id": CANVAS_ID,
                 "access_level": _string("read, write or owner.", enum=("read", "write", "owner")),
-                "channel_ids": _strings_schema("Channel IDs or names (not with user_ids)."),
-                "user_ids": _strings_schema("User IDs (not with channel_ids)."),
+                "channel_ids": _strings_schema("1–20 channel IDs or names (not with user_ids)."),
+                "user_ids": _strings_schema("1–20 user IDs (not with channel_ids)."),
             },
             ["canvas_id", "access_level"],
         ),
-        _canvas_access("canvases.access.set", needs_level=True),
+        _canvas_access("canvases.access.set", needs_level=True, max_ids=20),
         user=("canvases:write", *LOOKUP),
         bot=("canvases:write", *LOOKUP),
         tags=("canvas", "share", "access", "permissions"),
     ),
     _tool(
         "SLACK_DELETE_CANVAS_ACCESS", TIER_DESTRUCTIVE, "canvases", "canvases.access.delete",
-        "Remove a channel's or a person's access to a canvas. Paid plans.",
+        "Remove one channel's or one person's access to a canvas (one per call). Paid plans.",
         _schema(
             {
                 "canvas_id": CANVAS_ID,
-                "channel_ids": _strings_schema("Channel IDs or names (not with user_ids)."),
-                "user_ids": _strings_schema("User IDs (not with channel_ids)."),
+                "channel_ids": _strings_schema("Exactly one channel ID or name (not with user_ids)."),
+                "user_ids": _strings_schema("Exactly one user ID (not with channel_ids)."),
             },
             ["canvas_id"],
         ),
-        _canvas_access("canvases.access.delete", needs_level=False),
+        _canvas_access("canvases.access.delete", needs_level=False, max_ids=1),
         user=("canvases:write", *LOOKUP),
         bot=("canvases:write", *LOOKUP),
         tags=("canvas", "unshare", "access", "revoke"),

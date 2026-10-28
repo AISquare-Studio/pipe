@@ -10,7 +10,7 @@ from aisquare_pipe_slack.config import SlackSettings
 from aisquare_pipe_slack.rest import SlackAPIError
 from aisquare_pipe_slack.toolkit import describe_error, error_code, failure
 
-from .fakes import USER_TOKEN, harness, response, slack_error
+from .fakes import USER_TOKEN, harness, ok, response, slack_error
 
 TABLE = {
     "unauthorized": ["not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired"],
@@ -20,18 +20,34 @@ TABLE = {
         "two_factor_setup_required", "cant_update_message", "cant_delete_message", "not_in_channel",
         "plan_upgrade_required", "paid_only", "permission_denied", "edit_window_closed",
         "message_limit_exceeded", "messages_tab_disabled",
+        # S2
+        "cant_delete_file", "cant_delete", "delete_not_allowed", "file_deleting_disabled",
+        "canvas_deleting_disabled", "canvas_disabled_user_team", "canvas_disabled_file_team",
+        "canvas_globally_disabled", "free_teams_cannot_create_standalone_canvases",
+        "free_teams_cannot_edit_standalone_canvases", "team_tier_cannot_create_channel_canvases",
+        "paid_teams_only", "not_allowed", "public_file_type_not_allowed", "public_video_not_allowed",
+        "file_uploads_disabled", "file_uploads_except_images_disabled", "file_type_not_allowed",
+        "file_upload_size_restricted", "storage_limit_reached", "posting_to_channel_denied",
+        "user_is_external_guest", "cannot_bookmark_from_external_org",
+        "cannot_bookmark_restricted_sharing_enabled", "slack_connect_canvas_sharing_blocked",
+        "slack_connect_file_upload_sharing_blocked", "slack_connect_blocked_file_type",
+        "cannot_modify_role_admin", "use_skills_api",
     ],
     "not_found": [
         "channel_not_found", "user_not_found", "users_not_found", "message_not_found", "thread_not_found",
         "file_not_found", "canvas_not_found", "bookmark_not_found", "no_such_subteam", "team_not_found",
         "not_found",
+        "bot_not_found", "bots_not_found", "file_deleted", "canvas_deleted", "not_visible", "template_not_visible",
     ],
     "conflict": [
         "already_reacted", "no_reaction", "already_pinned", "not_pinned", "name_taken", "is_archived",
         "already_archived", "not_archived", "already_in_channel", "channel_canvas_already_exists",
         "is_inactive", "too_many_pins", "too_many_reactions",
+        "name_already_exists", "handle_already_exists", "file_already_added", "too_many_bookmarks",
+        "too_many_tabs", "free_team_canvas_tab_already_exists", "not_in_dnd", "subteam_max_users_exceeded",
     ],
-    "rate_limited": ["ratelimited", "rate_limited", "restricted_too_many"],
+    "rate_limited": ["ratelimited", "rate_limited", "restricted_too_many", "too_many_requests",
+                     "canvas_editing_locked"],
     "invalid_arguments": [
         "invalid_arguments", "invalid_arg_name", "invalid_cursor", "invalid_ts_latest", "invalid_ts_oldest",
         "msg_too_long", "msg_blocks_too_long", "no_text", "invalid_blocks", "invalid_name",
@@ -39,9 +55,18 @@ TABLE = {
         "invalid_user", "snippet_too_large", "invalid_charset", "invalid_form_data", "invalid_post_type",
         "missing_post_type", "markdown_text_conflict", "bad_timestamp", "no_item_specified",
         "cant_invite_self",
+        "invalid_timestamp", "invalid_link", "invalid_emoji", "invalid_bookmark_type", "invalid_entity_id",
+        "bad_image", "too_large", "too_many_frames", "missing_duration", "missing_argument", "cannot_parse",
+        "cannot_add_others", "cannot_add_others_recurring", "cannot_add_bot", "cannot_add_slackbot",
+        "unknown_type", "unknown_snippet_type", "alt_txt_too_large", "bad_handle", "forbidden_handle",
+        "description_too_long", "name_too_long", "missing_subteam_name", "invalid_channel_provided",
+        "no_users_provided", "channels_limit_exceeded", "invalid_parameters", "invalid_channel",
+        "canvas_too_large", "file_too_large",
     ],
     "upstream_error": [
         "fatal_error", "internal_error", "service_unavailable", "request_timeout", "something_new_from_slack",
+        "canvas_creation_failed", "canvas_editing_failed", "canvas_tab_creation_failed", "file_update_failed",
+        "snooze_failed", "snooze_end_failed",
     ],
 }
 ROWS = [(code, kind) for kind, codes in TABLE.items() for code in codes]
@@ -172,6 +197,29 @@ def test_the_token_type_hint_does_not_assume_the_identity_matches():
         message = describe_error(_error("not_allowed_token_type"), settings)
         assert "Check that config['identity']" in message
         assert f"(now {settings.identity!r})" in message
+
+
+@pytest.mark.parametrize("code", ["too_many_requests", "canvas_editing_locked"])
+def test_retry_soon_codes_are_retried_after_a_short_wait(code):
+    h = harness(slack_error(code), ok())
+    assert h.call("SLACK_TEST_AUTH", {}).successful
+    assert h.sleeps == [2.0]
+    limited = harness(*[slack_error(code) for _ in range(3)]).call("SLACK_TEST_AUTH", {})
+    assert (limited.error_code, limited.retry_after) == ("rate_limited", 2.0)
+
+
+@pytest.mark.parametrize(
+    "code, text",
+    [
+        ("name_already_exists", "pick another name"),
+        ("too_many_bookmarks", "limit of 100 bookmarks"),
+        ("bad_image", "512-1024 px"),
+        ("not_in_dnd", "nothing to end"),
+        ("file_deleted", "was deleted"),
+    ],
+)
+def test_s2_hints(code, text):
+    assert text in describe_error(_error(code))
 
 
 def test_failure_rounds_retry_after_up():

@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import pytest
 import requests
+import urllib3.exceptions
 
 from aisquare_pipe_slack.rest import SlackAPIError, SlackWebClient, is_slack_upload_url
 
 from .fakes import USER_TOKEN, FakeSession, response
 
 FILE_URL = "https://files.slack.com/files-pri/T0123-F0123/download/report.pdf"
+#: urlsplit sees files.slack.com; requests (urllib3) connects to evil.example.
+BACKSLASH = "https://evil.example\\@files.slack.com/files-pri/x"
 UPLOAD_URL = "https://files.slack.com/upload/v1/ABC123"
 
 
@@ -51,6 +54,13 @@ class TestDownload:
             "https://slack-files.com/x",
             "ftp://files.slack.com/x",
             None,
+            BACKSLASH,
+            "https://files.slack.com@evil.test/x",
+            "https://user:pw@files.slack.com/x",
+            "https://files.slack.com:8443/x",
+            "https://files.slack.com/x y",
+            "https://files.slack.com/x\n",
+            "https:files.slack.com/x",
         ],
     )
     def test_only_https_files_slack_com_gets_the_token(self, url):
@@ -78,6 +88,48 @@ class TestDownload:
         client.download(FILE_URL, max_bytes=10)
         assert session.last.url == "https://files.slack.com/files-pri/T0123-F0123/other"
         assert session.last.headers["Authorization"] == f"Bearer {USER_TOKEN}"
+
+    @pytest.mark.parametrize(
+        "location", [BACKSLASH, "https://files.slack.com@evil.test/x", "https://files.slack.com:8443/x"]
+    )
+    def test_a_disguised_redirect_never_gets_the_token(self, location):
+        client, session = _client(response(302, headers={"Location": location}), response(200, content=b"x"))
+        error = _raises(client.download, FILE_URL, max_bytes=10)
+        assert error.error == "insecure_redirect"
+        assert len(session.calls) == 1  # nothing was sent to the disguised host
+
+    def test_a_disguised_redirect_from_an_off_host_hop(self):
+        client, session = _client(
+            response(302, headers={"Location": "https://cdn.example.test/blob"}),
+            response(302, headers={"Location": BACKSLASH}),
+        )
+        assert _raises(client.download, FILE_URL, max_bytes=10).error == "insecure_redirect"
+        assert len(session.calls) == 2
+        assert "Authorization" not in session.calls[1].headers
+
+    @pytest.mark.parametrize(
+        "failure, code",
+        [
+            (requests.exceptions.ChunkedEncodingError("broken"), "network_error"),
+            (requests.ConnectionError("reset"), "network_error"),
+            (requests.ConnectionError(urllib3.exceptions.ReadTimeoutError(None, "/x", "read timed out")), "timeout"),
+            (requests.ReadTimeout("slow"), "timeout"),
+        ],
+    )
+    def test_a_transport_failure_mid_stream_is_classified(self, failure, code):
+        class Broken(requests.Response):
+            def iter_content(self, chunk_size=1, decode_unicode=False):
+                yield b"partial"
+                raise failure
+
+        broken = Broken()
+        broken._content_consumed = True
+        broken.status_code = 200
+        broken.headers = requests.structures.CaseInsensitiveDict({})
+        client, _ = _client(broken)
+        error = _raises(client.download, FILE_URL, max_bytes=1000)
+        assert error.error == code
+        assert error.timed_out is (code == "timeout")
 
     def test_redirects_must_stay_https_and_are_bounded(self):
         client, _ = _client(response(302, headers={"Location": "http://files.slack.com/x"}))
@@ -143,6 +195,9 @@ class TestUpload:
             ("https://evilslack.com/upload/x", False),
             ("https://files.slack.com.evil.test/x", False),
             ("https://169.254.169.254/latest", False),
+            (BACKSLASH.replace("files-pri", "upload"), False),
+            ("https://files.slack.com@evil.test/upload", False),
+            ("https://files.slack.com:8443/upload", False),
         ],
     )
     def test_only_https_slack_hosts(self, url, ok):

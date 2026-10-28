@@ -79,6 +79,26 @@ def upload_file(
     return {"id": file_id}
 
 
+def _too_large() -> ToolError:
+    """The same refusal whether the size pre-check or the stream hit the cap."""
+    return ToolError(
+        f"the file is over the {DOWNLOAD_MAX_BYTES // (1024 * 1024)} MiB download cap",
+        code=ERROR_INVALID_ARGUMENTS,
+    )
+
+
+def _sign_in_page(content: bytes, content_type: str, mimetype: str, declared_size: Any) -> bool:
+    """Whether Slack answered with its sign-in page instead of the file (as
+    it does without ``files:read``). An HTML answer is the file only when the
+    file is HTML *and* its length is the size ``files.info`` declared — the
+    file's type alone can't tell them apart."""
+    if not content_type.lower().startswith("text/html"):
+        return False
+    if "html" not in mimetype.lower():
+        return True
+    return isinstance(declared_size, int) and not isinstance(declared_size, bool) and declared_size != len(content)
+
+
 def download_file(client: SlackWebClient, file_id: str) -> ToolResult:
     """``files.info`` then the bytes, as a ToolResult with one file envelope."""
     info = client.call("files.info", {"file": file_id}, idempotent=True).get("file")
@@ -92,10 +112,7 @@ def download_file(client: SlackWebClient, file_id: str) -> ToolResult:
         )
     size = info.get("size")
     if isinstance(size, int) and size > DOWNLOAD_MAX_BYTES:
-        raise ToolError(
-            f"the file is {size} bytes, over the {DOWNLOAD_MAX_BYTES // (1024 * 1024)} MiB download cap",
-            code=ERROR_INVALID_ARGUMENTS,
-        )
+        raise _too_large()
     name = str(info.get("name") or file_id)
     mimetype = str(info.get("mimetype") or "")
     inline = info.get("content")
@@ -103,8 +120,13 @@ def download_file(client: SlackWebClient, file_id: str) -> ToolResult:
         content, content_type = inline.encode("utf-8"), mimetype or "text/plain"
     else:
         url = info.get("url_private_download") or info.get("url_private")
-        content, content_type = client.download(str(url or ""), max_bytes=DOWNLOAD_MAX_BYTES)
-        if content_type.lower().startswith("text/html") and "html" not in mimetype.lower():
+        try:
+            content, content_type = client.download(str(url or ""), max_bytes=DOWNLOAD_MAX_BYTES)
+        except SlackAPIError as e:
+            if e.error == "file_too_large":  # Slack understated the size: the cap hit while streaming
+                raise _too_large() from None
+            raise
+        if _sign_in_page(content, content_type, mimetype, size):
             raise ToolError(
                 "Slack returned a sign-in page instead of the file — this connection lacks "
                 "files:read (reconnect Slack to grant it)",

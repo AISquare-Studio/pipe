@@ -52,7 +52,7 @@ class TestUpload:
         assert done.args == {
             "files": [{"id": "F0UP12345", "title": "Notes"}],
             "channels": C,
-            "initial_comment": "fyi\nSent by pipe",
+            "initial_comment": "fyi\n_Sent by pipe_",
             "thread_ts": "1.2",
         }
         assert result.data == {"file": {"id": "F0UP12345", "name": "notes.md", "title": "Notes"}, "shared_to": [C]}
@@ -71,7 +71,38 @@ class TestUpload:
     def test_a_marker_alone_when_there_is_no_comment(self):
         h = harness(*_upload_replies())
         h.call(UPLOAD, {"content": "x", "channels": C})
-        assert h.session.last.args["initial_comment"] == "Sent by pipe"
+        assert h.session.last.args["initial_comment"] == "_Sent by pipe_"
+
+    def test_blocks_keep_the_marker_as_a_context_block(self):
+        # Slack ignores blocks when initial_comment is set, so the marker
+        # goes into the blocks and no initial_comment is sent.
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "see file"}}]
+        h = harness(*_upload_replies())
+        assert h.call(UPLOAD, {"content": "x", "channels": C, "blocks": blocks}).successful
+        sent = h.session.last.args
+        assert "initial_comment" not in sent
+        assert sent["blocks"] == [
+            *blocks,
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Sent by pipe"}]},
+        ]
+
+    def test_initial_comment_with_blocks_is_refused(self):
+        h = harness()
+        result = h.call(UPLOAD, {"content": "x", "channels": C, "initial_comment": "hi",
+                                 "blocks": [{"type": "divider"}]})
+        assert result.error_code == "invalid_arguments" and "not both" in result.error
+        assert h.session.calls == []
+
+    def test_a_full_block_list_leaves_no_room_for_the_marker(self):
+        h = harness()
+        result = h.call(UPLOAD, {"content": "x", "channels": C, "blocks": [{"type": "divider"}] * 50})
+        assert result.error_code == "invalid_arguments" and "at most 49 blocks" in result.error
+
+    def test_thread_ts_needs_one_channel(self):
+        h = harness()
+        result = h.call(UPLOAD, {"content": "x", "channels": f"{C},C0RANDOM1", "thread_ts": "1.2"})
+        assert result.error_code == "invalid_arguments" and "one channel" in result.error
+        assert h.session.calls == []  # no upload was started
 
     def test_channel_names_are_resolved(self):
         h = harness(channels_page({"id": C, "name": "general"}, {"id": "C0RANDOM1", "name": "random"}),
@@ -174,6 +205,13 @@ class TestDownload:
         assert "external" in result.error
         assert len(h.session.calls) == 1  # files.info only: the token never goes to the third party
 
+    def test_a_stream_over_the_cap_gives_the_same_refusal(self, monkeypatch):
+        monkeypatch.setattr("aisquare_pipe_slack.files.DOWNLOAD_MAX_BYTES", 10)
+        h = harness(_info(size=5), response(200, content=b"x" * 64))
+        result = h.call(DOWNLOAD, {"file": "F0123ABCD"})
+        assert result.error_code == "invalid_arguments"
+        assert result.error == "the file is over the 0 MiB download cap"
+
     def test_oversized_files_are_refused_before_downloading(self):
         h = harness(_info(size=DOWNLOAD_MAX_BYTES + 1))
         result = h.call(DOWNLOAD, {"file": "F0123ABCD"})
@@ -187,9 +225,26 @@ class TestDownload:
         assert "files:read" in result.error
 
     def test_an_html_file_is_fine(self):
-        h = harness(_info(name="a.html", mimetype="text/html"),
+        h = harness(_info(name="a.html", mimetype="text/html", size=9),
                     response(200, content=b"<p>hi</p>", headers={"Content-Type": "text/html"}))
         assert h.call(DOWNLOAD, {"file": "F0123ABCD"}).files[0].data == b"<p>hi</p>"
+
+    def test_a_sign_in_page_for_an_html_file_is_still_forbidden(self):
+        # The file's type can't tell them apart; the declared size can.
+        page = b"<html><title>Slack</title>Sign in to Acme</html>"
+        h = harness(_info(name="a.html", mimetype="text/html", size=9),
+                    response(200, content=page, headers={"Content-Type": "text/html; charset=utf-8"}))
+        result = h.call(DOWNLOAD, {"file": "F0123ABCD"})
+        assert result.error_code == "forbidden" and "sign-in page" in result.error
+
+    BACKSLASH = "https://evil.example\\@files.slack.com/files-pri/x"
+
+    def test_a_backslash_download_url_is_refused_before_any_get(self):
+        # urlsplit sees files.slack.com, requests would connect to evil.example.
+        h = harness(_info(url_private_download=self.BACKSLASH))
+        result = h.call(DOWNLOAD, {"file": "F0123ABCD"})
+        assert result.data == {"slack_error": "invalid_download_url", "status": 200}
+        assert len(h.session.calls) == 1
 
     def test_a_snippet_is_returned_inline(self):
         h = harness(_info(mode="snippet", content="print('hi')", mimetype="text/plain"))
@@ -270,6 +325,31 @@ class TestFilesAndCanvases:
         result = harness().call("SLACK_SET_CANVAS_ACCESS", {"canvas_id": "F0CANVAS1", **args}, enabled_tiers=ALL_TIERS)
         assert result.error_code == "invalid_arguments"
 
+    @pytest.mark.parametrize(
+        "slug, args, ok_count",
+        [
+            ("SLACK_SET_CANVAS_ACCESS", {"access_level": "read", "user_ids": [f"U0{i:07d}" for i in range(21)]}, 20),
+            ("SLACK_DELETE_CANVAS_ACCESS", {"user_ids": ["U01111111", "U02222222"]}, 1),
+            ("SLACK_DELETE_CANVAS_ACCESS", {"channel_ids": [C, "C0RANDOM1"]}, 1),
+        ],
+    )
+    def test_canvas_access_id_limits_are_checked_before_the_call(self, slug, args, ok_count):
+        h = harness()
+        result = h.call(slug, {"canvas_id": "F0CANVAS1", **args}, enabled_tiers=ALL_TIERS)
+        assert result.error_code == "invalid_arguments"
+        assert f"at most {ok_count} ID" in result.error
+        assert h.session.calls == []
+
+    def test_canvas_content_is_cut_at_the_cap(self):
+        content = "x" * 150_000
+        result = harness(ok(content=content)).call("SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"})
+        data = result.data
+        assert list(data)[:3] == ["truncated", "total_length", "hint"]
+        assert (data["truncated"], data["total_length"], len(data["content"])) == (True, 150_000, 100_000)
+        assert "SLACK_LOOKUP_CANVAS_SECTIONS" in data["hint"]
+        short = harness(ok(content="# Plan")).call("SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"}).data
+        assert short == {"content": "# Plan"}
+
     def test_create_channel_canvas_needs_a_channel(self):
         result = harness().call("SLACK_CREATE_CHANNEL_CANVAS", {"channel_id": ""}, enabled_tiers=ALL_TIERS)
         assert result.error_code == "invalid_arguments"
@@ -312,6 +392,11 @@ class TestPeople:
     def test_snooze_needs_whole_minutes(self, minutes):
         result = harness().call("SLACK_SET_DND_DURATION", {"num_minutes": minutes}, enabled_tiers=ALL_TIERS)
         assert result.error_code == "invalid_arguments"
+
+    def test_me_message_marker_is_an_italic_last_line(self):
+        h = harness(ok())
+        h.call("SLACK_SEND_ME_MESSAGE", {"channel": C, "text": "waves"})
+        assert h.session.last.args["text"] == "waves\n_Sent by pipe_"
 
     def test_me_message_as_the_bot_has_no_marker(self):
         h = harness(ok())

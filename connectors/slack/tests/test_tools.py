@@ -330,7 +330,7 @@ CASES = [
         "SLACK_SEND_ME_MESSAGE",
         {"channel": C, "text": "is reviewing the deck"},
         "chat.meMessage",
-        {"channel": C, "text": f"is reviewing the deck\n{MARK}"},
+        {"channel": C, "text": f"is reviewing the deck\n_{MARK}_"},
         reply={"channel": C, "ts": TS},
     ),
     Case(
