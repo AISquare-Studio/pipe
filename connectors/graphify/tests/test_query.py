@@ -12,10 +12,12 @@ import pytest
 
 # The query face needs the [engine] extra (graphifyy + networkx) — environments
 # without it (e.g. the bare CI validator) skip cleanly instead of erroring at
-# collection.
-q = pytest.importorskip(
-    "aisquare_pipe_graphify.query", reason="[engine] extra not installed"
-)
+# collection. The face raises a plain ImportError naming the extra, which
+# pytest 9's importorskip no longer skips on, hence the explicit guard.
+try:
+    import aisquare_pipe_graphify.query as q
+except ImportError as exc:
+    pytest.skip(f"[engine] extra not installed: {exc}", allow_module_level=True)
 
 # A miniature web-shop graph: SubscribeButton -> apiClient -> charge -> stripe,
 # with a god-ish hub (db) and a second caller of charge for blast-radius.
