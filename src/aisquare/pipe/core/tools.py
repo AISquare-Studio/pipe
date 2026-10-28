@@ -742,7 +742,7 @@ def _retry_after(e: urllib.error.HTTPError) -> float | None:
     except ValueError:
         try:
             when = email.utils.parsedate_to_datetime(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # oversized fields overflow
             return None
         if when.tzinfo is None:  # RFC 9110 dates are GMT; "-0000" parses naive
             when = when.replace(tzinfo=datetime.UTC)

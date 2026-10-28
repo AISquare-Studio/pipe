@@ -952,7 +952,21 @@ class TestHTTPErrorClassification:
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert (out.error_code, out.retry_after) == (ERROR_RATE_LIMITED, retry_after)
 
-    @pytest.mark.parametrize("header", [None, "", "soon", "-3", "nan", "inf", "1e400"])
+    @pytest.mark.parametrize(
+        "header",
+        [
+            None,
+            "",
+            "soon",
+            "-3",
+            "nan",
+            "inf",
+            "1e400",
+            "Fri, 31 Dec 2027 23:59:59 +99999999999999999999",  # OverflowError: zone
+            "Fri, 31 Dec 99999999999999999999 23:59:59 GMT",  # OverflowError: year
+            "Fri, 31 Dec 2027 99999999999999999999:59:59 GMT",  # OverflowError: hour
+        ],
+    )
     def test_unusable_retry_after_is_none(self, header):
         exc = _http_error(429, {} if header is None else {"Retry-After": header})
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
