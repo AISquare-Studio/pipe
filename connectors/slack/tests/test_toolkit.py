@@ -3,12 +3,13 @@ attribution, channel names, composites, result shaping and secrecy."""
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 
 import pytest
 import requests
-from aisquare.pipe import get_toolkit
+from aisquare.pipe import Toolkit, get_toolkit
 
 from aisquare_pipe_slack import SlackToolkit
 from aisquare_pipe_slack.constants import RESULT_CHAR_CAP
@@ -131,6 +132,25 @@ class TestTiers:
         assert h.call("SLACK_PIN_ITEM", {"channel": C, "timestamp": TS}, config).successful
         assert h.call("SLACK_UNPIN_ITEM", {"channel": C, "timestamp": TS}, config).error_code == "forbidden"
         assert {t.slug for t in SlackToolkit().tools_for(config)} == READ | SEND | {"SLACK_PIN_ITEM"}
+
+    def test_available_tools_is_the_config_aware_listing(self):
+        toolkit = SlackToolkit()
+        for config in (USER_CONFIG, BOT_CONFIG, {**USER_CONFIG, "enabled_tiers": ALL_TIERS}, {"enabled_tiers": ["*"]}):
+            assert toolkit.available_tools(config) == toolkit.tools_for(config)
+        # No connection to judge: the whole catalog, as tools().
+        assert toolkit.available_tools() == toolkit.available_tools(None) == toolkit.tools()
+
+    @pytest.mark.skipif(
+        "config" not in inspect.signature(Toolkit.search_tools).parameters,
+        reason="core without Toolkit.available_tools / search_tools(config=)",
+    )
+    def test_search_ranks_only_enabled_tools(self):
+        toolkit = SlackToolkit()
+        found = toolkit.search_tools("delete message", limit=51, config=USER_CONFIG)
+        assert found and {t.slug for t in found} <= READ | SEND
+        assert "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT" not in {t.slug for t in found}
+        everything = toolkit.search_tools("delete message", limit=1)
+        assert everything[0].slug == "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT"
 
     def test_comma_separated_names_are_accepted(self):
         config = {**USER_CONFIG, "enabled_tiers": "read, write"}

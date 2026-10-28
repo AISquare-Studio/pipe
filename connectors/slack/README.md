@@ -25,7 +25,7 @@ from aisquare_pipe_slack import SlackToolkit
 slack = SlackToolkit()
 config = {"access_token": "xoxp-…"}          # the user's token; see Config below
 
-slack.tools_for(config)                       # what this connection may call
+slack.available_tools(config)                 # what this connection may call
 result = slack.call_tool(
     "SLACK_SEND_MESSAGE", {"channel": "#general", "markdown_text": "Standup in 5"}, config
 )
@@ -72,9 +72,16 @@ would allow it:
 
 > `SLACK_ARCHIVE_CONVERSATION is a 'destructive' tool and is not enabled for this Slack connection: the host enables it by adding 'destructive' to config['enabled_tiers'] or 'SLACK_ARCHIVE_CONVERSATION' to config['enabled_tools']`
 
-Core's `Toolkit.tools()` takes no config, so `tools()` and `search_tools()` still
-return the whole catalog. To show a model only what it may call, hosts should list
-`tools_for(config)` (and rank it with `aisquare.pipe.rank_tools`).
+To show a model only what it may call, **list and search through the connection's
+config**:
+
+- `available_tools(config)` is core's config-aware listing hook.
+- `search_tools(query, limit, config=config)` ranks `available_tools(config)`.
+
+Both need an `aisquare-pipe` with `Toolkit.available_tools`. On an older core, list
+`tools_for(config)` and rank it with `aisquare.pipe.rank_tools`.
+
+`tools()`, and `available_tools()` without a config, return the whole catalog.
 `SlackToolkit.tier_of(slug)` gives a tool's tier.
 
 `ToolSpec.read_only` is true exactly for the `read` tier, and `destructive` is true

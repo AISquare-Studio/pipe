@@ -289,6 +289,16 @@ class SlackToolkit(Toolkit):
             return []
         return [TOOLS[spec.slug].spec for spec in TOOL_SPECS if gate(TOOLS[spec.slug], settings) is None]
 
+    def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
+        """Core's listing hook (``aisquare-pipe`` with ``available_tools``;
+        ``search_tools(..., config=...)`` ranks it): :meth:`tools_for` for a
+        connection's ``config``. Without a config — no connection to judge —
+        the whole catalog, as :meth:`tools`. On an older core this is just an
+        extra method; ``call_tool`` refuses disabled tools either way."""
+        if config is None:
+            return self.tools()
+        return self.tools_for(config)
+
     @staticmethod
     def tier_of(slug: str) -> str | None:
         """A tool's risk tier (read, send, write, destructive), or None."""
