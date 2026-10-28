@@ -14,6 +14,8 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from aisquare.pipe.testing.validation import (
     CheckResult,
@@ -24,6 +26,7 @@ from aisquare.pipe.testing.validation import (
 
 FRAMEWORK_DIST = "aisquare-pipe"
 ENTRY_POINT_GROUP = "aisquare_pipe.connectors"
+TOOLKIT_ENTRY_POINT_GROUP = "aisquare_pipe.toolkits"
 
 INSTALL_OK = "ok"
 INSTALL_BROKEN = "broken"
@@ -47,6 +50,20 @@ class ConnectorDir:
     @property
     def module_name(self) -> str:
         return f"aisquare_pipe_{self.safe_name}"
+
+    def entry_points(self, group: str) -> dict:
+        project = (self.pyproject or {}).get("project", {})
+        return project.get("entry-points", {}).get(group, {}) or {}
+
+    @property
+    def registers_toolkit(self) -> bool:
+        return bool(self.entry_points(TOOLKIT_ENTRY_POINT_GROUP))
+
+    @property
+    def registers_connector(self) -> bool:
+        """True when connector entry points are registered — or when nothing
+        is, so a bare package is still held to the connector scaffold."""
+        return bool(self.entry_points(ENTRY_POINT_GROUP)) or not self.registers_toolkit
 
 
 @dataclass
@@ -109,6 +126,19 @@ def list_connector_dirs(repo_root: Path) -> list[ConnectorDir]:
     return dirs
 
 
+def _file_url_to_path(url: str) -> Path:
+    """Convert a ``file://`` URL from ``direct_url.json`` into a real path.
+
+    Stripping the scheme textually is wrong on Windows: pip writes
+    ``file:///N:/repo``, whose path component is ``/N:/repo`` — a leading
+    slash that makes the result compare unequal to every real directory, so
+    every editable connector looks like a broken install. It also leaves
+    percent-escapes (``%20`` for a space) in place on all platforms.
+    ``url2pathname`` handles both, and is a no-op for ordinary POSIX paths.
+    """
+    return Path(url2pathname(urlparse(url).path))
+
+
 def load_dist_info(
     dist_name: str, discovered: list[DiscoveredConnector]
 ) -> DistInfo:
@@ -127,7 +157,7 @@ def load_dist_info(
         if raw:
             url = json.loads(raw).get("url", "")
             if url.startswith("file://"):
-                editable_path = Path(url.removeprefix("file://"))
+                editable_path = _file_url_to_path(url)
     except Exception:  # noqa: BLE001 — absent/odd metadata is not an error
         editable_path = None
 
@@ -209,12 +239,13 @@ def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
             "dependencies must include a versioned requirement on aisquare-pipe (e.g. aisquare-pipe>=0.1.0)",
         )
     )
-    eps = project.get("entry-points", {}).get(ENTRY_POINT_GROUP, {})
+    eps = cdir.entry_points(ENTRY_POINT_GROUP) or cdir.entry_points(TOOLKIT_ENTRY_POINT_GROUP)
     results.append(
         _result(
             "hygiene.entry-points-registered",
             bool(eps),
-            f'[project.entry-points."{ENTRY_POINT_GROUP}"] is missing or empty',
+            f'[project.entry-points."{ENTRY_POINT_GROUP}"] (or "{TOOLKIT_ENTRY_POINT_GROUP}") '
+            "is missing or empty",
         )
     )
     return results
@@ -223,26 +254,29 @@ def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
 def _check_scaffold_files(cdir: ConnectorDir) -> list[CheckResult]:
     module_dir = cdir.path / "src" / cdir.module_name
     missing: list[str] = []
-    for rel in (
-        "README.md",
-        f"src/{cdir.module_name}/__init__.py",
-        f"src/{cdir.module_name}/connector.py",
-        "tests",
-    ):
+    required = ["README.md", f"src/{cdir.module_name}/__init__.py"]
+    if cdir.registers_connector:
+        required.append(f"src/{cdir.module_name}/connector.py")
+    required.append("tests")
+    for rel in required:
         if not (cdir.path / rel).exists():
             missing.append(rel)
 
-    compliance_ok = False
+    compliance_text = ""
     compliance_file = cdir.path / "tests" / "test_compliance.py"
     if compliance_file.is_file():
         try:
-            compliance_ok = "connector_compliance_suite(" in compliance_file.read_text(
-                encoding="utf-8"
-            )
+            compliance_text = compliance_file.read_text(encoding="utf-8")
         except OSError:
-            compliance_ok = False
-    if not compliance_ok:
-        missing.append("tests/test_compliance.py (with connector_compliance_suite(...))")
+            compliance_text = ""
+    suites = []
+    if cdir.registers_connector:
+        suites.append("connector_compliance_suite(")
+    if cdir.registers_toolkit:
+        suites.append("toolkit_compliance_suite(")
+    for suite in suites:
+        if suite not in compliance_text:
+            missing.append(f"tests/test_compliance.py (with {suite}...))")
 
     return [
         _result(

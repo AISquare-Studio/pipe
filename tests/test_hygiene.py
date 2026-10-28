@@ -3,16 +3,20 @@ tmp_path fake repo trees."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
+from aisquare.pipe.testing import hygiene
 from aisquare.pipe.testing.hygiene import (
     INSTALL_BROKEN,
     INSTALL_MISSING,
     INSTALL_OK,
     ConnectorDir,
     DistInfo,
+    _file_url_to_path,
     check_install_state,
     classify_install_state,
     find_repo_root,
@@ -202,6 +206,73 @@ class TestScaffoldFiles:
         assert not _ok(run(root, "bad"), "hygiene.module-name")
 
 
+TOOLKIT_ONLY_PYPROJECT = """\
+[project]
+name = "aisquare-pipe-kit"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["aisquare-pipe>=0.3.0"]
+
+[project.entry-points."aisquare_pipe.toolkits"]
+kit = "aisquare_pipe_kit.toolkit:KitToolkit"
+"""
+
+BOTH_PYPROJECT = GOOD_PYPROJECT.replace("good", "both") + """
+[project.entry-points."aisquare_pipe.toolkits"]
+both = "aisquare_pipe_both.toolkit:BothToolkit"
+"""
+
+TOOLKIT_COMPLIANCE = "from x import toolkit_compliance_suite\ntoolkit_compliance_suite(object)\n"
+
+
+def _errors(results: dict) -> list:
+    return [r for r in results.values() if not r.passed and r.severity is Severity.ERROR]
+
+
+class TestToolkitPackages:
+    def test_toolkit_only_package_passes_without_connector_py(self, tmp_path):
+        root = build_repo(tmp_path)
+        cdir = build_connector(
+            root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT, compliance=TOOLKIT_COMPLIANCE
+        )
+        (cdir / "src" / "aisquare_pipe_kit" / "connector.py").unlink()
+        results = run(root, "kit", DistInfo(found=True, version="0.1.0"))
+        assert _errors(results) == []
+        assert _ok(results, "hygiene.entry-points-registered")
+
+    def test_toolkit_package_needs_toolkit_compliance_suite(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT)  # connector suite only
+        result = run(root, "kit")["hygiene.scaffold-files"]
+        assert not result.passed and "toolkit_compliance_suite" in result.message
+
+    def test_connector_and_toolkit_need_both_suites(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "both", pyproject=BOTH_PYPROJECT)
+        result = run(root, "both")["hygiene.scaffold-files"]
+        assert not result.passed
+        assert "toolkit_compliance_suite" in result.message
+        assert "connector_compliance_suite" not in result.message
+
+        both_suites = (
+            "from x import connector_compliance_suite, toolkit_compliance_suite\n"
+            "connector_compliance_suite(object)\ntoolkit_compliance_suite(object)\n"
+        )
+        (root / "connectors" / "both" / "tests" / "test_compliance.py").write_text(
+            both_suites, encoding="utf-8"
+        )
+        assert _ok(run(root, "both"), "hygiene.scaffold-files")
+
+    def test_package_without_any_entry_points_keeps_connector_rules(self, tmp_path):
+        root = build_repo(tmp_path)
+        bad = GOOD_PYPROJECT.replace("good", "bad").split("[project.entry-points")[0]
+        cdir = build_connector(root, "bad", pyproject=bad)
+        (cdir / "src" / "aisquare_pipe_bad" / "connector.py").unlink()
+        results = run(root, "bad")
+        assert not _ok(results, "hygiene.entry-points-registered")
+        assert "connector.py" in results["hygiene.scaffold-files"].message
+
+
 class TestSourceCode:
     def test_cross_connector_import(self, tmp_path):
         root = build_repo(tmp_path)
@@ -334,3 +405,49 @@ class TestInstallState:
 
     def test_non_editable_install_ok(self, cdir):
         assert classify_install_state(cdir, DistInfo(found=True, version="0.1.0")) == INSTALL_OK
+
+
+class TestFileUrlToPath:
+    """``direct_url.json`` records an editable install as a file:// URL. Getting
+    this wrong makes every editable connector look like a broken install.
+
+    ``url2pathname`` is itself platform-specific — ``nturl2path`` on Windows,
+    plain ``unquote`` elsewhere — so the cross-platform assertions here are
+    about the round-trip, and the drive-letter case is guarded."""
+
+    def test_roundtrips_a_real_directory(self, tmp_path):
+        """The invariant that actually decides install-state, on every OS."""
+        target = tmp_path / "connectors" / "good"
+        target.mkdir(parents=True)
+        assert _file_url_to_path(target.as_uri()).resolve() == target.resolve()
+
+    def test_roundtrips_a_path_containing_a_space(self, tmp_path):
+        target = tmp_path / "my repo" / "connectors" / "good"
+        target.mkdir(parents=True)
+        # as_uri() percent-escapes the space; the old textual strip left it in.
+        assert "%20" in target.as_uri()
+        assert _file_url_to_path(target.as_uri()).resolve() == target.resolve()
+
+    def test_percent_escapes_are_decoded(self):
+        assert _file_url_to_path("file:///tmp/my%20repo").name == "my repo"
+
+    @pytest.mark.skipif(os.name != "nt", reason="drive letters are Windows-only")
+    def test_windows_drive_url_has_no_leading_slash(self):
+        # pip writes three slashes, so the path component is "/N:/repo/x".
+        assert _file_url_to_path("file:///N:/repo/x").as_posix().startswith("N:")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+    def test_posix_url_is_unchanged(self):
+        assert _file_url_to_path("file:///home/u/repo/x") == Path("/home/u/repo/x")
+
+    def test_posix_behaviour_matches_the_old_strip_for_plain_paths(self, monkeypatch):
+        """On POSIX ``url2pathname`` is just ``unquote``, so ordinary paths must
+        resolve exactly as the previous textual strip did — this fix may only
+        change what was already wrong (escapes, Windows drives)."""
+        monkeypatch.setattr(hygiene, "url2pathname", unquote)
+        for url in (
+            "file:///home/u/repo/connectors/x",
+            "file:///var/lib/pipe/connectors/local",
+            "file:///srv/a-b_c.d/connectors/n8n",
+        ):
+            assert _file_url_to_path(url) == Path(url.removeprefix("file://"))

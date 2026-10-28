@@ -13,8 +13,9 @@ guard; no current connector uses one.
 
 from __future__ import annotations
 
+import re
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -23,6 +24,8 @@ from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
+from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, OAuthSpec
+from aisquare.pipe.core.tools import ERROR_CODES, Toolkit, ToolResult, ToolSpec
 from aisquare.pipe.errors import PipeError
 from aisquare.pipe.testing.fixtures import (
     make_binary_envelope,
@@ -36,6 +39,7 @@ from aisquare.pipe.testing.fixtures import (
 CLEAN_ERRORS = (PipeError, ValueError)
 
 ENTRY_POINT_GROUP = "aisquare_pipe.connectors"
+TOOLKIT_ENTRY_POINT_GROUP = "aisquare_pipe.toolkits"
 
 
 class Severity(Enum):
@@ -136,7 +140,8 @@ def no_network() -> Iterator[NetworkLog]:
 
 @dataclass
 class DiscoveredConnector:
-    """One ``aisquare_pipe.connectors`` entry point, load failures included."""
+    """One ``aisquare_pipe.connectors`` (or ``aisquare_pipe.toolkits``)
+    entry point, load failures included."""
 
     ep_name: str
     ep_value: str
@@ -144,17 +149,16 @@ class DiscoveredConnector:
     dist_version: str | None
     cls: type | None
     load_error: str | None
+    group: str = ENTRY_POINT_GROUP
+
+    @property
+    def is_toolkit(self) -> bool:
+        return self.group == TOOLKIT_ENTRY_POINT_GROUP
 
 
-def discover_connector_entry_points() -> list[DiscoveredConnector]:
-    """All connector entry points with dist identity and load outcome.
-
-    Unlike :func:`aisquare.pipe.core.registry.discover_connectors`, load
-    failures are returned (not just logged) and the owning distribution is
-    reported — both are needed to attribute problems to a connector package.
-    """
+def _discover_entry_points(group: str) -> list[DiscoveredConnector]:
     discovered: list[DiscoveredConnector] = []
-    for ep in entry_points(group=ENTRY_POINT_GROUP):
+    for ep in entry_points(group=group):
         dist = getattr(ep, "dist", None)
         cls: type | None = None
         load_error: str | None = None
@@ -170,9 +174,31 @@ def discover_connector_entry_points() -> list[DiscoveredConnector]:
                 dist_version=getattr(dist, "version", None),
                 cls=cls,
                 load_error=load_error,
+                group=group,
             )
         )
     return sorted(discovered, key=lambda d: d.ep_name)
+
+
+def discover_connector_entry_points() -> list[DiscoveredConnector]:
+    """All connector entry points with dist identity and load outcome.
+
+    Unlike :func:`aisquare.pipe.core.registry.discover_connectors`, load
+    failures are returned (not just logged) and the owning distribution is
+    reported — both are needed to attribute problems to a connector package.
+    """
+    return _discover_entry_points(ENTRY_POINT_GROUP)
+
+
+def discover_toolkit_entry_points() -> list[DiscoveredConnector]:
+    """All ``aisquare_pipe.toolkits`` entry points (see
+    :func:`discover_connector_entry_points`)."""
+    return _discover_entry_points(TOOLKIT_ENTRY_POINT_GROUP)
+
+
+def discover_all_entry_points() -> list[DiscoveredConnector]:
+    """Connector and toolkit entry points together."""
+    return discover_connector_entry_points() + discover_toolkit_entry_points()
 
 
 # --------------------------------------------------------------------------
@@ -488,4 +514,302 @@ def _run_contract_checks(cls: type, entry_point_name: str | None) -> list[CheckR
         results += check_input_types(cls)
         results += check_push_contract(cls)
         results += check_sink_validate_config(cls)
+    return results
+
+
+# --------------------------------------------------------------------------
+# Toolkit checks
+# --------------------------------------------------------------------------
+
+#: Longest tool description accepted (LLM tool APIs truncate or reject past this).
+MAX_TOOL_DESCRIPTION = 1024
+
+_TOOLKIT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_SLUG_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+#: A slug no toolkit defines — used to probe unknown-tool handling.
+UNKNOWN_TOOL_SLUG = "PIPE_COMPLIANCE_NO_SUCH_TOOL"
+
+
+def _toolkit_catalog(cls: type) -> tuple[list[Any] | None, str | None]:
+    """``tools()`` under the socket guard: (catalog, problem)."""
+    inst = cls()
+    try:
+        with no_network() as log:
+            catalog = inst.tools()
+    except Exception as e:  # noqa: BLE001
+        return None, f"tools() raised {type(e).__name__}: {e}"
+    if log.attempts:
+        return None, f"network in tools(): {log.attempts[0]}"
+    if not isinstance(catalog, list):
+        return None, f"tools() returned {type(catalog).__name__}, expected list[ToolSpec]"
+    return catalog, None
+
+
+def check_toolkit_name(cls: type) -> list[CheckResult]:
+    inst = cls()
+    name = getattr(inst, "name", None)
+    ok = isinstance(name, str) and bool(_TOOLKIT_NAME_RE.match(name))
+    return [
+        CheckResult(
+            "contract.toolkit.name",
+            ok,
+            message="" if ok else f"toolkit name {name!r} must be lowercase [a-z0-9_-] starting with a letter",
+        )
+    ]
+
+
+def check_toolkit_entry_point_name(cls: type, ep_name: str) -> list[CheckResult]:
+    """A toolkit's entry-point name must equal its ``name`` exactly."""
+    inst = cls()
+    ok = ep_name == getattr(inst, "name", None)
+    return [
+        CheckResult(
+            "contract.toolkit.entry-point-name",
+            ok,
+            message="" if ok else f"entry point {ep_name!r} does not match toolkit name {inst.name!r}",
+        )
+    ]
+
+
+def check_toolkit_catalog(cls: type) -> list[CheckResult]:
+    """``tools()`` is a non-empty ``list[ToolSpec]`` with unique UPPER_SNAKE
+    slugs under ``slug_prefix``, each resolvable via ``get_tool``."""
+    tools_id = "contract.toolkit.tools"
+    slugs_id = "contract.toolkit.slugs"
+    catalog, problem = _toolkit_catalog(cls)
+    if catalog is None:
+        return [
+            CheckResult(tools_id, False, message=problem or ""),
+            CheckResult(slugs_id, False, message="not evaluated — tools() failed"),
+        ]
+    bad_types = [type(t).__name__ for t in catalog if not isinstance(t, ToolSpec)]
+    if not catalog or bad_types:
+        message = "tools() returned an empty list" if not catalog else (
+            f"tools() items must be ToolSpec, got {', '.join(sorted(set(bad_types)))}"
+        )
+        return [
+            CheckResult(tools_id, False, message=message),
+            CheckResult(slugs_id, False, message="not evaluated — tools() is not a list of ToolSpec"),
+        ]
+
+    inst = cls()
+    prefix = getattr(inst, "slug_prefix", None)
+    problems: list[str] = []
+    if not isinstance(prefix, str) or not prefix.endswith("_") or not _SLUG_RE.match(prefix):
+        problems.append(f"slug_prefix {prefix!r} must be UPPER_SNAKE ending in '_'")
+        prefix = None
+    seen: set[str] = set()
+    for tool in catalog:
+        slug = tool.slug
+        if not isinstance(slug, str) or not _SLUG_RE.match(slug):
+            problems.append(f"slug {slug!r} is not UPPER_SNAKE")
+            continue
+        if prefix and (not slug.startswith(prefix) or slug == prefix):
+            problems.append(f"slug {slug!r} does not start with slug_prefix {prefix!r}")
+        if slug in seen:
+            problems.append(f"duplicate slug {slug!r}")
+        seen.add(slug)
+        if inst.get_tool(slug) != tool:
+            problems.append(f"get_tool({slug!r}) does not return its ToolSpec")
+    return [
+        CheckResult(tools_id, True),
+        CheckResult(slugs_id, not problems, message="; ".join(problems)),
+    ]
+
+
+def check_toolkit_schemas(cls: type) -> list[CheckResult]:
+    """Every ``input_schema`` is ``{"type": "object", "properties": {...}}``
+    with ``required`` a subset of ``properties``."""
+    check_id = "contract.toolkit.input-schema"
+    catalog, problem = _toolkit_catalog(cls)
+    if catalog is None:
+        return [CheckResult(check_id, False, message=f"not evaluated — {problem}")]
+    problems: list[str] = []
+    for tool in catalog:
+        if not isinstance(tool, ToolSpec):
+            continue
+        schema = tool.input_schema
+        if not isinstance(schema, Mapping) or schema.get("type") != "object":
+            problems.append(f"{tool.slug}: input_schema must have type 'object'")
+            continue
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            problems.append(f"{tool.slug}: input_schema.properties must be an object")
+            continue
+        required = schema.get("required", [])
+        if not isinstance(required, list) or not all(isinstance(r, str) for r in required):
+            problems.append(f"{tool.slug}: input_schema.required must be a list of strings")
+            continue
+        extra = [r for r in required if r not in properties]
+        if extra:
+            problems.append(f"{tool.slug}: required {extra} not in properties")
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
+def check_toolkit_descriptions(cls: type) -> list[CheckResult]:
+    check_id = "contract.toolkit.descriptions"
+    catalog, problem = _toolkit_catalog(cls)
+    if catalog is None:
+        return [CheckResult(check_id, False, message=f"not evaluated — {problem}")]
+    problems: list[str] = []
+    for tool in catalog:
+        if not isinstance(tool, ToolSpec):
+            continue
+        description = tool.description
+        if not isinstance(description, str) or not description.strip():
+            problems.append(f"{tool.slug}: description is empty")
+        elif len(description) > MAX_TOOL_DESCRIPTION:
+            problems.append(f"{tool.slug}: description is {len(description)} chars (max {MAX_TOOL_DESCRIPTION})")
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
+def _call_tool_check(cls: type, slug: str, label: str) -> str | None:
+    """Problem with ``call_tool(slug, {}, {})``, or None when it returned a
+    failed ToolResult without raising or touching the network."""
+    inst = cls()
+    try:
+        with no_network() as log:
+            result = inst.call_tool(slug, {}, {})
+    except Exception as e:  # noqa: BLE001
+        return f"call_tool({label}, {{}}, {{}}) raised {type(e).__name__}: {e}"
+    if log.attempts:
+        return f"network in call_tool({label}, {{}}, {{}}): {log.attempts[0]}"
+    if not isinstance(result, ToolResult):
+        return f"call_tool({label}, {{}}, {{}}) returned {type(result).__name__}, expected ToolResult"
+    if result.successful is not False:
+        return f"call_tool({label}, {{}}, {{}}) succeeded — empty config cannot hold credentials"
+    if not result.error:
+        return f"call_tool({label}, {{}}, {{}}) failed without an error message"
+    if result.error_code not in ERROR_CODES:
+        return f"call_tool({label}, {{}}, {{}}) returned non-canonical error_code {result.error_code!r}"
+    return None
+
+
+def check_toolkit_call_unknown(cls: type) -> list[CheckResult]:
+    problem = _call_tool_check(cls, UNKNOWN_TOOL_SLUG, "<unknown slug>")
+    return [CheckResult("contract.toolkit.call-unknown", problem is None, message=problem or "")]
+
+
+def check_toolkit_call_no_creds(cls: type) -> list[CheckResult]:
+    """``call_tool(slug, {}, {})`` fails cleanly for every real slug.
+
+    An ``AuthType.NONE`` toolkit legitimately runs tools without credentials,
+    so only its tools with required arguments are probed (they must fail
+    argument validation before any I/O)."""
+    check_id = "contract.toolkit.call-no-creds"
+    catalog, problem = _toolkit_catalog(cls)
+    if catalog is None:
+        return [CheckResult(check_id, False, message=f"not evaluated — {problem}")]
+    probe = [tool for tool in catalog if isinstance(tool, ToolSpec)]
+    if cls().auth_type is AuthType.NONE:
+        probe = [
+            tool
+            for tool in probe
+            if isinstance(tool.input_schema, Mapping) and tool.input_schema.get("required")
+        ]
+    problems = [
+        p for tool in probe for p in [_call_tool_check(cls, tool.slug, tool.slug)] if p is not None
+    ]
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
+def check_toolkit_validate_config(cls: type) -> list[CheckResult]:
+    return _validate_config_check(cls, "contract.toolkit.validate-config-no-creds")
+
+
+def check_toolkit_search(cls: type) -> list[CheckResult]:
+    check_id = "contract.toolkit.search"
+    inst = cls()
+    try:
+        with no_network() as log:
+            found = inst.search_tools("list search get", limit=3)
+    except Exception as e:  # noqa: BLE001
+        return [CheckResult(check_id, False, message=f"search_tools() raised {type(e).__name__}: {e}")]
+    if log.attempts:
+        return [CheckResult(check_id, False, message=f"network in search_tools(): {log.attempts[0]}")]
+    ok = isinstance(found, list) and len(found) <= 3 and all(isinstance(t, ToolSpec) for t in found)
+    return [
+        CheckResult(
+            check_id,
+            ok,
+            message="" if ok else "search_tools(query, limit=3) must return at most 3 ToolSpecs",
+        )
+    ]
+
+
+def _is_https(url: Any) -> bool:
+    return isinstance(url, str) and url.startswith("https://") and len(url) > len("https://")
+
+
+def check_toolkit_oauth(cls: type) -> list[CheckResult]:
+    """An OAuth spec, when declared, is an OAuthSpec with https endpoints.
+    An OAUTH2 toolkit without one is flagged as a warning."""
+    inst = cls()
+    spec = getattr(inst, "oauth", None)
+    if spec is None:
+        ok = inst.auth_type is not AuthType.OAUTH2
+        return [
+            CheckResult(
+                "contract.toolkit.oauth-declared",
+                ok,
+                severity=Severity.WARNING,
+                message="" if ok else "auth_type is OAUTH2 but no OAuthSpec is declared (oauth = None)",
+            )
+        ]
+    problems: list[str] = []
+    if not isinstance(spec, OAuthSpec):
+        problems.append(f"oauth must be an OAuthSpec, got {type(spec).__name__}")
+    else:
+        if not spec.provider:
+            problems.append("oauth.provider is empty")
+        for attr in ("authorize_url", "token_url"):
+            if not _is_https(getattr(spec, attr)):
+                problems.append(f"oauth.{attr} must be an https URL")
+        if spec.revoke_url is not None and not _is_https(spec.revoke_url):
+            problems.append("oauth.revoke_url must be an https URL")
+        reserved = sorted(set(spec.extra_authorize_params) & FLOW_AUTHORIZE_PARAMS)
+        if reserved:
+            problems.append(
+                f"oauth.extra_authorize_params may not set flow parameters: {', '.join(reserved)}"
+            )
+    return [CheckResult("contract.toolkit.oauth", not problems, message="; ".join(problems))]
+
+
+def run_toolkit_contract_checks(cls: type, entry_point_name: str | None = None) -> list[CheckResult]:
+    """All Layer A checks for one toolkit class (logging muted, as for connectors)."""
+    import logging
+
+    logging.disable(logging.ERROR)
+    try:
+        return _run_toolkit_contract_checks(cls, entry_point_name)
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def _run_toolkit_contract_checks(cls: type, entry_point_name: str | None) -> list[CheckResult]:
+    if not (isinstance(cls, type) and issubclass(cls, Toolkit)):
+        return [
+            CheckResult(
+                "contract.toolkit.base-class",
+                False,
+                message=f"{getattr(cls, '__name__', cls)!r} is not a Toolkit subclass",
+            )
+        ]
+    results = check_instantiation(cls)
+    if failures(results):
+        return results
+    results += check_toolkit_name(cls)
+    results += check_version(cls)
+    results += check_auth_type(cls)
+    if entry_point_name is not None:
+        results += check_toolkit_entry_point_name(cls, entry_point_name)
+    results += check_toolkit_catalog(cls)
+    results += check_toolkit_schemas(cls)
+    results += check_toolkit_descriptions(cls)
+    results += check_toolkit_search(cls)
+    results += check_toolkit_call_unknown(cls)
+    results += check_toolkit_call_no_creds(cls)
+    results += check_toolkit_validate_config(cls)
+    results += check_toolkit_oauth(cls)
     return results

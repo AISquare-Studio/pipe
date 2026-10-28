@@ -14,8 +14,8 @@ import subprocess
 from unittest import mock
 
 import pytest
-
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
+
 from aisquare_pipe_github import client as client_mod
 from aisquare_pipe_github.client import GitHubRepoClient
 
@@ -54,7 +54,7 @@ class TestCloneAuthEnv:
         return run_mock.call_args
 
     def test_token_absent_from_argv_and_url(self):
-        args, kwargs = self._run_clone()
+        args, _ = self._run_clone()
         argv = args[0]
         assert all(TOKEN not in str(a) for a in argv), f"token leaked into argv: {argv}"
         assert "https://github.com/owner/secret-repo.git" in argv
@@ -83,17 +83,21 @@ class TestCloneAuthEnv:
 class TestCloneFailures:
     def test_nonzero_exit_raises_pipeline_error_with_stderr_tail(self):
         failed = mock.Mock(returncode=128, stdout="", stderr="fatal: repository not found")
-        with mock.patch.object(client_mod.subprocess, "run", return_value=failed):
-            with pytest.raises(PipelineError) as exc:
-                _client().clone("/tmp/workdir")
+        with (
+            mock.patch.object(client_mod.subprocess, "run", return_value=failed),
+            pytest.raises(PipelineError) as exc,
+        ):
+            _client().clone("/tmp/workdir")
         assert "exited 128" in str(exc.value)
         assert "repository not found" in str(exc.value)
 
     def test_timeout_raises_pipeline_error(self):
         boom = subprocess.TimeoutExpired(cmd=["git"], timeout=300, stderr=b"slow network")
-        with mock.patch.object(client_mod.subprocess, "run", side_effect=boom):
-            with pytest.raises(PipelineError) as exc:
-                _client().clone("/tmp/workdir")
+        with (
+            mock.patch.object(client_mod.subprocess, "run", side_effect=boom),
+            pytest.raises(PipelineError) as exc,
+        ):
+            _client().clone("/tmp/workdir")
         assert "timed out" in str(exc.value)
         assert "slow network" in str(exc.value)
 

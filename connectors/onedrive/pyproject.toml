@@ -4,27 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe-onedrive"
-version = "0.1.0"
-description = "OneDrive connector for aisquare.pipe"
+version = "0.2.0"
+description = "OneDrive toolkit (search, download, upload, organize, share) and source/sink connectors for aisquare.pipe"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "AISquare Studio"}]
 dependencies = [
-    "aisquare-pipe>=0.1.0",
+    "aisquare-pipe>=0.3.0",
     "azure-identity>=1.15.0",
     "requests>=2.20.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "types-requests"]
 
 [project.entry-points."aisquare_pipe.connectors"]
 onedrive-source = "aisquare_pipe_onedrive.connector:OneDriveSource"
 onedrive-sink = "aisquare_pipe_onedrive.connector:OneDriveSink"
 
+[project.entry-points."aisquare_pipe.toolkits"]
+onedrive = "aisquare_pipe_onedrive.toolkit:OneDriveToolkit"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.ruff.lint.isort]
+# Same import grouping whatever directory ruff runs from (the repo root sees
+# src/aisquare as first-party otherwise).
+known-first-party = ["aisquare_pipe_onedrive"]
+known-third-party = ["aisquare"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"

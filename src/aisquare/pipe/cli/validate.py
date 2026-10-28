@@ -3,6 +3,7 @@ renders the report.
 
 Layers:
     A contract  — in-process, socket-guarded checks per installed connector
+                  and toolkit entry point
     B hygiene   — repo-dir packaging/isolation rules (repo checkout only)
     C unit      — each connector's own pytest suite, one subprocess per
                   connector (their identically-named ``tests`` packages
@@ -32,7 +33,9 @@ from aisquare.pipe.testing.validation import (
     DiscoveredConnector,
     Severity,
     discover_connector_entry_points,
+    discover_toolkit_entry_points,
     run_contract_checks,
+    run_toolkit_contract_checks,
 )
 
 FRAMEWORK_ROW = "framework"
@@ -190,6 +193,12 @@ def _extract_pass_count(summary: str) -> str:
     return match.group(1) if match else ""
 
 
+def _discover_entry_points() -> list[DiscoveredConnector]:
+    """Connector + toolkit entry points (looked up at call time so tests can
+    stub either discovery function on this module)."""
+    return discover_connector_entry_points() + discover_toolkit_entry_points()
+
+
 def _contract_layer(
     discovered: list[DiscoveredConnector], dist_name: str | None
 ) -> LayerReport:
@@ -197,7 +206,8 @@ def _contract_layer(
     for d in discovered:
         if d.dist_name != dist_name or d.cls is None:
             continue
-        for check in run_contract_checks(d.cls, d.ep_name):
+        run_checks = run_toolkit_contract_checks if d.is_toolkit else run_contract_checks
+        for check in run_checks(d.cls, d.ep_name):
             # Attribute each check to its entry point for the report.
             check.id = f"{check.id}@{d.ep_name}" if "@" not in check.id else check.id
             checks.append(check)
@@ -248,7 +258,7 @@ def install_missing_connectors(
     cdirs = hyg.list_connector_dirs(repo_root)
     if only is not None:
         cdirs = [c for c in cdirs if c.dir_name == only]
-    discovered = discover_connector_entry_points()
+    discovered = _discover_entry_points()
     installed = 0
     for cdir in cdirs:
         dist = hyg.load_dist_info(cdir.dist_name, discovered)
@@ -282,7 +292,7 @@ def validate_repo(
     if only is not None:
         cdirs = [c for c in cdirs if c.dir_name == only]
 
-    discovered = discover_connector_entry_points()
+    discovered = _discover_entry_points()
     reports: list[ConnectorReport] = []
 
     for index, cdir in enumerate(cdirs, start=1):
@@ -355,7 +365,7 @@ def validate_installed_only(
     *, live: bool = False, echo=click.echo
 ) -> list[ConnectorReport]:
     """Outside a repo checkout: Layer A only, grouped by distribution."""
-    discovered = discover_connector_entry_points()
+    discovered = _discover_entry_points()
     by_dist: dict[str, list[DiscoveredConnector]] = {}
     for d in discovered:
         by_dist.setdefault(d.dist_name or "(unknown dist)", []).append(d)

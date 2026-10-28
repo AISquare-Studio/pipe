@@ -1,4 +1,4 @@
-"""Compliance test suite for connector validation.
+"""Compliance test suites for connector and toolkit validation.
 
 The assertion logic lives in :mod:`aisquare.pipe.testing.validation` (pure
 check functions shared with ``pipe validate``); this module wraps it in the
@@ -12,6 +12,7 @@ from __future__ import annotations
 import unittest
 
 from aisquare.pipe.core.connector import SinkConnector, SourceConnector
+from aisquare.pipe.core.tools import Toolkit
 from aisquare.pipe.testing import validation
 from aisquare.pipe.testing.validation import CheckResult, failures
 
@@ -96,3 +97,69 @@ def connector_compliance_suite(connector_class: type) -> type:
     ComplianceTests.__name__ = f"{connector_class.__name__}Compliance"
     ComplianceTests.__qualname__ = f"{connector_class.__name__}Compliance"
     return ComplianceTests
+
+
+def toolkit_compliance_suite(toolkit_class: type) -> type:
+    """Generate a test class that validates a Toolkit against the spec.
+
+    Usage::
+
+        class TestMyToolkit(toolkit_compliance_suite(MyToolkit)):
+            pass
+
+    Credential-free like the connector suite: ``tools()``, ``search_tools``,
+    ``call_tool(..., {}, {})`` and ``validate_config({})`` run under the
+    socket guard, so a toolkit that reaches the network without credentials
+    fails.
+    """
+
+    class ToolkitComplianceTests(unittest.TestCase):
+        """Auto-generated toolkit compliance tests."""
+
+        toolkit_cls = toolkit_class
+
+        def test_instantiation(self):
+            _assert_checks(self, validation.check_instantiation(self.toolkit_cls))
+
+        def test_is_toolkit(self):
+            self.assertTrue(
+                issubclass(self.toolkit_cls, Toolkit),
+                f"{self.toolkit_cls.__name__} must subclass aisquare.pipe.Toolkit",
+            )
+
+        def test_has_name(self):
+            _assert_checks(self, validation.check_toolkit_name(self.toolkit_cls))
+
+        def test_has_version(self):
+            _assert_checks(self, validation.check_version(self.toolkit_cls))
+
+        def test_has_auth_type(self):
+            _assert_checks(self, validation.check_auth_type(self.toolkit_cls))
+
+        def test_tool_catalog(self):
+            _assert_checks(self, validation.check_toolkit_catalog(self.toolkit_cls))
+
+        def test_input_schemas(self):
+            _assert_checks(self, validation.check_toolkit_schemas(self.toolkit_cls))
+
+        def test_tool_descriptions(self):
+            _assert_checks(self, validation.check_toolkit_descriptions(self.toolkit_cls))
+
+        def test_search_tools(self):
+            _assert_checks(self, validation.check_toolkit_search(self.toolkit_cls))
+
+        def test_call_unknown_tool(self):
+            _assert_checks(self, validation.check_toolkit_call_unknown(self.toolkit_cls))
+
+        def test_call_tool_no_creds(self):
+            _assert_checks(self, validation.check_toolkit_call_no_creds(self.toolkit_cls))
+
+        def test_validate_config_no_creds(self):
+            _assert_checks(self, validation.check_toolkit_validate_config(self.toolkit_cls))
+
+        def test_oauth_spec(self):
+            _assert_checks(self, validation.check_toolkit_oauth(self.toolkit_cls))
+
+    ToolkitComplianceTests.__name__ = f"{toolkit_class.__name__}Compliance"
+    ToolkitComplianceTests.__qualname__ = f"{toolkit_class.__name__}Compliance"
+    return ToolkitComplianceTests

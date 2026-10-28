@@ -4,7 +4,7 @@
 This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for moving `DataEnvelope` objects between Source and Sink connectors. The root package provides the shared framework, CLI, test helpers, and example/mock connectors used by plugin packages.
 
 ## Repository Layout
-- `src/aisquare/pipe/core/`: core abstractions and pipeline logic (`connector.py`, `pipeline.py`, `envelope.py`, `merge.py`, `registry.py`, `types.py`)
+- `src/aisquare/pipe/core/`: core abstractions and pipeline logic (`connector.py`, `pipeline.py`, `envelope.py`, `merge.py`, `registry.py`, `types.py`), plus toolkits (`tools.py`: `ToolSpec`/`ToolResult`/`Toolkit`) and OAuth flow primitives (`oauth.py`)
 - `src/aisquare/pipe/cli/`: Click-based CLI entrypoint and commands
 - `src/aisquare/pipe/mcp/`: MCP server integration
 - `src/aisquare/pipe/testing/`: compliance helpers, fixtures, and mock connectors used by tests
@@ -73,8 +73,8 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 ## Connector Tiers
 All connectors live in the same `connectors/<name>/` directory; the tier signal is encoded in `pyproject.toml` extras bundles, not in folder location.
 
-- **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`. Installed via `pip install "aisquare-pipe[popular]"`.
-- **`[full]`** — Everything in `[popular]` plus the long-tail / enterprise / client-specific connectors. Currently adds `salesforce`, `docusign`. Installed via `pip install "aisquare-pipe[full]"`.
+- **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`, `googledrive`. Installed via `pip install "aisquare-pipe[popular]"`.
+- **`[full]`** — Everything in `[popular]` plus the long-tail / enterprise / client-specific connectors. Currently adds `salesforce`, `docusign`, `composio`, `github`. Installed via `pip install "aisquare-pipe[full]"`.
 - **Direct install** — `pip install aisquare-pipe-<name>` always works for any connector regardless of tier.
 
 **Where does a new connector belong?**

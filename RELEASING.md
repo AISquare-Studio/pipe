@@ -8,6 +8,7 @@ This repo is a monorepo of independently published PyPI packages:
 | `aisquare-pipe-local` | `connectors/local` |
 | `aisquare-pipe-dropbox` | `connectors/dropbox` |
 | `aisquare-pipe-onedrive` | `connectors/onedrive` |
+| `aisquare-pipe-googledrive` | `connectors/googledrive` |
 | `aisquare-pipe-salesforce` | `connectors/salesforce` |
 | `aisquare-pipe-docusign` | `connectors/docusign` |
 | `aisquare-pipe-composio` | `connectors/composio` |

@@ -36,8 +36,11 @@ Each connector is its own independently published pip package under `connectors/
 | Local filesystem | `aisquare-pipe-local` | ✓ | ✓ |
 | Dropbox | `aisquare-pipe-dropbox` | ✓ | ✓ |
 | OneDrive | `aisquare-pipe-onedrive` | ✓ | ✓ |
+| Google Drive | `aisquare-pipe-googledrive` | ✓ | ✓ |
 | Salesforce | `aisquare-pipe-salesforce` |   | ✓ |
 | DocuSign | `aisquare-pipe-docusign` |   | ✓ |
+| Composio | `aisquare-pipe-composio` |   | ✓ |
+| GitHub | `aisquare-pipe-github` |   | ✓ |
 
 Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
@@ -83,6 +86,8 @@ print(f"Sink received: {[e.data for e in sink.received]}")
 pipe list                            # list installed connectors
 pipe describe mock-source            # show connector details
 pipe check mock-source mock-sink     # check type compatibility
+pipe tools                           # list installed toolkits
+pipe tools mock --search "delete"    # a toolkit's tools, ranked for a query
 pipe run --source mock-source --sink mock-sink --config config.json
 pipe new-connector my-service        # scaffold a new connector plugin
 ```

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe"
-version = "0.1.1"
+version = "0.3.0"
 description = "Universal anything-to-anything connector framework"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -40,12 +40,14 @@ popular = [
     "aisquare-pipe-local",
     "aisquare-pipe-dropbox",
     "aisquare-pipe-onedrive",
+    "aisquare-pipe-googledrive",
 ]
 full = [
     "aisquare-pipe[popular]",
     "aisquare-pipe-salesforce",
     "aisquare-pipe-docusign",
     "aisquare-pipe-composio",
+    "aisquare-pipe-github",
 ]
 
 [project.scripts]
@@ -58,6 +60,9 @@ mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
 [project.entry-points."aisquare_pipe.converters"]
 mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
 
+[project.entry-points."aisquare_pipe.toolkits"]
+mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -66,3 +71,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+# src/aisquare is a namespace package: map files under src/ to their
+# aisquare.* module names so `mypy src` works with an editable install.
+mypy_path = "src"
+explicit_package_bases = true

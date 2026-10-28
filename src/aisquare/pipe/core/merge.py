@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from enum import Enum
 
 from aisquare.pipe.core.envelope import DataEnvelope
@@ -59,6 +59,7 @@ def merge_batch(
     sources: dict[str, Iterator[DataEnvelope]] | list[Iterator[DataEnvelope]],
 ) -> Iterator[DataEnvelope]:
     """Collect all envelopes from all sources into a flat sequence."""
+    iterators: Iterable[Iterator[DataEnvelope]]
     if isinstance(sources, dict):
         iterators = sources.values()
     else:
@@ -112,6 +113,7 @@ def merge_concat(
     sources: dict[str, Iterator[DataEnvelope]] | list[Iterator[DataEnvelope]],
 ) -> Iterator[DataEnvelope]:
     """Yield all envelopes from source 1, then source 2, etc."""
+    iterators: Iterable[Iterator[DataEnvelope]]
     if isinstance(sources, dict):
         iterators = sources.values()
     else:
