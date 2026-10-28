@@ -1,9 +1,10 @@
 # aisquare-pipe-slack
 
 Slack for [aisquare.pipe](../../README.md): `SlackToolkit`, registered as toolkit
-`slack` (`aisquare_pipe.toolkits`). It has 51 LLM-callable tools over Slack's Web API —
+`slack` (`aisquare_pipe.toolkits`). It has 95 LLM-callable tools over Slack's Web API —
 messages, history and threads, search, channels and DMs, reactions, pins, people and
-presence — and Slack's OAuth v2 spec. It acts **as the user** who connected, or
+presence, plus files (upload and download), canvases, bookmarks, Do Not Disturb,
+reminders and user groups — and Slack's OAuth v2 spec. It acts **as the user** who connected, or
 **as the app's bot**. Which one is a config option.
 
 pipe is app-agnostic. The host registers one Slack app and passes its client ID and
@@ -65,9 +66,9 @@ Every tool has exactly one tier:
 | Tier | What it covers | On by default |
 |---|---|:-:|
 | `read` | No side effects | ✓ |
-| `send` | Posting a new message: post, reply, DM (incl. opening the DM), ephemeral, scheduled | ✓ |
-| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, profile/status, presence | |
-| `destructive` | Things the caller can't undo: deleting a message or a scheduled message, archiving a channel, removing someone from a channel, leaving a channel (a private one can only be re-entered by invitation) | |
+| `send` | Posting into a conversation: a message, reply, DM (incl. opening the DM), ephemeral, scheduled or `/me` message; uploading a file into chosen conversations (it reaches nobody else) | ✓ |
+| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, the read cursor, bookmarks, canvases (create, give access), profile/status/photo, presence, DnD, reminders, user groups (create, update, enable), turning a file's public link off | |
+| `destructive` | Things the caller can't undo, or that reach beyond Slack: deleting a message, scheduled message, file, file comment, canvas, canvas access, bookmark, reminder or profile photo; archiving a channel, removing someone, leaving a channel; editing a canvas (an edit can replace or delete content); disabling a user group or replacing its members; making a file public | |
 
 If a connection calls a tool whose tier it hasn't enabled, the call fails with
 `forbidden` **before any request is made**. The message names the setting that
@@ -101,7 +102,7 @@ edits there.
 | Posts appear as | the user, with "Sent by <name>" | the app's bot (marker only with `bot_attribution`) |
 | Default tiers | read + send | **send only** |
 | Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
-| User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_LIST_UNREAD_CHANNEL_MESSAGES`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL` fail as `forbidden` without calling Slack (Slack accepts only user tokens for them). `available_tools` leaves them out. |
+| User-only tools | all available | `SLACK_SEARCH_*`, the two unread tools, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack (Slack's method docs list no bot scope for them). `available_tools` leaves them out. |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
 
 > **Warning: reading as the bot crosses users.** One bot token serves the whole
@@ -127,7 +128,8 @@ messages, since they still appear under the user's name.
 
 Messages sent with the user identity show a visible "Sent by <name>" line, like
 Claude's "Sent using Claude". This covers `SEND_MESSAGE`, `SEND_EPHEMERAL_MESSAGE`,
-`SCHEDULE_MESSAGE` and edits through `UPDATES_A_SLACK_MESSAGE`. How the line is
+`SCHEDULE_MESSAGE`, `SEND_ME_MESSAGE`, edits through `UPDATES_A_SLACK_MESSAGE`, and
+the share message of a file uploaded into a conversation. How the line is
 added depends on the content:
 
 - **`blocks`:** a context block (small grey text) goes after the blocks. This leaves
@@ -176,6 +178,31 @@ put their hints **first**, so they survive a caller truncating the result:
     first, and used as an ID if no channel has that name, since channel names are
     never uppercase. Slack doesn't promise IDs contain a digit: Slackbot is
     `USLACKBOT`. `SLACK_FIND_USERS` does the same with `users.info`.
+
+## Files
+
+Files travel as real bytes (plan §4.8).
+
+- **`SLACK_DOWNLOAD_SLACK_FILE`** returns the file in `ToolResult.files` as a
+  `DataEnvelope`: `content_type` is the MIME type and `metadata` holds the filename,
+  file ID and size. `data` describes the file and also carries small text inline.
+  - The token is sent only to `https://files.slack.com`. Redirects are followed by
+    hand, and the token is dropped for any other host.
+  - The download is capped at 100 MiB, checked before downloading and again while
+    streaming.
+  - External (remote) files are refused: their URL belongs to the third party.
+  - If Slack returns a sign-in page instead of the file, the result is `forbidden`
+    (the connection lacks `files:read`).
+- **`SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK`** uploads text `content` with Slack's v2
+  flow:
+  1. get a pre-signed URL;
+  2. POST the bytes to it, with no token, `https` `*.slack.com` only;
+  3. complete the upload exactly once.
+
+  Without `channels`, the file stays private to the uploader. Host-staged `file`
+  arguments are not supported yet. `aisquare_pipe_slack.files.upload_file` is the
+  same helper, for sinks.
+- **`SLACK_SET_PROFILE_PHOTO`** takes the image as `{"base64": …, "mimetype": …}`.
 
 ## Errors
 
@@ -243,8 +270,8 @@ because retrying won't help. The live test checks a channel and an optional DM.
 ## Scopes
 
 Every tool declares the scopes it needs for each identity, so the scope lists are
-derived from the catalog rather than kept by hand. `USER_SCOPES` (29) and
-`BOT_SCOPES` (28) are the full unions, and they are what a consent asks for by
+derived from the catalog rather than kept by hand. `USER_SCOPES` (41) and
+`BOT_SCOPES` (37) are the full unions, and they are what a consent asks for by
 default: one consent screen, and no re-consent later, because Slack scopes only
 ever add up.
 
@@ -252,7 +279,8 @@ To ask for less, pass `scopes` to `build_authorize_url`. It takes **scope group*
 names, raw Slack scopes, or both:
 
 - By area: `messages`, `history`, `search`, `conversations`, `dms`, `reactions`,
-  `pins`, `users`, `workspace`.
+  `pins`, `users`, `workspace`, `bookmarks`, `dnd`, `files`, `canvases`, `reminders`,
+  `usergroups`.
 - By tier: `read`, `send`, `write`, `destructive`. For example, `["read", "send"]`
   asks for exactly what the default tiers need.
 
@@ -384,6 +412,60 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_TEST_AUTH` | read | `auth.test` | user, bot |
 | `SLACK_WHO_AM_I` | read | `auth.test`, `team.info` | user, bot |
 | `SLACK_API_TEST` | read | `api.test` | user, bot |
+| **messages** | | | |
+| `SLACK_SEND_ME_MESSAGE` | send | `chat.meMessage` | user, bot |
+| **history** | | | |
+| `SLACK_GET_UNREAD_MESSAGES_FROM_USER` | read | `users.conversations`, `conversations.info`, `conversations.history` | user |
+| `SLACK_SET_READ_CURSOR_IN_A_CONVERSATION` | write | `conversations.mark` | user, bot |
+| **bookmarks** | | | |
+| `SLACK_ADD_BOOKMARK` | write | `bookmarks.add` | user, bot |
+| `SLACK_EDIT_BOOKMARK` | write | `bookmarks.edit` | user, bot |
+| `SLACK_REMOVE_BOOKMARK` | destructive | `bookmarks.remove` | user, bot |
+| `SLACK_LIST_BOOKMARKS` | read | `bookmarks.list` | user, bot |
+| **users** | | | |
+| `SLACK_GET_TEAM_PROFILE` | read | `team.profile.get` | user, bot |
+| `SLACK_SET_PROFILE_PHOTO` | write | `users.setPhoto` | user |
+| `SLACK_DELETE_USER_PROFILE_PHOTO` | destructive | `users.deletePhoto` | user |
+| `SLACK_GET_BOT_USER` | read | `bots.info` | user, bot |
+| **dnd** | | | |
+| `SLACK_RETRIEVE_CURRENT_USER_DND_STATUS` | read | `dnd.info` | user, bot |
+| `SLACK_GET_USER_DND_STATUS` | read | `dnd.teamInfo` | user, bot |
+| `SLACK_SET_DND_DURATION` | write | `dnd.setSnooze` | user |
+| `SLACK_END_DND` | write | `dnd.endDnd` | user |
+| `SLACK_END_SNOOZE` | write | `dnd.endSnooze` | user |
+| **files** | | | |
+| `SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK` | send | `files.getUploadURLExternal`, `files.completeUploadExternal` | user, bot |
+| `SLACK_DOWNLOAD_SLACK_FILE` | read | `files.info` | user, bot |
+| `SLACK_RETRIEVE_DETAILED_INFORMATION_ABOUT_A_FILE` | read | `files.info` | user, bot |
+| `SLACK_LIST_FILES_WITH_FILTERS_IN_SLACK` | read | `files.list` | user, bot |
+| `SLACK_DELETE_FILE` | destructive | `files.delete` | user, bot |
+| `SLACK_DELETE_FILE_COMMENT` | destructive | `files.comments.delete` | user, bot |
+| `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` | destructive | `files.sharedPublicURL` | user |
+| `SLACK_REVOKE_FILE_PUBLIC_SHARING` | write | `files.revokePublicURL` | user, bot |
+| **canvases** | | | |
+| `SLACK_CREATE_CANVAS` | write | `canvases.create` | user, bot |
+| `SLACK_EDIT_CANVAS` | destructive | `canvases.edit` | user, bot |
+| `SLACK_DELETE_CANVAS` | destructive | `canvases.delete` | user, bot |
+| `SLACK_LOOKUP_CANVAS_SECTIONS` | read | `canvases.sections.lookup` | user, bot |
+| `SLACK_GET_CANVAS_CONTENT` | read | `canvases.getContent` | user, bot |
+| `SLACK_CREATE_CHANNEL_CANVAS` | write | `conversations.canvases.create` | user, bot |
+| `SLACK_SET_CANVAS_ACCESS` | write | `canvases.access.set` | user, bot |
+| `SLACK_DELETE_CANVAS_ACCESS` | destructive | `canvases.access.delete` | user, bot |
+| **reminders** | | | |
+| `SLACK_CREATE_A_REMINDER` | write | `reminders.add` | user |
+| `SLACK_GET_REMINDER` | read | `reminders.info` | user |
+| `SLACK_LIST_REMINDERS` | read | `reminders.list` | user |
+| `SLACK_DELETE_REMINDER` | destructive | `reminders.delete` | user |
+| **usergroups** | | | |
+| `SLACK_CREATE_USER_GROUP` | write | `usergroups.create` | user, bot |
+| `SLACK_UPDATE_USER_GROUP` | write | `usergroups.update` | user, bot |
+| `SLACK_DISABLE_USER_GROUP` | destructive | `usergroups.disable` | user, bot |
+| `SLACK_ENABLE_USER_GROUP` | write | `usergroups.enable` | user, bot |
+| `SLACK_LIST_USER_GROUPS` | read | `usergroups.list` | user, bot |
+| `SLACK_LIST_USER_GROUP_MEMBERS` | read | `usergroups.users.list` | user, bot |
+| `SLACK_UPDATE_USER_GROUP_MEMBERS` | destructive | `usergroups.users.update` | user, bot |
+| **workspace** | | | |
+| `SLACK_LIST_AUTH_TEAMS` | read | `auth.teams.list` | user, bot |
 
 ## Tests
 

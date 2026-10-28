@@ -112,7 +112,10 @@ class TestScopes:
 
     def test_groups(self):
         assert set(SCOPE_GROUPS) == {*AREAS, "read", "send", "write", "destructive"}
-        assert AREAS == ("messages", "history", "search", "conversations", "dms", "reactions", "pins", "users", "workspace")
+        assert AREAS == (
+            "messages", "history", "search", "conversations", "dms", "reactions", "pins", "users", "workspace",
+            "bookmarks", "dnd", "files", "canvases", "reminders", "usergroups",
+        )
         assert SCOPE_GROUPS["search"]["user"] == (
             "channels:read", "groups:read", "im:read", "mpim:read", "search:read", "users:read", "users:read.email",
         )

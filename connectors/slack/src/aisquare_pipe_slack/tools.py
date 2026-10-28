@@ -77,8 +77,15 @@ class SlackCall:
     idempotent: bool = False
     attribution: str | None = None
 
-    def call(self, method: str, args: Mapping[str, Any] | None = None, *, json_body: bool = False) -> dict[str, Any]:
-        return self.client.call(method, args, json_body=json_body, idempotent=self.idempotent)
+    def call(
+        self,
+        method: str,
+        args: Mapping[str, Any] | None = None,
+        *,
+        json_body: bool = False,
+        files: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.client.call(method, args, json_body=json_body, idempotent=self.idempotent, files=files)
 
 
 Handler = Callable[[SlackCall, dict[str, Any]], ToolResult]

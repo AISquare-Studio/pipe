@@ -10,8 +10,12 @@ from __future__ import annotations
 from aisquare.pipe import ToolSpec
 
 from aisquare_pipe_slack.tools import CORE_CATALOG, SlackTool
+from aisquare_pipe_slack.tools_breadth import BREADTH_CATALOG
 
-CATALOG: tuple[SlackTool, ...] = (*CORE_CATALOG,)
+CATALOG: tuple[SlackTool, ...] = (
+    *CORE_CATALOG,
+    *BREADTH_CATALOG,
+)
 TOOLS: dict[str, SlackTool] = {tool.spec.slug: tool for tool in CATALOG}
 TOOL_SPECS: tuple[ToolSpec, ...] = tuple(tool.spec for tool in CATALOG)
 

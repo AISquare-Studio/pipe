@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Scopes.** Named scope groups (by area and by tier) select what a consent
     asks for; the default is every scope.
   - Joins `[full]`.
+- **Slack breadth tools**: 44 more `SlackToolkit` tools (95 in all) for files,
+  canvases, bookmarks, Do Not Disturb, reminders and user groups, plus `/me`
+  messages, unread-from-user, the read cursor, team profile, profile photo,
+  bot info and auth teams.
+  - **Tiers.** They use the same tiers, identity gate and attribution as the
+    core tools. Most are opt-in (write or destructive). Making a file public,
+    editing a canvas, disabling a user group and replacing its members are
+    destructive.
+  - **Files** travel as bytes. Downloads return a `DataEnvelope` in
+    `ToolResult.files`, and the token is sent only to `files.slack.com`.
+    Uploads use Slack's v2 flow (`aisquare_pipe_slack.files.upload_file`).
+  - **Scopes.** User scopes go from 29 to 41, and bot scopes from 28 to 37.
 
 - `Toolkit.available_tools(config=None)`: the tools a connection with that
   config may call, so hosts can list only those to a model. It returns

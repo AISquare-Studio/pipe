@@ -33,6 +33,7 @@ DROPPED: dict[str, dict[str, str]] = {
     },
     "SLACK_SCHEDULE_MESSAGE": {"attachments": "legacy secondary attachments; use blocks"},
     "SLACK_SEARCH_MESSAGES": {"auto_paginate": "one page per call, with next_page / next_cursor hints"},
+    "SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK": {"token": "a credential argument is never accepted"},
     "SLACK_OPEN_DM": {
         "return_im": "returns the DM's latest message and read state, which is reading; OPEN_DM is "
         "send tier, so it returns the channel ID only (manager ruling)"
@@ -46,9 +47,20 @@ def _params(slug: str) -> dict[str, dict]:
     return {p["name"]: p for p in COMPOSIO[slug]["params"]}
 
 
-def test_the_fixture_is_the_pr1_catalog():
+#: Tools Composio doesn't have (bookmarks, canvas read/access): named so a
+#: missing Composio tool can't hide among them.
+EXTRAS = set(FIXTURE["extras"])
+
+
+def test_the_fixture_is_the_catalog():
     assert FIXTURE["missing"] == []
-    assert set(COMPOSIO) == set(TOOLS)
+    assert set(COMPOSIO) | EXTRAS == set(TOOLS)
+    assert not set(COMPOSIO) & EXTRAS
+    assert EXTRAS == {
+        "SLACK_ADD_BOOKMARK", "SLACK_EDIT_BOOKMARK", "SLACK_REMOVE_BOOKMARK", "SLACK_LIST_BOOKMARKS",
+        "SLACK_GET_CANVAS_CONTENT", "SLACK_CREATE_CHANNEL_CANVAS", "SLACK_SET_CANVAS_ACCESS",
+        "SLACK_DELETE_CANVAS_ACCESS",
+    }
 
 
 @pytest.mark.parametrize("slug", SLUGS)
