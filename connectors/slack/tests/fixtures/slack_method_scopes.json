@@ -541,6 +541,48 @@
         "files:read"
       ]
     },
+    "files.remote.add": {
+      "bot": [
+        "remote_files:write"
+      ],
+      "user": []
+    },
+    "files.remote.info": {
+      "bot": [
+        "remote_files:read"
+      ],
+      "user": [
+        "remote_files:read"
+      ]
+    },
+    "files.remote.list": {
+      "bot": [
+        "remote_files:read"
+      ],
+      "user": [
+        "remote_files:read"
+      ]
+    },
+    "files.remote.remove": {
+      "bot": [
+        "remote_files:write"
+      ],
+      "user": []
+    },
+    "files.remote.share": {
+      "bot": [
+        "remote_files:share"
+      ],
+      "user": [
+        "remote_files:share"
+      ]
+    },
+    "files.remote.update": {
+      "bot": [
+        "remote_files:write"
+      ],
+      "user": []
+    },
     "files.revokePublicURL": {
       "bot": [
         "files:write"
@@ -651,6 +693,86 @@
       "bot": [],
       "user": [
         "search:read"
+      ]
+    },
+    "slackLists.access.delete": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.access.set": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.create": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.items.create": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.items.delete": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.items.deleteMultiple": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.items.info": {
+      "bot": [
+        "lists:read"
+      ],
+      "user": [
+        "lists:read"
+      ]
+    },
+    "slackLists.items.list": {
+      "bot": [
+        "lists:read"
+      ],
+      "user": [
+        "lists:read"
+      ]
+    },
+    "slackLists.items.update": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
+      ]
+    },
+    "slackLists.update": {
+      "bot": [
+        "lists:write"
+      ],
+      "user": [
+        "lists:write"
       ]
     },
     "team.info": {

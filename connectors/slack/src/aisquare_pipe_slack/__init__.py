@@ -1,10 +1,13 @@
-"""aisquare-pipe-slack — Slack toolkit for aisquare.pipe, acting as a user or as the app's bot."""
+"""aisquare-pipe-slack — Slack toolkit, message sink and Events API helpers for
+aisquare.pipe, acting as a user or as the app's bot."""
 
+from aisquare_pipe_slack import events
 from aisquare_pipe_slack.config import (
     SlackConfigError,
     SlackSettings,
     settings_from_config,
 )
+from aisquare_pipe_slack.connector import SlackMessageSink
 from aisquare_pipe_slack.constants import (
     DEFAULT_ATTRIBUTION_NAME,
     DEFAULT_TIERS,
@@ -38,9 +41,11 @@ __all__ = [
     "SlackAPIError",
     "SlackConfigError",
     "SlackInstallation",
+    "SlackMessageSink",
     "SlackSettings",
     "SlackToolkit",
     "SlackWebClient",
+    "events",
     "scopes_for",
     "settings_from_config",
 ]

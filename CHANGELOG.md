@@ -41,6 +41,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ToolResult.files`, and the token is sent only to `files.slack.com`.
     Uploads use Slack's v2 flow (`aisquare_pipe_slack.files.upload_file`).
   - **Scopes.** User scopes go from 29 to 41, and bot scopes from 28 to 37.
+- **Slack inbound, sink and Lists**: 16 more `SlackToolkit` tools (111 in
+  all), `SlackMessageSink` and Events API helpers.
+  - **Slack Lists and remote files**: Lists, their items and access
+    (`slackLists.*`), and remote files (`files.remote.*`; add / update /
+    remove are bot-only, as Slack requires). Reads are `read`, the rest
+    opt-in `write` / `destructive`.
+  - **`SlackMessageSink`** (`slack-message-sink`): posts envelopes as
+    messages, ephemeral messages or v2 file uploads, with the toolkit's
+    identity, attribution and send gate. `PushResult.ref` is the `ts`,
+    `message_ts` or file ID.
+  - **Events API helpers** (`aisquare_pipe_slack.events`): the v0 signature
+    check and the replay window in one call (`verify_request` /
+    `parse_request`); typed parsing of `url_verification`, `app_mention`,
+    `message.im`, `reaction_added` / `reaction_removed`, `tokens_revoked` and
+    `app_uninstalled`; `event_to_envelope` with Composio's trigger names. The
+    app's own posts (`is_from_this_app`) get no trigger, so a router can't
+    loop on them. The endpoint and the Signing Secret are the host's.
+  - **Scopes.** User scopes go from 41 to 45, and bot scopes from 37 to 43,
+    including `app_mentions:read` for the `app_mention` event. The manifest
+    subscribes the bot to six events and turns its Messages tab on.
 
 - `Toolkit.available_tools(config=None)`: the tools a connection with that
   config may call, so hosts can list only those to a model. It returns

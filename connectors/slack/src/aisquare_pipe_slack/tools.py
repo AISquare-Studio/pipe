@@ -94,19 +94,24 @@ Handler = Callable[[SlackCall, dict[str, Any]], ToolResult]
 @dataclass(frozen=True)
 class SlackTool:
     """One catalog row. ``bot_scopes`` is None for a tool only a user token
-    can run (search, profile writes, ...)."""
+    can run (search, profile writes, ...); ``user_scopes`` is None for one
+    only a bot token can run (adding remote files)."""
 
     spec: ToolSpec
     handler: Handler
     tier: str
     area: str
     methods: tuple[str, ...]
-    user_scopes: tuple[str, ...]
+    user_scopes: tuple[str, ...] | None
     bot_scopes: tuple[str, ...] | None
 
     @property
     def identities(self) -> tuple[str, ...]:
-        return (IDENTITY_USER,) if self.bot_scopes is None else (IDENTITY_USER, IDENTITY_BOT)
+        return tuple(
+            identity
+            for identity, scopes in ((IDENTITY_USER, self.user_scopes), (IDENTITY_BOT, self.bot_scopes))
+            if scopes is not None
+        )
 
 
 # --------------------------------------------------------------------------
@@ -232,15 +237,15 @@ def _clamp(value: Any, default: int, maximum: int) -> int:
     return min(max(1, number), maximum)
 
 
-def _id_list(value: Any, name: str) -> str:
-    """A comma-separated ID list from a string or an array."""
+def _id_list(value: Any, name: str, kind: str = "user") -> str:
+    """A comma-separated list of ``kind`` IDs from a string or an array."""
     if isinstance(value, (list, tuple)):
         items = [str(v).strip() for v in value]
     else:
         items = [v.strip() for v in str(value).split(",")]
     items = [v for v in items if v]
     if not items:
-        raise _invalid(f"{name} must name at least one user ID")
+        raise _invalid(f"{name} must name at least one {kind} ID")
     return ",".join(items)
 
 
@@ -885,7 +890,7 @@ def _tool(
     schema: dict[str, Any],
     handler: Handler,
     *,
-    user: Iterable[str] = (),
+    user: Iterable[str] | None = (),
     bot: Iterable[str] | None = (),
     tags: Iterable[str] = (),
     overwrites: bool = False,
@@ -907,7 +912,7 @@ def _tool(
         tier=tier,
         area=area,
         methods=(methods,) if isinstance(methods, str) else methods,
-        user_scopes=tuple(sorted(set(user))),
+        user_scopes=None if user is None else tuple(sorted(set(user))),
         bot_scopes=None if bot is None else tuple(sorted(set(bot))),
     )
 

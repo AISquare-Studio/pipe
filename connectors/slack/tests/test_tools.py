@@ -13,7 +13,7 @@ import pytest
 from aisquare_pipe_slack import SlackToolkit
 from aisquare_pipe_slack.catalog import TOOLS
 
-from .fakes import ALL_TIERS, harness, ok, response, slack_error
+from .fakes import ALL_TIERS, BOT_CONFIG, harness, ok, response, slack_error
 
 C = "C0123456"
 TS = "1761312000.004100"
@@ -32,6 +32,8 @@ class Case:
     before: tuple[dict[str, Any], ...] = ()
     reply: dict[str, Any] = field(default_factory=dict)
     paged: str | None = None  # "cursor" or "page"
+    #: The connection config (None: the user's); bot-only tools run as the bot.
+    config: dict[str, Any] | None = None
 
     def replies(self, final: Any = None) -> list[Any]:
         return [ok(**b) for b in self.before] + [final if final is not None else ok(**self.reply)]
@@ -502,13 +504,148 @@ CASES = [
 #: own tests in test_breadth.py cover the same ground.
 SPECIAL = {"SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK", "SLACK_DOWNLOAD_SLACK_FILE"}
 
+# Slack Lists and remote files
+LIST = "F0LIST1234"
+ROW = "Rec0ROW12345"
+REMOTE = "F0REMOTE12"
+
+
+def _rich(text: str) -> list[dict[str, Any]]:
+    return [{"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": text}]}]}]
+
+
+CASES += [
+    Case(
+        "SLACK_CREATE_SLACK_LIST",
+        {"name": "Sprint", "description_blocks": "Q4 work", "todo_mode": True},
+        "slackLists.create",
+        {"name": "Sprint", "description_blocks": _rich("Q4 work"), "todo_mode": True},
+        json=True,
+        reply={"list_id": LIST},
+    ),
+    Case(
+        "SLACK_UPDATE_SLACK_LIST",
+        {"id": LIST, "name": "Sprint 2"},
+        "slackLists.update",
+        {"id": LIST, "name": "Sprint 2"},
+        json=True,
+    ),
+    Case(
+        "SLACK_CREATE_SLACK_LIST_ITEM",
+        {"list_id": LIST, "initial_fields": [{"column_id": "Col01", "text": "Ship it"},
+                                             {"column_id": "Col02", "select": ["todo"]}]},
+        "slackLists.items.create",
+        {"list_id": LIST, "initial_fields": [{"column_id": "Col01", "rich_text": _rich("Ship it")},
+                                             {"column_id": "Col02", "select": ["todo"]}]},
+        json=True,
+        reply={"item": {"id": ROW, "list_id": LIST}},
+    ),
+    Case(
+        "SLACK_GET_SLACK_LIST_ITEM",
+        {"list_id": LIST, "id": ROW},
+        "slackLists.items.info",
+        {"list_id": LIST, "id": ROW},
+        json=True,
+        reply={"record": {"id": ROW}, "list": {"id": LIST}},
+    ),
+    Case(
+        "SLACK_LIST_SLACK_LIST_ITEMS",
+        {"list_id": LIST},
+        "slackLists.items.list",
+        {"list_id": LIST, "limit": 50},
+        json=True,
+        reply={"items": [{"id": ROW, "fields": []}]},
+        paged="cursor",
+    ),
+    Case(
+        "SLACK_UPDATE_SLACK_LIST_ITEM",
+        {"list_id": LIST, "cells": [{"row_id": ROW, "column_id": "Col02", "select": ["done"]}]},
+        "slackLists.items.update",
+        {"list_id": LIST, "cells": [{"row_id": ROW, "column_id": "Col02", "select": ["done"]}]},
+        json=True,
+    ),
+    Case(
+        "SLACK_DELETE_SLACK_LIST_ITEM",
+        {"list_id": LIST, "id": ROW},
+        "slackLists.items.delete",
+        {"list_id": LIST, "id": ROW},
+        json=True,
+    ),
+    Case(
+        "SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS",
+        {"list_id": LIST, "ids": "Rec0ROW12345, Rec0ROW67890"},
+        "slackLists.items.deleteMultiple",
+        {"list_id": LIST, "ids": ["Rec0ROW12345", "Rec0ROW67890"]},
+        json=True,
+    ),
+    Case(
+        "SLACK_SET_SLACK_LIST_ACCESS",
+        {"list_id": LIST, "access_level": "write", "channel_ids": [C]},
+        "slackLists.access.set",
+        {"list_id": LIST, "access_level": "write", "channel_ids": [C]},
+        json=True,
+    ),
+    Case(
+        "SLACK_DELETE_SLACK_LIST_ACCESS",
+        {"list_id": LIST, "user_ids": "U0123456"},
+        "slackLists.access.delete",
+        {"list_id": LIST, "user_ids": ["U0123456"]},
+        json=True,
+    ),
+    Case(
+        "SLACK_ADD_REMOTE_FILE",
+        {"external_id": "doc-1", "external_url": "https://docs.example.com/d/1", "title": "Plan"},
+        "files.remote.add",
+        {"external_id": "doc-1", "external_url": "https://docs.example.com/d/1", "title": "Plan"},
+        reply={"file": {"id": REMOTE, "is_external": True}},
+        config=BOT_CONFIG,
+    ),
+    Case(
+        "SLACK_UPDATE_REMOTE_FILE",
+        {"external_id": "doc-1", "title": "Plan v2"},
+        "files.remote.update",
+        {"external_id": "doc-1", "title": "Plan v2"},
+        reply={"file": {"id": REMOTE, "title": "Plan v2"}},
+        config=BOT_CONFIG,
+    ),
+    Case(
+        "SLACK_REMOVE_REMOTE_FILE",
+        {"file": REMOTE},
+        "files.remote.remove",
+        {"file": REMOTE},
+        config=BOT_CONFIG,
+    ),
+    Case(
+        "SLACK_GET_REMOTE_FILE",
+        {"file": REMOTE},
+        "files.remote.info",
+        {"file": REMOTE},
+        reply={"file": {"id": REMOTE, "external_url": "https://docs.example.com/d/1"}},
+    ),
+    Case(
+        "SLACK_LIST_REMOTE_FILES",
+        {"channel": C, "ts_from": 1761000000},
+        "files.remote.list",
+        {"channel": C, "ts_from": "1761000000", "limit": "100"},
+        reply={"files": []},
+        paged="cursor",
+    ),
+    Case(
+        "SLACK_SHARE_REMOTE_FILE",
+        {"file": REMOTE, "channels": [C, "D0123456"]},
+        "files.remote.share",
+        {"file": REMOTE, "channels": f"{C},D0123456"},
+        reply={"file": {"id": REMOTE}},
+    ),
+]
+
 IDS = [c.id for c in CASES]
 CURSOR_PAGED = [c for c in CASES if c.paged == "cursor"]
 PAGE_PAGED = [c for c in CASES if c.paged == "page"]
 
 
 def _call(h, case: Case, **overrides: Any):
-    return h.call(case.slug, case.args, enabled_tiers=ALL_TIERS, **overrides)
+    return h.call(case.slug, case.args, case.config, enabled_tiers=ALL_TIERS, **overrides)
 
 
 def test_cases_cover_every_tool_exactly_once():

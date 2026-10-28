@@ -11,10 +11,14 @@ from aisquare.pipe import ToolSpec
 
 from aisquare_pipe_slack.tools import CORE_CATALOG, SlackTool
 from aisquare_pipe_slack.tools_breadth import BREADTH_CATALOG
+from aisquare_pipe_slack.tools_lists import LISTS_CATALOG
+from aisquare_pipe_slack.tools_remote import REMOTE_FILES_CATALOG
 
 CATALOG: tuple[SlackTool, ...] = (
     *CORE_CATALOG,
     *BREADTH_CATALOG,
+    *LISTS_CATALOG,
+    *REMOTE_FILES_CATALOG,
 )
 TOOLS: dict[str, SlackTool] = {tool.spec.slug: tool for tool in CATALOG}
 TOOL_SPECS: tuple[ToolSpec, ...] = tuple(tool.spec for tool in CATALOG)

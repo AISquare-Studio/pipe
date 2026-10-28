@@ -7,9 +7,14 @@ consent, no re-consent later, since Slack scopes only ever add up), and the
 named groups are the unions over a slice of it:
 
 * by area — ``messages``, ``history``, ``search``, ``conversations``,
-  ``dms``, ``reactions``, ``pins``, ``users``, ``workspace``;
+  ``dms``, ``reactions``, ``pins``, ``users``, ``workspace``, ``lists``,
+  ``remote_files``;
 * by risk tier — ``read``, ``send``, ``write``, ``destructive`` (so a host
-  that enables only read + send can ask for only what those tools need).
+  that enables only read + send can ask for only what those tools need);
+* ``events`` — the bot scopes the Events API subscriptions need
+  (:data:`~aisquare_pipe_slack.events.BOT_EVENTS`). ``app_mentions:read`` is
+  needed by an event only, never by a tool, and is part of the default bot
+  set so inbound mentions work without a second consent.
 
 A selection mixes group names and raw Slack scopes (``"chat:write"``).
 Anything unknown is refused rather than sent to Slack, where it would fail
@@ -25,6 +30,7 @@ from aisquare.pipe import OAuthError
 
 from aisquare_pipe_slack.catalog import CATALOG
 from aisquare_pipe_slack.constants import IDENTITY_BOT, IDENTITY_USER, TIERS
+from aisquare_pipe_slack.events import BOT_EVENTS, EVENTS_ONLY_BOT_SCOPES
 from aisquare_pipe_slack.tools import SlackTool
 
 #: ``build_authorize_url``'s identity: one of the two, or both in one consent.
@@ -35,17 +41,18 @@ IDENTITY_BOTH: OAuthIdentity = "both"
 def _union(tools: Iterable[SlackTool], identity: str) -> tuple[str, ...]:
     scopes: set[str] = set()
     for tool in tools:
-        if identity == IDENTITY_USER:
-            scopes.update(tool.user_scopes)
-        elif tool.bot_scopes is not None:
-            scopes.update(tool.bot_scopes)
+        declared = tool.user_scopes if identity == IDENTITY_USER else tool.bot_scopes
+        scopes.update(declared or ())
     return tuple(sorted(scopes))
 
 
 #: Every user scope the catalog needs (the default for the user identity).
 USER_SCOPES: tuple[str, ...] = _union(CATALOG, IDENTITY_USER)
-#: Every bot scope the catalog needs (the default for the bot identity).
-BOT_SCOPES: tuple[str, ...] = _union(CATALOG, IDENTITY_BOT)
+#: Every bot scope the catalog and the event subscriptions need (the default
+#: for the bot identity).
+BOT_SCOPES: tuple[str, ...] = tuple(sorted({*_union(CATALOG, IDENTITY_BOT), *EVENTS_ONLY_BOT_SCOPES}))
+#: The bot scopes the subscribed events need.
+EVENT_SCOPES: tuple[str, ...] = tuple(sorted({s for scopes in BOT_EVENTS.values() for s in scopes}))
 
 AREAS: tuple[str, ...] = tuple(dict.fromkeys(tool.area for tool in CATALOG))
 
@@ -60,6 +67,7 @@ def _groups() -> dict[str, dict[str, tuple[str, ...]]]:
             IDENTITY_USER: _union(members, IDENTITY_USER),
             IDENTITY_BOT: _union(members, IDENTITY_BOT),
         }
+    groups["events"] = {IDENTITY_USER: (), IDENTITY_BOT: EVENT_SCOPES}
     return groups
 
 

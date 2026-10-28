@@ -18,6 +18,7 @@ from aisquare_pipe_slack import (
     scopes_for,
 )
 from aisquare_pipe_slack.catalog import TOOLS
+from aisquare_pipe_slack.events import EVENTS_ONLY_BOT_SCOPES
 from aisquare_pipe_slack.scopes import AREAS, resolve_scopes
 
 from .fakes import BOT_TOKEN, USER_TOKEN, FakeSession, ok, query, response, slack_error
@@ -106,16 +107,19 @@ class TestAuthorizeUrl:
 
 class TestScopes:
     def test_defaults_are_every_scope_the_catalog_uses(self):
-        assert USER_SCOPES == tuple(sorted({s for t in TOOLS.values() for s in t.user_scopes}))
-        assert BOT_SCOPES == tuple(sorted({s for t in TOOLS.values() for s in t.bot_scopes or ()}))
+        assert USER_SCOPES == tuple(sorted({s for t in TOOLS.values() for s in t.user_scopes or ()}))
+        declared = {s for t in TOOLS.values() for s in t.bot_scopes or ()}
+        assert BOT_SCOPES == tuple(sorted(declared | set(EVENTS_ONLY_BOT_SCOPES)))
+        assert "app_mentions:read" in BOT_SCOPES and "app_mentions:read" not in declared
         assert scopes_for(None, "both") == (USER_SCOPES, BOT_SCOPES)
 
     def test_groups(self):
-        assert set(SCOPE_GROUPS) == {*AREAS, "read", "send", "write", "destructive"}
+        assert set(SCOPE_GROUPS) == {*AREAS, "read", "send", "write", "destructive", "events"}
         assert AREAS == (
             "messages", "history", "search", "conversations", "dms", "reactions", "pins", "users", "workspace",
-            "bookmarks", "dnd", "files", "canvases", "reminders", "usergroups",
+            "bookmarks", "dnd", "files", "canvases", "reminders", "usergroups", "lists", "remote_files",
         )
+        assert SCOPE_GROUPS["events"] == {"user": (), "bot": ("app_mentions:read", "im:history", "reactions:read")}
         assert SCOPE_GROUPS["search"]["user"] == (
             "channels:read", "groups:read", "im:read", "mpim:read", "search:read", "users:read", "users:read.email",
         )
@@ -127,7 +131,7 @@ class TestScopes:
     def test_every_tool_runs_with_its_area_group_and_its_tier_group(self):
         for slug, tool in TOOLS.items():
             for group in (tool.area, tool.tier):
-                assert set(tool.user_scopes) <= set(SCOPE_GROUPS[group]["user"]), (slug, group)
+                assert set(tool.user_scopes or ()) <= set(SCOPE_GROUPS[group]["user"]), (slug, group)
                 assert set(tool.bot_scopes or ()) <= set(SCOPE_GROUPS[group]["bot"]), (slug, group)
 
     def test_read_and_send_tiers_ask_for_less(self):
