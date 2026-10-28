@@ -16,6 +16,9 @@ machine-readable ``error_code`` (one of the ``ERROR_*`` constants below).
 from __future__ import annotations
 
 import copy
+import datetime
+import email.utils
+import http
 import logging
 import math
 import re
@@ -42,6 +45,8 @@ logger = logging.getLogger("aisquare.pipe")
 
 #: Longest error message ``call_tool`` returns.
 _MAX_ERROR = 1000
+#: Longest ``Retry-After`` taken at face value (seconds); larger is capped.
+_MAX_RETRY_AFTER = 3600.0
 
 # --------------------------------------------------------------------------
 # Failure kinds — ``ToolResult.error_code``. Every toolkit and every host uses
@@ -503,7 +508,8 @@ class Toolkit(ABC):
         schema (with defaults applied) and ``config`` passed
         :meth:`validate_config`. Raise :class:`~aisquare.pipe.errors.ToolError`
         (or return ``ToolResult.fail``) for expected failures; anything else
-        raised is caught by :meth:`call_tool`."""
+        raised is caught by :meth:`call_tool` (an ``urllib.error.HTTPError``
+        maps through :func:`error_code_for_status`)."""
         ...
 
     def call_tool(
@@ -574,6 +580,11 @@ class Toolkit(ABC):
             return ToolResult.fail(
                 str(e) or f"{tool.slug} failed", code=e.code, retry_after=e.retry_after
             )
+        except urllib.error.HTTPError as e:
+            logger.warning(
+                "toolkit %s: %s raised HTTPError %s", self.name, tool.slug, _http_status(e)
+            )
+            return _http_failure(tool.slug, e)
         except Exception as e:  # noqa: BLE001 — surfaced to the caller, not raised
             if _timed_out(e):
                 return ToolResult.fail(f"{tool.slug} timed out", code=ERROR_TIMEOUT)
@@ -698,6 +709,57 @@ def _timed_out(e: BaseException) -> bool:
     return isinstance(e, TimeoutError) or (
         isinstance(e, urllib.error.URLError) and isinstance(e.reason, TimeoutError)
     )
+
+
+def _http_status(e: urllib.error.HTTPError) -> int | None:
+    """The error's HTTP status, or None when it carries no integer one."""
+    status = e.code
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _http_failure(slug: str, e: urllib.error.HTTPError) -> ToolResult:
+    """The failure for an ``HTTPError`` escaping ``run_tool``: the status maps
+    through :func:`error_code_for_status`, and a ``rate_limited`` one carries
+    ``Retry-After`` as ``retry_after``. The message is built from the status
+    alone — the provider's reason phrase, body and URL are not echoed (they
+    can carry argument values)."""
+    status = _http_status(e)
+    if status is None:
+        return ToolResult.fail(f"{slug} failed (HTTPError)", code=ERROR_UPSTREAM_ERROR)
+    try:
+        phrase = f" {http.HTTPStatus(status).phrase}"
+    except ValueError:
+        phrase = ""
+    code = error_code_for_status(status)
+    retry_after = _retry_after(e) if code == ERROR_RATE_LIMITED else None
+    return ToolResult.fail(
+        f"{slug} failed (HTTP {status}{phrase})", code=code, retry_after=retry_after
+    )
+
+
+def _retry_after(e: urllib.error.HTTPError) -> float | None:
+    """Seconds from the error's ``Retry-After`` header — delta-seconds or an
+    HTTP-date (a past date is 0), capped at :data:`_MAX_RETRY_AFTER` — or
+    None when absent or unusable."""
+    try:
+        value = e.headers.get("Retry-After") if e.headers is not None else None
+    except Exception:  # noqa: BLE001 — odd headers mean "unknown", not a crash
+        return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):  # oversized fields overflow
+            return None
+        if when.tzinfo is None:  # RFC 9110 dates are GMT; "-0000" parses naive
+            when = when.replace(tzinfo=datetime.UTC)
+        seconds = max(0.0, (when - datetime.datetime.now(datetime.UTC)).total_seconds())
+    if not (math.isfinite(seconds) and seconds >= 0):
+        return None
+    return min(seconds, _MAX_RETRY_AFTER)
 
 
 def _redact(text: str, config: Mapping[str, Any]) -> str:

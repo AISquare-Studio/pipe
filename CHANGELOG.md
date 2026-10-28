@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the `Toolkit` base class with `tools()`, `get_tool()`,
   `search_tools()` (deterministic keyword ranking), `call_tool()` (never
   raises, even on malformed toolkit results; validates arguments against
-  the schema; masks secret config values out of errors) and
+  the schema; masks secret config values out of errors; maps an
+  `urllib.error.HTTPError` from `run_tool` through
+  `error_code_for_status()`, with a 429's `Retry-After` as `retry_after`,
+  capped at 3600 s — the message names only the status, never the
+  provider's URL, reason or body) and
   `validate_config()`.
   Helpers `rank_tools()`, `validate_arguments()`,
   `error_code_for_status()` and `time_budget()` (the host's per-call
