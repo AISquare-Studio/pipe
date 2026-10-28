@@ -18,7 +18,8 @@ TABLE = {
         "missing_scope", "no_permission", "not_allowed_token_type", "restricted_action", "not_authorized",
         "ekm_access_denied", "team_access_not_granted", "enterprise_is_restricted", "accesslimited",
         "two_factor_setup_required", "cant_update_message", "cant_delete_message", "not_in_channel",
-        "plan_upgrade_required", "paid_only", "permission_denied",
+        "plan_upgrade_required", "paid_only", "permission_denied", "edit_window_closed",
+        "message_limit_exceeded", "messages_tab_disabled",
     ],
     "not_found": [
         "channel_not_found", "user_not_found", "users_not_found", "message_not_found", "thread_not_found",
@@ -28,7 +29,7 @@ TABLE = {
     "conflict": [
         "already_reacted", "no_reaction", "already_pinned", "not_pinned", "name_taken", "is_archived",
         "already_archived", "not_archived", "already_in_channel", "channel_canvas_already_exists",
-        "cant_invite_self",
+        "is_inactive", "too_many_pins", "too_many_reactions",
     ],
     "rate_limited": ["ratelimited", "rate_limited", "restricted_too_many"],
     "invalid_arguments": [
@@ -36,7 +37,8 @@ TABLE = {
         "msg_too_long", "msg_blocks_too_long", "no_text", "invalid_blocks", "invalid_name",
         "invalid_name_punctuation", "time_in_past", "time_too_far", "too_many_users", "user_not_in_channel",
         "invalid_user", "snippet_too_large", "invalid_charset", "invalid_form_data", "invalid_post_type",
-        "missing_post_type", "markdown_text_conflict",
+        "missing_post_type", "markdown_text_conflict", "bad_timestamp", "no_item_specified",
+        "cant_invite_self",
     ],
     "upstream_error": [
         "fatal_error", "internal_error", "service_unavailable", "request_timeout", "something_new_from_slack",
@@ -99,6 +101,16 @@ def test_transport_and_http_status_come_first(error, kind):
     "error, text",
     [
         (_error("already_reacted"), "already in that state; no change needed"),
+        (_error("is_archived"), "the channel is archived; nothing can be posted"),
+        (_error("is_inactive"), "archived, frozen or deleted"),
+        (_error("name_taken"), "pick another name"),
+        (_error("too_many_pins"), "limit on pins"),
+        (_error("too_many_reactions"), "limit on reactions"),
+        (_error("edit_window_closed"), "no longer allow editing"),
+        (_error("message_limit_exceeded"), "plan's message limit"),
+        (_error("messages_tab_disabled"), "Messages tab is turned off"),
+        (_error("bad_timestamp"), "pass ts exactly as Slack returned it"),
+        (_error("channel_canvas_already_exists"), "already has its canvas"),
         (_error("invalid_cursor"), "start again without it"),
         (_error("time_in_past"), "post_at must be in the future"),
         (_error("msg_too_long"), "shorten it"),
@@ -136,6 +148,30 @@ def test_not_in_channel_end_to_end_follows_the_config():
         "SLACK_SEND_MESSAGE", args, enabled_tiers=["read", "send", "write"]
     )
     assert "join it first" in enabled.error
+
+
+NO_CHANGE = ["already_reacted", "no_reaction", "already_pinned", "not_pinned", "already_archived",
+             "not_archived", "already_in_channel"]
+
+
+@pytest.mark.parametrize("code", [c for c, _ in ROWS])
+def test_no_change_needed_only_where_the_change_is_in_place(code):
+    # A failed action must never read as done.
+    assert ("no change needed" in describe_error(_error(code))) is (code in NO_CHANGE)
+
+
+def test_posting_to_an_archived_channel_does_not_read_as_done():
+    result = harness(slack_error("is_archived")).call("SLACK_SEND_MESSAGE", {"channel": "C0123456", "markdown_text": "hi"})
+    assert result.error_code == "conflict"
+    assert "no change needed" not in result.error
+    assert "archived" in result.error
+
+
+def test_the_token_type_hint_does_not_assume_the_identity_matches():
+    for settings in (SlackSettings(), SlackSettings(identity="bot")):
+        message = describe_error(_error("not_allowed_token_type"), settings)
+        assert "Check that config['identity']" in message
+        assert f"(now {settings.identity!r})" in message
 
 
 def test_failure_rounds_retry_after_up():

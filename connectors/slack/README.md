@@ -44,8 +44,8 @@ safe choices.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `access_token` | string | — (required) | The token for `identity`: a user token (`xoxp-…`) or the app's bot token (`xoxb-…`). Never put it anywhere else. |
-| `identity` | `"user"` \| `"bot"` | `"user"` | `user`: act as the person who connected, with their access, under their name. `bot`: post as the app's bot user and see only what the bot is in. |
-| `enabled_tiers` | list of tier names | `["read", "send"]` | The risk tiers this connection may call. It **replaces** the default, so list every tier you want. A comma-separated string works too. There is no wildcard. |
+| `identity` | `"user"` \| `"bot"` | `"user"` | `user`: act as the person who connected, with their access, under their name. `bot`: post as the app's bot user. |
+| `enabled_tiers` | list of tier names | user: `["read", "send"]`; bot: `["send"]` | The risk tiers this connection may call. It **replaces** the default, so list every tier you want. A comma-separated string works too. There is no wildcard. **Read under the bot exposes other people's conversations** (see Identity). |
 | `enabled_tools` | list of slugs | `[]` | Extra tools enabled one at a time, whatever their tier (e.g. `["SLACK_ADD_REACTION_TO_AN_ITEM"]`). |
 | `attribution_name` | string | `"pipe"` | The `<name>` in the "Sent by <name>" line (e.g. `"aisquare"` or `"pipe by aisquare"`). Whitespace is collapsed, and it is cut at 80 characters. |
 | `bot_attribution` | bool | `false` | Also add the line to messages the bot sends. The line is always added for the user identity. |
@@ -99,9 +99,24 @@ edits there.
 |---|---|---|
 | Token | user token (`xoxp-…`) | bot token (`xoxb-…`) |
 | Posts appear as | the user, with "Sent by <name>" | the app's bot (marker only with `bot_attribution`) |
-| Sees | what that user can see | conversations the bot is in (and any public channel it posts to, via `chat:write.public`) |
+| Default tiers | read + send | **send only** |
+| Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
 | User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_LIST_UNREAD_CHANNEL_MESSAGES`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL` fail as `forbidden` without calling Slack (Slack accepts only user tokens for them). `available_tools` leaves them out. |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
+
+> **Warning: reading as the bot crosses users.** One bot token serves the whole
+> workspace, and a host typically stores it once per team. With `read` enabled
+> under `identity: "bot"`, anyone given that connection can read every
+> conversation the bot is in. That includes other people's DMs with the bot, and
+> private channels that other people added it to. This is why `read` is off by
+> default for the bot. Enable it only for workspace admins or the person who
+> installed the app.
+
+`identity` comes from config. The token's own kind isn't checked, because Slack has
+changed token prefixes before. Where the two can disagree, the toolkit fails safe:
+the "Sent by" marker is dropped only when the token is positively a bot token
+(`xoxb-…`, `xoxe.xoxb-…`). A user token configured as `bot` still marks its
+messages, since they still appear under the user's name.
 
 ### Attribution
 
@@ -115,6 +130,12 @@ added depends on the content:
 - **`markdown_text`:** a final italic line, `_Sent by pipe_`. Slack won't combine
   `markdown_text` with blocks, so a context block isn't possible here.
 - **plain `text`:** a final italic line.
+
+The name is escaped for each format. In mrkdwn (`text`, context blocks), `&`, `<`
+and `>` become entities. In `markdown_text`, punctuation is backslash-escaped, so a
+name like `R&D <bot>` shows literally in both. Slack caps `markdown_text` at 12,000
+characters including the marker line, so the toolkit refuses longer content with
+`invalid_arguments` before sending. The error says how much room is left.
 
 ## Results
 
@@ -138,6 +159,10 @@ put their hints **first**, so they survive a caller truncating the result:
   `conversations.list`, which costs an extra call; IDs avoid that. If a name is
   ambiguous (on Enterprise Grid, two workspaces can each have `#general`), the call
   is **refused** with `invalid_arguments`, never guessed.
+  - The same applies when the lookup stops at its cap (2,000 channels) with more
+    left: one match so far isn't proof there's no second one.
+  - IDs always contain a digit, so an all-caps name like `GENERAL` is still looked
+    up as a name.
 
 ## Errors
 
@@ -154,6 +179,20 @@ this order:
    `*_not_found` is `not_found`; `already_reacted`/`is_archived` are `conflict`;
    `invalid_cursor`/`msg_too_long` are `invalid_arguments`; unknown codes are
    `upstream_error`. The full table is in `toolkit.py`.
+
+`conflict` reads as **"already in that state; no change needed"** only where the
+change really is in place: `already_reacted`, `no_reaction`, `already_pinned`,
+`not_pinned`, `already_archived`, `not_archived` and `already_in_channel`. Other
+conflicts mean nothing happened, and each has its own hint:
+
+- `is_archived` / `is_inactive`: the channel is archived or frozen;
+- `name_taken`: pick another name;
+- `too_many_pins` / `too_many_reactions`: Slack's limit.
+
+Workspace settings and plan limits (`edit_window_closed`, `message_limit_exceeded`,
+`messages_tab_disabled`) are `forbidden`. `SLACK_API_TEST` reports an echoed
+`error` as `upstream_error` and never retries, so a model can't make a healthy
+connection look revoked or rate limited.
 
 `missing_scope` is `forbidden`, **not** `unauthorized`. Its message says
 "reconnect Slack to grant `<scope>`", so a host doesn't loop through refreshes.
@@ -181,6 +220,12 @@ for up to 60 s in total, within `timeout_seconds`.
 messages a page** for new installs of commercially distributed apps that aren't in
 the Marketplace. The tool descriptions steer models toward `SLACK_SEARCH_MESSAGES`,
 or toward one narrow page.
+
+**Unread messages.** `SLACK_LIST_UNREAD_CHANNEL_MESSAGES` relies on the
+`last_read` field from `conversations.info`, and Slack documents that field for DMs.
+If a conversation doesn't report it, the tool fails with `invalid_arguments` and
+points to `SLACK_FETCH_CONVERSATION_HISTORY`. It does not use `upstream_error`,
+because retrying won't help. The live test checks a channel and an optional DM.
 
 ## Scopes
 
@@ -219,12 +264,14 @@ whole consent screen.
   refresh tokens at 30 days;
 - token rotation off.
 
-One consent can mint a user token, a bot token, or both:
+One consent can mint a user token, a bot token, or both. **The default is both, with
+every scope.** That makes it one consent screen: switching `config["identity"]`
+later needs no re-consent.
 
 ```python
 url = slack.build_authorize_url(
-    client_id=…, redirect_uri=…, state=csrf, identity="both", scopes=None
-)  # identity: "user" (default) | "bot" | "both"; user scopes go in user_scope, bot scopes in scope
+    client_id=…, redirect_uri=…, state=csrf, scopes=None
+)  # identity: "both" (default) | "user" | "bot"; user scopes go in user_scope, bot scopes in scope
 
 token = slack.exchange_code(client_id=…, client_secret=…, code=…, redirect_uri=…)
 # -> core's OAuthToken: the user token, or the bot token when no user token was minted;
@@ -246,11 +293,15 @@ installation = slack.exchange_installation(client_id=…, client_secret=…, cod
 
 ## The Slack app
 
-[`slack-app-manifest.json`](slack-app-manifest.json) is a ready-to-paste app
-manifest: user and bot scopes, the bot user, PKCE off, token rotation off. To use it,
-go to <https://api.slack.com/apps?new_app=1>, choose **From a manifest**, and use the
-JSON tab. Set your own redirect URL and name first.
-`tests/test_manifest.py` keeps its scopes equal to what the tools declare.
+[`slack-app-manifest.json`](slack-app-manifest.json) is an app manifest template:
+user and bot scopes, the bot user, PKCE off, token rotation off. pipe is
+app-agnostic, so first replace the placeholders `YOUR_APP_NAME`, `your-app-bot` and
+`https://YOUR_HOST/v1/connections/callback` with your app's values. Then go to
+<https://api.slack.com/apps?new_app=1>, choose **From a manifest**, and use the JSON
+tab.
+`tests/test_manifest.py` keeps its scopes equal to what the tools declare. It also
+checks every declared scope against Slack's own method docs, frozen in
+`tests/fixtures/slack_method_scopes.json`.
 
 Other workspaces can't install the app until you turn on **Manage Distribution →
 Activate Public Distribution**. Until then, installs fail with

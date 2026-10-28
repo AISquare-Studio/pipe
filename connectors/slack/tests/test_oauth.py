@@ -63,13 +63,20 @@ class TestSpec:
 
 
 class TestAuthorizeUrl:
-    def test_user_identity_by_default_with_every_user_scope(self):
+    def test_both_identities_by_default_with_every_scope(self):
+        # One consent mints both tokens, so switching config['identity']
+        # later needs no re-consent (owner Q5, manager seq 4660).
         url = SlackToolkit().build_authorize_url(**AUTH)
         params = query(url)
         assert url.startswith("https://slack.com/oauth/v2/authorize?")
         assert params["user_scope"] == ",".join(USER_SCOPES)
-        assert "scope" not in params
+        assert params["scope"] == ",".join(BOT_SCOPES)
         assert {k: params[k] for k in ("client_id", "redirect_uri", "state")} == AUTH
+
+    def test_user_identity(self):
+        params = query(SlackToolkit().build_authorize_url(**AUTH, identity="user"))
+        assert params["user_scope"] == ",".join(USER_SCOPES)
+        assert "scope" not in params
 
     def test_bot_identity(self):
         params = query(SlackToolkit().build_authorize_url(**AUTH, identity="bot"))
@@ -82,7 +89,7 @@ class TestAuthorizeUrl:
         assert params["scope"] == ",".join(BOT_SCOPES)
 
     def test_a_scope_subset(self):
-        params = query(SlackToolkit().build_authorize_url(**AUTH, scopes=["search", "reactions:read"]))
+        params = query(SlackToolkit().build_authorize_url(**AUTH, scopes=["search", "reactions:read"], identity="user"))
         assert params["user_scope"] == ",".join(sorted({*SCOPE_GROUPS["search"]["user"], "reactions:read"}))
         assert "chat:write" not in params["user_scope"]
 

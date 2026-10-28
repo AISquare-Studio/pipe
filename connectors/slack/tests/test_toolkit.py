@@ -197,7 +197,10 @@ class TestIdentity:
         assert h.session.last.headers["Authorization"] == f"Bearer {token}"
         assert h.session.last.api_method == "chat.postMessage"
 
-    @pytest.mark.parametrize("config, token", [(USER_CONFIG, USER_TOKEN), (BOT_CONFIG, BOT_TOKEN)])
+    @pytest.mark.parametrize(
+        "config, token",
+        [(USER_CONFIG, USER_TOKEN), ({**BOT_CONFIG, "enabled_tiers": ["read", "send"]}, BOT_TOKEN)],
+    )
     def test_read_works_with_either_identity(self, config, token):
         h = harness(ok(messages=[{"ts": TS, "text": "hi"}]))
         result = h.call("SLACK_FETCH_CONVERSATION_HISTORY", {"channel": C}, config)
@@ -208,11 +211,28 @@ class TestIdentity:
     @pytest.mark.parametrize("slug", sorted(USER_ONLY & READ))
     def test_user_only_tool_under_the_bot_is_forbidden_without_a_request(self, slug):
         h = harness()
-        result = h.call(slug, {"query": "x", "channel": C}, BOT_CONFIG)
+        result = h.call(slug, {"query": "x", "channel": C}, BOT_CONFIG, enabled_tiers=ALL_TIERS)
         assert result.error_code == "forbidden"
         assert "needs the user identity" in result.error
         assert "config['identity']" in result.error
         assert h.session.calls == []
+
+    def test_the_bot_defaults_to_send_only(self):
+        # Manager seq 4660: a shared bot token would let one person read every
+        # conversation the bot is in, so read is opt-in under the bot.
+        assert {t.slug for t in SlackToolkit().available_tools(BOT_CONFIG)} == SEND
+        h = harness()
+        result = h.call("SLACK_FETCH_CONVERSATION_HISTORY", {"channel": C}, BOT_CONFIG)
+        assert result.error_code == "forbidden"
+        assert "Read is off by default for the bot" in result.error
+        assert "other people's DMs" in result.error
+        assert h.session.calls == []
+        assert {t.slug for t in SlackToolkit().available_tools({**BOT_CONFIG, "enabled_tiers": ["read", "send"]})} == (
+            (READ | SEND) - USER_ONLY
+        )
+
+    def test_the_user_keeps_read_and_send(self):
+        assert {t.slug for t in SlackToolkit().available_tools({**USER_CONFIG, "identity": "user"})} == READ | SEND
 
     def test_bot_listing_drops_user_only_tools(self):
         listed = {t.slug for t in SlackToolkit().tools_for({**BOT_CONFIG, "enabled_tiers": ALL_TIERS})}
@@ -222,12 +242,11 @@ class TestIdentity:
         h = harness(slack_error("not_allowed_token_type"))
         result = h.call("SLACK_SEND_MESSAGE", SEND_ARGS, BOT_CONFIG)
         assert result.error_code == "forbidden"
-        assert "does not accept a bot token" in result.error
-        assert "the user identity (config['identity'])" in result.error
+        assert "Check that config['identity'] (now 'bot') matches the token" in result.error
 
     def test_who_am_i_reports_the_identity(self):
         h = harness(ok(user="aisquare", user_id="U0BOT1234", bot_id="B0123", team="Acme"), slack_error("missing_scope"))
-        result = h.call("SLACK_WHO_AM_I", {}, BOT_CONFIG)
+        result = h.call("SLACK_WHO_AM_I", {}, BOT_CONFIG, enabled_tiers=["read"])
         assert result.successful, result.error
         assert result.data["identity"] == "bot"
         assert result.data["label"] == "aisquare @ Acme"
@@ -247,10 +266,20 @@ class TestAttribution:
         sent = self._sent(SEND_ARGS, attribution_name="  pipe   by aisquare ")
         assert sent["markdown_text"] == "hello\n\n_Sent by pipe by aisquare_"
 
-    def test_name_is_escaped_and_blank_falls_back(self):
-        assert self._sent(SEND_ARGS, attribution_name="<!channel> & co")["markdown_text"].endswith(
-            "_Sent by &lt;!channel&gt; &amp; co_"
+    def test_name_is_escaped_for_each_format(self):
+        name = "<!channel> R&D_*"
+        # markdown_text: backslash escapes (entities would show literally).
+        assert self._sent(SEND_ARGS, attribution_name=name)["markdown_text"].endswith(
+            "_Sent by \\<\\!channel\\> R\\&D\\_\\*_"
         )
+        # mrkdwn (text, context blocks): entities for & < >.
+        text = self._sent({"channel": C, "user": "U0123456", "text": "x"}, "SLACK_SEND_EPHEMERAL_MESSAGE",
+                          attribution_name=name)["text"]
+        assert text.endswith("_Sent by &lt;!channel&gt; R&amp;D_*_")
+        block = self._sent({"channel": C, "blocks": [{"type": "divider"}]}, attribution_name=name)["blocks"][-1]
+        assert block["elements"][0]["text"] == "Sent by &lt;!channel&gt; R&amp;D_*"
+
+    def test_blank_name_falls_back(self):
         assert self._sent(SEND_ARGS, attribution_name="   ")["markdown_text"].endswith("_Sent by pipe_")
 
     def test_blocks_get_a_context_block(self):
@@ -284,6 +313,29 @@ class TestAttribution:
     def test_bot_marker_can_be_enabled(self):
         sent = self._sent(SEND_ARGS, config=BOT_CONFIG, bot_attribution=True, attribution_name="aisquare")
         assert sent["markdown_text"] == "hello\n\n_Sent by aisquare_"
+
+    @pytest.mark.parametrize(
+        "token, marked",
+        [(USER_TOKEN, True), ("some-new-format-token", True), (BOT_TOKEN, False), ("xoxe.xoxb-1-rotated", False)],
+    )
+    def test_the_bot_drops_the_marker_only_for_a_real_bot_token(self, token, marked):
+        # Fail safe: a user token configured as the bot still posts under the
+        # user's name, so it keeps the marker.
+        sent = self._sent(SEND_ARGS, config={"access_token": token, "identity": "bot"})
+        assert sent["markdown_text"].endswith("_Sent by pipe_") is marked
+
+    def test_markdown_text_stays_under_slacks_cap_with_the_marker(self):
+        marker = "\n\n_Sent by pipe_"
+        room = 12_000 - len(marker)
+        assert len(self._sent({"channel": C, "markdown_text": "x" * room})["markdown_text"]) == 12_000
+        h = harness()
+        result = h.call("SLACK_SEND_MESSAGE", {"channel": C, "markdown_text": "x" * (room + 1)})
+        assert result.error_code == "invalid_arguments"
+        assert f"at most {room} characters" in result.error
+        assert h.session.calls == []
+        assert self._sent({"channel": C, "markdown_text": "x" * 12_000}, config=BOT_CONFIG)
+        too_long = harness().call("SLACK_SEND_MESSAGE", {"channel": C, "markdown_text": "x" * 12_001}, BOT_CONFIG)
+        assert too_long.error_code == "invalid_arguments"
 
     def test_a_full_block_list_leaves_no_room_for_the_marker(self):
         blocks = [{"type": "divider"}] * 50
@@ -342,6 +394,25 @@ class TestChannelNames:
         assert result.error_code == "invalid_arguments"
         assert "matches 2 conversations" in result.error
         assert h.session.methods == ["conversations.list"]
+
+    @pytest.mark.parametrize("matches_on_page_one", [0, 1])
+    def test_a_capped_scan_never_guesses(self, matches_on_page_one):
+        first = [{"id": "C1AAAAAA1", "name": "general"}] if matches_on_page_one else []
+        pages = [channels_page(*first, cursor="n0")] + [
+            channels_page({"id": f"C0{i}XXXXX", "name": f"c{i}"}, cursor=f"n{i}") for i in range(1, 10)
+        ]
+        h = harness(*pages)
+        result = h.call("SLACK_SEND_MESSAGE", {"channel": "#general", "markdown_text": "hi"})
+        assert result.error_code == "invalid_arguments"
+        assert "could not check every channel" in result.error
+        assert h.session.methods == ["conversations.list"] * 10
+
+    @pytest.mark.parametrize("name", ["GENERAL", "CEO-OFFICE", "DESIGNTEAM"])
+    def test_all_caps_names_are_still_names(self, name):
+        h = harness(channels_page({"id": C, "name": name.lower()}), ok())
+        assert h.call("SLACK_SEND_MESSAGE", {"channel": name, "markdown_text": "hi"}).successful
+        assert h.session.methods == ["conversations.list", "chat.postMessage"]
+        assert h.session.last.args["channel"] == C
 
     def test_an_unknown_name_is_not_found(self):
         h = harness(channels_page({"id": C, "name": "general"}))
@@ -425,8 +496,30 @@ class TestComposites:
 
     def test_unread_without_a_read_position(self):
         result = harness(ok(channel={"id": C})).call("SLACK_LIST_UNREAD_CHANNEL_MESSAGES", {"channel": C})
-        assert result.error_code == "upstream_error"
+        assert result.error_code == "invalid_arguments"  # not retryable: the channel doesn't report it
         assert "last_read" in result.error
+        assert "reliably for DMs" in result.error
+        assert "SLACK_FETCH_CONVERSATION_HISTORY" in result.error
+
+    def test_find_users_takes_all_caps_text_as_a_name(self):
+        h = harness(ok(members=[{"id": "U0123456", "name": "williams"}]))
+        result = h.call("SLACK_FIND_USERS", {"search_query": "WILLIAMS", "limit": 1})
+        assert h.session.methods == ["users.list"]
+        assert [u["id"] for u in result.data["members"]] == ["U0123456"]
+
+    def test_api_test_echoes_cannot_forge_failures(self):
+        for code in ("invalid_auth", "ratelimited", "missing_scope"):
+            h = harness(slack_error(code))
+            result = h.call("SLACK_API_TEST", {"error": code})
+            assert (result.error_code, h.sleeps) == ("upstream_error", [])
+            assert result.data == {"slack_error": code, "status": 200, "echoed": True}
+            assert "requested test error" in result.error
+            assert len(h.session.calls) == 1
+
+    def test_api_test_real_failures_still_map(self):
+        result = harness(slack_error("invalid_auth")).call("SLACK_API_TEST", {"error": "my_error"})
+        assert result.error_code == "unauthorized"
+        assert harness(ok(args={"foo": "bar"})).call("SLACK_API_TEST", {"foo": "bar"}).data == {"args": {"foo": "bar"}}
 
     def test_unread_reports_the_read_position(self):
         h = harness(ok(channel={"id": C, "last_read": "1.5", "unread_count_display": 3}), ok(messages=[]))
@@ -504,6 +597,16 @@ class TestResultShaping:
             "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION", {"channel": C, "ts": TS}
         )
         assert result.data["resume_oldest"] == result.data["messages"][-1]["ts"]
+
+    @pytest.mark.parametrize(
+        "slug", ["SLACK_LIST_ALL_CHANNELS", "SLACK_LIST_CONVERSATIONS", "SLACK_LIST_ALL_USERS",
+                 "SLACK_RETRIEVE_CONVERSATION_MEMBERS_LIST"]
+    )
+    def test_list_limits_stay_under_1000(self, slug):
+        h = harness(ok())
+        h.call(slug, {"channel": C, "limit": 5000})
+        assert h.session.last.args["limit"] == "999"
+        assert "max 999" in TOOLS[slug].spec.input_schema["properties"]["limit"]["description"]
 
     def test_limits_are_clamped(self):
         h = harness(ok(messages=[]))

@@ -4,20 +4,20 @@
     "minor_version": 1
   },
   "display_information": {
-    "name": "AISquare",
-    "description": "Let your AISquare agents search, read and act in Slack, with the permissions you grant.",
+    "name": "YOUR_APP_NAME",
+    "description": "Let your agents search, read and act in Slack, with the permissions you grant.",
     "background_color": "#1F2937",
     "long_description": "Connect Slack to the AI agents you run. Once connected, an agent can search messages and files, read channels and threads, post, reply and schedule messages, react and pin, and manage channels and DMs — either as you, only where you already have access and with a visible 'Sent by' line on what it posts, or as this app's bot. Risky actions such as deleting or archiving stay off unless your administrator turns them on. You can disconnect at any time."
   },
   "features": {
     "bot_user": {
-      "display_name": "aisquare",
+      "display_name": "your-app-bot",
       "always_online": false
     }
   },
   "oauth_config": {
     "redirect_urls": [
-      "https://api.aisquare.studio/v1/connections/callback"
+      "https://YOUR_HOST/v1/connections/callback"
     ],
     "scopes": {
       "user": [

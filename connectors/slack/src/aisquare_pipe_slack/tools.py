@@ -44,6 +44,7 @@ from aisquare.pipe import (
 
 from aisquare_pipe_slack.config import SlackSettings
 from aisquare_pipe_slack.constants import (
+    ATTRIBUTION_TEMPLATE,
     HISTORY_DEFAULT_LIMIT,
     HISTORY_MAX_LIMIT,
     IDENTITY_BOT,
@@ -51,6 +52,7 @@ from aisquare_pipe_slack.constants import (
     LIST_DEFAULT_LIMIT,
     LIST_MAX_LIMIT,
     MAX_BLOCKS,
+    MAX_MARKDOWN_TEXT,
     RESULT_CHAR_CAP,
     SCAN_MAX_PAGES,
     SCAN_PAGE_SIZE,
@@ -66,12 +68,14 @@ from aisquare_pipe_slack.rest import SlackAPIError, SlackWebClient, next_cursor
 
 @dataclass(frozen=True)
 class SlackCall:
-    """What a handler works with: the client, the call's settings, and
-    whether the tool is a read (reads are retried on Slack server errors)."""
+    """What a handler works with: the client, the call's settings, whether
+    the tool is a read (reads are retried on Slack server errors), and the
+    attribution name for messages it posts (None: no marker)."""
 
     client: SlackWebClient
     settings: SlackSettings
     idempotent: bool = False
+    attribution: str | None = None
 
     def call(self, method: str, args: Mapping[str, Any] | None = None, *, json_body: bool = False) -> dict[str, Any]:
         return self.client.call(method, args, json_body=json_body, idempotent=self.idempotent)
@@ -196,8 +200,10 @@ def _search_props(sort_enum: bool = True) -> dict[str, Any]:
 # Argument helpers
 # --------------------------------------------------------------------------
 
-#: IDs of conversations (C/G/D) and users (U/W) — passed through as they are.
-_ID = re.compile(r"^[CGDUW][A-Z0-9]{6,}$")
+#: IDs of conversations (C/G/D) and users (U/W) — passed through as they
+#: are. Slack IDs always carry a digit, so an all-caps name ('GENERAL') is
+#: still looked up as a name.
+_ID = re.compile(r"^[CGDUW](?=[A-Z0-9]*[0-9])[A-Z0-9]{6,}$")
 
 
 def _invalid(message: str) -> ToolError:
@@ -257,18 +263,22 @@ def resolve_channel(call: SlackCall, value: Any, *, archived: bool = False) -> s
         {"types": "public_channel,private_channel", "exclude_archived": not archived},
     ):
         matches += [str(c["id"]) for c in page if c.get("name") == name and c.get("id")]
+    if cursor is not None:
+        # The scan stopped at its cap: a later page could hold another
+        # '#name' (Enterprise Grid), so even one match is not an answer.
+        raise _invalid(
+            f"could not check every channel for '#{name}' (more than {SCAN_MAX_PAGES * SCAN_PAGE_SIZE} "
+            "are visible); pass the channel ID instead (find it with SLACK_FIND_CHANNELS)"
+        )
     if len(matches) > 1:
         raise _invalid(
             f"channel name '#{name}' matches {len(matches)} conversations; pass the channel ID "
             "(find it with SLACK_FIND_CHANNELS)"
         )
     if not matches:
-        scope = (
-            f"within the first {SCAN_MAX_PAGES * SCAN_PAGE_SIZE} channels" if cursor else "among the channels"
-        )
         raise ToolError(
-            f"no channel named '#{name}' {scope} this Slack connection can see — check the name "
-            "or pass the channel ID (SLACK_FIND_CHANNELS)",
+            f"no channel named '#{name}' among the channels this Slack connection can see — check "
+            "the name or pass the channel ID (SLACK_FIND_CHANNELS)",
             code=ERROR_NOT_FOUND,
         )
     return matches[0]
@@ -300,18 +310,35 @@ def _blocks(value: Any) -> list[Any] | None:
     return list(value)
 
 
-def attribution_block(marker: str) -> dict[str, Any]:
+#: ASCII punctuation, which CommonMark lets a backslash escape.
+_MARKDOWN_PUNCTUATION = re.compile(r"([!-/:-@\[-`{-~])")
+
+
+def mrkdwn_marker(name: str) -> str:
+    """The marker for Slack mrkdwn (``text``, context blocks): ``&``, ``<``
+    and ``>`` as entities, which is mrkdwn's only escaping."""
+    escaped = name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return ATTRIBUTION_TEMPLATE.format(name=escaped)
+
+
+def markdown_marker(name: str) -> str:
+    """The marker for ``markdown_text`` (standard markdown): punctuation in
+    the name backslash-escaped, so it shows literally — entities would."""
+    return ATTRIBUTION_TEMPLATE.format(name=_MARKDOWN_PUNCTUATION.sub(r"\\\1", name))
+
+
+def attribution_block(name: str) -> dict[str, Any]:
     """The context block (small grey text under the message) that carries
     the marker."""
-    return {"type": "context", "elements": [{"type": "mrkdwn", "text": marker}]}
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": mrkdwn_marker(name)}]}
 
 
-def compose_message(args: Mapping[str, Any], marker: str | None, *, text_arg: str) -> dict[str, Any]:
+def compose_message(args: Mapping[str, Any], attribution: str | None, *, text_arg: str) -> dict[str, Any]:
     """Slack's content fields for a message tool: exactly one of
     ``markdown_text``, or ``blocks`` (with ``text_arg`` as the notification
-    fallback), or plain ``text_arg`` mrkdwn — with ``marker`` (the
-    attribution) appended visibly: a context block after ``blocks``, an
-    italic last line otherwise."""
+    fallback), or plain ``text_arg`` mrkdwn — with the "Sent by
+    <attribution>" marker appended visibly, escaped for its format: a
+    context block after ``blocks``, an italic last line otherwise."""
     markdown = args.get("markdown_text")
     blocks = _blocks(args.get("blocks"))
     text = args.get(text_arg)
@@ -322,19 +349,26 @@ def compose_message(args: Mapping[str, Any], marker: str | None, *, text_arg: st
     if markdown is not None:
         if not str(markdown).strip():
             raise _invalid("markdown_text is empty")
-        return {"markdown_text": f"{markdown}\n\n_{marker}_" if marker else markdown}
+        content = f"{markdown}\n\n_{markdown_marker(attribution)}_" if attribution else str(markdown)
+        if len(content) > MAX_MARKDOWN_TEXT:
+            room = MAX_MARKDOWN_TEXT - (len(content) - len(str(markdown)))
+            raise _invalid(
+                f"markdown_text is too long: at most {room} characters "
+                + ("(Slack's 12,000 minus the attribution line)" if attribution else "(Slack's limit)")
+            )
+        return {"markdown_text": content}
     if blocks is not None:
-        if marker:
+        if attribution:
             if len(blocks) >= MAX_BLOCKS:
                 raise _invalid(
                     f"at most {MAX_BLOCKS - 1} blocks: one of Slack's {MAX_BLOCKS} is the attribution"
                 )
-            blocks.append(attribution_block(marker))
-        content: dict[str, Any] = {"blocks": blocks}
+            blocks.append(attribution_block(attribution))
+        content_fields: dict[str, Any] = {"blocks": blocks}
         if text is not None:
-            content["text"] = text
-        return content
-    return {"text": f"{text}\n_{marker}_" if marker else text}
+            content_fields["text"] = text
+        return content_fields
+    return {"text": f"{text}\n_{mrkdwn_marker(attribution)}_" if attribution else text}
 
 
 # --------------------------------------------------------------------------
@@ -481,7 +515,7 @@ def _message_tool(method: str, args: Iterable[str], *, text_arg: str, channel_ar
     names = tuple(args)
 
     def handler(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
-        content = compose_message(arguments, call.settings.attribution, text_arg=text_arg)
+        content = compose_message(arguments, call.attribution, text_arg=text_arg)
         values = _resolve(call, arguments, [channel_arg])
         body = {n: values[n] for n in names if n in values}
         if "post_at" in body:
@@ -522,8 +556,11 @@ def _list_unread(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     conversation = info.get("channel")
     last_read = conversation.get("last_read") if isinstance(conversation, dict) else None
     if not isinstance(last_read, str) or not last_read:
-        raise ToolError(
-            "Slack reported no read position (last_read) for this conversation", code=ERROR_UPSTREAM_ERROR
+        # Slack documents last_read for DMs; channels may not carry it.
+        raise _invalid(
+            "Slack reports no read position (last_read) for this conversation, so unread messages "
+            "can't be told apart — this works reliably for DMs; for a channel, read recent "
+            "messages with SLACK_FETCH_CONVERSATION_HISTORY (narrow it with oldest)"
         )
     payload = call.call(
         "conversations.history",
@@ -735,6 +772,26 @@ def _open_dm(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         "prevent_creation": arguments.get("prevent_creation"),
     }
     return ToolResult.ok(_payload(call.call("conversations.open", sent)))
+
+
+def _api_test(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
+    """``api.test`` echoes ``error`` back as a failure on purpose. An echo
+    is reported as ``upstream_error``, never through the error table, so a
+    model can't make a healthy connection look revoked (``invalid_auth``)
+    or rate limited. It runs without retries, so an echoed ``ratelimited``
+    can't make the call sleep."""
+    sent: dict[str, Any] = {n: arguments[n] for n in ("foo", "error") if n in arguments}
+    try:
+        payload = call.client.call("api.test", sent, idempotent=True, retry=False)
+    except SlackAPIError as e:
+        if not (sent.get("error") and e.error == sent["error"]):
+            raise
+        return ToolResult.fail(
+            f"api.test: returned the requested test error ({e.error})",
+            data={"slack_error": e.error, "status": e.status, "echoed": True},
+            code=ERROR_UPSTREAM_ERROR,
+        )
+    return ToolResult.ok(_payload(payload))
 
 
 def _who_am_i(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -1026,9 +1083,10 @@ CATALOG: tuple[SlackTool, ...] = (
     _tool(
         "SLACK_LIST_UNREAD_CHANNEL_MESSAGES", TIER_READ, "history",
         ("conversations.info", "conversations.history"),
-        "Messages the connected user has not read yet in a channel or DM (after their read "
-        "position, last_read). User identity only. Costs one history call (see the rate limit "
-        "caveat on SLACK_FETCH_CONVERSATION_HISTORY).",
+        "Messages the connected user has not read yet in a DM or group DM (after their read "
+        "position, last_read). Reliable for DMs; Slack may not report a read position for "
+        "channels, and then this fails with invalid_arguments. User identity only. Costs one "
+        "history call (see the rate limit caveat on SLACK_FETCH_CONVERSATION_HISTORY).",
         _schema(
             {
                 "channel": CHANNEL,
@@ -1594,7 +1652,7 @@ CATALOG: tuple[SlackTool, ...] = (
         "Check that Slack's API is reachable; echoes its arguments (error makes it fail on "
         "purpose, for testing error handling).",
         _schema({"foo": _string("Any value to echo back."), "error": _string("An error code Slack should return.")}),
-        _rpc("api.test", ("foo", "error"), channels=()),
+        _api_test,
         user=(),
         bot=(),
         tags=("ping", "test", "connectivity", "health"),

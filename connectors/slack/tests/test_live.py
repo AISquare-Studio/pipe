@@ -3,7 +3,8 @@
 Run with ``pytest -m live`` (or ``pipe validate --live``). Skipped unless
 ``SLACK_TEST_USER_TOKEN`` and ``SLACK_TEST_CHANNEL`` (a dedicated test
 channel's ID, on the staging app) are set; ``SLACK_TEST_BOT_TOKEN`` adds the
-bot-identity checks. Posts, reacts to and deletes its own messages there.
+bot-identity checks. ``SLACK_TEST_DM`` (a DM's ID) adds the unread check on a
+DM. Posts, reacts to and deletes its own messages there.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from aisquare_pipe_slack import SlackToolkit
 USER_TOKEN = os.environ.get("SLACK_TEST_USER_TOKEN", "")
 BOT_TOKEN = os.environ.get("SLACK_TEST_BOT_TOKEN", "")
 CHANNEL = os.environ.get("SLACK_TEST_CHANNEL", "")
+DM = os.environ.get("SLACK_TEST_DM", "")
 ALL_TIERS = ["read", "send", "write", "destructive"]
 
 pytestmark = [
@@ -36,6 +38,27 @@ def test_reads():
     assert "label" in _call("SLACK_WHO_AM_I", {})
     assert "messages" in _call("SLACK_FETCH_CONVERSATION_HISTORY", {"channel": CHANNEL, "limit": 5})
     assert "messages" in _call("SLACK_SEARCH_MESSAGES", {"query": "the", "count": 1})
+
+
+def test_unread_on_a_channel_works_or_says_why():
+    # Slack documents last_read for DMs only; on a channel the tool must
+    # either work or fail with the documented, non-retryable error.
+    result = SlackToolkit().call_tool(
+        "SLACK_LIST_UNREAD_CHANNEL_MESSAGES", {"channel": CHANNEL}, {"access_token": USER_TOKEN}
+    )
+    assert result.successful or (result.error_code == "invalid_arguments" and "last_read" in result.error), result.error
+
+
+@pytest.mark.skipif(not DM, reason="SLACK_TEST_DM not set")
+def test_unread_on_a_dm():
+    assert "last_read" in _call("SLACK_LIST_UNREAD_CHANNEL_MESSAGES", {"channel": DM})
+
+
+def test_attribution_name_with_punctuation_posts():
+    # Per-format escaping: check by eye in the channel that it reads "R&D <bot>".
+    posted = _call("SLACK_SEND_MESSAGE", {"channel": CHANNEL, "markdown_text": "escaping check"},
+                   attribution_name="R&D <bot>")
+    _call("SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", {"channel": CHANNEL, "ts": posted["ts"]})
 
 
 def test_post_update_react_delete_as_the_user():

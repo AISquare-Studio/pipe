@@ -402,7 +402,10 @@ def test_invalid_auth_says_reconnect(case: Case):
     assert "reconnect Slack" in result.error
 
 
-@pytest.mark.parametrize("case", CASES, ids=IDS)
+RETRIED = [c for c in CASES if c.slug != "SLACK_API_TEST"]  # api.test never retries (echoes)
+
+
+@pytest.mark.parametrize("case", RETRIED, ids=[c.id for c in RETRIED])
 def test_rate_limit_is_retried(case: Case):
     limited = response(429, {"ok": False, "error": "ratelimited"}, headers={"Retry-After": "2"})
     h = harness(limited, *case.replies())

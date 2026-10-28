@@ -42,6 +42,7 @@ from aisquare_pipe_slack.constants import (
     CONFIG_IDENTITY,
     IDENTITY_BOT,
     IDENTITY_USER,
+    TIER_READ,
 )
 from aisquare_pipe_slack.oauth import (
     SLACK_OAUTH,
@@ -77,23 +78,25 @@ _KINDS: dict[str, frozenset[str]] = {
             "plan_upgrade_required", "paid_only", "permission_denied", "cant_kick_self",
             "cant_kick_from_general", "cant_archive_general", "cant_leave_general",
             "restricted_action_read_only_channel", "user_is_restricted",
+            # A workspace setting or plan limit: retrying won't help.
+            "edit_window_closed", "message_limit_exceeded", "messages_tab_disabled",
         }
     ),
     ERROR_NOT_FOUND: frozenset(
         {
             "channel_not_found", "user_not_found", "users_not_found", "message_not_found",
-            "thread_not_found", "file_not_found", "file_comment_not_found", "no_item_specified",
+            "thread_not_found", "file_not_found", "file_comment_not_found",
             "canvas_not_found", "bookmark_not_found", "no_such_subteam", "team_not_found",
-            "not_found", "invalid_scheduled_message_id", "no_pin", "bad_timestamp",
-            "user_not_visible",
+            "not_found", "invalid_scheduled_message_id", "no_pin", "user_not_visible",
         }
     ),
     ERROR_CONFLICT: frozenset(
         {
-            "already_reacted", "no_reaction", "already_pinned", "not_pinned", "name_taken",
-            "is_archived", "already_archived", "not_archived", "already_in_channel",
-            "channel_canvas_already_exists", "cant_invite_self", "edit_window_closed",
-            "message_limit_exceeded", "too_many_reactions", "too_many_pins",
+            *("already_reacted", "no_reaction", "already_pinned", "not_pinned"),
+            *("already_archived", "not_archived", "already_in_channel"),
+            # Nothing happened: the channel's state or a Slack limit is in the way.
+            "is_archived", "is_inactive", "name_taken", "channel_canvas_already_exists",
+            "too_many_reactions", "too_many_pins",
         }
     ),
     ERROR_RATE_LIMITED: frozenset({*RATE_LIMIT_ERRORS, "restricted_too_many"}),
@@ -111,6 +114,7 @@ _KINDS: dict[str, frozenset[str]] = {
             "invalid_post_at", "invalid_time", "too_many_attachments", "no_user",
             "no_reaction_name", "invalid_name_emoji", "not_enough_users", "too_many_emoji",
             "too_long", "invalid_types", "invalid_limit", "invalid_auth_type",
+            "bad_timestamp", "no_item_specified", "cant_invite_self",
         }
     ),
     # Slack's "request_timeout" means "POST data missing or truncated", not a
@@ -120,6 +124,28 @@ _KINDS: dict[str, frozenset[str]] = {
     ),
 }
 _KIND_OF: dict[str, str] = {code: kind for kind, codes in _KINDS.items() for code in codes}
+
+#: Conflicts that mean the change is already in place — the only codes
+#: reported as "no change needed". Every other conflict means nothing happened.
+_NO_CHANGE = frozenset(
+    {"already_reacted", "no_reaction", "already_pinned", "not_pinned", "already_archived",
+     "not_archived", "already_in_channel"}
+)
+#: Own hints for conflicts and limits where nothing happened.
+_HINTS = {
+    "is_archived": "the channel is archived; nothing can be posted or changed there",
+    "is_inactive": "the channel is archived, frozen or deleted; the message can't be changed",
+    "name_taken": "that name is taken; pick another name",
+    "channel_canvas_already_exists": "the channel already has its canvas",
+    "too_many_pins": "the channel has reached Slack's limit on pins; unpin something first",
+    "too_many_reactions": "the message has reached Slack's limit on reactions",
+    "edit_window_closed": "the workspace's settings no longer allow editing this message",
+    "message_limit_exceeded": "the workspace has reached its plan's message limit",
+    "messages_tab_disabled": "this DM's Messages tab is turned off, so it can't receive messages",
+    "bad_timestamp": "the timestamp is not valid; pass ts exactly as Slack returned it",
+    "no_item_specified": "pass channel + timestamp (or file / file_comment)",
+    "cant_invite_self": "leave the connection's own user out of users",
+}
 
 #: The tool that fixes ``not_in_channel``.
 _JOIN_TOOL = "SLACK_JOIN_AN_EXISTING_CONVERSATION"
@@ -175,17 +201,23 @@ def describe_error(error: SlackAPIError, settings: SlackSettings | None = None) 
             f"config[{CONFIG_ENABLED_TOOLS!r}])"
         )
     if error.error == "not_allowed_token_type":
-        other = IDENTITY_BOT if identity == IDENTITY_USER else IDENTITY_USER
+        # Neutral: the token may not match config['identity'] (a user token
+        # configured as the bot, or the reverse).
         return (
-            f"{text} — Slack does not accept a {identity} token here; this needs the {other} "
-            f"identity (config[{CONFIG_IDENTITY!r}])"
+            f"{text} — Slack does not accept this connection's kind of token for this method. "
+            f"Check that config[{CONFIG_IDENTITY!r}] (now {identity!r}) matches the token "
+            "(a user token xoxp-… for 'user', the bot token xoxb-… for 'bot')"
         )
+    if error.error in _HINTS:
+        return f"{text} — {_HINTS[error.error]}"
     if code == ERROR_FORBIDDEN:
         return f"{text} — this Slack connection is not allowed to do that"
     if code == ERROR_NOT_FOUND:
         return f"{text} — it does not exist, or this Slack connection can't see it"
-    if code == ERROR_CONFLICT:
+    if error.error in _NO_CHANGE:
         return f"{text} — already in that state; no change needed"
+    if code == ERROR_CONFLICT:
+        return f"{text} — conflicts with the current state in Slack; nothing was changed"
     if error.error == "invalid_cursor":
         return f"{text} — the cursor is invalid or expired; start again without it"
     if error.error in ("time_in_past", "time_too_far", "invalid_post_at", "invalid_time"):
@@ -216,10 +248,16 @@ def gate(tool: SlackTool, settings: SlackSettings) -> ToolResult | None:
     None."""
     slug = tool.spec.slug
     if not settings.allows(slug, tool.tier):
+        warning = ""
+        if settings.identity == IDENTITY_BOT and tool.tier == TIER_READ:
+            warning = (
+                ". Read is off by default for the bot: it would show this person every "
+                "conversation the bot is in, including other people's DMs with it"
+            )
         return ToolResult.fail(
             f"{slug} is a {tool.tier!r} tool and is not enabled for this Slack connection: the "
             f"host enables it by adding {tool.tier!r} to config[{CONFIG_ENABLED_TIERS!r}] or "
-            f"{slug!r} to config[{CONFIG_ENABLED_TOOLS!r}]",
+            f"{slug!r} to config[{CONFIG_ENABLED_TOOLS!r}]{warning}",
             code=ERROR_FORBIDDEN,
         )
     if settings.identity not in tool.identities:
@@ -362,7 +400,13 @@ class SlackToolkit(Toolkit):
             return blocked
         with self.client(config) as client:
             try:
-                return row.handler(SlackCall(client, settings, idempotent=row.spec.read_only), arguments)
+                call = SlackCall(
+                    client,
+                    settings,
+                    idempotent=row.spec.read_only,
+                    attribution=settings.attribution(config.get("access_token")),
+                )
+                return row.handler(call, arguments)
             except SlackAPIError as e:
                 return failure(e, settings)
 
@@ -387,10 +431,12 @@ class SlackToolkit(Toolkit):
         state: str,
         scopes: Sequence[str] | None = None,
         code_challenge: str | None = None,
-        identity: OAuthIdentity = "user",
+        identity: OAuthIdentity = "both",
     ) -> str:
         """Slack's consent URL. ``identity`` picks the token(s) the consent
-        mints: ``"user"`` (default), ``"bot"``, or ``"both"`` in one consent.
+        mints: ``"both"`` (default — user and bot in one consent, so switching
+        ``config["identity"]`` later needs no re-consent), ``"user"`` or
+        ``"bot"``.
         ``scopes`` mixes scope-group names (see
         :data:`~aisquare_pipe_slack.scopes.SCOPE_GROUPS`) and raw Slack
         scopes; None asks for every scope the catalog uses. User scopes go

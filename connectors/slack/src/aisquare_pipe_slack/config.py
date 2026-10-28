@@ -2,7 +2,8 @@
 
 A host passes these next to ``access_token`` in the ``config`` of every
 ``call_tool``. Every key is optional; the defaults are the safe ones (act as
-the user, read + send only, "Sent by pipe" on the user's messages). Values
+the user, read + send only — send only as the bot — and "Sent by pipe" on the
+user's messages). Values
 are checked strictly: a typo in a tier name fails the call with a message
 naming the key, instead of silently changing what an agent may do.
 """
@@ -14,13 +15,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from aisquare_pipe_slack.constants import (
-    ATTRIBUTION_TEMPLATE,
+    BOT_TOKEN_PREFIXES,
     CONFIG_ATTRIBUTION_NAME,
     CONFIG_BOT_ATTRIBUTION,
     CONFIG_ENABLED_TIERS,
     CONFIG_ENABLED_TOOLS,
     CONFIG_IDENTITY,
     DEFAULT_ATTRIBUTION_NAME,
+    DEFAULT_BOT_TIERS,
     DEFAULT_TIERS,
     IDENTITIES,
     IDENTITY_BOT,
@@ -44,17 +46,24 @@ class SlackSettings:
     attribution_name: str = DEFAULT_ATTRIBUTION_NAME
     bot_attribution: bool = False
 
-    @property
-    def attribution(self) -> str | None:
-        """The visible marker for messages this call posts, or None. Always
-        on for the user identity (the message shows under the user's name);
-        on for the bot only when ``bot_attribution`` is set."""
+    def attribution(self, token: str | None) -> str | None:
+        """The name for the "Sent by <name>" marker on messages this call
+        posts (raw: each message format escapes it), or None for no marker.
+        Always on for the user identity, since the message shows under the
+        user's name. On for the bot only with ``bot_attribution``. It fails
+        safe: the marker is dropped only when ``token`` is positively a bot
+        token, so a user token configured as ``bot`` still gets it."""
         if self.identity == IDENTITY_USER or self.bot_attribution:
-            return ATTRIBUTION_TEMPLATE.format(name=self.attribution_name)
-        return None
+            return self.attribution_name
+        return None if is_bot_token(token) else self.attribution_name
 
     def allows(self, slug: str, tier: str) -> bool:
         return tier in self.enabled_tiers or slug in self.enabled_tools
+
+
+def is_bot_token(token: str | None) -> bool:
+    """Whether ``token`` is positively a bot token (by its prefix)."""
+    return isinstance(token, str) and token.strip().startswith(BOT_TOKEN_PREFIXES)
 
 
 def settings_from_config(config: Mapping[str, Any]) -> SlackSettings:
@@ -69,7 +78,7 @@ def settings_from_config(config: Mapping[str, Any]) -> SlackSettings:
         )
     tiers = _names(config, CONFIG_ENABLED_TIERS)
     if tiers is None:
-        tiers = frozenset(DEFAULT_TIERS)
+        tiers = frozenset(DEFAULT_BOT_TIERS if identity == IDENTITY_BOT else DEFAULT_TIERS)
     unknown = sorted(tiers - set(TIERS))
     if unknown:
         raise SlackConfigError(
@@ -107,17 +116,15 @@ def _names(config: Mapping[str, Any], key: str) -> frozenset[str] | None:
 
 
 def _attribution_name(value: Any) -> str:
-    """The configured name, whitespace collapsed, escaped for Slack's mrkdwn
-    (``&``, ``<``, ``>``) and cut to :data:`MAX_ATTRIBUTION_NAME`; the
-    default when unset or blank."""
+    """The configured name, whitespace collapsed and cut to
+    :data:`MAX_ATTRIBUTION_NAME`; the default when unset or blank. Kept
+    raw: each message format escapes it its own way."""
     if value is None:
         return DEFAULT_ATTRIBUTION_NAME
     if not isinstance(value, str):
         raise SlackConfigError(f"config[{CONFIG_ATTRIBUTION_NAME!r}] must be a string")
     name = " ".join(value.split())[:MAX_ATTRIBUTION_NAME].strip()
-    if not name:
-        return DEFAULT_ATTRIBUTION_NAME
-    return name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return name or DEFAULT_ATTRIBUTION_NAME
 
 
 __all__ = [
@@ -125,5 +132,6 @@ __all__ = [
     "IDENTITY_USER",
     "SlackConfigError",
     "SlackSettings",
+    "is_bot_token",
     "settings_from_config",
 ]

@@ -157,10 +157,12 @@ class SlackWebClient:
         *,
         json_body: bool = False,
         idempotent: bool = False,
+        retry: bool = True,
     ) -> dict[str, Any]:
         """Call one Web API method; return Slack's payload (``ok`` is true) or
         raise :class:`SlackAPIError`. ``None`` arguments are dropped.
-        ``idempotent`` calls (reads) are also retried on server errors."""
+        ``idempotent`` calls (reads) are also retried on server errors;
+        ``retry=False`` never retries."""
         if not _METHOD.match(method):
             raise ValueError(f"not a Slack method name: {method!r}")
         fields = {k: v for k, v in (args or {}).items() if v is not None}
@@ -201,6 +203,7 @@ class SlackWebClient:
             remaining = self._remaining()
             if (
                 wait is None
+                or not retry
                 or attempt >= self.max_retries
                 or waited + wait > self.max_retry_wait
                 # The sleep must leave room for the retried request itself.
