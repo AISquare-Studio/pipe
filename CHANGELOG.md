@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raises, even on malformed toolkit results; validates arguments against
   the schema; masks secret config values out of errors) and
   `validate_config()`.
-  Helpers `rank_tools()`, `validate_arguments()` and
-  `error_code_for_status()`.
+  Helpers `rank_tools()`, `validate_arguments()`,
+  `error_code_for_status()` and `time_budget()` (the host's per-call
+  `config["timeout_seconds"]`, shared by the native toolkits).
 - Canonical tool failure kinds as `ERROR_*` constants (`ERROR_CODES`):
   `unauthorized`, `forbidden`, `not_found`, `rate_limited`,
   `invalid_arguments`, `unknown_tool`, `conflict`, `upstream_error`,

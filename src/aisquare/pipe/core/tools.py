@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import re
 import time
 import urllib.error
@@ -102,6 +103,16 @@ def error_code_for_status(status: int) -> str:
     (401 -> ``unauthorized``, 429 -> ``rate_limited``, ...). Statuses with no
     specific kind map to ``upstream_error``."""
     return _STATUS_CODES.get(status, ERROR_UPSTREAM_ERROR)
+
+
+def time_budget(config: Mapping[str, Any]) -> float | None:
+    """The host's per-call budget, ``config["timeout_seconds"]`` (a positive
+    number), or None. A toolkit fits its whole call — request timeouts and
+    retry sleeps — inside it."""
+    value = config.get("timeout_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,7 @@ from aisquare.pipe import (
     ToolResult,
     ToolSpec,
     error_code_for_status,
+    time_budget,
 )
 from aisquare.pipe import revoke_token as oauth_revoke_token
 
@@ -126,15 +127,6 @@ def failure(error: GoogleDriveAPIError) -> ToolResult:
         code=error_code(error),
         retry_after=whole_seconds(error.retry_after),
     )
-
-
-def time_budget(config: Mapping[str, Any]) -> float | None:
-    """The host's per-call budget, ``config["timeout_seconds"]`` (a positive
-    number), or None."""
-    value = config.get("timeout_seconds")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 class GoogleDriveToolkit(Toolkit):

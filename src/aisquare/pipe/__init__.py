@@ -51,6 +51,7 @@ from aisquare.pipe.core.tools import (
     ToolSpec,
     error_code_for_status,
     rank_tools,
+    time_budget,
     validate_arguments,
 )
 from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
@@ -99,6 +100,7 @@ __all__ = [
     "rank_tools",
     "validate_arguments",
     "error_code_for_status",
+    "time_budget",
     "ERROR_CODES",
     "ERROR_UNAUTHORIZED",
     "ERROR_FORBIDDEN",

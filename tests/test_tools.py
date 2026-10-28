@@ -27,6 +27,7 @@ from aisquare.pipe import (
     ToolSpec,
     error_code_for_status,
     rank_tools,
+    time_budget,
     validate_arguments,
 )
 from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments, query_terms
@@ -159,6 +160,36 @@ class TestErrorCodes:
     def test_tool_error_rejects_non_canonical_code(self):
         with pytest.raises(ValueError, match="not one of"):
             ToolError("x", code="auth_failed")
+
+
+class TestTimeBudget:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (5, 5.0),
+            (2.5, 2.5),
+            (0.001, 0.001),
+            (None, None),
+            (0, None),
+            (-1, None),
+            (True, None),
+            (False, None),
+            ("10", None),
+            ([10], None),
+            (float("nan"), None),
+            (float("inf"), None),
+            (float("-inf"), None),
+        ],
+    )
+    def test_budget_from_config(self, value, expected):
+        assert time_budget({"access_token": "t", "timeout_seconds": value}) == expected
+
+    def test_absent_key_is_no_budget(self):
+        assert time_budget({"access_token": "t"}) is None
+        assert time_budget({}) is None
+
+    def test_returns_a_float(self):
+        assert type(time_budget({"timeout_seconds": 5})) is float
 
 
 # --------------------------------------------------------------------------
