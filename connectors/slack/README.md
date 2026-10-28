@@ -63,13 +63,15 @@ safe choices.
 A value the toolkit can't use (an unknown tier such as `"destrucive"`, an identity
 of `"app"`, a bot token with identity `"user"`, …) fails every call with
 `forbidden`, before its arguments are looked at, and the message names the key.
-`available_tools` / `search_tools` list nothing for such a config. The toolkit never
-guesses what you meant:
-- an unknown slug in `enabled_tools` enables nothing;
-- an unusable `timeout_seconds` is ignored, as core's `time_budget` does. `forbidden` was chosen over
-`upstream_error`, because a host may retry the latter and this is the host's
-misconfiguration, not a Slack failure. It was chosen over `invalid_arguments`
+`available_tools` / `search_tools` list nothing for such a config. `forbidden` was
+chosen over `upstream_error`, because a host may retry the latter and this is the
+host's misconfiguration, not a Slack failure. It was chosen over `invalid_arguments`
 because the model can't fix it by changing its arguments.
+
+The toolkit never guesses what you meant. Two values are ignored rather than refused:
+
+- an unknown slug in `enabled_tools` enables nothing;
+- an unusable `timeout_seconds` is ignored, as core's `time_budget` does.
 
 ### Risk tiers
 
@@ -521,7 +523,7 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_UPDATE_USER_GROUP_MEMBERS` | destructive | `usergroups.users.update` | user, bot |
 | **workspace** | | | |
 | `SLACK_LIST_AUTH_TEAMS` | read | `auth.teams.list` | user, bot |
-| **lists** | | | |
+| **lists** (paid workspaces) | | | |
 | `SLACK_CREATE_SLACK_LIST` | write | `slackLists.create` | user, bot |
 | `SLACK_UPDATE_SLACK_LIST` | write | `slackLists.update` | user, bot |
 | `SLACK_CREATE_SLACK_LIST_ITEM` | write | `slackLists.items.create` | user, bot |
@@ -532,13 +534,21 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS` | destructive | `slackLists.items.deleteMultiple` | user, bot |
 | `SLACK_SET_SLACK_LIST_ACCESS` | write | `slackLists.access.set` | user, bot |
 | `SLACK_DELETE_SLACK_LIST_ACCESS` | destructive | `slackLists.access.delete` | user, bot |
-| **remote_files** | | | |
+| **remote files** | | | |
 | `SLACK_ADD_REMOTE_FILE` | write | `files.remote.add` | bot |
 | `SLACK_UPDATE_REMOTE_FILE` | write | `files.remote.update` | bot |
 | `SLACK_REMOVE_REMOTE_FILE` | destructive | `files.remote.remove` | bot |
 | `SLACK_GET_REMOTE_FILE` | read | `files.remote.info` | user, bot |
 | `SLACK_LIST_REMOTE_FILES` | read | `files.remote.list` | user, bot |
 | `SLACK_SHARE_REMOTE_FILE` | write | `files.remote.share` | bot |
+
+Slack Lists text cells and descriptions are Block Kit `rich_text`. As in Composio, a
+plain string is wrapped for you: a cell may be `{"column_id": "Col…", "text": "Ship
+it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both:
+`files.remote.info` refuses both (`too_many_ids`), and the others need only one, so
+the toolkit asks for exactly one everywhere rather than guess which Slack would use.
+Composio's `preview_image` is not offered: Slack takes it only as a multipart image
+upload.
 
 ## Message sink
 

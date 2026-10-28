@@ -869,13 +869,18 @@ def _invite(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         data: dict[str, Any] = {"slack_error": e.error, "status": e.status}
         if e.errors:
             data["errors"] = e.errors
-        return ToolResult.fail(
-            "conversations.invite: already_in_channel — at least one of the users is already in "
-            "the channel; Slack invites all or none unless force is true, so nobody may have been "
-            "invited (see errors); retry with force: true, or without those users",
-            data=data,
-            code=ERROR_CONFLICT,
-        )
+        if arguments.get("force"):
+            message = (
+                "conversations.invite: already_in_channel — the users listed in errors are "
+                "already members of the channel"
+            )
+        else:
+            message = (
+                "conversations.invite: already_in_channel — at least one of the users is already "
+                "in the channel; Slack invites all or none unless force is true, so nobody may "
+                "have been invited (see errors); retry with force: true, or without those users"
+            )
+        return ToolResult.fail(message, data=data, code=ERROR_CONFLICT)
 
 
 def _api_test(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:

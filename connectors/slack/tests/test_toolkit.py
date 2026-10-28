@@ -749,6 +749,15 @@ class TestComposites:
             "errors": [{"error": "already_in_channel", "user": "U01111111"}],
         }
 
+    def test_a_forced_invite_names_the_members_without_retry_advice(self):
+        h = harness(slack_error("already_in_channel", errors=[{"user": "U01111111", "error": "already_in_channel"}]))
+        result = h.call("SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL",
+                        {"channel": C, "users": "U01111111,U02222222", "force": True}, enabled_tiers=ALL_TIERS)
+        assert result.error_code == "conflict"
+        assert "the users listed in errors are already members" in result.error
+        assert "retry with force" not in result.error and "no change needed" not in result.error
+        assert result.data["errors"] == [{"error": "already_in_channel", "user": "U01111111"}]
+
     def test_a_single_user_invite_already_in_is_no_change(self):
         h = harness(slack_error("already_in_channel"))
         result = h.call("SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL", {"channel": C, "users": "U01111111"},
