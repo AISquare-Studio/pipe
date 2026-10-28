@@ -3,13 +3,12 @@ attribution, channel names, composites, result shaping and secrecy."""
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 
 import pytest
 import requests
-from aisquare.pipe import Toolkit, get_toolkit
+from aisquare.pipe import get_toolkit
 
 from aisquare_pipe_slack import SlackToolkit
 from aisquare_pipe_slack.constants import RESULT_CHAR_CAP
@@ -45,11 +44,11 @@ READ = {
 SEND = {"SLACK_SEND_MESSAGE", "SLACK_SEND_EPHEMERAL_MESSAGE", "SLACK_SCHEDULE_MESSAGE", "SLACK_OPEN_DM"}
 DESTRUCTIVE = {
     "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", "SLACK_DELETE_SCHEDULED_MESSAGE",
-    "SLACK_REMOVE_USER_FROM_CONVERSATION", "SLACK_ARCHIVE_CONVERSATION",
+    "SLACK_REMOVE_USER_FROM_CONVERSATION", "SLACK_ARCHIVE_CONVERSATION", "SLACK_LEAVE_CONVERSATION",
 }
 WRITE = {
     "SLACK_UPDATES_A_SLACK_MESSAGE", "SLACK_CREATE_CHANNEL", "SLACK_JOIN_AN_EXISTING_CONVERSATION",
-    "SLACK_LEAVE_CONVERSATION", "SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL", "SLACK_UNARCHIVE_CHANNEL",
+    "SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL", "SLACK_UNARCHIVE_CHANNEL",
     "SLACK_RENAME_CONVERSATION", "SLACK_SET_THE_TOPIC_OF_A_CONVERSATION",
     "SLACK_SET_CONVERSATION_PURPOSE", "SLACK_CLOSE_DM", "SLACK_ADD_REACTION_TO_AN_ITEM",
     "SLACK_REMOVE_REACTION_FROM_ITEM", "SLACK_PIN_ITEM", "SLACK_UNPIN_ITEM",
@@ -137,20 +136,29 @@ class TestTiers:
         toolkit = SlackToolkit()
         for config in (USER_CONFIG, BOT_CONFIG, {**USER_CONFIG, "enabled_tiers": ALL_TIERS}, {"enabled_tiers": ["*"]}):
             assert toolkit.available_tools(config) == toolkit.tools_for(config)
-        # No connection to judge: the whole catalog, as tools().
-        assert toolkit.available_tools() == toolkit.available_tools(None) == toolkit.tools()
 
-    @pytest.mark.skipif(
-        "config" not in inspect.signature(Toolkit.search_tools).parameters,
-        reason="core without Toolkit.available_tools / search_tools(config=)",
-    )
+    def test_without_a_config_only_safe_tools_are_listed(self):
+        # Owner Q6: default exposure is read + send. A host that lists or
+        # searches without the connection's config must not offer the rest.
+        toolkit = SlackToolkit()
+        assert {t.slug for t in toolkit.available_tools()} == READ | SEND
+        assert toolkit.available_tools(None) == toolkit.available_tools({}) == toolkit.tools_for(None)
+        assert len(toolkit.tools()) == 51  # tools() stays the full catalog, for browsing
+
+    @pytest.mark.parametrize("query", ["delete message", "archive channel", "remove user kick", "leave channel",
+                                       "edit message", "pin", "react emoji", "set status"])
+    def test_search_without_a_config_offers_no_write_or_destructive_tool(self, query):
+        found = {t.slug for t in SlackToolkit().search_tools(query, limit=51)}
+        assert found and found <= READ | SEND
+        assert not found & (WRITE | DESTRUCTIVE)
+
     def test_search_ranks_only_enabled_tools(self):
         toolkit = SlackToolkit()
-        found = toolkit.search_tools("delete message", limit=51, config=USER_CONFIG)
-        assert found and {t.slug for t in found} <= READ | SEND
-        assert "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT" not in {t.slug for t in found}
-        everything = toolkit.search_tools("delete message", limit=1)
-        assert everything[0].slug == "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT"
+        assert SlackToolkit().search_tools("delete message")[0].slug != "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT"
+        found = toolkit.search_tools("delete message", limit=1, config={**USER_CONFIG, "enabled_tiers": ALL_TIERS})
+        assert found[0].slug == "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT"
+        by_slug = {**USER_CONFIG, "enabled_tools": ["SLACK_ARCHIVE_CONVERSATION"]}
+        assert toolkit.search_tools("archive", limit=1, config=by_slug)[0].slug == "SLACK_ARCHIVE_CONVERSATION"
 
     def test_comma_separated_names_are_accepted(self):
         config = {**USER_CONFIG, "enabled_tiers": "read, write"}
@@ -165,7 +173,7 @@ class TestTiers:
         h = harness()
         result = h.call("SLACK_TEST_AUTH", {}, enabled_tiers=tiers)
         assert result.successful is False
-        assert result.error_code == "upstream_error"
+        assert result.error_code == "forbidden"  # not upstream_error: hosts retry that
         assert "config['enabled_tiers']" in result.error
         assert h.session.calls == []
         assert SlackToolkit().tools_for({**USER_CONFIG, "enabled_tiers": tiers}) == []
@@ -175,7 +183,7 @@ class TestTiers:
     )
     def test_bad_config_values_name_their_key(self, key, value):
         result = harness().call("SLACK_TEST_AUTH", {}, **{key: value})
-        assert result.error_code == "upstream_error"
+        assert result.error_code == "forbidden"
         assert f"config[{key!r}]" in result.error
 
 
@@ -520,6 +528,20 @@ class TestSecrecy:
     def test_token_echoed_in_an_error_is_scrubbed(self):
         result = harness(slack_error(f"weird {USER_TOKEN}")).call("SLACK_TEST_AUTH", {})
         assert USER_TOKEN not in (result.error or "")
+        assert USER_TOKEN not in json.dumps(result.data)
+
+    @pytest.mark.parametrize(
+        "code", ["has space", "UPPER", "with-dash", "x\n", "a" * 0, "<script>", "channel_not_found\nmore"]
+    )
+    def test_only_safe_slack_codes_are_passed_on(self, code):
+        result = harness(slack_error(code)).call("SLACK_SEND_MESSAGE", SEND_ARGS)
+        assert result.data == {"slack_error": "unknown_error", "status": 200}
+        assert result.error.startswith("chat.postMessage: unknown_error")
+        assert result.error_code == "upstream_error"
+
+    def test_odd_needed_scopes_are_dropped(self):
+        result = harness(slack_error("missing_scope", needed="chat:write <b>")).call("SLACK_SEND_MESSAGE", SEND_ARGS)
+        assert result.error.endswith("reconnect Slack to grant the missing scope")
 
     def test_network_error_carries_no_url_or_arguments(self):
         failure = requests.ConnectionError("https://slack.com/api/chat.postMessage?text=secret-plan")

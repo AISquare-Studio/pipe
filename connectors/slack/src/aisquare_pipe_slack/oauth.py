@@ -26,7 +26,7 @@ import requests
 from aisquare.pipe import OAuthError, OAuthSpec, OAuthToken
 
 from aisquare_pipe_slack.constants import API_BASE, TOKEN_ROTATION, USER_AGENT
-from aisquare_pipe_slack.rest import parse_body
+from aisquare_pipe_slack.rest import SAFE_CODE, parse_body
 from aisquare_pipe_slack.scopes import USER_SCOPES
 
 logger = logging.getLogger("aisquare.pipe.slack")
@@ -156,7 +156,10 @@ def token_request(
         )
     error = payload.get("error")
     if status >= 400 or payload.get("ok") is False or error:
-        code = str(error) if isinstance(error, str) and error else f"http_{status}"
+        if isinstance(error, str) and SAFE_CODE.fullmatch(error):
+            code = error
+        else:
+            code = f"http_{status}" if status >= 400 else "unknown_error"
         if code in _DEAD_GRANT:
             code = "invalid_grant"
         raise OAuthError(

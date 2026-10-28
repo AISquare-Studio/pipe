@@ -52,8 +52,11 @@ safe choices.
 | `timeout_seconds` | number | none | Set by hosts. It bounds the whole call, including retries and rate-limit sleeps. |
 
 A value the toolkit can't use (an unknown tier such as `"destrucive"`, an identity
-of `"app"`, …) fails the call with `upstream_error`, and the message names the key.
-The toolkit never guesses what you meant.
+of `"app"`, …) fails every call with `forbidden`, and the message names the key.
+The toolkit never guesses what you meant. `forbidden` was chosen over
+`upstream_error`, because a host may retry the latter and this is the host's
+misconfiguration, not a Slack failure. It was chosen over `invalid_arguments`
+because the model can't fix it by changing its arguments.
 
 ### Risk tiers
 
@@ -63,8 +66,8 @@ Every tool has exactly one tier:
 |---|---|:-:|
 | `read` | No side effects | ✓ |
 | `send` | Posting a new message: post, reply, DM (incl. opening the DM), ephemeral, scheduled | ✓ |
-| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, leave, invite, rename, topic, purpose, unarchive), closing a DM, profile/status, presence | |
-| `destructive` | Deleting a message or a scheduled message, archiving a channel, removing someone from a channel | |
+| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, profile/status, presence | |
+| `destructive` | Things the caller can't undo: deleting a message or a scheduled message, archiving a channel, removing someone from a channel, leaving a channel (a private one can only be re-entered by invitation) | |
 
 If a connection calls a tool whose tier it hasn't enabled, the call fails with
 `forbidden` **before any request is made**. The message names the setting that
@@ -78,10 +81,10 @@ config**:
 - `available_tools(config)` is core's config-aware listing hook.
 - `search_tools(query, limit, config=config)` ranks `available_tools(config)`.
 
-Both need an `aisquare-pipe` with `Toolkit.available_tools`. On an older core, list
-`tools_for(config)` and rank it with `aisquare.pipe.rank_tools`.
-
-`tools()`, and `available_tools()` without a config, return the whole catalog.
+Without a config, both give the **default exposure: read + send only**. A host that
+lists without passing the connection's config therefore never offers a write or
+destructive tool. `search_tools` is defined on `SlackToolkit` too, so this also holds
+on an older core. Only `tools()` returns the full catalog, for browsing.
 `SlackToolkit.tier_of(slug)` gives a tool's tier.
 
 `ToolSpec.read_only` is true exactly for the `read` tier, and `destructive` is true
@@ -97,7 +100,7 @@ edits there.
 | Token | user token (`xoxp-…`) | bot token (`xoxb-…`) |
 | Posts appear as | the user, with "Sent by <name>" | the app's bot (marker only with `bot_attribution`) |
 | Sees | what that user can see | conversations the bot is in (and any public channel it posts to, via `chat:write.public`) |
-| User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_LIST_UNREAD_CHANNEL_MESSAGES`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL` fail as `forbidden` without calling Slack (Slack accepts only user tokens for them). `tools_for` leaves them out. |
+| User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_LIST_UNREAD_CHANNEL_MESSAGES`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL` fail as `forbidden` without calling Slack (Slack accepts only user tokens for them). `available_tools` leaves them out. |
 | Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
 
 ### Attribution
@@ -156,7 +159,12 @@ this order:
 "reconnect Slack to grant `<scope>`", so a host doesn't loop through refreshes.
 Messages look like `"<method>: <slack code> — <what to do>"`, and `data` is
 `{"slack_error": code, "status": http_status}`. Neither ever carries arguments or
-the token.
+the token. Slack's code is passed on only if it looks like one (`[a-z0-9_]+`, and
+the same for `needed` scopes); anything else is reported as `unknown_error`.
+
+A `not_in_channel` hint points to `SLACK_JOIN_AN_EXISTING_CONVERSATION` only when
+that write-tier tool is enabled for the connection. Otherwise the hint says to ask a
+member for an invite, and names the config keys that would enable joining.
 
 **Rate limits.** A 429 (or `ok: false, error: ratelimited`) is retried up to twice
 for up to 60 s in total, within `timeout_seconds`.
@@ -278,7 +286,7 @@ Activate Public Distribution**. Until then, installs fail with
 | `SLACK_RETRIEVE_CONVERSATION_MEMBERS_LIST` | read | `conversations.members` | user, bot |
 | `SLACK_CREATE_CHANNEL` | write | `conversations.create` | user, bot |
 | `SLACK_JOIN_AN_EXISTING_CONVERSATION` | write | `conversations.join` | user, bot |
-| `SLACK_LEAVE_CONVERSATION` | write | `conversations.leave` | user, bot |
+| `SLACK_LEAVE_CONVERSATION` | destructive | `conversations.leave` | user, bot |
 | `SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL` | write | `conversations.invite` | user, bot |
 | `SLACK_REMOVE_USER_FROM_CONVERSATION` | destructive | `conversations.kick` | user, bot |
 | `SLACK_ARCHIVE_CONVERSATION` | destructive | `conversations.archive` | user, bot |

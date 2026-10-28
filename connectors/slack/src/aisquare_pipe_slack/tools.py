@@ -1242,8 +1242,9 @@ CATALOG: tuple[SlackTool, ...] = (
         tags=("join", "enter", "channel"),
     ),
     _tool(
-        "SLACK_LEAVE_CONVERSATION", TIER_WRITE, "conversations", "conversations.leave",
-        "Leave a conversation. (As the bot: channels and DMs, not group DMs.)",
+        "SLACK_LEAVE_CONVERSATION", TIER_DESTRUCTIVE, "conversations", "conversations.leave",
+        "Leave a conversation. Leaving a private channel can't be undone by this connection: "
+        "only a member can invite it back. (As the bot: channels and DMs, not group DMs.)",
         _schema({"channel": CHANNEL}, ["channel"]),
         _rpc("conversations.leave", ("channel",)),
         user=("channels:write", "groups:write", "im:write", "mpim:write", *LOOKUP),

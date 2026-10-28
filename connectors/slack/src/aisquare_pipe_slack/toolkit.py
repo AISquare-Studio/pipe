@@ -26,6 +26,7 @@ from aisquare.pipe import (
     ToolResult,
     ToolSpec,
     error_code_for_status,
+    rank_tools,
     time_budget,
 )
 from aisquare.pipe.core.oauth import build_authorize_url as core_build_authorize_url
@@ -143,9 +144,12 @@ def error_code(error: SlackAPIError) -> str:
     return _KIND_OF.get(error.error, ERROR_UPSTREAM_ERROR)
 
 
-def describe_error(error: SlackAPIError, *, identity: str = IDENTITY_USER) -> str:
-    """``"<method>: <slack error> — <what to do>"``. Never carries arguments
-    or the token."""
+def describe_error(error: SlackAPIError, settings: SlackSettings | None = None) -> str:
+    """``"<method>: <slack error> — <what to do>"``, the advice fitted to the
+    connection's ``settings`` (its identity, and whether the tool a hint
+    points to is enabled). Never carries arguments or the token."""
+    settings = settings or SlackSettings()
+    identity = settings.identity
     code = error_code(error)
     text = f"{error.method}: {error.error}"
     if error.timed_out:
@@ -162,7 +166,14 @@ def describe_error(error: SlackAPIError, *, identity: str = IDENTITY_USER) -> st
         needed = f"`{error.needed}`" if error.needed else "the missing scope"
         return f"{text} — reconnect Slack to grant {needed}"
     if error.error == "not_in_channel":
-        return f"{text} — join the channel first with {_JOIN_TOOL} (or invite the app)"
+        if settings.allows(_JOIN_TOOL, TOOLS[_JOIN_TOOL].tier):
+            return f"{text} — join it first with {_JOIN_TOOL} (public channels), or ask a member to invite it"
+        return (
+            f"{text} — this connection is not a member: ask a member to invite it. {_JOIN_TOOL} "
+            f"could join a public channel, but it is a {TOOLS[_JOIN_TOOL].tier!r} tool that is not "
+            f"enabled here (the host adds it via config[{CONFIG_ENABLED_TIERS!r}] or "
+            f"config[{CONFIG_ENABLED_TOOLS!r}])"
+        )
     if error.error == "not_allowed_token_type":
         other = IDENTITY_BOT if identity == IDENTITY_USER else IDENTITY_USER
         return (
@@ -188,11 +199,11 @@ def describe_error(error: SlackAPIError, *, identity: str = IDENTITY_USER) -> st
     return text
 
 
-def failure(error: SlackAPIError, *, identity: str = IDENTITY_USER) -> ToolResult:
+def failure(error: SlackAPIError, settings: SlackSettings | None = None) -> ToolResult:
     """A failed ToolResult: message, canonical ``error_code``, ``retry_after``
     (whole seconds) on a rate limit, and ``data={"slack_error", "status"}``."""
     return ToolResult.fail(
-        describe_error(error, identity=identity),
+        describe_error(error, settings),
         data={"slack_error": error.error, "status": error.status},
         code=error_code(error),
         retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
@@ -282,7 +293,8 @@ class SlackToolkit(Toolkit):
     def tools_for(self, config: Mapping[str, Any] | None) -> list[ToolSpec]:
         """The tools ``config`` lets this connection call (enabled tier or
         slug, and runnable under its identity) — what a host should list to
-        a model. Empty for a config the toolkit cannot use."""
+        a model. No config means the defaults: read + send, as the user.
+        Empty for a config the toolkit cannot use."""
         try:
             settings = settings_from_config(config if isinstance(config, Mapping) else {})
         except SlackConfigError:
@@ -290,14 +302,20 @@ class SlackToolkit(Toolkit):
         return [TOOLS[spec.slug].spec for spec in TOOL_SPECS if gate(TOOLS[spec.slug], settings) is None]
 
     def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
-        """Core's listing hook (``aisquare-pipe`` with ``available_tools``;
-        ``search_tools(..., config=...)`` ranks it): :meth:`tools_for` for a
-        connection's ``config``. Without a config — no connection to judge —
-        the whole catalog, as :meth:`tools`. On an older core this is just an
-        extra method; ``call_tool`` refuses disabled tools either way."""
-        if config is None:
-            return self.tools()
+        """Core's listing hook: :meth:`tools_for`. Without a config that is
+        the default exposure — read + send only — so a host that lists
+        without passing the connection's config never offers write or
+        destructive tools. :meth:`tools` stays the full catalog, for
+        browsing."""
         return self.tools_for(config)
+
+    def search_tools(
+        self, query: str, limit: int = 6, *, config: Mapping[str, Any] | None = None
+    ) -> list[ToolSpec]:
+        """Tools most relevant to ``query`` among :meth:`available_tools`
+        for ``config`` (read + send without one). Defined here as well as in
+        core so the safe default holds on a core without ``available_tools``."""
+        return rank_tools(self.available_tools(config), query, limit)
 
     @staticmethod
     def tier_of(slug: str) -> str | None:
@@ -333,7 +351,12 @@ class SlackToolkit(Toolkit):
         try:
             settings = settings_from_config(config)
         except SlackConfigError as e:
-            raise ToolError(f"invalid Slack toolkit config: {e}", code=ERROR_UPSTREAM_ERROR) from None
+            # forbidden, not upstream_error: a host's misconfiguration is not a
+            # Slack failure, and retrying it changes nothing.
+            raise ToolError(
+                f"invalid Slack toolkit config, nothing is allowed until the host fixes it: {e}",
+                code=ERROR_FORBIDDEN,
+            ) from None
         blocked = gate(row, settings)
         if blocked is not None:
             return blocked
@@ -341,7 +364,7 @@ class SlackToolkit(Toolkit):
             try:
                 return row.handler(SlackCall(client, settings, idempotent=row.spec.read_only), arguments)
             except SlackAPIError as e:
-                return failure(e, identity=settings.identity)
+                return failure(e, settings)
 
     def client(self, config: Mapping[str, Any]) -> SlackWebClient:
         """A Web API client bound to ``config["access_token"]``."""

@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   risk tier — read, send, write, destructive — and only read + send are
   enabled unless `config["enabled_tiers"]` / `config["enabled_tools"]` say
   otherwise; `available_tools(config)` (and `search_tools(..., config=...)`)
-  list only what a connection may call. Messages
+  list only what a connection may call, which is read + send when no config
+  is passed. An invalid config fails as `forbidden`. Messages
   sent as the user carry a visible "Sent by <name>" line
   (`config["attribution_name"]`, default `pipe`; opt-in for the bot).
   Named scope groups (by area and by tier) select what a consent asks for;

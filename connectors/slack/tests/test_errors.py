@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from aisquare_pipe_slack.config import SlackSettings
 from aisquare_pipe_slack.rest import SlackAPIError
 from aisquare_pipe_slack.toolkit import describe_error, error_code, failure
 
@@ -97,7 +98,6 @@ def test_transport_and_http_status_come_first(error, kind):
 @pytest.mark.parametrize(
     "error, text",
     [
-        (_error("not_in_channel"), "join the channel first with SLACK_JOIN_AN_EXISTING_CONVERSATION"),
         (_error("already_reacted"), "already in that state; no change needed"),
         (_error("invalid_cursor"), "start again without it"),
         (_error("time_in_past"), "post_at must be in the future"),
@@ -112,6 +112,30 @@ def test_transport_and_http_status_come_first(error, kind):
 )
 def test_hints(error, text):
     assert text in describe_error(error)
+
+
+def test_not_in_channel_points_to_join_only_when_it_is_enabled():
+    error = _error("not_in_channel")
+    off = describe_error(error)  # default tiers: read + send
+    assert "ask a member to invite it" in off
+    assert "'write' tool that is not enabled here" in off
+    assert "config['enabled_tiers'] or config['enabled_tools']" in off
+    for settings in (
+        SlackSettings(enabled_tiers=frozenset({"read", "send", "write"})),
+        SlackSettings(enabled_tools=frozenset({"SLACK_JOIN_AN_EXISTING_CONVERSATION"})),
+    ):
+        on = describe_error(error, settings)
+        assert "join it first with SLACK_JOIN_AN_EXISTING_CONVERSATION" in on
+        assert "not enabled" not in on
+
+
+def test_not_in_channel_end_to_end_follows_the_config():
+    args = {"channel": "C0123456", "markdown_text": "hi"}
+    assert "not enabled here" in harness(slack_error("not_in_channel")).call("SLACK_SEND_MESSAGE", args).error
+    enabled = harness(slack_error("not_in_channel")).call(
+        "SLACK_SEND_MESSAGE", args, enabled_tiers=["read", "send", "write"]
+    )
+    assert "join it first" in enabled.error
 
 
 def test_failure_rounds_retry_after_up():

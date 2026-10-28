@@ -201,6 +201,8 @@ class TestExchange:
         [
             (response(200, {"ok": False, "error": "invalid_code"}), "invalid_code"),
             (response(200, {"ok": False, "error": "bad_redirect_uri"}), "bad_redirect_uri"),
+            (response(200, {"ok": False, "error": "code c0de expired"}), "unknown_error"),
+            (response(400, {"ok": False, "error": "<b>"}), "http_400"),
             (response(200, {"ok": True}), "invalid_token_response"),
             (response(200, content=b"<html>"), "invalid_token_response"),
             (response(500, content=b"{}"), "http_500"),

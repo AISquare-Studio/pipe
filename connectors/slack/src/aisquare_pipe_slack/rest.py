@@ -62,6 +62,12 @@ _REQUEST_FLOOR = 2.0
 #: ``chat.postMessage``, ``users.profile.get``, ``api.test``.
 _METHOD = re.compile(r"^[a-z]+(\.[a-zA-Z]+)+$")
 
+#: What a Slack error code looks like. Anything else in ``error`` (or
+#: ``needed``) is not passed on: it reaches messages and ``ToolResult.data``,
+#: and core masks secrets only in the message.
+SAFE_CODE = re.compile(r"[a-z0-9_]+")
+_SAFE_SCOPES = re.compile(r"[a-z0-9_.:,]+")
+
 #: ``ok: false`` codes that are rate limits.
 RATE_LIMIT_ERRORS = frozenset({"ratelimited", "rate_limited"})
 #: ``ok: false`` codes that are Slack-side failures (retried for reads only).
@@ -224,7 +230,7 @@ def _outcome(
     body = parse_body(response)
     payload = body if isinstance(body, dict) else {}
     slack_error = payload.get("error")
-    code = slack_error if isinstance(slack_error, str) and slack_error else None
+    code = slack_error if isinstance(slack_error, str) and SAFE_CODE.fullmatch(slack_error) else None
 
     if status == 429 or (code in RATE_LIMIT_ERRORS):
         wait = retry_after_seconds(response)
@@ -240,7 +246,7 @@ def _outcome(
             method,
             code,
             status=status,
-            needed=needed if isinstance(needed, str) and needed else None,
+            needed=needed if isinstance(needed, str) and _SAFE_SCOPES.fullmatch(needed) else None,
         )
         retry_wait = _SERVER_ERROR_WAIT * (2**attempt) if server_error and idempotent else None
         return payload, error, retry_wait
