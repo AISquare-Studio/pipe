@@ -1,0 +1,1448 @@
+{
+  "source": "https://docs.composio.dev/toolkits/slack.md",
+  "composio_toolkit_version": "20261023_00",
+  "fetched": "2026-10-28",
+  "notes": "Params trimmed to <=160 chars. 'enum' added where the docs table lists allowed values. SLACK_TEST_AUTH and SLACK_WHO_AM_I have no Input Parameters section (zero args).",
+  "tools": {
+    "SLACK_SEND_MESSAGE": {
+      "params": [
+        {
+          "name": "blocks",
+          "type": "array",
+          "required": false,
+          "description": "Use this instead of `markdown_text` only when you need Slack Block Kit capabilities that Markdown cannot express: buttons, approval/reject actions, select me..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID or name of the channel, private group, or IM channel to send the message to. Can be specified as either 'channel' or 'channel_id'. Do NOT include the '#'..."
+        },
+        {
+          "name": "thread_ts",
+          "type": "string",
+          "required": false,
+          "description": "Timestamp (`ts`) of an existing message to make this a threaded reply. Use `ts` of the parent message, not another reply. Example: '1476746824.000004'."
+        },
+        {
+          "name": "unfurl_links",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable unfurling of text-based URLs. Defaults `false` for bots, `true` if `as_user` is `true`."
+        },
+        {
+          "name": "unfurl_media",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable media previews (images, videos) from URLs. Set to `true` (default) to show media previews, `false` to hide them."
+        },
+        {
+          "name": "fallback_text",
+          "type": "string",
+          "required": false,
+          "description": "Optional only when using `blocks`. Maps to Slack's top-level `text` field for notifications, accessibility, search previews, and clients that cannot render b..."
+        },
+        {
+          "name": "markdown_text",
+          "type": "string",
+          "required": false,
+          "description": "Use this for normal LLM-written message content. Pass standard Markdown exactly as written; this tool sends it to Slack's native `markdown_text` argument wit..."
+        },
+        {
+          "name": "reply_broadcast",
+          "type": "boolean",
+          "required": false,
+          "description": "If `true` for a threaded reply, also posts to main channel. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_UPDATES_A_SLACK_MESSAGE": {
+      "params": [
+        {
+          "name": "ts",
+          "type": "string",
+          "required": true,
+          "description": "Timestamp of the message to update (string, Unix time with microseconds, e.g., `'1234567890.123456'`)."
+        },
+        {
+          "name": "blocks",
+          "type": "array",
+          "required": false,
+          "description": "Use this instead of `markdown_text` only when updating to Slack Block Kit capabilities that Markdown cannot express: buttons, approval/reject actions, select..."
+        },
+        {
+          "name": "as_user",
+          "type": "boolean",
+          "required": false,
+          "description": "Pass `true` to update the message as the authenticated user; applicable to bot users as well."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID or name of the channel, private group, or IM channel containing the message to update. Can be specified as either 'channel' or 'channel_id'. Do NOT includ..."
+        },
+        {
+          "name": "file_ids",
+          "type": "array",
+          "required": false,
+          "description": "Array of file IDs to attach to the updated message. Files must already be uploaded to Slack."
+        },
+        {
+          "name": "metadata",
+          "type": "object",
+          "required": false,
+          "description": "JSON object containing `event_type` (string) and `event_payload` (dict) fields for adding custom metadata to the message."
+        },
+        {
+          "name": "fallback_text",
+          "type": "string",
+          "required": false,
+          "description": "Optional only when using `blocks`. Maps to Slack's top-level `text` field for notifications, accessibility, search previews, and clients that cannot render b..."
+        },
+        {
+          "name": "markdown_text",
+          "type": "string",
+          "required": false,
+          "description": "Use this for normal LLM-written updated message content. Pass standard Markdown exactly as written; this tool sends it to Slack's native `markdown_text` argu..."
+        },
+        {
+          "name": "reply_broadcast",
+          "type": "boolean",
+          "required": false,
+          "description": "If `true` and the message is a thread reply, broadcast the updated message to the channel. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_DELETES_A_MESSAGE_FROM_A_CHAT": {
+      "params": [
+        {
+          "name": "ts",
+          "type": "string",
+          "required": false,
+          "description": "Timestamp of the message to be deleted. Must be the exact Slack message timestamp string with fractional precision, e.g., '1234567890.123456'. Thread replies..."
+        },
+        {
+          "name": "as_user",
+          "type": "boolean",
+          "required": false,
+          "description": "Legacy parameter for classic Slack apps. Pass true to delete the message as the authed user. Bot tokens can only delete messages posted by that bot. This par..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the channel, private group, or direct message conversation containing the message to be deleted."
+        }
+      ]
+    },
+    "SLACK_SEND_EPHEMERAL_MESSAGE": {
+      "params": [
+        {
+          "name": "text",
+          "type": "string",
+          "required": false,
+          "description": "The message text to display. Required unless 'blocks' or 'attachments' is provided. When using blocks, this serves as fallback text for notifications. Suppor..."
+        },
+        {
+          "name": "user",
+          "type": "string",
+          "required": true,
+          "description": "User ID of the user to send the ephemeral message to."
+        },
+        {
+          "name": "parse",
+          "type": "string",
+          "required": false,
+          "description": "Controls text parsing behavior. Use 'full' to enable automatic linking of @mentions, #channels, and URLs. Use 'none' to disable special parsing (URLs will st..."
+        },
+        {
+          "name": "blocks",
+          "type": "string",
+          "required": false,
+          "description": "A JSON-based array of structured blocks, presented as a URL-encoded string."
+        },
+        {
+          "name": "as_user",
+          "type": "boolean",
+          "required": false,
+          "description": "Legacy parameter for authenticated user authorship. Defaults to true without chat:write:bot scope, false otherwise. Setting to true requires chat:write:user..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "Channel, private group, or DM channel to send message to. Can be an encoded ID, or a name. **IMPORTANT:** org-wide (Enterprise Grid) tokens cannot resolve ch..."
+        },
+        {
+          "name": "icon_url",
+          "type": "string",
+          "required": false,
+          "description": "URL to an image to use as the icon for this message. Must be used in conjunction with as_user set to false, otherwise ignored. See authorship below."
+        },
+        {
+          "name": "username",
+          "type": "string",
+          "required": false,
+          "description": "Set your bot's user name. Must be used in conjunction with as_user set to false, otherwise ignored. See authorship below."
+        },
+        {
+          "name": "thread_ts",
+          "type": "string",
+          "required": false,
+          "description": "Provide another message's ts value to make this message a reply. Avoid using a reply's ts value; use its parent instead."
+        },
+        {
+          "name": "icon_emoji",
+          "type": "string",
+          "required": false,
+          "description": "Emoji to use as the icon for this message. Overrides icon_url. Must be used in conjunction with as_user set to false, otherwise ignored. See authorship below."
+        },
+        {
+          "name": "link_names",
+          "type": "boolean",
+          "required": false,
+          "description": "Find and link channel names and usernames."
+        },
+        {
+          "name": "attachments",
+          "type": "string",
+          "required": false,
+          "description": "This is Slack's legacy 'secondary attachments' field for adding rich formatting elements like colored sidebars, structured fields, and author info. Pass as a..."
+        },
+        {
+          "name": "markdown_text",
+          "type": "string",
+          "required": false,
+          "description": "PREFERRED: Write your ephemeral message in markdown for nicely formatted display. Supports: headers (# ## ###), bold (**text** or __text__), italic (*text* o..."
+        }
+      ]
+    },
+    "SLACK_SCHEDULE_MESSAGE": {
+      "params": [
+        {
+          "name": "text",
+          "type": "string",
+          "required": false,
+          "description": "This sends raw text only, use markdown_text field for formatting. Primary text of the message; formatting with `mrkdwn` applies. Required if `blocks` and `at..."
+        },
+        {
+          "name": "parse",
+          "type": "string",
+          "required": false,
+          "description": "Message text treatment: `full` for special formatting, `none` otherwise (default). See Slack's `chat.postMessage` docs for options."
+        },
+        {
+          "name": "blocks",
+          "type": "string",
+          "required": false,
+          "description": "**DEPRECATED**: Use `markdown_text` field instead. JSON array of structured blocks as a URL-encoded string for message layout and design. Required if `text`..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "Channel, private group, or DM channel ID (e.g., C1234567890) or name (e.g., #general) to send the message to. Bot must be a member of the target channel; mis..."
+        },
+        {
+          "name": "post_at",
+          "type": "string",
+          "required": false,
+          "description": "Unix EPOCH timestamp (integer seconds since 1970-01-01 00:00:00 UTC) for the future message send time. Must be strictly greater than current time (past value..."
+        },
+        {
+          "name": "thread_ts",
+          "type": "string",
+          "required": false,
+          "description": "Timestamp of the parent message for the scheduled message to be a thread reply. Must be float seconds (e.g., `1234567890.123456`)."
+        },
+        {
+          "name": "link_names",
+          "type": "boolean",
+          "required": false,
+          "description": "Pass true to automatically link channel names (e.g., #general) and usernames (e.g., @user). NOTE: This parameter is deprecated by Slack; the linking behavior..."
+        },
+        {
+          "name": "attachments",
+          "type": "string",
+          "required": false,
+          "description": "This is Slack's legacy 'secondary attachments' field for adding rich formatting elements like colored sidebars, structured fields, and author info. Pass as a..."
+        },
+        {
+          "name": "unfurl_links",
+          "type": "boolean",
+          "required": false,
+          "description": "Pass false to disable automatic link unfurling. Defaults to true. NOTE: Due to a known Slack API limitation, this parameter may not be respected for schedule..."
+        },
+        {
+          "name": "unfurl_media",
+          "type": "boolean",
+          "required": false,
+          "description": "Pass false to disable automatic media unfurling. Defaults to true. NOTE: Due to a known Slack API limitation, this parameter may not be respected for schedul..."
+        },
+        {
+          "name": "markdown_text",
+          "type": "string",
+          "required": false,
+          "description": "**PREFERRED**: Write your scheduled message in markdown for nicely formatted display. Supports headers (#), bold (**text**), italic (*text*), strikethrough (..."
+        },
+        {
+          "name": "reply_broadcast",
+          "type": "boolean",
+          "required": false,
+          "description": "With `thread_ts`, makes reply visible to all in channel, not just thread members. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_LIST_SCHEDULED_MESSAGES": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum messages per page (1-1000). Defaults to 100."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from `response_metadata.next_cursor` of a previous response. Omit for the first page."
+        },
+        {
+          "name": "latest",
+          "type": "string",
+          "required": false,
+          "description": "Latest UNIX timestamp (exclusive) for messages. Defaults to the current time if omitted."
+        },
+        {
+          "name": "oldest",
+          "type": "string",
+          "required": false,
+          "description": "Earliest UNIX timestamp (inclusive) for messages. Defaults to 0 if omitted."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID or name of the channel (public, private, or DM) to list messages for. If omitted, lists for all accessible channels in the workspace."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        }
+      ]
+    },
+    "SLACK_DELETE_SCHEDULED_MESSAGE": {
+      "params": [
+        {
+          "name": "as_user",
+          "type": "boolean",
+          "required": false,
+          "description": "Pass true to delete the message as the authed user with chat:write:user scope. Bot users in this context are considered authed users. If not provided, defaul..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of the channel, private group, or DM conversation where the message is scheduled."
+        },
+        {
+          "name": "scheduled_message_id",
+          "type": "string",
+          "required": true,
+          "description": "Unique ID (`scheduled_message_id`) of the message to be deleted; obtained from `chat.scheduleMessage` response."
+        }
+      ]
+    },
+    "SLACK_RETRIEVE_MESSAGE_PERMALINK_URL": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the conversation or channel containing the message. This can be a public channel ID, a private channel ID, a direct message channel ID, or a multi-..."
+        },
+        {
+          "name": "message_ts",
+          "type": "string",
+          "required": true,
+          "description": "A message's `ts` value (timestamp), uniquely identifying it within a channel. Example: '1610144875.000600'."
+        }
+      ]
+    },
+    "SLACK_FETCH_CONVERSATION_HISTORY": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of messages to request in this single Slack API call (1-1000). Defaults to 100. Slack may return fewer than requested, especially for non-Mark..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from `response_metadata.next_cursor` of a previous response. Omit this for the first page; pass the returned cursor in a follow-up call to..."
+        },
+        {
+          "name": "latest",
+          "type": "string",
+          "required": false,
+          "description": "End of the time range of messages to include in results. Accepts a Unix timestamp or a Slack timestamp (e.g., '1234567890.000000'). NOTE: This filter only ap..."
+        },
+        {
+          "name": "oldest",
+          "type": "string",
+          "required": false,
+          "description": "Start of the time range of messages to include in results. Accepts a Unix timestamp or a Slack timestamp (e.g., '1234567890.000000'). NOTE: This filter only..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the public channel, private channel, direct message, or multi-person direct message to fetch history from."
+        },
+        {
+          "name": "inclusive",
+          "type": "boolean",
+          "required": false,
+          "description": "When true, includes messages at the exact 'oldest' or 'latest' boundary timestamps in results. When false (default), excludes boundary messages. Only applies..."
+        },
+        {
+          "name": "include_all_metadata",
+          "type": "boolean",
+          "required": false,
+          "description": "Return all metadata associated with messages in the conversation history. When true, includes additional metadata fields that may be present on messages."
+        }
+      ]
+    },
+    "SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION": {
+      "params": [
+        {
+          "name": "ts",
+          "type": "string",
+          "required": true,
+          "description": "Timestamp of the parent message in the thread. Must be an existing message. If no replies, only the parent message itself is returned. Must be the exact full..."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of messages to return. Fewer may be returned even if more are available."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from `response_metadata.next_cursor` of a previous response to get subsequent pages. If omitted, fetches the first page."
+        },
+        {
+          "name": "latest",
+          "type": "string",
+          "required": false,
+          "description": "Latest message timestamp in the time range to include results."
+        },
+        {
+          "name": "oldest",
+          "type": "string",
+          "required": false,
+          "description": "Oldest message timestamp in the time range to include results. Must be a UTC-based Slack ts string; incorrect timezone conversion or rounding can produce emp..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of the conversation (channel, direct message, etc.) to fetch the thread from. Must be a channel ID, not a channel name. Token must have membership in priv..."
+        },
+        {
+          "name": "inclusive",
+          "type": "boolean",
+          "required": false,
+          "description": "Whether to include messages with `latest` or `oldest` timestamps in results. Effective only if `latest` or `oldest` is specified."
+        },
+        {
+          "name": "include_all_metadata",
+          "type": "boolean",
+          "required": false,
+          "description": "Return all metadata associated with messages in the thread. When true, includes additional metadata fields that may be present on messages."
+        }
+      ]
+    },
+    "SLACK_LIST_UNREAD_CHANNEL_MESSAGES": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of unread messages to return (1-1000). Defaults to 25. Use pagination cursor for additional messages."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from response_metadata.next_cursor of a previous response. Omit for the first page."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the channel to fetch unread messages from. Must be a channel, private channel, or group DM that the authenticated user is a member of."
+        },
+        {
+          "name": "include_all_metadata",
+          "type": "boolean",
+          "required": false,
+          "description": "Return all metadata associated with messages. When true, includes additional metadata fields."
+        }
+      ]
+    },
+    "SLACK_SEARCH_MESSAGES": {
+      "params": [
+        {
+          "name": "page",
+          "type": "integer",
+          "required": false,
+          "description": "Page number for manual pagination control. Cannot be used with auto_paginate - choose either automatic collection OR manual page control, not both."
+        },
+        {
+          "name": "sort",
+          "type": "string",
+          "required": false,
+          "description": "Sort results by `score` (relevance) or `timestamp` (chronological)."
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "description": "Without auto_paginate: Number of messages per page (max 100). With auto_paginate: Total messages desired. Set count=500 to get 500 messages with automatic pa..."
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "required": true,
+          "description": "Search query supporting various modifiers for precise filtering:          **Location Modifiers:**         - `in:#channel-name` - Messages in specific channel..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Cursor for cursor-mark pagination. Use `*` for the first call, then use `next_cursor` from the previous response for subsequent calls. This is the modern pag..."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "sort_dir",
+          "type": "string",
+          "required": false,
+          "description": "Sort direction: `asc` (ascending) or `desc` (descending)."
+        },
+        {
+          "name": "highlight",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable highlighting of search terms in results."
+        },
+        {
+          "name": "auto_paginate",
+          "type": "boolean",
+          "required": false,
+          "description": "When enabled, 'count' becomes the total messages desired instead of per-page limit. System automatically handles pagination to collect the specified total. C..."
+        }
+      ]
+    },
+    "SLACK_SEARCH_FILES": {
+      "params": [
+        {
+          "name": "page",
+          "type": "integer",
+          "required": false,
+          "description": "Page number to return, from 1 to 100."
+        },
+        {
+          "name": "sort",
+          "type": "string",
+          "required": false,
+          "description": "Sort matches by relevance score or timestamp.",
+          "enum": [
+            "score",
+            "timestamp"
+          ]
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "description": "Number of file matches to return per page, from 1 to 100."
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "required": true,
+          "description": "Slack file search query, including supported search modifiers."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "Workspace ID required for org-level Enterprise Grid tokens; omit for workspace tokens."
+        },
+        {
+          "name": "sort_dir",
+          "type": "string",
+          "required": false,
+          "description": "Sort matches in ascending or descending order.",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        },
+        {
+          "name": "highlight",
+          "type": "boolean",
+          "required": false,
+          "description": "Wrap matching terms in Slack highlight markers."
+        }
+      ]
+    },
+    "SLACK_SEARCH_ALL": {
+      "params": [
+        {
+          "name": "page",
+          "type": "integer",
+          "required": false,
+          "description": "Page number of results to return; default is 1. Iterate until total_count or page_count signals completion."
+        },
+        {
+          "name": "sort",
+          "type": "string",
+          "required": false,
+          "description": "Sort by `score` (relevance) or `timestamp` (chronological)."
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "description": "Number of results per page; default is 20; max is 100."
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "required": true,
+          "description": "Search query supporting Slack search modifiers/booleans. Date modifiers after:, before:, on: are UTC day-based; after: is exclusive, so convert time ranges t..."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "sort_dir",
+          "type": "string",
+          "required": false,
+          "description": "Sort direction: `asc` or `desc`."
+        },
+        {
+          "name": "highlight",
+          "type": "boolean",
+          "required": false,
+          "description": "If true, search terms are wrapped with markers for client-side highlighting."
+        }
+      ]
+    },
+    "SLACK_FIND_CHANNELS": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of conversations to request from Slack in this single API page before local search filtering (1 to 999). Defaults to 50. Fewer matching channe..."
+        },
+        {
+          "name": "query",
+          "type": "string",
+          "required": true,
+          "description": "Search query to find channels. Searches across channel name, topic, purpose, and description (case-insensitive partial matching). Leading '#' prefix is autom..."
+        },
+        {
+          "name": "types",
+          "type": "string",
+          "required": false,
+          "description": "Comma-separated list of channel types to include: `public_channel`, `private_channel`, `mpim` (multi-person direct message), `im` (direct message). Defaults..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from response_metadata.next_cursor of a previous response. Omit for the first page."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "exact_match",
+          "type": "boolean",
+          "required": false,
+          "description": "When true, only return channels whose name exactly matches the query (case-insensitive). Also matches against previous channel names and the 'general' flag...."
+        },
+        {
+          "name": "member_only",
+          "type": "boolean",
+          "required": false,
+          "description": "Only return channels the user is a member of. Defaults to false."
+        },
+        {
+          "name": "exclude_archived",
+          "type": "boolean",
+          "required": false,
+          "description": "Exclude archived channels from search results. Defaults to true."
+        }
+      ]
+    },
+    "SLACK_FIND_USERS": {
+      "params": [
+        {
+          "name": "email",
+          "type": "string",
+          "required": false,
+          "description": "Email address to search for. This is a convenience parameter that automatically performs an email-based search. Either email or search_query parameter is req..."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of users to request from Slack in this single API page before local search filtering (1 to 1000). Defaults to 50. Fewer matching users may be..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor from response_metadata.next_cursor of a previous users.list response. Used for general searches; omit for the first page."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "exact_match",
+          "type": "boolean",
+          "required": false,
+          "description": "When true, only returns users with exact matches on name, display name, real name, first name, last name, or email fields (case-insensitive). For email queri..."
+        },
+        {
+          "name": "include_bots",
+          "type": "boolean",
+          "required": false,
+          "description": "Include bot users in search results. Defaults to false."
+        },
+        {
+          "name": "search_query",
+          "type": "string",
+          "required": false,
+          "description": "Search query to find users. Can be a Slack user ID (e.g., 'U012ABCDEF'), email address, or name. For user IDs (starting with 'U' or 'W'), uses Slack's users...."
+        },
+        {
+          "name": "include_locale",
+          "type": "boolean",
+          "required": false,
+          "description": "Include the `locale` field for each user. Defaults to `false`."
+        },
+        {
+          "name": "include_deleted",
+          "type": "boolean",
+          "required": false,
+          "description": "Include deleted/deactivated users in search results. Defaults to false."
+        },
+        {
+          "name": "include_restricted",
+          "type": "boolean",
+          "required": false,
+          "description": "Include restricted (guest) users in search results. Defaults to true."
+        }
+      ]
+    },
+    "SLACK_LIST_ALL_CHANNELS": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of channels to return per page (1 to 1000). Fewer channels may be returned than requested. This schema defaults to 1 if omitted."
+        },
+        {
+          "name": "types",
+          "type": "string",
+          "required": false,
+          "description": "Comma-separated list of conversation types to include: `public_channel` (regular #channels everyone can join), `private_channel` (invite-only channels), `im`..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor (from a previous response's `next_cursor`) for the next page of results. Omit for the first page. Loop on `response_metadata.next_cursor` u..."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "exclude_archived",
+          "type": "boolean",
+          "required": false,
+          "description": "Excludes archived channels if true. The API defaults to false (archived channels are included)."
+        }
+      ]
+    },
+    "SLACK_LIST_CONVERSATIONS": {
+      "params": [
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the user whose conversations will be listed. If not provided, conversations for the authenticated user are returned. Non-public channels are restri..."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "The maximum number of items to return per page. Must be an integer, typically between 1 and 1000 (e.g., 100). If omitted, the API's default limit (often 100)..."
+        },
+        {
+          "name": "types",
+          "type": "string",
+          "required": false,
+          "description": "Comma-separated list of conversation types to include: `public_channel` (regular #channels everyone can join), `private_channel` (invite-only channels), `im`..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor for retrieving the next set of results. Obtain this from the `next_cursor` field in a previous response's `response_metadata`. If omitted,..."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "exclude_archived",
+          "type": "boolean",
+          "required": false,
+          "description": "Set to `true` to exclude archived channels from the list. If `false` or omitted, archived channels are typically included (the API's default behavior for omi..."
+        }
+      ]
+    },
+    "SLACK_RETRIEVE_CONVERSATION_INFORMATION": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the conversation (channel, direct message, or multi-person direct message) to retrieve information for. Effectively required — omitting this parame..."
+        },
+        {
+          "name": "include_locale",
+          "type": "boolean",
+          "required": false,
+          "description": "If true, the response will include the locale setting for the conversation. Defaults to false."
+        },
+        {
+          "name": "include_num_members",
+          "type": "boolean",
+          "required": false,
+          "description": "If true, the response will include the number of members in the conversation. Defaults to false."
+        }
+      ]
+    },
+    "SLACK_RETRIEVE_CONVERSATION_MEMBERS_LIST": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "The maximum number of members to return per page. Fewer items may be returned than the requested limit, even if more members exist and the end of the list ha..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor value for fetching specific pages of results. To retrieve the next page, provide the `next_cursor` value obtained from the `response_metada..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID of the conversation (public channel, private channel, direct message, or multi-person direct message) for which to retrieve the member list. Public channe..."
+        }
+      ]
+    },
+    "SLACK_CREATE_CHANNEL": {
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the public or private channel to create Must be lowercase, unique, and contain no spaces or periods; max 80 characters."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "is_private",
+          "type": "boolean",
+          "required": false,
+          "description": "Create a private channel instead of a public one"
+        }
+      ]
+    },
+    "SLACK_JOIN_AN_EXISTING_CONVERSATION": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of the Slack conversation (public channel, private channel, or multi-person direct message) to join."
+        }
+      ]
+    },
+    "SLACK_LEAVE_CONVERSATION": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of the conversation to leave (e.g., C1234567890)."
+        }
+      ]
+    },
+    "SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL": {
+      "params": [
+        {
+          "name": "force",
+          "type": "boolean",
+          "required": false,
+          "description": "When set to true and multiple user IDs are provided, continue inviting the valid ones while disregarding invalid IDs. Default is false."
+        },
+        {
+          "name": "users",
+          "type": "string",
+          "required": false,
+          "description": "Comma-separated string of valid Slack User IDs to invite. Up to 1000 user IDs can be included."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID of the public or private Slack channel to invite users to; must be an existing channel. Typically starts with 'C' (public) or 'G' (private/group). Bot mus..."
+        }
+      ]
+    },
+    "SLACK_REMOVE_USER_FROM_CONVERSATION": {
+      "params": [
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the user to be removed from the conversation."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID of the conversation (channel) to remove the user from."
+        }
+      ]
+    },
+    "SLACK_ARCHIVE_CONVERSATION": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack conversation to archive. This ID uniquely identifies a channel (e.g., public, private)."
+        }
+      ]
+    },
+    "SLACK_UNARCHIVE_CHANNEL": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of conversation to unarchive"
+        }
+      ]
+    },
+    "SLACK_RENAME_CONVERSATION": {
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": false,
+          "description": "New name for the conversation. Must be 80 characters or less and contain only lowercase letters, numbers, hyphens, and underscores."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID of the conversation (channel) to rename."
+        }
+      ]
+    },
+    "SLACK_SET_THE_TOPIC_OF_A_CONVERSATION": {
+      "params": [
+        {
+          "name": "topic",
+          "type": "string",
+          "required": false,
+          "description": "The new topic for the conversation. It must be a string up to 250 characters long. Text formatting and linkification are not supported."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the public channel, private channel, direct message, or multi-person direct message conversation for which the topic will be set. Must be a channel..."
+        }
+      ]
+    },
+    "SLACK_SET_CONVERSATION_PURPOSE": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the conversation (channel, direct message, or group message) to set the purpose for."
+        },
+        {
+          "name": "purpose",
+          "type": "string",
+          "required": false,
+          "description": "The new purpose for the conversation. This text will be displayed as the channel description. The maximum length is 250 characters."
+        }
+      ]
+    },
+    "SLACK_OPEN_DM": {
+      "params": [
+        {
+          "name": "users",
+          "type": "string",
+          "required": false,
+          "description": "Comma-separated string of user IDs (1 for a DM, or 2-8 for an MPIM) to open/resume a conversation. Order is preserved for MPIMs. Either `channel` or `users`..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "ID or name of an existing DM or MPIM channel to open/resume. Either `channel` or `users` must be provided."
+        },
+        {
+          "name": "return_im",
+          "type": "boolean",
+          "required": false,
+          "description": "If `true`, returns the full DM channel object. Applies only when opening a DM via a single user ID in `users` (not with `channel`)."
+        },
+        {
+          "name": "prevent_creation",
+          "type": "boolean",
+          "required": false,
+          "description": "Do not create a direct message or multi-person direct message. This is used to see if there is an existing dm or mpdm."
+        }
+      ]
+    },
+    "SLACK_CLOSE_DM": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the direct message or multi-person direct message channel to close. Example: D1234567890 or G0123456789."
+        }
+      ]
+    },
+    "SLACK_ADD_REACTION_TO_AN_ITEM": {
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the emoji to add as a reaction (e.g., 'thumbsup'). This is the emoji name without colons. For emojis with skin tone modifiers, append '::skin-tone-X'..."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "ID of the channel where the message to add the reaction to was posted."
+        },
+        {
+          "name": "timestamp",
+          "type": "string",
+          "required": true,
+          "description": "Timestamp of the message to which the reaction will be added. This is a unique identifier for the message, typically a string representing a float value like..."
+        }
+      ]
+    },
+    "SLACK_REMOVE_REACTION_FROM_ITEM": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "ID of the file to remove the reaction from."
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the emoji reaction to remove (e.g., 'thumbsup'), without colons. Must be Slack's canonical emoji name; non-canonical names return a 'no_reaction' error."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "Channel ID of the message. Required if `timestamp` is provided."
+        },
+        {
+          "name": "timestamp",
+          "type": "string",
+          "required": false,
+          "description": "Timestamp of the message. Required if `channel` is provided."
+        },
+        {
+          "name": "file_comment",
+          "type": "string",
+          "required": false,
+          "description": "ID of the file comment to remove the reaction from."
+        }
+      ]
+    },
+    "SLACK_FETCH_ITEM_REACTIONS": {
+      "params": [
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "File ID. Use instead of channel/timestamp or file comment ID."
+        },
+        {
+          "name": "full",
+          "type": "boolean",
+          "required": false,
+          "description": "If true, returns the complete list of users for each reaction."
+        },
+        {
+          "name": "channel",
+          "type": "string",
+          "required": false,
+          "description": "Channel ID. Required if `timestamp` is provided and no file or file comment ID is given."
+        },
+        {
+          "name": "timestamp",
+          "type": "string",
+          "required": false,
+          "description": "Message timestamp (e.g., '1234567890.123456'). Required if `channel` is provided and no file or file comment ID is given. Thread reply timestamps are tracked..."
+        },
+        {
+          "name": "file_comment",
+          "type": "string",
+          "required": false,
+          "description": "File comment ID. Use instead of channel/timestamp or file ID."
+        }
+      ]
+    },
+    "SLACK_LIST_USER_REACTIONS": {
+      "params": [
+        {
+          "name": "full",
+          "type": "boolean",
+          "required": false,
+          "description": "If true, return the complete reaction list, which may include reactions to deleted items. Significantly inflates payload size; enable only when reactions to..."
+        },
+        {
+          "name": "page",
+          "type": "integer",
+          "required": false,
+          "description": "Page number of results to return."
+        },
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "Reactions made by this user. Defaults to the authed user."
+        },
+        {
+          "name": "count",
+          "type": "integer",
+          "required": false,
+          "description": "Number of items to return per page."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of items to return; fewer items may be returned. Use with cursor-based pagination."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor. Set to `next_cursor` from a previous response's `response_metadata`. See Slack API pagination documentation for details."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        }
+      ]
+    },
+    "SLACK_PIN_ITEM": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the channel where the message will be pinned."
+        },
+        {
+          "name": "timestamp",
+          "type": "string",
+          "required": true,
+          "description": "Timestamp of the message to pin, in ‘epoch_time.microseconds’ format (e.g., ‘1624464000.000200’). This is required by the Slack pins.add API."
+        }
+      ]
+    },
+    "SLACK_UNPIN_ITEM": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the channel where the message is pinned (e.g., a public channel, private channel, or direct message)."
+        },
+        {
+          "name": "timestamp",
+          "type": "string",
+          "required": true,
+          "description": "Timestamp of the message to unpin. This is required to identify the specific message to be removed from the channel's pinned items."
+        }
+      ]
+    },
+    "SLACK_LIST_PINNED_ITEMS": {
+      "params": [
+        {
+          "name": "channel",
+          "type": "string",
+          "required": true,
+          "description": "The ID of the channel to retrieve pinned items from. This can be a public channel ID, private group ID, or direct message channel ID."
+        }
+      ]
+    },
+    "SLACK_LIST_ALL_USERS": {
+      "params": [
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum number of items to return per page; fewer may be returned if the end of the list is reached. Recommended to set a value (e.g., 100) as Slack may erro..."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination cursor for fetching subsequent pages. Set to `next_cursor` from a previous response's `response_metadata`. Omit for the first page. Paginate until..."
+        },
+        {
+          "name": "team_id",
+          "type": "string",
+          "required": false,
+          "description": "ID of the Slack workspace (team) to operate on, e.g. T0123456789. Use only with org-level Enterprise Grid tokens when you need to target a specific workspace..."
+        },
+        {
+          "name": "include_locale",
+          "type": "boolean",
+          "required": false,
+          "description": "Include the `locale` field for each user. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_RETRIEVE_DETAILED_USER_INFORMATION": {
+      "params": [
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the user to retrieve information for. Must be a Slack user ID (U- or W-prefixed); passing emails, display names, or other non-ID strings returns a..."
+        },
+        {
+          "name": "include_locale",
+          "type": "boolean",
+          "required": false,
+          "description": "Set to `true` to include the user's locale (e.g., `en-US`) in the response. Defaults to `false`."
+        }
+      ]
+    },
+    "SLACK_FIND_USER_BY_EMAIL_ADDRESS": {
+      "params": [
+        {
+          "name": "email",
+          "type": "string",
+          "required": true,
+          "description": "The email address of the user to look up."
+        }
+      ]
+    },
+    "SLACK_RETRIEVE_USER_PROFILE_INFORMATION": {
+      "params": [
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "User ID to retrieve profile information for; defaults to the authenticated user."
+        },
+        {
+          "name": "include_labels",
+          "type": "boolean",
+          "required": false,
+          "description": "Include human-readable labels for custom profile fields. API defaults to false."
+        }
+      ]
+    },
+    "SLACK_SET_USER_PROFILE": {
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": false,
+          "description": "Name of a single profile field to set. Use with `value` if `profile` is not provided."
+        },
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "ID of the user whose profile will be updated; defaults to authenticated user. Team admins on paid teams can specify another member's ID."
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "required": false,
+          "description": "Value for the single profile field specified by `name`. Use with `name` if `profile` is not provided."
+        },
+        {
+          "name": "profile",
+          "type": "string",
+          "required": false,
+          "description": "JSON string of key-value pairs for profile fields to update (max 50 fields, 255 chars per field name). Pass as a plain JSON string (not URL-encoded). If prov..."
+        }
+      ]
+    },
+    "SLACK_GET_USER_PRESENCE": {
+      "params": [
+        {
+          "name": "user",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the user to query for presence information. This is a string identifier, typically starting with 'U' or 'W' (e.g., 'U123ABC456'). If not provided,..."
+        }
+      ]
+    },
+    "SLACK_SET_USER_PRESENCE": {
+      "params": [
+        {
+          "name": "presence",
+          "type": "string",
+          "required": true,
+          "description": "The presence state to set for the user.",
+          "enum": [
+            "auto",
+            "away"
+          ]
+        }
+      ]
+    },
+    "SLACK_FETCH_TEAM_INFO": {
+      "params": [
+        {
+          "name": "team",
+          "type": "string",
+          "required": false,
+          "description": "The ID of the team to retrieve information for. If omitted, information for the current team (associated with the authentication token) is returned. The toke..."
+        },
+        {
+          "name": "domain",
+          "type": "string",
+          "required": false,
+          "description": "Query by domain instead of team (only when team is null). This only works for domains in the same enterprise as the querying team token. This also expects th..."
+        }
+      ]
+    },
+    "SLACK_LIST_CUSTOM_EMOJIS": {
+      "params": [
+        {
+          "name": "include_categories",
+          "type": "boolean",
+          "required": false,
+          "description": "Include a list of categories for Unicode emoji and the emoji in each category. When true, the response will include 'categories' and 'categories_version' fie..."
+        }
+      ]
+    },
+    "SLACK_TEST_AUTH": {
+      "params": []
+    },
+    "SLACK_WHO_AM_I": {
+      "params": []
+    },
+    "SLACK_API_TEST": {
+      "params": [
+        {
+          "name": "foo",
+          "type": "string",
+          "required": false,
+          "description": "Example property to return in the response. This can be any arbitrary string value to test echo functionality."
+        },
+        {
+          "name": "error",
+          "type": "string",
+          "required": false,
+          "description": "Error response to return. Use this parameter to test error handling by simulating various error responses."
+        }
+      ]
+    }
+  },
+  "missing": [],
+  "slack_answers": {
+    "chat.postEphemeral_accepts_markdown_text": {
+      "answer": "yes",
+      "source": "https://docs.slack.dev/reference/methods/chat.postEphemeral.md"
+    },
+    "chat.scheduleMessage_accepts_markdown_text": {
+      "answer": "yes",
+      "source": "https://docs.slack.dev/reference/methods/chat.scheduleMessage.md"
+    },
+    "chat.update_accepts_markdown_text": {
+      "answer": "yes",
+      "source": "https://docs.slack.dev/reference/methods/chat.update.md"
+    },
+    "chat.postMessage_markdown_text_conflicts_with_blocks": {
+      "answer": "yes",
+      "detail": "markdown_text_conflict: 'Markdown text cannot be used in conjunction with blocks or text argument.' Same error listed on all four methods; markdown_text limit 12,000 chars.",
+      "source": "https://docs.slack.dev/reference/methods/chat.postMessage.md"
+    }
+  }
+}

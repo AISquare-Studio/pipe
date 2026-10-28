@@ -16,6 +16,7 @@ This repo is a monorepo of independently published PyPI packages:
 | `aisquare-pipe-n8n` | `connectors/n8n` |
 | `aisquare-pipe-github` | `connectors/github` |
 | `aisquare-pipe-graphify` | `connectors/graphify` |
+| `aisquare-pipe-slack` | `connectors/slack` |
 
 Publishing is automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
 using **PyPI Trusted Publishing (OIDC)** — no API tokens are stored anywhere.

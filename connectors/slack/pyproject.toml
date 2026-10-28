@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe-slack"
+version = "0.1.0"
+description = "Slack toolkit (messages, history, search, channels, DMs, reactions, pins, users) for aisquare.pipe, acting as a user or as the app's bot"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "A-Square"}]
+dependencies = [
+    "aisquare-pipe>=0.3.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "types-requests"]
+
+[project.entry-points."aisquare_pipe.toolkits"]
+slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff.lint.isort]
+# Same import grouping whatever directory ruff runs from (the repo root sees
+# src/aisquare as first-party otherwise).
+known-first-party = ["aisquare_pipe_slack"]
+known-third-party = ["aisquare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
