@@ -36,8 +36,11 @@ Each connector is its own independently published pip package under `connectors/
 | Local filesystem | `aisquare-pipe-local` | ✓ | ✓ |
 | Dropbox | `aisquare-pipe-dropbox` | ✓ | ✓ |
 | OneDrive | `aisquare-pipe-onedrive` | ✓ | ✓ |
+| Google Drive | `aisquare-pipe-googledrive` | ✓ | ✓ |
 | Salesforce | `aisquare-pipe-salesforce` |   | ✓ |
 | DocuSign | `aisquare-pipe-docusign` |   | ✓ |
+| Composio | `aisquare-pipe-composio` |   | ✓ |
+| GitHub | `aisquare-pipe-github` |   | ✓ |
 
 Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
