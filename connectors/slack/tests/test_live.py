@@ -9,6 +9,7 @@ DM. Posts, reacts to and deletes its own messages there.
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -54,11 +55,20 @@ def test_unread_on_a_dm():
     assert "last_read" in _call("SLACK_LIST_UNREAD_CHANNEL_MESSAGES", {"channel": DM})
 
 
-def test_attribution_name_with_punctuation_posts():
-    # Per-format escaping: check by eye in the channel that it reads "R&D <bot>".
+@pytest.mark.parametrize("name", ["pipe.ai (R&D)", "R_D *bot* <x>"])
+def test_attribution_name_with_punctuation_shows_no_backslash(name):
+    # The marker is escaped per format: in markdown_text, only markup
+    # characters get a backslash. Slack must render the name without the
+    # backslashes. If the second case fails, Slack doesn't honour CommonMark
+    # escapes in markdown_text, and markdown_marker must avoid them.
     posted = _call("SLACK_SEND_MESSAGE", {"channel": CHANNEL, "markdown_text": "escaping check"},
-                   attribution_name="R&D <bot>")
-    _call("SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", {"channel": CHANNEL, "ts": posted["ts"]})
+                   attribution_name=name)
+    try:
+        shown = json.dumps({k: posted["message"].get(k) for k in ("text", "blocks")})
+        assert "\\\\" not in shown, shown
+        assert "Sent by" in shown
+    finally:
+        _call("SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", {"channel": CHANNEL, "ts": posted["ts"]})
 
 
 def test_post_update_react_delete_as_the_user():

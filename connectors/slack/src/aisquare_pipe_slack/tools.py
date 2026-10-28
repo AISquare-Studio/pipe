@@ -200,10 +200,17 @@ def _search_props(sort_enum: bool = True) -> dict[str, Any]:
 # Argument helpers
 # --------------------------------------------------------------------------
 
-#: IDs of conversations (C/G/D) and users (U/W) — passed through as they
-#: are. Slack IDs always carry a digit, so an all-caps name ('GENERAL') is
-#: still looked up as a name.
-_ID = re.compile(r"^[CGDUW](?=[A-Z0-9]*[0-9])[A-Z0-9]{6,}$")
+#: The shape of a conversation (C/G/D) or user (U/W) ID. Slack doesn't say
+#: IDs carry a digit (Slackbot is USLACKBOT), and a person may type a channel
+#: name in capitals ('GENERAL'). So a value of this shape *with* a digit is
+#: used as an ID at once. One without a digit is tried as a name first, and
+#: used as an ID when no such name exists: channel names are never uppercase.
+_ID = re.compile(r"^[CGDUW][A-Z0-9]{6,}$")
+_DIGIT = re.compile(r"[0-9]")
+
+
+def _surely_an_id(text: str) -> bool:
+    return bool(_ID.match(text) and _DIGIT.search(text))
 
 
 def _invalid(message: str) -> ToolError:
@@ -247,9 +254,10 @@ def _scan(call: SlackCall, method: str, key: str, args: Mapping[str, Any], curso
 def resolve_channel(call: SlackCall, value: Any, *, archived: bool = False) -> str:
     """A conversation ID for ``value``: an ID as it is, a name (with or
     without '#') looked up among the channels this connection can see.
-    Ambiguity is refused, never guessed."""
+    Ambiguity is refused, never guessed. An all-caps value that names no
+    channel is taken as an ID (see :data:`_ID`)."""
     text = str(value).strip()
-    if _ID.match(text):
+    if _surely_an_id(text):
         return text
     name = text.removeprefix("#").strip().lower()
     if not name:
@@ -276,6 +284,8 @@ def resolve_channel(call: SlackCall, value: Any, *, archived: bool = False) -> s
             "(find it with SLACK_FIND_CHANNELS)"
         )
     if not matches:
+        if _ID.match(text):
+            return text
         raise ToolError(
             f"no channel named '#{name}' among the channels this Slack connection can see — check "
             "the name or pass the channel ID (SLACK_FIND_CHANNELS)",
@@ -310,8 +320,12 @@ def _blocks(value: Any) -> list[Any] | None:
     return list(value)
 
 
-#: ASCII punctuation, which CommonMark lets a backslash escape.
-_MARKDOWN_PUNCTUATION = re.compile(r"([!-/:-@\[-`{-~])")
+#: Characters markdown_text can read as markup: emphasis and strikethrough
+#: (* _ ~), code (`), links ([ ]), Slack's <...> mentions and links, and the
+#: escape character itself. Only these get a backslash. A typical name such as
+#: 'pipe.ai (R&D)' gets none, so it reads right even if Slack ignored
+#: CommonMark escapes (undocumented; tests/test_live.py checks it).
+_MARKDOWN_MARKUP = re.compile(r"([\\`*_~\[\]<>])")
 
 
 def mrkdwn_marker(name: str) -> str:
@@ -322,9 +336,10 @@ def mrkdwn_marker(name: str) -> str:
 
 
 def markdown_marker(name: str) -> str:
-    """The marker for ``markdown_text`` (standard markdown): punctuation in
-    the name backslash-escaped, so it shows literally — entities would."""
-    return ATTRIBUTION_TEMPLATE.format(name=_MARKDOWN_PUNCTUATION.sub(r"\\\1", name))
+    """The marker for ``markdown_text`` (standard markdown): only markup
+    characters in the name are backslash-escaped (see
+    :data:`_MARKDOWN_MARKUP`). Entities would show literally."""
+    return ATTRIBUTION_TEMPLATE.format(name=_MARKDOWN_MARKUP.sub(r"\\\1", name))
 
 
 def attribution_block(name: str) -> dict[str, Any]:
@@ -660,10 +675,8 @@ def _find_users(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     if not isinstance(query, str) or not query.strip():
         raise _invalid("pass search_query (a name, display name or user ID) or email")
     query = query.strip().removeprefix("@")
-    if _ID.match(query) and query[0] in "UW":
-        payload = call.call("users.info", {"user": query, "include_locale": locale})
-        user = payload.get("user")
-        return ToolResult.ok({"has_more": False, "next_cursor": None, "members": [user] if user else []})
+    if _surely_an_id(query) and query[0] in "UW":
+        return _user_by_id(call, query, locale)
     needle = query.lower()
     exact = bool(arguments.get("exact_match"))
     wanted = _clamp(arguments.get("limit"), 50, LIST_MAX_LIMIT)
@@ -701,10 +714,24 @@ def _find_users(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         found += [_user_summary(u) for u in page if matches(u)]
         if len(found) >= wanted:
             break
+    if not found and _ID.match(query) and query[0] in "UW":
+        # A digitless all-caps ID such as USLACKBOT: no name matched it.
+        return _user_by_id(call, query, locale)
     data: dict[str, Any] = {"has_more": cursor is not None, "next_cursor": cursor}
     if cursor is not None and len(found) < wanted and pages >= SCAN_MAX_PAGES:
         data["truncated"] = True
     return ToolResult.ok({**data, "members": found})
+
+
+def _user_by_id(call: SlackCall, user_id: str, locale: Any) -> ToolResult:
+    """FIND_USERS by ID: ``users.info``; an unknown ID finds nobody."""
+    try:
+        user = call.call("users.info", {"user": user_id, "include_locale": locale}).get("user")
+    except SlackAPIError as e:
+        if e.error not in ("user_not_found", "users_not_found"):
+            raise
+        user = None
+    return ToolResult.ok({"has_more": False, "next_cursor": None, "members": [user] if user else []})
 
 
 def _reaction_name(call: SlackCall, arguments: dict[str, Any], method: str, names: tuple[str, ...]) -> ToolResult:
@@ -762,16 +789,33 @@ def _set_user_profile(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     return ToolResult.ok(_payload(call.call("users.profile.set", body, json_body=True)))
 
 
+#: What OPEN_DM returns: only what sending needs. The full conversation
+#: object (Slack's return_im) would carry the DM's latest message and read
+#: state, which is reading, and OPEN_DM is a send-tier tool (manager ruling).
+_DM_CHANNEL_FIELDS = ("id", "is_im", "is_mpim", "user")
+_DM_RESULT_FIELDS = ("already_open", "no_op")
+
+
 def _open_dm(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
+    """``conversations.open`` without ``return_im``, returning the channel
+    ID (plus ``is_im`` / ``user`` and ``already_open`` / ``no_op``) and
+    never message content, for every identity and tier."""
     if not arguments.get("users") and not arguments.get("channel"):
         raise _invalid("pass users (1 user for a DM, 2–8 for a group DM) or the channel to resume")
     sent = {
         "users": _id_list(arguments["users"], "users") if arguments.get("users") else None,
         "channel": arguments.get("channel"),
-        "return_im": arguments.get("return_im"),
         "prevent_creation": arguments.get("prevent_creation"),
     }
-    return ToolResult.ok(_payload(call.call("conversations.open", sent)))
+    payload = call.call("conversations.open", sent)
+    channel = payload.get("channel")
+    data: dict[str, Any] = {
+        "channel": {k: channel[k] for k in _DM_CHANNEL_FIELDS if k in channel}
+        if isinstance(channel, Mapping)
+        else None
+    }
+    data.update({k: payload[k] for k in _DM_RESULT_FIELDS if k in payload})
+    return ToolResult.ok(data)
 
 
 def _api_test(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -1386,12 +1430,12 @@ CATALOG: tuple[SlackTool, ...] = (
         "SLACK_OPEN_DM", TIER_SEND, "dms", "conversations.open",
         "Open (or find) a DM with one user, or a group DM with 2–8 users, and return its channel "
         "ID (D…) for SLACK_SEND_MESSAGE. Returns the existing conversation when there is one "
-        "(already_open). As the bot: DMs only, not group DMs.",
+        "(already_open). Returns the channel ID only, never the DM's messages (read them with "
+        "SLACK_FETCH_CONVERSATION_HISTORY). As the bot: DMs only, not group DMs.",
         _schema(
             {
                 "users": USERS_LIST,
                 "channel": _string("Resume this existing DM or group DM instead (its ID)."),
-                "return_im": _boolean("Return the full DM object."),
                 "prevent_creation": _boolean("Only find an existing DM; don't create one."),
             }
         ),

@@ -33,6 +33,10 @@ DROPPED: dict[str, dict[str, str]] = {
     },
     "SLACK_SCHEDULE_MESSAGE": {"attachments": "legacy secondary attachments; use blocks"},
     "SLACK_SEARCH_MESSAGES": {"auto_paginate": "one page per call, with next_page / next_cursor hints"},
+    "SLACK_OPEN_DM": {
+        "return_im": "returns the DM's latest message and read state, which is reading; OPEN_DM is "
+        "send tier, so it returns the channel ID only (manager ruling)"
+    },
 }
 
 SLUGS = sorted(COMPOSIO)

@@ -112,6 +112,11 @@ edits there.
 > default for the bot. Enable it only for workspace admins or the person who
 > installed the app.
 
+`SLACK_OPEN_DM` is a send step, so it returns only what sending needs: the channel ID
+(plus `is_im` / `user` and `already_open` / `no_op`). This holds for every identity
+and tier. Composio's `return_im` is not accepted, because the full DM object carries
+the latest message and read state.
+
 `identity` comes from config. The token's own kind isn't checked, because Slack has
 changed token prefixes before. Where the two can disagree, the toolkit fails safe:
 the "Sent by" marker is dropped only when the token is positively a bot token
@@ -131,9 +136,14 @@ added depends on the content:
   `markdown_text` with blocks, so a context block isn't possible here.
 - **plain `text`:** a final italic line.
 
-The name is escaped for each format. In mrkdwn (`text`, context blocks), `&`, `<`
-and `>` become entities. In `markdown_text`, punctuation is backslash-escaped, so a
-name like `R&D <bot>` shows literally in both. Slack caps `markdown_text` at 12,000
+The name is escaped for each format:
+
+- **mrkdwn** (`text`, context blocks): `&`, `<` and `>` become entities.
+- **`markdown_text`**: only the characters markdown would read as markup get a
+  backslash: `` \ ` * _ ~ [ ] < > ``. A typical name such as `pipe.ai (R&D)` gets
+  none, so it shows as written either way. Slack doesn't document whether
+  `markdown_text` honours CommonMark escapes; `tests/test_live.py` checks the posted
+  message for stray backslashes. Slack caps `markdown_text` at 12,000
 characters including the marker line, so the toolkit refuses longer content with
 `invalid_arguments` before sending. The error says how much room is left.
 
@@ -161,8 +171,11 @@ put their hints **first**, so they survive a caller truncating the result:
   is **refused** with `invalid_arguments`, never guessed.
   - The same applies when the lookup stops at its cap (2,000 channels) with more
     left: one match so far isn't proof there's no second one.
-  - IDs always contain a digit, so an all-caps name like `GENERAL` is still looked
-    up as a name.
+  - An ID-shaped value containing a digit (`C04PRODUCT`) is used as an ID straight
+    away. An all-caps value without one (`GENERAL`, `CABCDEFGH`) is tried as a name
+    first, and used as an ID if no channel has that name, since channel names are
+    never uppercase. Slack doesn't promise IDs contain a digit: Slackbot is
+    `USLACKBOT`. `SLACK_FIND_USERS` does the same with `users.info`.
 
 ## Errors
 

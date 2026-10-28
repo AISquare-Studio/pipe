@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any, ClassVar
 
 import pytest
 import requests
@@ -231,6 +232,43 @@ class TestIdentity:
             (READ | SEND) - USER_ONLY
         )
 
+    BOB_DM: ClassVar[dict[str, Any]] = {
+        "id": "D0BOB1234",
+        "is_im": True,
+        "user": "U0BOB1234",
+        "last_read": "1761312000.004100",
+        "latest": {"type": "message", "user": "U0BOB1234", "text": "bob's private note to the bot"},
+        "unread_count": 1,
+        "unread_count_display": 1,
+    }
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            BOT_CONFIG,  # the bot's send-only default
+            {**USER_CONFIG, "enabled_tiers": ["send"]},
+            USER_CONFIG,
+            {**BOT_CONFIG, "enabled_tiers": ALL_TIERS},
+        ],
+        ids=["bot-default", "user-send-only", "user-default", "bot-all-tiers"],
+    )
+    def test_open_dm_returns_only_what_sending_needs(self, config):
+        # Manager ruling on MJ1 / tester seq 4682: OPEN_DM is send tier, so for
+        # every identity and tier it returns the channel ID, never DM content.
+        h = harness(ok(channel=self.BOB_DM, already_open=True))
+        result = h.call("SLACK_OPEN_DM", {"users": "U0BOB1234", "return_im": True}, config)
+        assert result.successful, result.error
+        assert h.session.last.args == {"users": "U0BOB1234"}  # return_im is never sent
+        assert result.data == {
+            "channel": {"id": "D0BOB1234", "is_im": True, "user": "U0BOB1234"},
+            "already_open": True,
+        }
+        for key in ("latest", "last_read", "unread_count", "unread_count_display", "private note"):
+            assert key not in json.dumps(result.data)
+
+    def test_open_dm_has_no_return_im_argument(self):
+        assert "return_im" not in TOOLS["SLACK_OPEN_DM"].spec.input_schema["properties"]
+
     def test_the_user_keeps_read_and_send(self):
         assert {t.slug for t in SlackToolkit().available_tools({**USER_CONFIG, "identity": "user"})} == READ | SEND
 
@@ -268,9 +306,10 @@ class TestAttribution:
 
     def test_name_is_escaped_for_each_format(self):
         name = "<!channel> R&D_*"
-        # markdown_text: backslash escapes (entities would show literally).
+        # markdown_text: backslashes on markup characters only (entities would
+        # show literally).
         assert self._sent(SEND_ARGS, attribution_name=name)["markdown_text"].endswith(
-            "_Sent by \\<\\!channel\\> R\\&D\\_\\*_"
+            "_Sent by \\<!channel\\> R&D\\_\\*_"
         )
         # mrkdwn (text, context blocks): entities for & < >.
         text = self._sent({"channel": C, "user": "U0123456", "text": "x"}, "SLACK_SEND_EPHEMERAL_MESSAGE",
@@ -278,6 +317,12 @@ class TestAttribution:
         assert text.endswith("_Sent by &lt;!channel&gt; R&amp;D_*_")
         block = self._sent({"channel": C, "blocks": [{"type": "divider"}]}, attribution_name=name)["blocks"][-1]
         assert block["elements"][0]["text"] == "Sent by &lt;!channel&gt; R&amp;D_*"
+
+    @pytest.mark.parametrize("name", ["pipe.ai (R&D)", "pipe by aisquare", "AISquare #1!", "R&D: agents/bots"])
+    def test_ordinary_punctuation_needs_no_backslash(self, name):
+        # Whether markdown_text honours CommonMark escapes is undocumented, so a
+        # typical name must not depend on it.
+        assert self._sent(SEND_ARGS, attribution_name=name)["markdown_text"].endswith(f"_Sent by {name}_")
 
     def test_blank_name_falls_back(self):
         assert self._sent(SEND_ARGS, attribution_name="   ")["markdown_text"].endswith("_Sent by pipe_")
@@ -414,6 +459,13 @@ class TestChannelNames:
         assert h.session.methods == ["conversations.list", "chat.postMessage"]
         assert h.session.last.args["channel"] == C
 
+    def test_an_all_caps_value_that_names_no_channel_is_an_id(self):
+        # Slack doesn't promise a digit in IDs; channel names are never uppercase.
+        h = harness(channels_page({"id": C, "name": "general"}), ok())
+        assert h.call("SLACK_SEND_MESSAGE", {"channel": "CABCDEFGH", "markdown_text": "hi"}).successful
+        assert h.session.methods == ["conversations.list", "chat.postMessage"]
+        assert h.session.last.args["channel"] == "CABCDEFGH"
+
     def test_an_unknown_name_is_not_found(self):
         h = harness(channels_page({"id": C, "name": "general"}))
         result = h.call("SLACK_SEND_MESSAGE", {"channel": "#nope", "markdown_text": "hi"})
@@ -506,6 +558,19 @@ class TestComposites:
         result = h.call("SLACK_FIND_USERS", {"search_query": "WILLIAMS", "limit": 1})
         assert h.session.methods == ["users.list"]
         assert [u["id"] for u in result.data["members"]] == ["U0123456"]
+
+    def test_find_users_falls_back_to_a_digitless_id(self):
+        slackbot = {"id": "USLACKBOT", "name": "slackbot", "is_bot": True}
+        h = harness(ok(members=[slackbot, {"id": "U0123456", "name": "sam"}]), ok(user=slackbot))
+        result = h.call("SLACK_FIND_USERS", {"search_query": "USLACKBOT"})
+        assert h.session.methods == ["users.list", "users.info"]
+        assert h.session.last.args == {"user": "USLACKBOT"}
+        assert result.data["members"] == [slackbot]
+
+    def test_find_users_unknown_digitless_id_finds_nobody(self):
+        h = harness(ok(members=[]), slack_error("user_not_found"))
+        result = h.call("SLACK_FIND_USERS", {"search_query": "UNOBODYXX"})
+        assert result.successful and result.data["members"] == []
 
     def test_api_test_echoes_cannot_forge_failures(self):
         for code in ("invalid_auth", "ratelimited", "missing_scope"):
