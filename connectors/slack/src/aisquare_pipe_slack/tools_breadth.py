@@ -51,6 +51,7 @@ from aisquare_pipe_slack.tools import (
     _rpc,
     _scan,
     _schema,
+    _size,
     _string,
     _strings_schema,
     _tool,
@@ -361,22 +362,43 @@ def _canvas_access(method: str, *, needs_level: bool, max_ids: int) -> Any:
     return handler
 
 
+#: Why a cut canvas can't be read further here (lookup returns section IDs only).
+_CANVAS_CUT_HINT = (
+    "the canvas is longer than one result; the rest can't be read through this tool. "
+    "SLACK_LOOKUP_CANVAS_SECTIONS finds section IDs, which help with targeted edits "
+    "(SLACK_EDIT_CANVAS), not with reading"
+)
+
+
 def _canvas_content(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
     """canvases.getContent returns the whole canvas in one string (up to
-    1 MiB): cut at :data:`RESULT_CHAR_CAP`, flagged, with the total length."""
+    1 MiB). The result is cut so its JSON — where newlines and quotes take
+    two characters — fits :data:`RESULT_CHAR_CAP`, as S1's message lists
+    are, and is flagged with the total length."""
     sent: dict[str, Any] = {n: arguments[n] for n in ("canvas_id", "content_type") if n in arguments}
     data = _payload(call.call("canvases.getContent", sent))
     content = data.get("content")
-    if isinstance(content, str) and len(content) > RESULT_CHAR_CAP:
-        rest = {k: v for k, v in data.items() if k != "content"}
-        data = {
+    if not isinstance(content, str) or _size(data) <= RESULT_CHAR_CAP:
+        return ToolResult.ok(data)
+    rest = {k: v for k, v in data.items() if k != "content"}
+
+    def shaped(n: int) -> dict[str, Any]:
+        return {
             "truncated": True,
             "total_length": len(content),
-            "hint": "the canvas is longer than one result; find sections with SLACK_LOOKUP_CANVAS_SECTIONS",
+            "hint": _CANVAS_CUT_HINT,
             **rest,
-            "content": content[:RESULT_CHAR_CAP],
+            "content": content[:n],
         }
-    return ToolResult.ok(data)
+
+    low, high = 0, len(content)  # the longest prefix whose result fits
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _size(shaped(middle)) <= RESULT_CHAR_CAP:
+            low = middle
+        else:
+            high = middle - 1
+    return ToolResult.ok(shaped(low))
 
 
 def _num_minutes(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
@@ -809,9 +831,9 @@ BREADTH_CATALOG: tuple[SlackTool, ...] = (
     ),
     _tool(
         "SLACK_GET_CANVAS_CONTENT", TIER_READ, "canvases", "canvases.getContent",
-        "Read a whole canvas as markdown (or HTML with content_type). A canvas longer than "
-        "100,000 characters is cut (truncated: true, total_length); read parts of it by finding "
-        "sections with SLACK_LOOKUP_CANVAS_SECTIONS.",
+        "Read a whole canvas as markdown (or HTML with content_type). A canvas too long for one "
+        "result (about 100,000 characters) is cut, with truncated: true and total_length; the "
+        "rest can't be read through this tool.",
         _schema(
             {"canvas_id": CANVAS_ID, "content_type": _string("markdown (default) or html.", enum=("markdown", "html"))},
             ["canvas_id"],

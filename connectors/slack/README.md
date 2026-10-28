@@ -217,9 +217,10 @@ Files travel as real bytes (plan §4.8).
   the other.
 - **`SLACK_SET_PROFILE_PHOTO`** takes the image as `{"base64": …, "mimetype": …}`.
 - **Canvases:**
-  - `SLACK_GET_CANVAS_CONTENT` cuts a canvas over 100,000 characters
-    (`truncated: true`, `total_length`); read parts of it via
-    `SLACK_LOOKUP_CANVAS_SECTIONS`.
+  - `SLACK_GET_CANVAS_CONTENT` cuts a canvas whose result would exceed 100,000
+    characters of JSON (`truncated: true`, `total_length`). The rest can't be read
+    through this tool. `SLACK_LOOKUP_CANVAS_SECTIONS` only finds section IDs, for
+    targeted edits.
   - Access: `SLACK_SET_CANVAS_ACCESS` takes 1–20 IDs, and
     `SLACK_DELETE_CANVAS_ACCESS` takes exactly one. Both limits are checked before
     the call.

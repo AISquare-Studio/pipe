@@ -5,10 +5,12 @@ composite — end to end through ``call_tool`` with HTTP mocked."""
 from __future__ import annotations
 
 import base64
+import json
 
 import pytest
 from aisquare.pipe import DataEnvelope
 
+from aisquare_pipe_slack.constants import RESULT_CHAR_CAP
 from aisquare_pipe_slack.files import DOWNLOAD_MAX_BYTES
 
 from .fakes import (
@@ -340,15 +342,31 @@ class TestFilesAndCanvases:
         assert f"at most {ok_count} ID" in result.error
         assert h.session.calls == []
 
-    def test_canvas_content_is_cut_at_the_cap(self):
-        content = "x" * 150_000
+    @pytest.mark.parametrize(
+        "content", ["x" * 150_000, "\n" * 99_000, '"' * 60_000, "é" * 120_000], ids=["plain", "newlines", "quotes", "accents"]
+    )
+    def test_canvas_content_result_fits_the_cap(self, content):
+        # The JSON of the result must fit — newlines and quotes take two characters.
         result = harness(ok(content=content)).call("SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"})
         data = result.data
+        size = len(json.dumps(data, ensure_ascii=False))
+        assert size <= RESULT_CHAR_CAP
         assert list(data)[:3] == ["truncated", "total_length", "hint"]
-        assert (data["truncated"], data["total_length"], len(data["content"])) == (True, 150_000, 100_000)
-        assert "SLACK_LOOKUP_CANVAS_SECTIONS" in data["hint"]
+        assert (data["truncated"], data["total_length"]) == (True, len(content))
+        assert content.startswith(data["content"])
+        # The longest prefix that fits: one more character would not.
+        assert len(json.dumps({**data, "content": content[: len(data["content"]) + 1]}, ensure_ascii=False)) > (
+            RESULT_CHAR_CAP
+        )
+        assert "can't be read through this tool" in data["hint"]
+
+    def test_a_canvas_that_fits_is_returned_whole(self):
         short = harness(ok(content="# Plan")).call("SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"}).data
         assert short == {"content": "# Plan"}
+        fits = "\n" * 49_000  # under the cap even as JSON
+        assert "truncated" not in harness(ok(content=fits)).call(
+            "SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"}
+        ).data
 
     def test_create_channel_canvas_needs_a_channel(self):
         result = harness().call("SLACK_CREATE_CHANNEL_CANVAS", {"channel_id": ""}, enabled_tiers=ALL_TIERS)
