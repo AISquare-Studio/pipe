@@ -92,8 +92,6 @@ class TestArgumentChecks:
             ("SLACK_CREATE_SLACK_LIST", {"name": "x", "schema": [1]}, "'schema[0]' must be object"),
             ("SLACK_CREATE_SLACK_LIST", {"name": "x", "schema": '{"name": "a"}'}, "schema must be an array of objects"),
             ("SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS", {"list_id": LIST, "ids": " , "}, "at least one ID"),
-            ("SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS", {"list_id": LIST, "ids": [ROW] * (MAX_CELLS + 1)},
-             f"at most {MAX_CELLS}"),
             ("SLACK_SET_SLACK_LIST_ACCESS", {"list_id": LIST, "access_level": "read"}, "exactly one of"),
             ("SLACK_SET_SLACK_LIST_ACCESS",
              {"list_id": LIST, "access_level": "read", "user_ids": ["U1"], "channel_ids": ["C1"]}, "exactly one of"),
@@ -104,6 +102,14 @@ class TestArgumentChecks:
     )
     def test_lists(self, slug, args, message):
         assert message in refused(slug, args)
+
+    def test_only_updates_are_capped(self):
+        # Slack documents 100 cells per items.update; it caps neither
+        # items.create's initial_fields nor deleteMultiple's ids.
+        many = [{"column_id": f"Col{i}", "text": "x"} for i in range(MAX_CELLS + 1)]
+        assert len(sent("SLACK_CREATE_SLACK_LIST_ITEM", {"list_id": LIST, "initial_fields": many})["initial_fields"]) == 101
+        ids = [f"Rec{i:09d}" for i in range(MAX_CELLS + 1)]
+        assert sent("SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS", {"list_id": LIST, "ids": ids})["ids"] == ids
 
     def test_items_page_size_is_clamped(self):
         assert sent("SLACK_LIST_SLACK_LIST_ITEMS", {"list_id": LIST, "limit": 5000})["limit"] == 200

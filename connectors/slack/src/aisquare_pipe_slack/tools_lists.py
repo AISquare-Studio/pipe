@@ -44,7 +44,7 @@ WRITE_SCOPES = ("lists:write",)
 #: slackLists.items.list page size (default, max).
 ITEMS_DEFAULT_LIMIT = 50
 ITEMS_MAX_LIMIT = 200
-#: slackLists.items.update / deleteMultiple: at most this many per call.
+#: slackLists.items.update: at most this many cells per call (Slack's documented maximum).
 MAX_CELLS = 100
 
 LIST_ID = _string("The List's ID (F…), as SLACK_CREATE_SLACK_LIST returned it.")
@@ -123,7 +123,7 @@ def _cells(value: Any, name: str, *, row_ids: bool) -> list[dict[str, Any]]:
     cells = _objects(value, name)
     if not cells:
         raise _invalid(f"{name} is empty")
-    if len(cells) > MAX_CELLS:
+    if row_ids and len(cells) > MAX_CELLS:  # items.update's documented cap
         raise _invalid(f"{name}: at most {MAX_CELLS} cells per call")
     for cell in cells:
         if not isinstance(cell.get("column_id"), str) or not cell["column_id"]:
@@ -210,10 +210,7 @@ def _prepare_items_page(arguments: dict[str, Any], body: dict[str, Any]) -> None
 
 
 def _prepare_ids(arguments: dict[str, Any], body: dict[str, Any]) -> None:
-    ids = _id_array(body.get("ids"), "ids")
-    if len(ids) > MAX_CELLS:
-        raise _invalid(f"ids: at most {MAX_CELLS} per call")
-    body["ids"] = ids
+    body["ids"] = _id_array(body.get("ids"), "ids")
 
 
 def _prepare_access_set(arguments: dict[str, Any], body: dict[str, Any]) -> None:
@@ -370,8 +367,8 @@ LISTS_CATALOG: tuple[SlackTool, ...] = (
     ),
     _tool(
         "SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS", TIER_DESTRUCTIVE, AREA, "slackLists.items.deleteMultiple",
-        f"Delete several items (rows) of one Slack List at once (at most {MAX_CELLS}). All or "
-        "nothing: on failure none were deleted. Cannot be undone.",
+        "Delete several items (rows) of one Slack List at once. All or nothing: on failure none "
+        "were deleted. Cannot be undone.",
         _schema(
             {"list_id": LIST_ID, "ids": _ids_schema("Item IDs (Rec…): an array or a comma-separated string.")},
             ["list_id", "ids"],
