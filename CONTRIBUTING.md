@@ -255,10 +255,13 @@ What the base class does for you:
 - **`available_tools(config=None)`** is what a host lists to a model for one
   connection. The default is every tool (`tools()`). Override it when config
   switches tools off (for example, risk tiers). Keep it offline. Listing is
-  advisory, so `call_tool` must still refuse a switched-off tool. Hosts should
-  list and search through it, not through `tools()`.
+  advisory, so `call_tool` must still refuse a switched-off tool. An override
+  returns a subset of `tools()` and never raises (`[]` for an unreadable
+  config), which `contract.toolkit.available-tools` checks. Hosts should list
+  and search through it, not through `tools()`.
 - **`search_tools(query, limit=6, *, config=None)`** ranks
-  `available_tools(config)` with a deterministic keyword score (+2 per query
+  `available_tools(config)`. If you override it, keep the `*, config=None`
+  parameter. Ranking uses a deterministic keyword score (+2 per query
   term in the slug, +1 in the description or tags; first-person queries
   favour `..._AUTHENTICATED_...` tools).
 - **`validate_config(config)`** defaults to "has a non-empty

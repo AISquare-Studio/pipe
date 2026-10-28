@@ -134,6 +134,41 @@ def test_network_without_creds_fails():
     assert "network" in failed["contract.toolkit.call-no-creds"]
 
 
+def _listing(fn) -> type:
+    return type("Listing", (Good,), {"available_tools": lambda self, config=None: fn(self, config)})
+
+
+def _boom(self, config):
+    raise KeyError("enabled_tiers")
+
+
+def _dial(self, config):
+    socket.create_connection(("api.example.com", 443))
+    return self.tools()
+
+
+@pytest.mark.parametrize(
+    ("fn", "expected"),
+    [
+        (_boom, "available_tools(None) raised KeyError"),
+        (_dial, "network in available_tools(None)"),
+        (lambda self, config: tuple(self.tools()), "must return a list of ToolSpec"),
+        (lambda self, config: [{"slug": "GOOD_GET"}], "must return a list of ToolSpec"),
+        (lambda self, config: [ToolSpec("GOOD_NEW", "x", SCHEMA, read_only=True)], "outside the catalog: GOOD_NEW"),
+        (lambda self, config: self.tools() if config is None else _boom(self, config), "available_tools({}) raised"),
+    ],
+)
+def test_broken_available_tools_fails(fn, expected):
+    failed = {r.id: r.message for r in failures(run_toolkit_contract_checks(_listing(fn)))}
+    assert expected in failed["contract.toolkit.available-tools"]
+
+
+def test_a_filtered_listing_passes():
+    cls = _listing(lambda self, config: [t for t in self.tools() if t.slug == "GOOD_GET"])
+    assert failed_ids(cls) == set()
+    assert "contract.toolkit.available-tools" in {r.id for r in run_toolkit_contract_checks(Good)}
+
+
 def test_network_in_init_short_circuits():
     class Dialer(Good):
         def __init__(self):

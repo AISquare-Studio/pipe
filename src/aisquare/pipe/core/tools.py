@@ -497,9 +497,13 @@ class Toolkit(ABC):
     def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
         """The tools a connection with this ``config`` may call — what a host
         lists to a model. Default: every tool (:meth:`tools`). A toolkit
-        whose config switches tools off overrides it. Like :meth:`tools`, it
-        must not touch the network. Listing is advisory: :meth:`call_tool`
-        enforces on its own, whatever was listed."""
+        whose config switches tools off overrides it.
+
+        An override returns a subset of :meth:`tools` (the same ToolSpecs).
+        It must not raise for any ``config``, including None, ``{}`` and
+        garbage: return ``[]`` when the config can't be read. Like
+        :meth:`tools`, it must not touch the network. Listing is advisory:
+        :meth:`call_tool` enforces on its own, whatever was listed."""
         return self.tools()
 
     def search_tools(
