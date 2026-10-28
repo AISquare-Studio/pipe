@@ -9,16 +9,18 @@ import re
 from pathlib import Path
 
 from aisquare_pipe_slack import BOT_SCOPES, USER_SCOPES
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.constants import TOKEN_ROTATION
-from aisquare_pipe_slack.tools import TOOLS
 
 MANIFEST = json.loads((Path(__file__).parent.parent / "slack-app-manifest.json").read_text())
 #: Each method's scopes as docs.slack.dev's page header lists them (frozen
 #: 2026-10-28 from https://docs.slack.dev/reference/methods/<method>.md).
 #: Refresh it when a tool starts calling a new method.
 DOCS = json.loads((Path(__file__).parent / "fixtures" / "slack_method_scopes.json").read_text())
-#: A tool resolving a channel *name* also calls this method.
+#: A tool resolving a channel *name* also calls this method; these are the
+#: arguments that take one.
 LOOKUP_METHOD = "conversations.list"
+CHANNEL_ARGS = {"channel", "channel_id", "channels", "channel_ids"}
 #: Scopes a tool may declare beyond its methods' headers, and why.
 FEATURE_SCOPES = {
     ("SLACK_SEND_MESSAGE", "bot", "chat:write.public"): "lets the bot post to public channels it is not in",
@@ -86,7 +88,7 @@ def test_every_declared_scope_is_documented_for_its_methods():
     problems = []
     for slug, tool in TOOLS.items():
         methods = list(tool.methods)
-        if "channel" in tool.spec.input_schema["properties"]:
+        if CHANNEL_ARGS & set(tool.spec.input_schema["properties"]):
             methods.append(LOOKUP_METHOD)
         for side, declared in (("user", tool.user_scopes), ("bot", tool.bot_scopes or ())):
             documented = {scope for m in methods for scope in DOCS["methods"][m][side]}

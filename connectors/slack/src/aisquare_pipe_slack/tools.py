@@ -77,8 +77,15 @@ class SlackCall:
     idempotent: bool = False
     attribution: str | None = None
 
-    def call(self, method: str, args: Mapping[str, Any] | None = None, *, json_body: bool = False) -> dict[str, Any]:
-        return self.client.call(method, args, json_body=json_body, idempotent=self.idempotent)
+    def call(
+        self,
+        method: str,
+        args: Mapping[str, Any] | None = None,
+        *,
+        json_body: bool = False,
+        files: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.client.call(method, args, json_body=json_body, idempotent=self.idempotent, files=files)
 
 
 Handler = Callable[[SlackCall, dict[str, Any]], ToolResult]
@@ -907,7 +914,9 @@ def _tool(
 
 _SEND_ARGS = ("channel", "thread_ts", "reply_broadcast", "unfurl_links", "unfurl_media")
 
-CATALOG: tuple[SlackTool, ...] = (
+#: The core tools (S1). The whole catalog is assembled in
+#: :mod:`aisquare_pipe_slack.catalog`; other areas live in their own modules.
+CORE_CATALOG: tuple[SlackTool, ...] = (
     # -- messages ------------------------------------------------------------
     _tool(
         "SLACK_SEND_MESSAGE", TIER_SEND, "messages", "chat.postMessage",
@@ -1710,7 +1719,3 @@ CATALOG: tuple[SlackTool, ...] = (
         tags=("ping", "test", "connectivity", "health"),
     ),
 )
-
-
-TOOLS: dict[str, SlackTool] = {tool.spec.slug: tool for tool in CATALOG}
-TOOL_SPECS: tuple[ToolSpec, ...] = tuple(tool.spec for tool in CATALOG)

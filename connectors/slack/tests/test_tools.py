@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from aisquare_pipe_slack import SlackToolkit
-from aisquare_pipe_slack.tools import TOOLS
+from aisquare_pipe_slack.catalog import TOOLS
 
 from .fakes import ALL_TIERS, harness, ok, response, slack_error
 
@@ -325,7 +325,182 @@ CASES = [
         reply={"team": {"id": "T0123456", "name": "Acme", "domain": "acme"}},
     ),
     Case("SLACK_API_TEST", {"foo": "bar"}, "api.test", {"foo": "bar"}, reply={"args": {"foo": "bar"}}),
+    # -- breadth (S2) --------------------------------------------------------
+    Case(
+        "SLACK_SEND_ME_MESSAGE",
+        {"channel": C, "text": "is reviewing the deck"},
+        "chat.meMessage",
+        {"channel": C, "text": f"is reviewing the deck\n_{MARK}_"},
+        reply={"channel": C, "ts": TS},
+    ),
+    Case(
+        "SLACK_GET_UNREAD_MESSAGES_FROM_USER",
+        {"user_id": "U0SAM1234"},
+        "conversations.history",
+        {"channel": "D0SAM1234", "oldest": "1761000000.000100", "limit": "50"},
+        before=(
+            {"channels": [{"id": "D0OTHER1", "user": "U0BOB1234"}, {"id": "D0SAM1234", "user": "U0SAM1234"}]},
+            {"channel": {"id": "D0SAM1234", "last_read": "1761000000.000100"}},
+        ),
+        reply=MESSAGES,
+        paged="cursor",
+    ),
+    Case("SLACK_SET_READ_CURSOR_IN_A_CONVERSATION", {"channel": C, "ts": TS}, "conversations.mark", {"channel": C, "ts": TS}),
+    Case(
+        "SLACK_ADD_BOOKMARK",
+        {"channel_id": C, "title": "Roadmap", "link": "https://example.test/roadmap", "emoji": ":map:"},
+        "bookmarks.add",
+        {"channel_id": C, "title": "Roadmap", "link": "https://example.test/roadmap", "emoji": ":map:", "type": "link"},
+        reply={"bookmark": {"id": "Bk0123ABCD"}},
+    ),
+    Case(
+        "SLACK_EDIT_BOOKMARK",
+        {"channel_id": C, "bookmark_id": "Bk0123ABCD", "title": "Roadmap v2"},
+        "bookmarks.edit",
+        {"channel_id": C, "bookmark_id": "Bk0123ABCD", "title": "Roadmap v2"},
+    ),
+    Case(
+        "SLACK_REMOVE_BOOKMARK",
+        {"channel_id": C, "bookmark_id": "Bk0123ABCD"},
+        "bookmarks.remove",
+        {"channel_id": C, "bookmark_id": "Bk0123ABCD"},
+    ),
+    Case("SLACK_LIST_BOOKMARKS", {"channel_id": C}, "bookmarks.list", {"channel_id": C}, reply={"bookmarks": []}),
+    Case("SLACK_GET_TEAM_PROFILE", {"visibility": "visible"}, "team.profile.get", {"visibility": "visible"},
+         reply={"profile": {"fields": []}}),
+    Case(
+        "SLACK_SET_PROFILE_PHOTO",
+        {"image": {"base64": "iVBORw0KGgo=", "mimetype": "image/png"}, "crop_w": 512},
+        "users.setPhoto",
+        {"crop_w": "512"},
+    ),
+    Case("SLACK_DELETE_USER_PROFILE_PHOTO", {}, "users.deletePhoto", {}),
+    Case("SLACK_GET_BOT_USER", {"bot": "B0123ABCD"}, "bots.info", {"bot": "B0123ABCD"}, reply={"bot": {"id": "B0123ABCD"}}),
+    Case("SLACK_RETRIEVE_CURRENT_USER_DND_STATUS", {}, "dnd.info", {}, reply={"dnd_enabled": False}),
+    Case(
+        "SLACK_GET_USER_DND_STATUS",
+        {"users": ["U1111111", "U2222222"]},
+        "dnd.teamInfo",
+        {"users": "U1111111,U2222222"},
+        reply={"users": {}},
+    ),
+    Case("SLACK_SET_DND_DURATION", {"num_minutes": "60"}, "dnd.setSnooze", {"num_minutes": "60"},
+         reply={"snooze_enabled": True}),
+    Case("SLACK_END_DND", {}, "dnd.endDnd", {}),
+    Case("SLACK_END_SNOOZE", {}, "dnd.endSnooze", {}, reply={"snooze_enabled": False}),
+    Case(
+        "SLACK_RETRIEVE_DETAILED_INFORMATION_ABOUT_A_FILE",
+        {"file": "F0123ABCD"},
+        "files.info",
+        {"file": "F0123ABCD", "limit": "100"},
+        reply={"file": {"id": "F0123ABCD"}, "comments": []},
+        paged="cursor",
+    ),
+    Case(
+        "SLACK_LIST_FILES_WITH_FILTERS_IN_SLACK",
+        {"types": "pdfs", "channel": C},
+        "files.list",
+        {"types": "pdfs", "channel": C},
+        reply={"files": [], "paging": {"count": 100, "total": 0, "page": 1, "pages": 1}},
+    ),
+    Case("SLACK_DELETE_FILE", {"file": "F0123ABCD"}, "files.delete", {"file": "F0123ABCD"}),
+    Case("SLACK_DELETE_FILE_COMMENT", {"file": "F0123ABCD", "id": "Fc0123ABCD"}, "files.comments.delete",
+         {"file": "F0123ABCD", "id": "Fc0123ABCD"}),
+    Case("SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE", {"file": "F0123ABCD"}, "files.sharedPublicURL", {"file": "F0123ABCD"},
+         reply={"file": {"permalink_public": "https://slack-files.com/T-F-x"}}),
+    Case("SLACK_REVOKE_FILE_PUBLIC_SHARING", {"file": "F0123ABCD"}, "files.revokePublicURL", {"file": "F0123ABCD"}),
+    Case(
+        "SLACK_CREATE_CANVAS",
+        {"title": "Plan", "document_content": "# Plan"},
+        "canvases.create",
+        {"title": "Plan", "document_content": {"type": "markdown", "markdown": "# Plan"}},
+        json=True,
+        reply={"canvas_id": "F0CANVAS1"},
+    ),
+    Case(
+        "SLACK_EDIT_CANVAS",
+        {"canvas_id": "F0CANVAS1", "document_content": {"type": "markdown", "markdown": "- one more"}},
+        "canvases.edit",
+        {
+            "canvas_id": "F0CANVAS1",
+            "changes": [{"operation": "insert_at_end", "document_content": {"type": "markdown", "markdown": "- one more"}}],
+        },
+        json=True,
+    ),
+    Case("SLACK_DELETE_CANVAS", {"canvas_id": "F0CANVAS1"}, "canvases.delete", {"canvas_id": "F0CANVAS1"}),
+    Case(
+        "SLACK_LOOKUP_CANVAS_SECTIONS",
+        {"canvas_id": "F0CANVAS1", "criteria": {"section_types": ["any_header"], "contains_text": "Agenda"}},
+        "canvases.sections.lookup",
+        {"canvas_id": "F0CANVAS1", "criteria": {"section_types": ["any_header"], "contains_text": "Agenda"}},
+        json=True,
+        reply={"sections": [{"id": "temp:C:abc"}]},
+    ),
+    Case("SLACK_GET_CANVAS_CONTENT", {"canvas_id": "F0CANVAS1"}, "canvases.getContent", {"canvas_id": "F0CANVAS1"},
+         reply={"content": "# Plan"}),
+    Case(
+        "SLACK_CREATE_CHANNEL_CANVAS",
+        {"channel_id": C, "document_content": "# Welcome"},
+        "conversations.canvases.create",
+        {"document_content": {"type": "markdown", "markdown": "# Welcome"}, "channel_id": C},
+        json=True,
+        reply={"canvas_id": "F0CANVAS2"},
+    ),
+    Case(
+        "SLACK_SET_CANVAS_ACCESS",
+        {"canvas_id": "F0CANVAS1", "access_level": "read", "user_ids": ["U0123456"]},
+        "canvases.access.set",
+        {"canvas_id": "F0CANVAS1", "user_ids": ["U0123456"], "access_level": "read"},
+        json=True,
+    ),
+    Case(
+        "SLACK_DELETE_CANVAS_ACCESS",
+        {"canvas_id": "F0CANVAS1", "channel_ids": [C]},
+        "canvases.access.delete",
+        {"canvas_id": "F0CANVAS1", "channel_ids": [C]},
+        json=True,
+    ),
+    Case(
+        "SLACK_CREATE_A_REMINDER",
+        {"text": "standup", "time": "in 15 minutes"},
+        "reminders.add",
+        {"text": "standup", "time": "in 15 minutes"},
+        reply={"reminder": {"id": "Rm0123ABCD"}},
+    ),
+    Case("SLACK_GET_REMINDER", {"reminder": "Rm0123ABCD"}, "reminders.info", {"reminder": "Rm0123ABCD"},
+         reply={"reminder": {"id": "Rm0123ABCD"}}),
+    Case("SLACK_LIST_REMINDERS", {}, "reminders.list", {}, reply={"reminders": []}),
+    Case("SLACK_DELETE_REMINDER", {"reminder": "Rm0123ABCD"}, "reminders.delete", {"reminder": "Rm0123ABCD"}),
+    Case(
+        "SLACK_CREATE_USER_GROUP",
+        {"name": "Design", "handle": "design", "include_count": True},
+        "usergroups.create",
+        {"name": "Design", "handle": "design", "include_count": "true"},
+        reply={"usergroup": {"id": "S0123ABCD"}},
+    ),
+    Case(
+        "SLACK_UPDATE_USER_GROUP",
+        {"usergroup": "S0123ABCD", "description": "Design team"},
+        "usergroups.update",
+        {"usergroup": "S0123ABCD", "description": "Design team"},
+    ),
+    Case("SLACK_DISABLE_USER_GROUP", {"usergroup": "S0123ABCD"}, "usergroups.disable", {"usergroup": "S0123ABCD"}),
+    Case("SLACK_ENABLE_USER_GROUP", {"usergroup": "S0123ABCD"}, "usergroups.enable", {"usergroup": "S0123ABCD"}),
+    Case("SLACK_LIST_USER_GROUPS", {"include_users": True}, "usergroups.list", {"include_users": "true"},
+         reply={"usergroups": []}),
+    Case("SLACK_LIST_USER_GROUP_MEMBERS", {"usergroup": "S0123ABCD"}, "usergroups.users.list",
+         {"usergroup": "S0123ABCD"}, reply={"users": ["U0123456"]}),
+    Case(
+        "SLACK_UPDATE_USER_GROUP_MEMBERS",
+        {"usergroup": "S0123ABCD", "users": "U1111111, U2222222"},
+        "usergroups.users.update",
+        {"usergroup": "S0123ABCD", "users": "U1111111,U2222222"},
+    ),
+    Case("SLACK_LIST_AUTH_TEAMS", {}, "auth.teams.list", {"limit": "100"}, reply={"teams": []}, paged="cursor"),
 ]
+#: Tools whose calls leave the Web API (the upload POST, the file GET): their
+#: own tests in test_breadth.py cover the same ground.
+SPECIAL = {"SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK", "SLACK_DOWNLOAD_SLACK_FILE"}
 
 IDS = [c.id for c in CASES]
 CURSOR_PAGED = [c for c in CASES if c.paged == "cursor"]
@@ -337,7 +512,7 @@ def _call(h, case: Case, **overrides: Any):
 
 
 def test_cases_cover_every_tool_exactly_once():
-    assert sorted(c.slug for c in CASES) == sorted(t.slug for t in SlackToolkit().tools())
+    assert sorted([c.slug for c in CASES] + sorted(SPECIAL)) == sorted(t.slug for t in SlackToolkit().tools())
 
 
 @pytest.mark.parametrize("case", CASES, ids=IDS)

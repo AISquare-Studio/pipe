@@ -71,6 +71,20 @@ def test_attribution_name_with_punctuation_shows_no_backslash(name):
         _call("SLACK_DELETES_A_MESSAGE_FROM_A_CHAT", {"channel": CHANNEL, "ts": posted["ts"]})
 
 
+def test_upload_download_delete_a_snippet():
+    uploaded = _call("SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK",
+                     {"content": "pipe live test", "filename": "pipe-live.txt", "channels": CHANNEL})
+    file_id = uploaded["file"]["id"]
+    try:
+        result = SlackToolkit().call_tool(
+            "SLACK_DOWNLOAD_SLACK_FILE", {"file": file_id}, {"access_token": USER_TOKEN}
+        )
+        assert result.successful, result.error
+        assert result.files[0].data == b"pipe live test"
+    finally:
+        _call("SLACK_DELETE_FILE", {"file": file_id})
+
+
 def test_post_update_react_delete_as_the_user():
     posted = _call("SLACK_SEND_MESSAGE", {"channel": CHANNEL, "markdown_text": "pipe live test"})
     ts = posted["ts"]

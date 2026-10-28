@@ -23,8 +23,9 @@ from typing import Literal
 
 from aisquare.pipe import OAuthError
 
+from aisquare_pipe_slack.catalog import CATALOG
 from aisquare_pipe_slack.constants import IDENTITY_BOT, IDENTITY_USER, TIERS
-from aisquare_pipe_slack.tools import CATALOG, SlackTool
+from aisquare_pipe_slack.tools import SlackTool
 
 #: ``build_authorize_url``'s identity: one of the two, or both in one consent.
 OAuthIdentity = Literal["user", "bot", "both"]

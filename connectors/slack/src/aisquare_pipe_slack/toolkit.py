@@ -31,6 +31,7 @@ from aisquare.pipe import (
 )
 from aisquare.pipe.core.oauth import build_authorize_url as core_build_authorize_url
 
+from aisquare_pipe_slack.catalog import TOOL_SPECS, TOOLS
 from aisquare_pipe_slack.config import (
     SlackConfigError,
     SlackSettings,
@@ -55,11 +56,12 @@ from aisquare_pipe_slack.rest import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_RETRY_WAIT,
     RATE_LIMIT_ERRORS,
+    RETRY_SOON_ERRORS,
     SlackAPIError,
     SlackWebClient,
 )
 from aisquare_pipe_slack.scopes import OAuthIdentity, scopes_for
-from aisquare_pipe_slack.tools import TOOL_SPECS, TOOLS, SlackCall, SlackTool
+from aisquare_pipe_slack.tools import SlackCall, SlackTool
 
 # --------------------------------------------------------------------------
 # Errors: Slack's ok:false codes -> ERROR_*
@@ -80,6 +82,18 @@ _KINDS: dict[str, frozenset[str]] = {
             "restricted_action_read_only_channel", "user_is_restricted",
             # A workspace setting or plan limit: retrying won't help.
             "edit_window_closed", "message_limit_exceeded", "messages_tab_disabled",
+            # S2: files, canvases, bookmarks, user groups
+            "cant_delete_file", "cant_delete", "delete_not_allowed", "file_deleting_disabled",
+            "canvas_deleting_disabled", "canvas_disabled_user_team", "canvas_disabled_file_team",
+            "canvas_globally_disabled", "free_teams_cannot_create_standalone_canvases",
+            "free_teams_cannot_edit_standalone_canvases", "team_tier_cannot_create_channel_canvases",
+            "paid_teams_only", "not_allowed", "public_file_type_not_allowed", "public_video_not_allowed",
+            "file_uploads_disabled", "file_uploads_except_images_disabled", "file_type_not_allowed",
+            "file_upload_size_restricted", "storage_limit_reached", "posting_to_channel_denied",
+            "user_is_external_guest", "cannot_bookmark_from_external_org",
+            "cannot_bookmark_restricted_sharing_enabled", "slack_connect_canvas_sharing_blocked",
+            "slack_connect_file_upload_sharing_blocked", "slack_connect_blocked_file_type",
+            "cannot_modify_role_admin", "use_skills_api",
         }
     ),
     ERROR_NOT_FOUND: frozenset(
@@ -88,6 +102,9 @@ _KINDS: dict[str, frozenset[str]] = {
             "thread_not_found", "file_not_found", "file_comment_not_found",
             "canvas_not_found", "bookmark_not_found", "no_such_subteam", "team_not_found",
             "not_found", "invalid_scheduled_message_id", "no_pin", "user_not_visible",
+            # S2
+            "bot_not_found", "bots_not_found", "file_deleted", "canvas_deleted", "not_visible",
+            "template_not_visible",
         }
     ),
     ERROR_CONFLICT: frozenset(
@@ -97,9 +114,12 @@ _KINDS: dict[str, frozenset[str]] = {
             # Nothing happened: the channel's state or a Slack limit is in the way.
             "is_archived", "is_inactive", "name_taken", "channel_canvas_already_exists",
             "too_many_reactions", "too_many_pins",
+            # S2: already there, or a Slack limit in the way
+            "name_already_exists", "handle_already_exists", "file_already_added", "too_many_bookmarks",
+            "too_many_tabs", "free_team_canvas_tab_already_exists", "not_in_dnd", "subteam_max_users_exceeded",
         }
     ),
-    ERROR_RATE_LIMITED: frozenset({*RATE_LIMIT_ERRORS, "restricted_too_many"}),
+    ERROR_RATE_LIMITED: frozenset({*RATE_LIMIT_ERRORS, *RETRY_SOON_ERRORS, "restricted_too_many"}),
     ERROR_INVALID_ARGUMENTS: frozenset(
         {
             "invalid_arguments", "invalid_arg_name", "invalid_array_arg", "invalid_cursor",
@@ -115,12 +135,26 @@ _KINDS: dict[str, frozenset[str]] = {
             "no_reaction_name", "invalid_name_emoji", "not_enough_users", "too_many_emoji",
             "too_long", "invalid_types", "invalid_limit", "invalid_auth_type",
             "bad_timestamp", "no_item_specified", "cant_invite_self",
+            # S2
+            "invalid_timestamp", "invalid_link", "invalid_emoji", "invalid_bookmark_type",
+            "invalid_entity_id", "bad_image", "too_large", "too_many_frames", "missing_duration",
+            "missing_argument", "cannot_parse", "cannot_add_others", "cannot_add_others_recurring",
+            "cannot_add_bot", "cannot_add_slackbot", "unknown_type", "unknown_snippet_type",
+            "alt_txt_too_large", "bad_handle", "forbidden_handle", "description_too_long",
+            "name_too_long", "missing_subteam_name", "invalid_channel_provided", "no_users_provided",
+            "channels_limit_exceeded", "invalid_parameters", "invalid_channel", "canvas_too_large",
+            "file_too_large",
         }
     ),
     # Slack's "request_timeout" means "POST data missing or truncated", not a
     # server timeout; it is a failed request like any other upstream error.
     ERROR_UPSTREAM_ERROR: frozenset(
-        {"fatal_error", "internal_error", "service_unavailable", "request_timeout"}
+        {
+            "fatal_error", "internal_error", "service_unavailable", "request_timeout",
+            # S2: Slack failed to do it
+            "canvas_creation_failed", "canvas_editing_failed", "canvas_tab_creation_failed",
+            "file_update_failed", "snooze_failed", "snooze_end_failed",
+        }
     ),
 }
 _KIND_OF: dict[str, str] = {code: kind for kind, codes in _KINDS.items() for code in codes}
@@ -145,6 +179,23 @@ _HINTS = {
     "bad_timestamp": "the timestamp is not valid; pass ts exactly as Slack returned it",
     "no_item_specified": "pass channel + timestamp (or file / file_comment)",
     "cant_invite_self": "leave the connection's own user out of users",
+    # S2
+    "file_deleted": "the file was deleted",
+    "canvas_deleted": "the canvas was deleted",
+    "name_already_exists": "a user group with that name exists; pick another name",
+    "handle_already_exists": "a user group with that handle exists; pick another handle",
+    "file_already_added": "the file is already there",
+    "too_many_bookmarks": "the channel has reached Slack's limit of 100 bookmarks; remove one first",
+    "too_many_tabs": "the channel has reached Slack's limit on tabs",
+    "free_team_canvas_tab_already_exists": "this free workspace allows one canvas tab per channel",
+    "not_in_dnd": "Do Not Disturb isn't on, so there is nothing to end",
+    "subteam_max_users_exceeded": "the user group would exceed Slack's member limit",
+    "file_too_large": "the file is over the download cap",
+    "bad_image": "the image is not one Slack accepts (512-1024 px square PNG, JPG or GIF works)",
+    "cannot_add_others": "reminders can only be set for the connected user",
+    "paid_teams_only": "this needs a paid Slack plan",
+    "not_allowed": "the workspace doesn't allow this",
+    "storage_limit_reached": "the workspace has reached its file storage limit",
 }
 
 #: The tool that fixes ``not_in_channel``.

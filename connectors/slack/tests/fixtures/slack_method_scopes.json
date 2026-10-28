@@ -6,9 +6,109 @@
       "bot": [],
       "user": []
     },
+    "auth.teams.list": {
+      "bot": [],
+      "user": []
+    },
     "auth.test": {
       "bot": [],
       "user": []
+    },
+    "bookmarks.add": {
+      "bot": [
+        "bookmarks:write"
+      ],
+      "user": [
+        "bookmarks:write"
+      ]
+    },
+    "bookmarks.edit": {
+      "bot": [
+        "bookmarks:write"
+      ],
+      "user": [
+        "bookmarks:write"
+      ]
+    },
+    "bookmarks.list": {
+      "bot": [
+        "bookmarks:read"
+      ],
+      "user": [
+        "bookmarks:read"
+      ]
+    },
+    "bookmarks.remove": {
+      "bot": [
+        "bookmarks:write"
+      ],
+      "user": [
+        "bookmarks:write"
+      ]
+    },
+    "bots.info": {
+      "bot": [
+        "users:read"
+      ],
+      "user": [
+        "users:read"
+      ]
+    },
+    "canvases.access.delete": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
+      ]
+    },
+    "canvases.access.set": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
+      ]
+    },
+    "canvases.create": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
+      ]
+    },
+    "canvases.delete": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
+      ]
+    },
+    "canvases.edit": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
+      ]
+    },
+    "canvases.getContent": {
+      "bot": [
+        "canvases:read"
+      ],
+      "user": [
+        "canvases:read"
+      ]
+    },
+    "canvases.sections.lookup": {
+      "bot": [
+        "canvases:read"
+      ],
+      "user": [
+        "canvases:read"
+      ]
     },
     "chat.delete": {
       "bot": [
@@ -29,6 +129,14 @@
     "chat.getPermalink": {
       "bot": [],
       "user": []
+    },
+    "chat.meMessage": {
+      "bot": [
+        "chat:write"
+      ],
+      "user": [
+        "chat:write"
+      ]
     },
     "chat.postEphemeral": {
       "bot": [
@@ -79,6 +187,14 @@
         "groups:write",
         "im:write",
         "mpim:write"
+      ]
+    },
+    "conversations.canvases.create": {
+      "bot": [
+        "canvases:write"
+      ],
+      "user": [
+        "canvases:write"
       ]
     },
     "conversations.close": {
@@ -204,6 +320,21 @@
         "mpim:read"
       ]
     },
+    "conversations.mark": {
+      "bot": [
+        "channels:manage",
+        "channels:write",
+        "groups:write",
+        "im:write",
+        "mpim:write"
+      ],
+      "user": [
+        "channels:write",
+        "groups:write",
+        "im:write",
+        "mpim:write"
+      ]
+    },
     "conversations.members": {
       "bot": [
         "channels:read",
@@ -320,12 +451,108 @@
         "mpim:write"
       ]
     },
+    "dnd.endDnd": {
+      "bot": [],
+      "user": [
+        "dnd:write"
+      ]
+    },
+    "dnd.endSnooze": {
+      "bot": [],
+      "user": [
+        "dnd:write"
+      ]
+    },
+    "dnd.info": {
+      "bot": [
+        "dnd:read"
+      ],
+      "user": [
+        "dnd:read"
+      ]
+    },
+    "dnd.setSnooze": {
+      "bot": [],
+      "user": [
+        "dnd:write"
+      ]
+    },
+    "dnd.teamInfo": {
+      "bot": [
+        "dnd:read"
+      ],
+      "user": [
+        "dnd:read"
+      ]
+    },
     "emoji.list": {
       "bot": [
         "emoji:read"
       ],
       "user": [
         "emoji:read"
+      ]
+    },
+    "files.comments.delete": {
+      "bot": [
+        "files:write"
+      ],
+      "user": [
+        "files:write"
+      ]
+    },
+    "files.completeUploadExternal": {
+      "bot": [
+        "files:write"
+      ],
+      "user": [
+        "files:write"
+      ]
+    },
+    "files.delete": {
+      "bot": [
+        "files:write"
+      ],
+      "user": [
+        "files:write"
+      ]
+    },
+    "files.getUploadURLExternal": {
+      "bot": [
+        "files:write"
+      ],
+      "user": [
+        "files:write"
+      ]
+    },
+    "files.info": {
+      "bot": [
+        "files:read"
+      ],
+      "user": [
+        "files:read"
+      ]
+    },
+    "files.list": {
+      "bot": [
+        "files:read"
+      ],
+      "user": [
+        "files:read"
+      ]
+    },
+    "files.revokePublicURL": {
+      "bot": [
+        "files:write"
+      ],
+      "user": [
+        "files:write"
+      ]
+    },
+    "files.sharedPublicURL": {
+      "bot": [],
+      "user": [
+        "files:write"
       ]
     },
     "pins.add": {
@@ -384,6 +611,30 @@
         "reactions:write"
       ]
     },
+    "reminders.add": {
+      "bot": [],
+      "user": [
+        "reminders:write"
+      ]
+    },
+    "reminders.delete": {
+      "bot": [],
+      "user": [
+        "reminders:write"
+      ]
+    },
+    "reminders.info": {
+      "bot": [],
+      "user": [
+        "reminders:read"
+      ]
+    },
+    "reminders.list": {
+      "bot": [],
+      "user": [
+        "reminders:read"
+      ]
+    },
     "search.all": {
       "bot": [],
       "user": [
@@ -410,6 +661,70 @@
         "team:read"
       ]
     },
+    "team.profile.get": {
+      "bot": [
+        "users.profile:read"
+      ],
+      "user": [
+        "users.profile:read"
+      ]
+    },
+    "usergroups.create": {
+      "bot": [
+        "usergroups:write"
+      ],
+      "user": [
+        "usergroups:write"
+      ]
+    },
+    "usergroups.disable": {
+      "bot": [
+        "usergroups:write"
+      ],
+      "user": [
+        "usergroups:write"
+      ]
+    },
+    "usergroups.enable": {
+      "bot": [
+        "usergroups:write"
+      ],
+      "user": [
+        "usergroups:write"
+      ]
+    },
+    "usergroups.list": {
+      "bot": [
+        "usergroups:read"
+      ],
+      "user": [
+        "usergroups:read"
+      ]
+    },
+    "usergroups.update": {
+      "bot": [
+        "usergroups:write"
+      ],
+      "user": [
+        "usergroups:write"
+      ]
+    },
+    "usergroups.users.list": {
+      "bot": [
+        "usergroups:read"
+      ],
+      "user": [
+        "usergroups:read"
+      ]
+    },
+    "usergroups.users.update": {
+      "bot": [
+        "usergroups:write"
+      ],
+      "user": [
+        "usergroups:write"
+      ]
+    },
     "users.conversations": {
       "bot": [
         "channels:read",
@@ -422,6 +737,12 @@
         "groups:read",
         "im:read",
         "mpim:read"
+      ]
+    },
+    "users.deletePhoto": {
+      "bot": [],
+      "user": [
+        "users.profile:write"
       ]
     },
     "users.getPresence": {
@@ -465,6 +786,12 @@
       ]
     },
     "users.profile.set": {
+      "bot": [],
+      "user": [
+        "users.profile:write"
+      ]
+    },
+    "users.setPhoto": {
       "bot": [],
       "user": [
         "users.profile:write"

@@ -17,8 +17,8 @@ from aisquare_pipe_slack import (
     SlackToolkit,
     scopes_for,
 )
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.scopes import AREAS, resolve_scopes
-from aisquare_pipe_slack.tools import TOOLS
 
 from .fakes import BOT_TOKEN, USER_TOKEN, FakeSession, ok, query, response, slack_error
 
@@ -112,7 +112,10 @@ class TestScopes:
 
     def test_groups(self):
         assert set(SCOPE_GROUPS) == {*AREAS, "read", "send", "write", "destructive"}
-        assert AREAS == ("messages", "history", "search", "conversations", "dms", "reactions", "pins", "users", "workspace")
+        assert AREAS == (
+            "messages", "history", "search", "conversations", "dms", "reactions", "pins", "users", "workspace",
+            "bookmarks", "dnd", "files", "canvases", "reminders", "usergroups",
+        )
         assert SCOPE_GROUPS["search"]["user"] == (
             "channels:read", "groups:read", "im:read", "mpim:read", "search:read", "users:read", "users:read.email",
         )
