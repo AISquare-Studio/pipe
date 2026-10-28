@@ -4,6 +4,10 @@ keyword ranking, argument validation, and Toolkit.call_tool semantics."""
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import email.message
+import email.utils
+import io
 import urllib.error
 
 import pytest
@@ -876,3 +880,85 @@ class TestTimeoutClassification:
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert out.error_code == ERROR_UPSTREAM_ERROR
         assert (out.error or "").startswith("RET_DO failed (URLError)")
+
+
+def _http_error(status, headers=None, *, url="https://api.ret.example/do", msg="Nope", body=b""):
+    hdrs = email.message.Message()
+    for name, value in (headers or {}).items():
+        hdrs[name] = value
+    return urllib.error.HTTPError(url, status, msg, hdrs, io.BytesIO(body))
+
+
+class TestHTTPErrorClassification:
+    """An ``HTTPError`` escaping ``run_tool`` maps through ``error_code_for_status``."""
+
+    @pytest.mark.parametrize(
+        ("status", "code", "message"),
+        [
+            (400, ERROR_INVALID_ARGUMENTS, "HTTP 400 Bad Request"),
+            (401, ERROR_UNAUTHORIZED, "HTTP 401 Unauthorized"),
+            (403, ERROR_FORBIDDEN, "HTTP 403 Forbidden"),
+            (404, ERROR_NOT_FOUND, "HTTP 404 Not Found"),
+            (408, ERROR_TIMEOUT, "HTTP 408 Request Timeout"),
+            (409, ERROR_CONFLICT, "HTTP 409 Conflict"),
+            (410, ERROR_NOT_FOUND, "HTTP 410 Gone"),
+            (412, ERROR_CONFLICT, "HTTP 412 Precondition Failed"),
+            (422, ERROR_INVALID_ARGUMENTS, "HTTP 422 Unprocessable Entity"),
+            (429, ERROR_RATE_LIMITED, "HTTP 429 Too Many Requests"),
+            (500, ERROR_UPSTREAM_ERROR, "HTTP 500 Internal Server Error"),
+            (502, ERROR_UPSTREAM_ERROR, "HTTP 502 Bad Gateway"),
+            (503, ERROR_UPSTREAM_ERROR, "HTTP 503 Service Unavailable"),
+            (504, ERROR_TIMEOUT, "HTTP 504 Gateway Timeout"),
+            (418, ERROR_UPSTREAM_ERROR, "HTTP 418 I'm a Teapot"),
+            (599, ERROR_UPSTREAM_ERROR, "HTTP 599"),
+        ],
+    )
+    def test_status_maps_to_its_error_code(self, status, code, message):
+        out = _Returns(raise_exc=_http_error(status)).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.successful is False
+        assert (out.error, out.error_code) == (f"RET_DO failed ({message})", code)
+        assert code == error_code_for_status(status)
+        assert out.retry_after is None
+
+    @pytest.mark.parametrize(
+        ("header", "retry_after"),
+        [("7", 7.0), (" 120 ", 120.0), ("1.5", 1.5), ("0", 0.0), ("Wed, 21 Oct 2015 07:28:00 GMT", 0.0)],
+        ids=["seconds", "padded", "fractional", "zero", "past-date"],
+    )
+    def test_rate_limited_carries_retry_after(self, header, retry_after):
+        exc = _http_error(429, {"Retry-After": header})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error_code, out.retry_after) == (ERROR_RATE_LIMITED, retry_after)
+
+    def test_rate_limited_retry_after_as_future_http_date(self):
+        when = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=90)
+        exc = _http_error(429, {"Retry-After": email.utils.format_datetime(when, usegmt=True)})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.error_code == ERROR_RATE_LIMITED
+        assert out.retry_after is not None and 80 <= out.retry_after <= 90
+
+    @pytest.mark.parametrize("header", [None, "", "soon", "-3", "nan", "inf", "1e400"])
+    def test_unusable_retry_after_is_none(self, header):
+        exc = _http_error(429, {} if header is None else {"Retry-After": header})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error_code, out.retry_after) == (ERROR_RATE_LIMITED, None)
+
+    def test_retry_after_only_accompanies_rate_limited(self):
+        exc = _http_error(503, {"Retry-After": "7"})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error_code, out.retry_after) == (ERROR_UPSTREAM_ERROR, None)
+
+    def test_message_echoes_no_secret_or_argument_value(self):
+        exc = _http_error(
+            404,
+            url=f"https://api.ret.example/do?q=private+memo&token={SECRET}",
+            msg=f"no file 'private memo' for {SECRET}",
+            body=f'{{"error": "private memo", "token": "{SECRET}"}}'.encode(),
+        )
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": SECRET})
+        assert (out.error, out.error_code) == ("RET_DO failed (HTTP 404 Not Found)", ERROR_NOT_FOUND)
+
+    def test_non_integer_status_is_upstream(self):
+        exc = _http_error(None)
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error, out.error_code) == ("RET_DO failed (HTTPError)", ERROR_UPSTREAM_ERROR)
