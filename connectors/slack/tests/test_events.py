@@ -77,6 +77,17 @@ class TestSignature:
         given = {"x-slack-request-timestamp": VECTOR["timestamp"], "x-slack-signature": VECTOR["signature"]}
         assert verify_request(given, VECTOR["body"].encode(), SECRET, now=int(VECTOR["timestamp"]) + 60) is None
 
+    @pytest.mark.parametrize("ts", ["0" + VECTOR["timestamp"], " " + VECTOR["timestamp"], VECTOR["timestamp"] + " "])
+    def test_the_timestamp_is_signed_exactly_as_sent(self, ts):
+        # Slack's base string uses the header as sent: the same number
+        # written differently is a different signature.
+        assert not verify_slack_signature(VECTOR["body"].encode(), ts, VECTOR["signature"], SECRET)
+
+    def test_an_int_timestamp_is_its_decimal(self):
+        assert verify_slack_signature(
+            VECTOR["body"].encode(), int(VECTOR["timestamp"]), VECTOR["signature"], SECRET
+        )
+
     def test_a_str_body_is_its_utf8_bytes(self):
         assert verify_slack_signature(VECTOR["body"], VECTOR["timestamp"], VECTOR["signature"], SECRET)
 
@@ -130,13 +141,28 @@ class TestWindow:
     def test_five_minutes_either_way(self, offset, inside):
         assert timestamp_in_window(str(NOW + offset), now=NOW) is inside
 
-    @pytest.mark.parametrize("ts", ["1800000000.5", "1e9", "-5", "", " ", "abc", "0x10", True, None, 1.5, "１８"])
+    @pytest.mark.parametrize(
+        "ts", ["1800000000.5", "1e9", "-5", "", " ", "abc", "0x10", True, None, 1.5, "１８", f" {NOW}", f"{NOW}\n"]
+    )
     def test_only_whole_seconds(self, ts):
         assert timestamp_in_window(ts, now=NOW) is False
 
-    def test_an_int_and_surrounding_spaces_are_fine(self):
+    def test_an_int_is_fine(self):
         assert timestamp_in_window(NOW, now=NOW)
-        assert timestamp_in_window(f" {NOW} ", now=NOW)
+
+    @pytest.mark.parametrize(
+        "ts",
+        [10**400, -(10**400), 2**1024, 10**5000 - 1, "9" * 400, "9" * 5000, 10**15, "1" * 16],
+        ids=["int-400-digits", "negative", "2**1024", "int-5000-digits", "str-400-digits", "str-5000-digits",
+             "10**15", "str-16-digits"],
+    )
+    def test_huge_numbers_are_refused_without_raising(self, ts):
+        # A host may pass int(header) itself: never an OverflowError (a
+        # float clock minus a huge int) or ValueError (Python's 4300-digit
+        # str/int limit), always False.
+        assert timestamp_in_window(ts, now=float(NOW)) is False
+        assert timestamp_in_window(ts) is False
+        assert verify_slack_signature(b"{}", ts, "v0=" + "0" * 64, SECRET) is False
 
     def test_defaults_to_the_clock(self, monkeypatch):
         monkeypatch.setattr(events.time, "time", lambda: float(NOW))
@@ -169,6 +195,13 @@ class TestVerifyRequest:
         body = body_of("app_mention")
         assert verify_request(given(headers(body)), body, SECRET, now=NOW) is None
 
+    def test_surrounding_header_whitespace_is_http_framing(self):
+        # HTTP strips optional whitespace around a header value; the
+        # digits are what Slack signed.
+        body = body_of("app_mention")
+        given = {**headers(body), "X-Slack-Request-Timestamp": f" {NOW} "}
+        assert verify_request(given, body, SECRET, now=NOW) is None
+
     def test_a_correctly_signed_but_old_request_is_refused(self):
         # The replay check is not optional: the signature alone would pass.
         body = body_of("app_mention")
@@ -182,6 +215,8 @@ class TestVerifyRequest:
         assert self._reason({"X-Slack-Signature": good["X-Slack-Signature"]}, body) == "missing_timestamp"
         assert self._reason({"X-Slack-Request-Timestamp": str(NOW)}, body) == "missing_signature"
         assert self._reason({**good, "X-Slack-Request-Timestamp": f"{NOW}.0"}, body) == "bad_timestamp"
+        assert self._reason({**good, "X-Slack-Request-Timestamp": "9" * 5000}, body) == "bad_timestamp"
+        assert self._reason({**good, "X-Slack-Request-Timestamp": f"0{NOW}"}, body) == "bad_signature"
         assert self._reason(good, body + b" ") == "bad_signature"
         assert self._reason(good, body, secret="") == "no_signing_secret"
         assert self._reason(good, None) == "bad_body"  # type: ignore[arg-type]
@@ -392,6 +427,7 @@ class TestEnvelopes:
             "team_id": "T123ABC456",
             "api_app_id": "A0PNCHHK2",
             "event_time": 1355517523,
+            "is_from_bot": False,
         }
 
     def test_reaction_envelope(self):
@@ -413,6 +449,20 @@ class TestEnvelopes:
         assert isinstance(event, EventCallback)
         assert event_to_envelope(event).data == {"id": "C0NEW", "name": "launch", "created": 1360782804, "creator": "U1"}
 
+    @pytest.mark.parametrize(
+        "body, from_bot",
+        [
+            (EVENTS["app_mention"], False),
+            (variant("app_mention", bot_id="B0BOT"), True),
+            (variant("message.im", bot_id="B0BOT"), True),
+            (variant("message.im", subtype="bot_message"), True),
+        ],
+    )
+    def test_messages_say_whether_a_bot_posted_them(self, body, from_bot):
+        event = parse_event(body)
+        assert isinstance(event, EventCallback)
+        assert event_to_envelope(event).metadata["is_from_bot"] is from_bot
+
     def test_an_untriggered_event_carries_the_event_as_sent(self):
         event = parse_event(body_of("tokens_revoked"))
         assert isinstance(event, EventCallback)
@@ -420,3 +470,4 @@ class TestEnvelopes:
         assert envelope.data == EVENTS["tokens_revoked"]["event"]
         assert envelope.metadata["trigger_slug"] is None
         assert envelope.metadata["event_id"] == "EvXXXXXXXX"
+        assert "is_from_bot" not in envelope.metadata

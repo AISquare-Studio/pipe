@@ -82,7 +82,11 @@ EVENTS_ONLY_BOT_SCOPES: tuple[str, ...] = ("app_mentions:read",)
 #: joins — are events about a message, and carry no trigger).
 NEW_MESSAGE_SUBTYPES = frozenset({None, "bot_message", "file_share", "thread_broadcast", "me_message"})
 
+#: A timestamp header: whole Unix seconds, digits only (no sign, point or
+#: spaces). 15 digits bounds it far beyond any real clock, so arithmetic on it
+#: can't overflow.
 _TIMESTAMP = re.compile(r"[0-9]{1,15}")
+_MAX_TIMESTAMP = 10**15
 _RETRY_NUM = re.compile(r"[0-9]{1,3}")
 _RETRY_REASON = re.compile(r"[a-z_]{1,64}")
 
@@ -116,11 +120,12 @@ def verify_slack_signature(
     """Whether ``signature`` (``X-Slack-Signature``) is Slack's v0 signature
     of ``raw_body`` at ``timestamp`` (``X-Slack-Request-Timestamp``):
     ``"v0=" + hex(HMAC-SHA256(secret, b"v0:" + ts + b":" + raw_body))``,
-    compared in constant time. False — never an exception — for any missing
-    or malformed part. Does not check the timestamp's age: use
-    :func:`verify_request`, which does both."""
+    compared in constant time, with ``ts`` the header exactly as sent (as
+    Slack's spec builds it: ``"01531420618"`` is not ``"1531420618"``).
+    False — never an exception — for any missing or malformed part. Does not
+    check the timestamp's age: use :func:`verify_request`, which does both."""
     body = _body_bytes(raw_body)
-    ts = _timestamp(timestamp)
+    ts = _timestamp_text(timestamp)
     if body is None or ts is None or not isinstance(signature, str) or not isinstance(signing_secret, str):
         return False
     given = signature.strip()
@@ -215,16 +220,21 @@ def _body_bytes(raw_body: Any) -> bytes | None:
     return None
 
 
-def _timestamp(value: Any) -> int | None:
-    """Whole Unix seconds from a header value; None for anything else
-    (floats, signs, exponents, blanks, booleans)."""
+def _timestamp_text(value: Any) -> str | None:
+    """The timestamp as Slack signed it: a header value of 1–15 digits as it
+    is, or an int in range as its decimal; None for anything else (floats,
+    signs, exponents, spaces, booleans, huge numbers)."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and _TIMESTAMP.fullmatch(value.strip()):
-        return int(value.strip())
-    return None
+        return str(value) if 0 <= value < _MAX_TIMESTAMP else None
+    return value if isinstance(value, str) and _TIMESTAMP.fullmatch(value) else None
+
+
+def _timestamp(value: Any) -> int | None:
+    """Whole Unix seconds from a header value (see :func:`_timestamp_text`)."""
+    text = _timestamp_text(value)
+    return int(text) if text is not None else None
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +308,12 @@ class PostedMessage(EventCallback):
     def is_thread_reply(self) -> bool:
         return self.thread_ts is not None and self.thread_ts != self.ts
 
+    @property
+    def is_from_bot(self) -> bool:
+        """Posted by a bot — possibly this app's own: skip it, or the bot
+        answers itself in a loop."""
+        return self.bot_id is not None
+
 
 @dataclass(frozen=True, kw_only=True)
 class AppMention(PostedMessage):
@@ -322,7 +338,7 @@ class Message(PostedMessage):
 
     @property
     def is_from_bot(self) -> bool:
-        return self.bot_id is not None or self.subtype == "bot_message"
+        return super().is_from_bot or self.subtype == "bot_message"
 
     @property
     def is_new(self) -> bool:
@@ -551,7 +567,9 @@ def event_to_envelope(event: EventCallback) -> DataEnvelope:
     reactions; the channel for ``channel_created``), or the inner event as
     Slack sent it when there is no trigger. ``metadata`` carries
     ``trigger_slug`` (None without one), ``event_id`` (the dedupe key),
-    ``event_type``, ``team_id``, ``api_app_id`` and ``event_time``."""
+    ``event_type``, ``team_id``, ``api_app_id`` and ``event_time``, and for
+    messages and mentions ``is_from_bot`` (route those nowhere that answers,
+    or the bot replies to itself)."""
     slug = trigger_slug(event)
     data: dict[str, Any]
     if isinstance(event, PostedMessage) and slug is not None:
@@ -572,19 +590,17 @@ def event_to_envelope(event: EventCallback) -> DataEnvelope:
         data = {k: channel[k] for k in ("id", "name", "created", "creator") if k in channel}
     else:
         data = dict(event.event)
-    return DataEnvelope(
-        content_type="application/json",
-        data=data,
-        source_id="slack",
-        metadata={
-            "trigger_slug": slug,
-            "event_id": event.event_id,
-            "event_type": event.event_type,
-            "team_id": event.team_id,
-            "api_app_id": event.api_app_id,
-            "event_time": event.event_time,
-        },
-    )
+    metadata: dict[str, Any] = {
+        "trigger_slug": slug,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "team_id": event.team_id,
+        "api_app_id": event.api_app_id,
+        "event_time": event.event_time,
+    }
+    if isinstance(event, PostedMessage):
+        metadata["is_from_bot"] = event.is_from_bot
+    return DataEnvelope(content_type="application/json", data=data, source_id="slack", metadata=metadata)
 
 
 __all__ = [

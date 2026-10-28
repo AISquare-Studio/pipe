@@ -603,22 +603,25 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
 ```
 
 - **`verify_request(headers, raw_body, signing_secret, now=None)`** checks the
-  timestamp (whole seconds, within 300 s either way) and the v0 signature
-  (`HMAC-SHA256` over `v0:<ts>:<raw body>`, compared in constant time) in one call,
+  timestamp (whole seconds, at most 15 digits, within 300 s either way) and the v0
+  signature (`HMAC-SHA256` over `v0:<ts>:<raw body>`, with `<ts>` the header exactly
+  as sent, compared in constant time) in one call,
   so a host can't skip the replay check. Headers are matched case-insensitively
   (a mapping, or ASGI-style `(name, value)` pairs). It raises
   `SlackSignatureError` with a `reason`: `missing_timestamp`, `missing_signature`,
   `bad_timestamp`, `stale_timestamp`, `bad_signature`, `bad_body`,
   `no_signing_secret`. Pass the **raw** body bytes: a re-serialized JSON body no
   longer matches. `verify_slack_signature` and `timestamp_in_window` are the two
-  checks on their own (both return a bool and never raise).
+  checks on their own. Both return a bool and never raise, even for a huge
+  `int(header)`.
 - **`parse_event(body, headers=None)`** (and `parse_request`, which verifies first)
   returns a typed object: `UrlVerification` (`challenge`), `AppRateLimited`, or an
   `EventCallback` — `AppMention`, `Message` (`message.im`, and the channel variants
   if subscribed), `Reaction` (`reaction_added` / `reaction_removed`),
   `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for anything else.
   `event_id` is the dedupe key; `retry_num` / `retry_reason` come from Slack's retry
-  headers. Ignore `Message.is_from_bot` messages, or the bot answers itself.
+  headers. Ignore messages and mentions with `is_from_bot` (also in the envelope's
+  `metadata["is_from_bot"]`), or the bot answers itself.
 - **`event_to_envelope(event)`** gives a pipeline a `DataEnvelope` whose
   `metadata["trigger_slug"]` uses Composio's trigger names, so existing
   subscriptions keep their vocabulary:
