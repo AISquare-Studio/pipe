@@ -74,8 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mypy src` works with an editable install.
 - The GitHub, OneDrive and Google Drive packages require
   `aisquare-pipe>=0.2.0`.
-- `aisquare-pipe-graphify`'s `[engine]` extra pins `graphifyy==0.9.72`
-  (was 0.8.36).
+- `aisquare-pipe-graphify` 0.2.1: the `[engine]` extra pins
+  `graphifyy==0.9.72` (was 0.8.36).
 - CI uses `actions/setup-python@v7`.
 
 ### Fixed
@@ -89,9 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata into real paths. On Windows, every editable connector was
   reported as a broken install. On every platform, a path containing a
   percent-escape (such as `%20` for a space) never matched.
-- `aisquare-pipe-graphify`: without the `[engine]` extra, the graph modules
-  raise `ModuleNotFoundError` and their unit tests skip explicitly. Under
-  pytest 9 they errored at collection, so a bare `pipe validate` failed.
+- `aisquare-pipe-graphify` 0.2.1: without the `[engine]` extra, the graph
+  modules raise `ModuleNotFoundError` and their unit tests skip explicitly.
+  Under pytest 9 they errored at collection, so a bare `pipe validate`
+  failed.
 
 ## [0.1.1] - 2026-06-29
 
