@@ -32,6 +32,7 @@ jobs:
           - connectors/local
           - connectors/dropbox
           - connectors/onedrive
+          - connectors/googledrive
           - connectors/salesforce
           - connectors/docusign
           - connectors/composio
