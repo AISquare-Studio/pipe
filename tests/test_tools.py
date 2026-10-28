@@ -8,6 +8,7 @@ import datetime
 import email.message
 import email.utils
 import io
+import logging
 import urllib.error
 
 import pytest
@@ -930,12 +931,26 @@ class TestHTTPErrorClassification:
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert (out.error_code, out.retry_after) == (ERROR_RATE_LIMITED, retry_after)
 
-    def test_rate_limited_retry_after_as_future_http_date(self):
+    @pytest.mark.parametrize("zone", ["GMT", "-0000"])
+    def test_rate_limited_retry_after_as_future_http_date(self, zone):
         when = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=90)
-        exc = _http_error(429, {"Retry-After": email.utils.format_datetime(when, usegmt=True)})
+        header = email.utils.format_datetime(when, usegmt=True).replace("GMT", zone)
+        if zone == "-0000":  # "-0000" parses to a naive datetime
+            assert email.utils.parsedate_to_datetime(header).tzinfo is None
+        exc = _http_error(429, {"Retry-After": header})
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert out.error_code == ERROR_RATE_LIMITED
         assert out.retry_after is not None and 80 <= out.retry_after <= 90
+
+    @pytest.mark.parametrize(
+        ("header", "retry_after"),
+        [("3600", 3600.0), ("3601", 3600.0), ("1e10", 3600.0), ("Fri, 31 Dec 9999 23:59:59 GMT", 3600.0)],
+        ids=["at-cap", "over-cap", "1e10", "year-9999"],
+    )
+    def test_retry_after_is_capped(self, header, retry_after):
+        exc = _http_error(429, {"Retry-After": header})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error_code, out.retry_after) == (ERROR_RATE_LIMITED, retry_after)
 
     @pytest.mark.parametrize("header", [None, "", "soon", "-3", "nan", "inf", "1e400"])
     def test_unusable_retry_after_is_none(self, header):
@@ -948,7 +963,8 @@ class TestHTTPErrorClassification:
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert (out.error_code, out.retry_after) == (ERROR_UPSTREAM_ERROR, None)
 
-    def test_message_echoes_no_secret_or_argument_value(self):
+    def test_message_and_log_echo_no_secret_or_argument_value(self, caplog):
+        caplog.set_level(logging.WARNING, logger="aisquare.pipe")
         exc = _http_error(
             404,
             url=f"https://api.ret.example/do?q=private+memo&token={SECRET}",
@@ -957,8 +973,11 @@ class TestHTTPErrorClassification:
         )
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": SECRET})
         assert (out.error, out.error_code) == ("RET_DO failed (HTTP 404 Not Found)", ERROR_NOT_FOUND)
+        assert "toolkit ret: RET_DO raised HTTPError 404" in caplog.text
+        assert SECRET not in caplog.text and "private memo" not in caplog.text
 
-    def test_non_integer_status_is_upstream(self):
-        exc = _http_error(None)
+    @pytest.mark.parametrize("status", [None, True, "404"], ids=["None", "bool", "str"])
+    def test_non_integer_status_is_upstream(self, status):
+        exc = _http_error(status)
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert (out.error, out.error_code) == ("RET_DO failed (HTTPError)", ERROR_UPSTREAM_ERROR)

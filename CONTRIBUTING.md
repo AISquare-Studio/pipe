@@ -243,12 +243,15 @@ What the base class does for you:
   error_code=...)`, with `error_code` set to `unknown_tool`,
   `invalid_arguments` or `unauthorized` (missing credentials) by the base
   class, to the `ToolError`'s `code`, to `timeout` for a `TimeoutError`,
-  and to `upstream_error` for anything else. An unexpected exception's text
-  is redacted (URL query strings dropped, truncated), and secret-looking
-  config values — at any nesting depth, including stripped, escaped and
-  `Bearer`-prefixed forms — are masked out of every error message. A
-  malformed result (non-string `error`, unknown `error_code`) is normalized
-  rather than raised.
+  to `error_code_for_status(status)` for an `urllib.error.HTTPError` (a
+  `rate_limited` one also gets `retry_after` from `Retry-After`, capped at
+  an hour; the message names only the status, never the URL, reason or
+  body), and to `upstream_error` for anything else. An unexpected
+  exception's text is redacted (URL query strings dropped, truncated), and
+  secret-looking config values — at any nesting depth, including stripped,
+  escaped and `Bearer`-prefixed forms — are masked out of every error
+  message. A malformed result (non-string `error`, unknown `error_code`) is
+  normalized rather than raised.
 - **`search_tools(query, limit=6)`** ranks the catalog with a deterministic
   keyword score (+2 per query term in the slug, +1 in the description or
   tags; first-person queries favour `..._AUTHENTICATED_...` tools).

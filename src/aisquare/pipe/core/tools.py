@@ -45,6 +45,8 @@ logger = logging.getLogger("aisquare.pipe")
 
 #: Longest error message ``call_tool`` returns.
 _MAX_ERROR = 1000
+#: Longest ``Retry-After`` taken at face value (seconds); larger is capped.
+_MAX_RETRY_AFTER = 3600.0
 
 # --------------------------------------------------------------------------
 # Failure kinds — ``ToolResult.error_code``. Every toolkit and every host uses
@@ -569,7 +571,9 @@ class Toolkit(ABC):
                 str(e) or f"{tool.slug} failed", code=e.code, retry_after=e.retry_after
             )
         except urllib.error.HTTPError as e:
-            logger.warning("toolkit %s: %s raised HTTPError", self.name, tool.slug)
+            logger.warning(
+                "toolkit %s: %s raised HTTPError %s", self.name, tool.slug, _http_status(e)
+            )
             return _http_failure(tool.slug, e)
         except Exception as e:  # noqa: BLE001 — surfaced to the caller, not raised
             if _timed_out(e):
@@ -697,14 +701,20 @@ def _timed_out(e: BaseException) -> bool:
     )
 
 
+def _http_status(e: urllib.error.HTTPError) -> int | None:
+    """The error's HTTP status, or None when it carries no integer one."""
+    status = e.code
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
 def _http_failure(slug: str, e: urllib.error.HTTPError) -> ToolResult:
     """The failure for an ``HTTPError`` escaping ``run_tool``: the status maps
     through :func:`error_code_for_status`, and a ``rate_limited`` one carries
     ``Retry-After`` as ``retry_after``. The message is built from the status
     alone — the provider's reason phrase, body and URL are not echoed (they
     can carry argument values)."""
-    status = e.code
-    if not isinstance(status, int) or isinstance(status, bool):
+    status = _http_status(e)
+    if status is None:
         return ToolResult.fail(f"{slug} failed (HTTPError)", code=ERROR_UPSTREAM_ERROR)
     try:
         phrase = f" {http.HTTPStatus(status).phrase}"
@@ -719,7 +729,8 @@ def _http_failure(slug: str, e: urllib.error.HTTPError) -> ToolResult:
 
 def _retry_after(e: urllib.error.HTTPError) -> float | None:
     """Seconds from the error's ``Retry-After`` header — delta-seconds or an
-    HTTP-date (a past date is 0) — or None when absent or unusable."""
+    HTTP-date (a past date is 0), capped at :data:`_MAX_RETRY_AFTER` — or
+    None when absent or unusable."""
     try:
         value = e.headers.get("Retry-After") if e.headers is not None else None
     except Exception:  # noqa: BLE001 — odd headers mean "unknown", not a crash
@@ -736,7 +747,9 @@ def _retry_after(e: urllib.error.HTTPError) -> float | None:
         if when.tzinfo is None:  # RFC 9110 dates are GMT; "-0000" parses naive
             when = when.replace(tzinfo=datetime.UTC)
         seconds = max(0.0, (when - datetime.datetime.now(datetime.UTC)).total_seconds())
-    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+    if not (math.isfinite(seconds) and seconds >= 0):
+        return None
+    return min(seconds, _MAX_RETRY_AFTER)
 
 
 def _redact(text: str, config: Mapping[str, Any]) -> str:

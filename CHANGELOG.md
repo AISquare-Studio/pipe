@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `Toolkit.call_tool` maps a `urllib.error.HTTPError` escaping `run_tool`
-  through `error_code_for_status()` (401 `unauthorized`, 404 `not_found`,
-  429 `rate_limited` with `retry_after` from `Retry-After`, ...) instead of
-  `upstream_error`. The message names only the status; the provider's
-  reason phrase, body and URL are not echoed.
-
 ## [0.3.0] - 2026-10-15
 
 ### Added
@@ -27,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the `Toolkit` base class with `tools()`, `get_tool()`,
   `search_tools()` (deterministic keyword ranking), `call_tool()` (never
   raises, even on malformed toolkit results; validates arguments against
-  the schema; masks secret config values out of errors) and
+  the schema; masks secret config values out of errors; maps an
+  `urllib.error.HTTPError` from `run_tool` through `error_code_for_status()`,
+  with a 429's `Retry-After` as `retry_after` — the message names only the
+  status, never the provider's URL, reason or body) and
   `validate_config()`.
   Helpers `rank_tools()`, `validate_arguments()` and
   `error_code_for_status()`.
