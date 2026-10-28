@@ -19,6 +19,7 @@ from aisquare.pipe import (
     ToolResult,
     ToolSpec,
     error_code_for_status,
+    time_budget,
 )
 
 from aisquare_pipe_github.rest import (
@@ -99,15 +100,6 @@ def failure(error: GitHubAPIError) -> ToolResult:
         code=error_code(error),
         retry_after=float(math.ceil(error.retry_after)) if error.retry_after is not None else None,
     )
-
-
-def time_budget(config: dict[str, Any]) -> float | None:
-    """The host's per-call budget, ``config["timeout_seconds"]`` (a positive
-    number), or None."""
-    value = config.get("timeout_seconds")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 class GitHubToolkit(Toolkit):

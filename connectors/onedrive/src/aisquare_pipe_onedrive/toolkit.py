@@ -27,6 +27,7 @@ from aisquare.pipe import (
     error_code_for_status,
     exchange_code,
     refresh_access_token,
+    time_budget,
 )
 
 from aisquare_pipe_onedrive.rest import (
@@ -143,15 +144,6 @@ def failure(error: OneDriveAPIError) -> ToolResult:
         code=error_code(error),
         retry_after=retry_seconds(error.retry_after) if error.retry_after is not None else None,
     )
-
-
-def time_budget(config: dict[str, Any]) -> float | None:
-    """The host's per-call budget, ``config["timeout_seconds"]`` (a positive
-    number), or None."""
-    value = config.get("timeout_seconds")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return float(value) if math.isfinite(value) and value > 0 else None
 
 
 class OneDriveToolkit(Toolkit):

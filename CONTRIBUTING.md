@@ -291,6 +291,10 @@ Conventions:
   HTTP status; override it where the provider is quirky (e.g. GitHub's
   rate-limit 403). Never put tokens or the raw argument payload in the
   message, and never log them — log slugs, counts, timings.
+- A host may bound a whole call with `config["timeout_seconds"]`.
+  `time_budget(config)` reads it (a positive number, else `None`); fit
+  request timeouts and retry sleeps inside it, and fail a call whose budget
+  is spent with `timeout`.
 - When porting a Composio toolkit, keep Composio's slugs and argument names
   so existing callers keep working.
 
