@@ -40,14 +40,14 @@ class TestRichText:
             ('[{"type": "rich_text", "elements": []}]', [{"type": "rich_text", "elements": []}]),
             ({"type": "rich_text", "elements": []}, [{"type": "rich_text", "elements": []}]),
             ([{"type": "rich_text", "elements": []}], [{"type": "rich_text", "elements": []}]),
-            ("[draft] plan", None),  # looks like JSON, isn't: refused, not guessed
+            # Plain text that only looks like JSON is still plain text.
+            ("[Draft] Q3 plan", [rich_text("[Draft] Q3 plan")]),
+            ("[1, 2]", [rich_text("[1, 2]")]),
+            ('{"note": "x"}', [rich_text('{"note": "x"}')]),
         ],
     )
     def test_description_blocks(self, given, blocks):
-        if blocks is None:
-            assert "not valid JSON" in refused("SLACK_CREATE_SLACK_LIST", {"name": "x", "description_blocks": given})
-        else:
-            assert sent("SLACK_CREATE_SLACK_LIST", {"name": "x", "description_blocks": given})["description_blocks"] == blocks
+        assert sent("SLACK_CREATE_SLACK_LIST", {"name": "x", "description_blocks": given})["description_blocks"] == blocks
 
     @pytest.mark.parametrize("given", ["  ", [], [{"elements": []}], 5])
     def test_bad_description_blocks(self, given):
@@ -121,7 +121,7 @@ class TestArgumentChecks:
             ("SLACK_GET_REMOTE_FILE", {}, "pass either file"),
             ("SLACK_GET_REMOTE_FILE", {"file": "F1", "external_id": "doc-1"}, "not both"),
             ("SLACK_SHARE_REMOTE_FILE", {"channels": "C0123456"}, "pass either file"),
-            ("SLACK_SHARE_REMOTE_FILE", {"file": "F1", "channels": " , "}, "at least one"),
+            ("SLACK_SHARE_REMOTE_FILE", {"file": "F1", "channels": " , "}, "at least one conversation ID"),
             ("SLACK_REMOVE_REMOTE_FILE", {"file": "F1", "external_id": "doc-1"}, "not both"),
             ("SLACK_UPDATE_REMOTE_FILE", {"file": "F1"}, "nothing to change"),
             ("SLACK_UPDATE_REMOTE_FILE", {"file": "F1", "external_url": "javascript:alert(1)"}, "http(s) URL"),

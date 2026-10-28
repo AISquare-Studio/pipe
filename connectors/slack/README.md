@@ -530,9 +530,11 @@ Activate Public Distribution**. Until then, installs fail with
 
 Slack Lists text cells and descriptions are Block Kit `rich_text`. As in Composio, a
 plain string is wrapped for you: a cell may be `{"column_id": "Col…", "text": "Ship
-it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both
-(Slack refuses both). Composio's `preview_image` is not offered: Slack takes it only
-as a multipart image upload.
+it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both:
+`files.remote.info` refuses both (`too_many_ids`), and the others need only one, so
+the toolkit asks for exactly one everywhere rather than guess which Slack would use.
+Composio's `preview_image` is not offered: Slack takes it only as a multipart image
+upload.
 
 ## Message sink
 
@@ -559,12 +561,15 @@ result.success, result.ref  # ref: the new message's ts
 | `str` with `text/plain` (Slack mrkdwn) or `text/markdown` (standard markdown) | `chat.postMessage` | `ts` |
 | `dict` with `application/json`: `text`, `markdown_text` and/or `blocks` (`metadata["blocks"]` overrides) | `chat.postMessage` | `ts` |
 | either of the above, with `params["ephemeral_user"]` | `chat.postEphemeral` | `message_ts` |
-| `bytes`, a `stream`, or any other content type | v2 file upload into the channel (or thread) | file ID |
+| anything else: `bytes`, a `stream`, a `str` of another type (JSON text, CSV…), a `dict` of another type | v2 file upload into the channel (or thread) | file ID |
 
 - **`params`:** `channel` (required; an ID or a name), `thread_ts`,
   `reply_broadcast`, `ephemeral_user`, `unfurl_links`, `unfurl_media`; for files
   `filename`, `title` and `initial_comment` (`envelope.metadata["filename"]` /
-  `["title"]` work too).
+  `["title"]` work too). They are checked before any request: the strings must be
+  non-empty strings (a float `thread_ts` would lose digits) and the flags booleans,
+  otherwise the push fails with `invalid_arguments`. A config the toolkit can't
+  read fails as `forbidden`, naming the key.
 - **Attribution** is the toolkit's: as the user, every message gets the "Sent by
   <name>" line, and a file's `initial_comment` gets it as its last line.
 - **Tiers:** a push is a `send` action. If a host's config leaves `send` out of
@@ -584,7 +589,7 @@ Secret**, the dedupe ledger and the 3-second ack. In `aisquare_pipe_slack.events
 
 ```python
 from aisquare_pipe_slack.events import (
-    EventCallback, SlackEventError, SlackSignatureError, UrlVerification,
+    EventCallback, PostedMessage, SlackEventError, SlackSignatureError, UrlVerification,
     event_to_envelope, parse_request,
 )
 
@@ -597,6 +602,8 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
         return 400
     if isinstance(event, UrlVerification):
         return 200, event.response()             # {"challenge": "..."}
+    if isinstance(event, PostedMessage) and event.is_from_this_app:
+        return 200                               # the app's own post: never answer it
     if isinstance(event, EventCallback) and not ledger.seen(event.event_id):
         queue.put(event_to_envelope(event))      # do the work after acking
     return 200
@@ -620,8 +627,10 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
   if subscribed), `Reaction` (`reaction_added` / `reaction_removed`),
   `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for anything else.
   `event_id` is the dedupe key; `retry_num` / `retry_reason` come from Slack's retry
-  headers. Ignore messages and mentions with `is_from_bot` (also in the envelope's
-  `metadata["is_from_bot"]`), or the bot answers itself.
+  headers. **Skip `is_from_this_app` messages and mentions** (the app's own posts,
+  as Bolt's `ignoreSelf` does), or the bot answers itself in a loop. Other bots'
+  messages are kept; `is_from_bot` tells them apart. Both are also in the
+  envelope's metadata.
 - **`event_to_envelope(event)`** gives a pipeline a `DataEnvelope` whose
   `metadata["trigger_slug"]` uses Composio's trigger names, so existing
   subscriptions keep their vocabulary:
@@ -629,12 +638,13 @@ def slack_events(request):                       # the host's POST /v1/slack/eve
   | Event | `trigger_slug` |
   |---|---|
   | `message` in a DM (`message.im`) | `SLACK_DIRECT_MESSAGE_RECEIVED` |
-  | `message` in a channel, private channel or group DM | `SLACK_CHANNEL_MESSAGE_RECEIVED` |
+  | `message` in a channel, private channel or group DM (`channel_type` `channel`, `group`, `mpim`) | `SLACK_CHANNEL_MESSAGE_RECEIVED` |
   | `reaction_added` / `reaction_removed` on a message | `SLACK_MESSAGE_REACTION_ADDED` / `_REMOVED` |
   | `channel_created` | `SLACK_CHANNEL_CREATED` |
   | `app_mention` | `SLACK_APP_MENTION_RECEIVED` (pipe's; Composio has none) |
 
-  Edits, deletions and other message subtypes, and reactions to files, carry no
+  The app's own posts, edits, deletions and other message subtypes, messages with
+  any other `channel_type` (such as `app_home`), and reactions to files carry no
   trigger (`None`). `data` is the trigger payload in Composio's field names.
 
 **Host duties** ([Slack's Events API docs](https://docs.slack.dev/apis/events-api)):

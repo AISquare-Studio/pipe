@@ -237,15 +237,15 @@ def _clamp(value: Any, default: int, maximum: int) -> int:
     return min(max(1, number), maximum)
 
 
-def _id_list(value: Any, name: str) -> str:
-    """A comma-separated ID list from a string or an array."""
+def _id_list(value: Any, name: str, kind: str = "user") -> str:
+    """A comma-separated list of ``kind`` IDs from a string or an array."""
     if isinstance(value, (list, tuple)):
         items = [str(v).strip() for v in value]
     else:
         items = [v.strip() for v in str(value).split(",")]
     items = [v for v in items if v]
     if not items:
-        raise _invalid(f"{name} must name at least one user ID")
+        raise _invalid(f"{name} must name at least one {kind} ID")
     return ",".join(items)
 
 

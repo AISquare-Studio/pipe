@@ -15,6 +15,8 @@ A typical endpoint::
         return 400
     if isinstance(event, UrlVerification):
         return 200, event.response()          # {"challenge": ...}
+    if isinstance(event, PostedMessage) and event.is_from_this_app:
+        return 200                            # the app's own post: never answer it
     if isinstance(event, EventCallback) and not ledger.seen(event.event_id):
         queue(event_to_envelope(event))       # do the work after the ack
     return 200
@@ -77,6 +79,10 @@ BOT_EVENTS: dict[str, tuple[str, ...]] = {
 #: Scopes only an event subscription needs: no tool calls a method that uses
 #: them, so the catalog doesn't declare them.
 EVENTS_ONLY_BOT_SCOPES: tuple[str, ...] = ("app_mentions:read",)
+
+#: ``channel_type`` values of a channel message: public, private, group DM.
+#: (``im`` is a DM; ``app_home`` and anything new carry no trigger.)
+CHANNEL_TYPES = frozenset({"channel", "group", "mpim"})
 
 #: Message subtypes that are a new message (others — edits, deletions,
 #: joins — are events about a message, and carry no trigger).
@@ -189,12 +195,16 @@ def verify_request(
 def header(headers: Mapping[str, Any] | Iterable[tuple[Any, Any]], name: str) -> str | None:
     """One header's value, by case-insensitive name; None when absent, and
     when it appears more than once with different values (fail closed).
-    Byte names and values (ASGI) are read as Latin-1."""
-    pairs = headers.items() if isinstance(headers, Mapping) else headers
+    Takes a mapping, anything with ``items()`` (``http.server``'s and
+    ``email``'s message headers, multi-dicts), or ``(name, value)`` pairs;
+    byte names and values (ASGI) are read as Latin-1."""
+    items = getattr(headers, "items", None)
+    pairs: Iterable[Any] = items() if callable(items) else headers
     wanted = name.lower()
     found: set[str] = set()
     try:
-        for key, value in pairs:
+        for pair in pairs:
+            key, value = pair
             if _latin1(key).lower() == wanted:
                 if isinstance(value, (list, tuple)):  # multi-dict style
                     found.update(_latin1(v) for v in value)
@@ -295,7 +305,8 @@ class EventCallback(SlackEvent):
 
 @dataclass(frozen=True, kw_only=True)
 class PostedMessage(EventCallback):
-    """What a mention and a message have in common: where, who, what, when."""
+    """What a mention and a message have in common: where, who, what, when.
+    ``app_id`` is the app that posted it, when an app did."""
 
     channel: str
     user: str | None
@@ -303,6 +314,7 @@ class PostedMessage(EventCallback):
     ts: str
     thread_ts: str | None
     bot_id: str | None
+    app_id: str | None = None
 
     @property
     def is_thread_reply(self) -> bool:
@@ -310,9 +322,15 @@ class PostedMessage(EventCallback):
 
     @property
     def is_from_bot(self) -> bool:
-        """Posted by a bot — possibly this app's own: skip it, or the bot
-        answers itself in a loop."""
+        """Posted by a bot or app (an alert bot, a workflow, this app...)."""
         return self.bot_id is not None
+
+    @property
+    def is_from_this_app(self) -> bool:
+        """Posted by the app receiving the event (``app_id`` is
+        ``api_app_id``), like Bolt's ``ignoreSelf``: skip it, or the bot
+        answers itself in a loop. Other bots' messages stay."""
+        return self.app_id is not None and self.app_id == self.api_app_id
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -326,8 +344,8 @@ class Message(PostedMessage):
     with the bot), or ``message.channels`` / ``.groups`` / ``.mpim`` when
     subscribed. ``subtype`` is None for an ordinary new message; edits
     (``message_changed``) and deletions (``message_deleted``) arrive as
-    subtypes too. Ignore :attr:`is_from_bot` messages to avoid answering the
-    bot's own posts in a loop."""
+    subtypes too. Skip :attr:`is_from_this_app` messages, or the bot answers
+    its own posts in a loop; :func:`trigger_slug` gives them none."""
 
     channel_type: str | None
     subtype: str | None
@@ -495,6 +513,7 @@ def _typed(callback: dict[str, Any], event: Mapping[str, Any]) -> EventCallback 
             "ts": ts,
             "thread_ts": _str(event, "thread_ts"),
             "bot_id": _str(event, "bot_id"),
+            "app_id": _str(event, "app_id") or _str(_mapping(event.get("bot_profile")), "app_id"),
         }
         if kind == "app_mention":
             return AppMention(**posted)
@@ -527,6 +546,10 @@ def _typed(callback: dict[str, Any], event: Mapping[str, Any]) -> EventCallback 
     return None
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _ids(value: Any) -> tuple[str, ...]:
     return tuple(v for v in value if isinstance(v, str) and v) if isinstance(value, list) else ()
 
@@ -544,13 +567,18 @@ _MESSAGE_FIELDS = (
 
 def trigger_slug(event: EventCallback) -> str | None:
     """The Composio-style trigger name for an event, or None when it is not
-    one pipe triggers on (an edit, a reaction to a file, an unknown type)."""
+    one pipe triggers on: the app's own post, an edit, a reaction to a file,
+    an unknown type."""
+    if isinstance(event, PostedMessage) and event.is_from_this_app:
+        return None
     if isinstance(event, AppMention):
         return TRIGGER_APP_MENTION
     if isinstance(event, Message):
-        if not event.is_new or event.channel_type is None:
+        if not event.is_new:
             return None
-        return TRIGGER_DIRECT_MESSAGE if event.is_direct_message else TRIGGER_CHANNEL_MESSAGE
+        if event.is_direct_message:
+            return TRIGGER_DIRECT_MESSAGE
+        return TRIGGER_CHANNEL_MESSAGE if event.channel_type in CHANNEL_TYPES else None
     if isinstance(event, Reaction):
         if event.item_type != "message":
             return None
@@ -568,8 +596,8 @@ def event_to_envelope(event: EventCallback) -> DataEnvelope:
     Slack sent it when there is no trigger. ``metadata`` carries
     ``trigger_slug`` (None without one), ``event_id`` (the dedupe key),
     ``event_type``, ``team_id``, ``api_app_id`` and ``event_time``, and for
-    messages and mentions ``is_from_bot`` (route those nowhere that answers,
-    or the bot replies to itself)."""
+    messages and mentions ``is_from_bot`` and ``is_from_this_app`` (the
+    app's own posts get no trigger, so a router can't loop on them)."""
     slug = trigger_slug(event)
     data: dict[str, Any]
     if isinstance(event, PostedMessage) and slug is not None:
@@ -600,11 +628,13 @@ def event_to_envelope(event: EventCallback) -> DataEnvelope:
     }
     if isinstance(event, PostedMessage):
         metadata["is_from_bot"] = event.is_from_bot
+        metadata["is_from_this_app"] = event.is_from_this_app
     return DataEnvelope(content_type="application/json", data=data, source_id="slack", metadata=metadata)
 
 
 __all__ = [
     "BOT_EVENTS",
+    "CHANNEL_TYPES",
     "EVENTS_ONLY_BOT_SCOPES",
     "RETRY_NUM_HEADER",
     "RETRY_REASON_HEADER",

@@ -4,8 +4,11 @@ header lookup, typed parsing of Slack's own example payloads
 
 from __future__ import annotations
 
+import email.message
 import hashlib
 import hmac
+import http.client
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -221,6 +224,20 @@ class TestVerifyRequest:
         assert self._reason(good, body, secret="") == "no_signing_secret"
         assert self._reason(good, None) == "bad_body"  # type: ignore[arg-type]
 
+    def test_stdlib_message_headers(self):
+        # http.server hands a handler an email.message.Message: iterating it
+        # yields names only, so its items() must be used.
+        body = body_of("app_mention")
+        raw = "".join(f"{k}: {v}\r\n" for k, v in headers(body).items()) + "\r\n"
+        parsed = http.client.parse_headers(io.BytesIO(raw.encode("latin-1")))
+        assert verify_request(parsed, body, SECRET, now=NOW) is None
+        message = email.message.Message()
+        for key, value in headers(body).items():
+            message[key] = value
+        assert verify_request(message, body, SECRET, now=NOW) is None
+        message["x-slack-signature"] = "v0=" + "0" * 64  # a second, different value
+        assert self._reason(message, body) == "missing_signature"
+
     def test_conflicting_duplicate_headers_fail_closed(self):
         body = body_of("app_mention")
         good = headers(body)
@@ -394,6 +411,7 @@ class TestEnvelopes:
             (variant("message.im", subtype="message_changed"), None),
             (variant("message.im", subtype="message_deleted"), None),
             (variant("message.im", channel_type=None), None),
+            (variant("message.im", channel="D0HOME", channel_type="app_home"), None),
             (variant("reaction_added", item={"type": "file", "file": "F0123"}), None),
             (EVENTS["tokens_revoked"], None),
             (EVENTS["app_uninstalled"], None),
@@ -428,6 +446,7 @@ class TestEnvelopes:
             "api_app_id": "A0PNCHHK2",
             "event_time": 1355517523,
             "is_from_bot": False,
+            "is_from_this_app": False,
         }
 
     def test_reaction_envelope(self):
@@ -462,6 +481,33 @@ class TestEnvelopes:
         event = parse_event(body)
         assert isinstance(event, EventCallback)
         assert event_to_envelope(event).metadata["is_from_bot"] is from_bot
+
+    def test_the_apps_own_dm_reply_gets_no_trigger(self):
+        # The self-reply loop: the app answers a DM, Slack sends that answer
+        # back as message.im. Like Bolt's ignoreSelf, it must not trigger.
+        own = parse_event(variant("message.im", user="U0BOTUSER", bot_id="B0BOT", app_id="A0PNCHHK2"))
+        assert isinstance(own, Message)
+        assert own.is_from_bot and own.is_from_this_app
+        assert trigger_slug(own) is None
+        envelope = event_to_envelope(own)
+        assert envelope.metadata["trigger_slug"] is None
+        assert envelope.metadata["is_from_this_app"] is True
+
+    def test_the_app_is_also_found_in_bot_profile(self):
+        body = variant("message.im", bot_id="B0BOT", bot_profile={"id": "B0BOT", "app_id": "A0PNCHHK2"})
+        event = parse_event(body)
+        assert isinstance(event, Message) and event.app_id == "A0PNCHHK2" and event.is_from_this_app
+
+    def test_other_bots_keep_their_trigger(self):
+        # An alert bot's DM is still a message to act on (Composio's
+        # is_bot_message=null keeps bots too).
+        other = parse_event(variant("message.im", bot_id="B0ALERT", app_id="A0ALERTS", subtype="bot_message"))
+        assert isinstance(other, Message)
+        assert other.is_from_bot and not other.is_from_this_app
+        assert trigger_slug(other) == "SLACK_DIRECT_MESSAGE_RECEIVED"
+        mention = parse_event(variant("app_mention", bot_id="B0BOT", app_id="A123ABC456"))
+        assert isinstance(mention, AppMention) and mention.is_from_this_app
+        assert trigger_slug(mention) is None
 
     def test_an_untriggered_event_carries_the_event_as_sent(self):
         event = parse_event(body_of("tokens_revoked"))

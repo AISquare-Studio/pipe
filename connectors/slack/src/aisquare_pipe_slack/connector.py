@@ -9,13 +9,17 @@ add; as the bot, only with ``bot_attribution``.
 
 Routing, by the envelope:
 
-* a message — ``str`` data with a text content type (``text/plain`` is Slack
-  mrkdwn, ``text/markdown`` standard markdown), or ``application/json`` dict
-  data with ``text``, ``markdown_text`` and/or ``blocks`` — goes to
-  ``chat.postMessage``, or to ``chat.postEphemeral`` with
+* a message — ``str`` data as ``text/plain`` (Slack mrkdwn) or
+  ``text/markdown`` (standard markdown), or ``dict`` data as
+  ``application/json`` with ``text``, ``markdown_text`` and/or ``blocks`` —
+  goes to ``chat.postMessage``, or to ``chat.postEphemeral`` with
   ``params["ephemeral_user"]``;
-* anything else — ``bytes``, a ``stream``, or another content type — is
-  uploaded as a file with Slack's v2 upload, into the channel (or thread).
+* anything else — ``bytes``, a ``stream``, ``str`` of another type (JSON
+  text, CSV...), a ``dict`` of another type — is uploaded as a file with
+  Slack's v2 upload, into the channel (or thread).
+
+``params`` are checked before any request: strings must be non-empty
+strings and flags booleans (a float ``thread_ts`` would lose digits).
 
 ``PushResult.ref`` is the new message's ``ts`` (``message_ts`` for an
 ephemeral message) or the uploaded file's ID. A failed push never raises: it
@@ -75,9 +79,14 @@ from aisquare_pipe_slack.tools import (
 
 logger = logging.getLogger("aisquare.pipe.slack")
 
-#: Content types posted as a message (with ``str`` or ``dict`` data).
-MESSAGE_TYPES = frozenset({"text/plain", "text/markdown", "text/x-markdown", "application/json"})
+#: Content types whose ``str`` data is posted as a message; a ``dict`` is a
+#: message only as :data:`JSON_TYPE`.
+TEXT_TYPES = frozenset({"text/plain", "text/markdown", "text/x-markdown"})
 MARKDOWN_TYPES = frozenset({"text/markdown", "text/x-markdown"})
+JSON_TYPE = "application/json"
+#: ``params`` the sink reads: non-empty strings, and booleans.
+STRING_PARAMS = ("channel", "thread_ts", "ephemeral_user", "filename", "title", "initial_comment")
+BOOL_PARAMS = ("reply_broadcast", "unfurl_links", "unfurl_media")
 #: Largest file the sink uploads (the same cap as downloads).
 UPLOAD_MAX_BYTES = 100 * 1024 * 1024
 #: The tools whose enablement a push follows: posting is ``send`` tier by
@@ -141,10 +150,7 @@ class SlackMessageSink(SinkConnector):
     def validate_config(self, config: dict) -> bool:
         """Offline: a usable ``access_token`` (non-blank, no inner
         whitespace) and toolkit options the sink can read."""
-        if not isinstance(config, Mapping):
-            return False
-        token = config.get("access_token")
-        if not isinstance(token, str) or not token.strip() or any(ch.isspace() for ch in token.strip()):
+        if not isinstance(config, Mapping) or not _usable_token(config.get("access_token")):
             return False
         try:
             settings_from_config(config)
@@ -159,16 +165,17 @@ class SlackMessageSink(SinkConnector):
         settings: SlackSettings | None = None
         try:
             config = config if isinstance(config, Mapping) else {}
-            options = params.params if isinstance(params, PushParams) else {}
-            channel = options.get("channel")
-            if not isinstance(channel, str) or not channel.strip():
-                raise _PushError("params['channel'] is required (a channel ID or name)")
-            if not self.validate_config(config):
+            options = _options(params)
+            channel = options["channel"]
+            if not _usable_token(config.get("access_token")):
+                raise _PushError("config['access_token'] is missing or not a usable Slack token", ERROR_FORBIDDEN)
+            try:
+                settings = settings_from_config(config)
+            except SlackConfigError as e:
+                # forbidden, as in the toolkit: the host's config, not Slack.
                 raise _PushError(
-                    "config needs a Slack access_token (and toolkit options the sink can read)",
-                    ERROR_FORBIDDEN,
-                )
-            settings = settings_from_config(config)
+                    f"invalid Slack config, nothing is sent until the host fixes it: {e}", ERROR_FORBIDDEN
+                ) from None
             token = str(config["access_token"]).strip()
             attribution = settings.attribution(token)
             # Content first: a bad envelope fails before any request. A message
@@ -206,8 +213,8 @@ class SlackMessageSink(SinkConnector):
             )
         except ToolError as e:
             return _failed(str(e), e.code)
-        except (_PushError, SlackConfigError) as e:
-            return _failed(str(e), getattr(e, "code", ERROR_FORBIDDEN))
+        except _PushError as e:
+            return _failed(str(e), e.code)
         except Exception as e:  # noqa: BLE001 — a sink reports, never raises
             logger.warning("slack: push failed (%s)", type(e).__name__)
             return _failed(f"slack: push failed ({type(e).__name__})", ERROR_UPSTREAM_ERROR)
@@ -233,12 +240,43 @@ def _base_type(content_type: Any) -> str:
     return str(content_type or "").split(";", 1)[0].strip().lower()
 
 
+def _usable_token(token: Any) -> bool:
+    """Core's toolkit rule: a non-blank string without inner whitespace."""
+    return isinstance(token, str) and bool(token.strip()) and not any(ch.isspace() for ch in token.strip())
+
+
+def _options(params: PushParams | None) -> dict[str, Any]:
+    """The params the sink reads, checked: non-empty strings and booleans,
+    ``channel`` required. Anything else is refused before any request."""
+    raw = params.params if isinstance(params, PushParams) else None
+    raw = raw if isinstance(raw, Mapping) else {}
+    options: dict[str, Any] = {}
+    for name in STRING_PARAMS:
+        value = raw.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise _PushError(f"params[{name!r}] must be a non-empty string")
+        options[name] = value.strip()
+    for name in BOOL_PARAMS:
+        value = raw.get(name)
+        if value is None:
+            continue
+        if not isinstance(value, bool):
+            raise _PushError(f"params[{name!r}] must be true or false")
+        options[name] = value
+    if "channel" not in options:
+        raise _PushError("params['channel'] is required (a channel ID or name)")
+    return options
+
+
 def _is_message(envelope: DataEnvelope) -> bool:
-    return (
-        envelope.stream is None
-        and isinstance(envelope.data, (str, dict))
-        and _base_type(envelope.content_type) in MESSAGE_TYPES
-    )
+    if envelope.stream is not None:
+        return False
+    kind = _base_type(envelope.content_type)
+    if isinstance(envelope.data, str):
+        return kind in TEXT_TYPES
+    return isinstance(envelope.data, dict) and kind == JSON_TYPE
 
 
 def _message_content(envelope: DataEnvelope) -> dict[str, Any]:

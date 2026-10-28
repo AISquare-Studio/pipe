@@ -92,7 +92,9 @@ class TestRequest:
         assert session.last.allow_redirects is False
 
     @pytest.mark.parametrize(
-        "method", ["../oauth.v2.access", "auth.test?x=1", "https://evil.test/a.b", "auth", "SlackLists.create", "a.b/c"]
+        "method",
+        ["../oauth.v2.access", "auth.test?x=1", "https://evil.test/a.b", "auth", "SlackLists.create", "a.b/c",
+         "auth.test\n", "auth.test\r\n"],
     )
     def test_method_names_are_checked(self, method):
         client, session, _ = _client()

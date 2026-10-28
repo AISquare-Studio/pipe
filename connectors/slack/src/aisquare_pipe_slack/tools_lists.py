@@ -95,19 +95,36 @@ def _json_value(value: Any, name: str) -> Any:
     return value
 
 
+def _blocks_or_none(value: Any) -> list[dict[str, Any]] | None:
+    """``value`` as a list of Block Kit blocks (one block is wrapped), or
+    None when it isn't one."""
+    if isinstance(value, dict):
+        value = [value]
+    if isinstance(value, list) and value and all(isinstance(b, dict) and b.get("type") for b in value):
+        return value
+    return None
+
+
 def _description_blocks(value: Any) -> list[dict[str, Any]]:
     """Blocks for ``description_blocks``: a list of blocks as is, one block
-    wrapped in a list, plain text wrapped into a ``rich_text`` block."""
-    decoded = _json_value(value, "description_blocks")
-    if isinstance(decoded, dict):
-        decoded = [decoded]
-    if isinstance(decoded, list):
-        if not decoded or not all(isinstance(b, dict) and b.get("type") for b in decoded):
-            raise _invalid("description_blocks must be text, or Block Kit blocks with a type")
-        return decoded
-    if not isinstance(decoded, str) or not decoded.strip():
-        raise _invalid("description_blocks is empty")
-    return [rich_text(decoded)]
+    wrapped in a list, plain text wrapped into a ``rich_text`` block. A
+    string is blocks only when it is their JSON; anything else in it — even
+    '[Draft] Q3 plan' — is plain text."""
+    if isinstance(value, str):
+        if not value.strip():
+            raise _invalid("description_blocks is empty")
+        if value.lstrip()[:1] in ("[", "{"):
+            try:
+                blocks = _blocks_or_none(json.loads(value))
+            except (ValueError, RecursionError):
+                blocks = None
+            if blocks is not None:
+                return blocks
+        return [rich_text(value)]
+    blocks = _blocks_or_none(value)
+    if blocks is None:
+        raise _invalid("description_blocks must be text, or Block Kit blocks with a type")
+    return blocks
 
 
 def _objects(value: Any, name: str) -> list[dict[str, Any]]:
@@ -367,8 +384,9 @@ LISTS_CATALOG: tuple[SlackTool, ...] = (
     ),
     _tool(
         "SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS", TIER_DESTRUCTIVE, AREA, "slackLists.items.deleteMultiple",
-        "Delete several items (rows) of one Slack List at once. All or nothing: on failure none "
-        "were deleted. Cannot be undone.",
+        "Delete several items (rows) of one Slack List at once. Cannot be undone. Slack answers "
+        "for the whole batch, with no per-item result: after a failure, list the items to see "
+        "which remain before retrying.",
         _schema(
             {"list_id": LIST_ID, "ids": _ids_schema("Item IDs (Rec…): an array or a comma-separated string.")},
             ["list_id", "ids"],

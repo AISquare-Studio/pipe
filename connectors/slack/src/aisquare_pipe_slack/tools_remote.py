@@ -56,14 +56,16 @@ TIMESTAMP_FILTER = {"type": ["string", "number"], "description": "Unix time in s
 
 def _by_file_or_external_id(method: str, names: tuple[str, ...]) -> Handler:
     """A call that names the file by ``file`` or ``external_id`` — exactly
-    one: Slack refuses both (``too_many_ids``)."""
+    one. ``files.remote.info`` refuses both (``too_many_ids``); the other
+    methods' docs allow both, but one is all they need, so every tool here
+    asks for exactly one rather than guess which Slack would use."""
 
     def handler(call: SlackCall, arguments: dict[str, Any]) -> ToolResult:
         if bool(arguments.get("file")) == bool(arguments.get("external_id")):
             raise _invalid("pass either file (the Slack file ID) or external_id, not both")
         sent = {n: arguments[n] for n in names if arguments.get(n) is not None}
         if "channels" in sent:
-            sent["channels"] = _id_list(sent["channels"], "channels")
+            sent["channels"] = _id_list(sent["channels"], "channels", "conversation")
         return ToolResult.ok(_payload(call.call(method, sent)))
 
     return handler

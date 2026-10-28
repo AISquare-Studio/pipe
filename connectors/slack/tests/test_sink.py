@@ -200,9 +200,13 @@ class TestFiles:
         [
             (envelope("plain words", "text/csv"), b"plain words"),
             (envelope({"a": 1}, "application/vnd.acme+json"), b'{"a": 1}'),
+            # JSON text is a document, not a message: only a dict is one.
+            (envelope('{"a": 1}', "application/json"), b'{"a": 1}'),
+            # A dict is a message only as application/json.
+            (envelope({"text": "hi"}, "text/plain"), b'{"text": "hi"}'),
             (DataEnvelope(content_type="text/plain", data="", source_id="t", stream=io.BytesIO(b"streamed")), b"streamed"),
         ],
-        ids=["str-non-message-type", "dict-non-message-type", "stream"],
+        ids=["str-non-message-type", "dict-non-message-type", "str-json", "dict-text-plain", "stream"],
     )
     def test_what_becomes_a_file(self, env, sent):
         result, session, _ = push(env, *self._replies(), config=BOT_CONFIG)
@@ -248,6 +252,33 @@ class TestGateAndFailures:
         assert no_channel.metadata["error_code"] == no_params.metadata["error_code"] == "invalid_arguments"
         assert "params['channel'] is required" in (no_channel.error or "")
         assert no_token.metadata["error_code"] == "forbidden"
+        assert session.calls == []
+
+    @pytest.mark.parametrize(
+        "params, message",
+        [
+            ({"thread_ts": 1761312000.0041}, "params['thread_ts'] must be a non-empty string"),
+            ({"thread_ts": "  "}, "params['thread_ts'] must be a non-empty string"),
+            ({"ephemeral_user": {"x": 1}}, "params['ephemeral_user'] must be a non-empty string"),
+            ({"reply_broadcast": "yes"}, "params['reply_broadcast'] must be true or false"),
+            ({"unfurl_links": 1}, "params['unfurl_links'] must be true or false"),
+            ({"unfurl_media": "false"}, "params['unfurl_media'] must be true or false"),
+            ({"filename": 5}, "params['filename'] must be a non-empty string"),
+            ({"channel": ["C0123456"]}, "params['channel'] must be a non-empty string"),
+        ],
+    )
+    def test_params_are_checked_before_any_request(self, params, message):
+        # A float thread_ts would go out as a JSON number and lose digits.
+        result, session, _ = push(envelope("hi"), **params)
+        assert result.success is False
+        assert result.error == message
+        assert result.metadata["error_code"] == "invalid_arguments"
+        assert session.calls == []
+
+    def test_a_config_error_names_its_key(self):
+        result, session, _ = push(envelope("hi"), config={**USER_CONFIG, "identity": "robot"})
+        assert result.metadata["error_code"] == "forbidden"
+        assert "config['identity'] must be 'user' or 'bot'" in (result.error or "")
         assert session.calls == []
 
     def test_send_must_be_enabled(self):
