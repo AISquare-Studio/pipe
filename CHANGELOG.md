@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
+  (`slack`, 51 tools — messages, history and threads, search, channels and
+  DMs, reactions, pins, people and presence, workspace) and `SLACK_OAUTH`.
+  - **One toolkit for both identities.** `config["identity"]` is `"user"`
+    (act as the person who connected) or `"bot"` (post as the app's bot).
+    By default one consent mints both tokens
+    (`build_authorize_url(identity="both")`, `exchange_installation()`).
+  - **Risk tiers.** Every tool has a tier: read, send, write or destructive.
+    The defaults are read + send for the user and send only for the bot,
+    because a shared bot token would expose other people's conversations.
+    Anything more needs `config["enabled_tiers"]` / `config["enabled_tools"]`.
+  - **Listing.** `available_tools(config)` and `search_tools(..., config=...)`
+    list only what a connection may call; with no config, that is the default
+    exposure. An invalid config fails as `forbidden`.
+  - **Attribution.** Messages sent as the user carry a visible "Sent by <name>"
+    line (`config["attribution_name"]`, default `pipe`; opt-in for the bot).
+    The line is dropped only for a token that is positively a bot token.
+  - **Scopes.** Named scope groups (by area and by tier) select what a consent
+    asks for; the default is every scope.
+  - Joins `[full]`.
+
 - `Toolkit.available_tools(config=None)`: the tools a connection with that
   config may call, so hosts can list only those to a model. It returns
   every tool (`tools()`) unless a toolkit overrides it.

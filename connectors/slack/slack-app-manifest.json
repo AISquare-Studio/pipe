@@ -1,0 +1,93 @@
+{
+  "_metadata": {
+    "major_version": 2,
+    "minor_version": 1
+  },
+  "display_information": {
+    "name": "YOUR_APP_NAME",
+    "description": "Let your agents search, read and act in Slack, with the permissions you grant.",
+    "background_color": "#1F2937",
+    "long_description": "Connect Slack to the AI agents you run. Once connected, an agent can search messages and files, read channels and threads, post, reply and schedule messages, react and pin, and manage channels and DMs — either as you, only where you already have access and with a visible 'Sent by' line on what it posts, or as this app's bot. Risky actions such as deleting or archiving stay off unless your administrator turns them on. You can disconnect at any time."
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "your-app-bot",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://YOUR_HOST/v1/connections/callback"
+    ],
+    "scopes": {
+      "user": [
+        "channels:history",
+        "channels:read",
+        "channels:write",
+        "channels:write.invites",
+        "channels:write.topic",
+        "chat:write",
+        "emoji:read",
+        "groups:history",
+        "groups:read",
+        "groups:write",
+        "groups:write.invites",
+        "groups:write.topic",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "pins:read",
+        "pins:write",
+        "reactions:read",
+        "reactions:write",
+        "search:read",
+        "team:read",
+        "users.profile:read",
+        "users.profile:write",
+        "users:read",
+        "users:read.email",
+        "users:write"
+      ],
+      "bot": [
+        "channels:history",
+        "channels:join",
+        "channels:manage",
+        "channels:read",
+        "channels:write.invites",
+        "channels:write.topic",
+        "chat:write",
+        "chat:write.public",
+        "emoji:read",
+        "groups:history",
+        "groups:read",
+        "groups:write",
+        "groups:write.invites",
+        "groups:write.topic",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "pins:read",
+        "pins:write",
+        "reactions:read",
+        "reactions:write",
+        "team:read",
+        "users.profile:read",
+        "users:read",
+        "users:read.email",
+        "users:write"
+      ]
+    },
+    "pkce_enabled": false,
+    "token_management_enabled": true
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
