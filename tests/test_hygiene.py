@@ -3,16 +3,20 @@ tmp_path fake repo trees."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
+from aisquare.pipe.testing import hygiene
 from aisquare.pipe.testing.hygiene import (
     INSTALL_BROKEN,
     INSTALL_MISSING,
     INSTALL_OK,
     ConnectorDir,
     DistInfo,
+    _file_url_to_path,
     check_install_state,
     classify_install_state,
     find_repo_root,
@@ -334,3 +338,49 @@ class TestInstallState:
 
     def test_non_editable_install_ok(self, cdir):
         assert classify_install_state(cdir, DistInfo(found=True, version="0.1.0")) == INSTALL_OK
+
+
+class TestFileUrlToPath:
+    """``direct_url.json`` records an editable install as a file:// URL. Getting
+    this wrong makes every editable connector look like a broken install.
+
+    ``url2pathname`` is itself platform-specific — ``nturl2path`` on Windows,
+    plain ``unquote`` elsewhere — so the cross-platform assertions here are
+    about the round-trip, and the drive-letter case is guarded."""
+
+    def test_roundtrips_a_real_directory(self, tmp_path):
+        """The invariant that actually decides install-state, on every OS."""
+        target = tmp_path / "connectors" / "good"
+        target.mkdir(parents=True)
+        assert _file_url_to_path(target.as_uri()).resolve() == target.resolve()
+
+    def test_roundtrips_a_path_containing_a_space(self, tmp_path):
+        target = tmp_path / "my repo" / "connectors" / "good"
+        target.mkdir(parents=True)
+        # as_uri() percent-escapes the space; the old textual strip left it in.
+        assert "%20" in target.as_uri()
+        assert _file_url_to_path(target.as_uri()).resolve() == target.resolve()
+
+    def test_percent_escapes_are_decoded(self):
+        assert _file_url_to_path("file:///tmp/my%20repo").name == "my repo"
+
+    @pytest.mark.skipif(os.name != "nt", reason="drive letters are Windows-only")
+    def test_windows_drive_url_has_no_leading_slash(self):
+        # pip writes three slashes, so the path component is "/N:/repo/x".
+        assert _file_url_to_path("file:///N:/repo/x").as_posix().startswith("N:")
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+    def test_posix_url_is_unchanged(self):
+        assert _file_url_to_path("file:///home/u/repo/x") == Path("/home/u/repo/x")
+
+    def test_posix_behaviour_matches_the_old_strip_for_plain_paths(self, monkeypatch):
+        """On POSIX ``url2pathname`` is just ``unquote``, so ordinary paths must
+        resolve exactly as the previous textual strip did — this fix may only
+        change what was already wrong (escapes, Windows drives)."""
+        monkeypatch.setattr(hygiene, "url2pathname", unquote)
+        for url in (
+            "file:///home/u/repo/connectors/x",
+            "file:///var/lib/pipe/connectors/local",
+            "file:///srv/a-b_c.d/connectors/n8n",
+        ):
+            assert _file_url_to_path(url) == Path(url.removeprefix("file://"))

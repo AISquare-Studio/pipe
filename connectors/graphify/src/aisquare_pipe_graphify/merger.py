@@ -35,7 +35,7 @@ try:
     import networkx as nx
     from networkx.readwrite import json_graph
 except ImportError as exc:  # pragma: no cover — import-time guard
-    raise ImportError(
+    raise ModuleNotFoundError(
         "aisquare-pipe-graphify's merger needs networkx/graphifyy importable — "
         "install the engine extra: pip install 'aisquare-pipe-graphify[engine]'"
     ) from exc

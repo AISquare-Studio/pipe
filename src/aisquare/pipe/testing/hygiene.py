@@ -14,6 +14,8 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from aisquare.pipe.testing.validation import (
     CheckResult,
@@ -109,6 +111,19 @@ def list_connector_dirs(repo_root: Path) -> list[ConnectorDir]:
     return dirs
 
 
+def _file_url_to_path(url: str) -> Path:
+    """Convert a ``file://`` URL from ``direct_url.json`` into a real path.
+
+    Stripping the scheme textually is wrong on Windows: pip writes
+    ``file:///N:/repo``, whose path component is ``/N:/repo`` — a leading
+    slash that makes the result compare unequal to every real directory, so
+    every editable connector looks like a broken install. It also leaves
+    percent-escapes (``%20`` for a space) in place on all platforms.
+    ``url2pathname`` handles both, and is a no-op for ordinary POSIX paths.
+    """
+    return Path(url2pathname(urlparse(url).path))
+
+
 def load_dist_info(
     dist_name: str, discovered: list[DiscoveredConnector]
 ) -> DistInfo:
@@ -127,7 +142,7 @@ def load_dist_info(
         if raw:
             url = json.loads(raw).get("url", "")
             if url.startswith("file://"):
-                editable_path = Path(url.removeprefix("file://"))
+                editable_path = _file_url_to_path(url)
     except Exception:  # noqa: BLE001 — absent/odd metadata is not an error
         editable_path = None
 
