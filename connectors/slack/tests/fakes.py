@@ -35,6 +35,8 @@ class Call:
     headers: dict[str, str]
     timeout: Any = None
     allow_redirects: Any = None
+    stream: Any = None
+    files: Any = None
 
     @property
     def api_method(self) -> str:
@@ -71,6 +73,8 @@ class FakeSession:
                 headers=dict(kwargs.get("headers") or {}),
                 timeout=kwargs.get("timeout"),
                 allow_redirects=kwargs.get("allow_redirects"),
+                stream=kwargs.get("stream"),
+                files=kwargs.get("files"),
             )
         )
         if not self.responses:
@@ -109,6 +113,8 @@ def response(
     if content is None:
         content = b"" if body is None else json.dumps(body).encode()
     r._content = content
+    # iter_content() then slices _content: downloads stream from it.
+    r._content_consumed = True
     all_headers = dict(headers or {})
     if body is not None:
         all_headers.setdefault("Content-Type", "application/json; charset=utf-8")

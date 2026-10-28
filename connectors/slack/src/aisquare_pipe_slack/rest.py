@@ -38,6 +38,7 @@ import logging
 import math
 import re
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping
 from typing import Any, Self
 
@@ -150,6 +151,30 @@ class SlackWebClient:
             return None
         return self._deadline - self._monotonic()
 
+    def _send(self, label: str, verb: str, url: str, **kwargs: Any) -> requests.Response:
+        """One request outside the Web API (file bytes), inside the time
+        budget, redirects never followed by requests itself. Transport
+        failures raise :class:`SlackAPIError` labelled ``label``."""
+        remaining = self._remaining()
+        if remaining is not None and remaining <= 0:
+            raise SlackAPIError(label, "timeout", timed_out=True)
+        timeout = self.timeout if remaining is None else min(self.timeout, remaining)
+        try:
+            return self._session.request(verb, url, timeout=timeout, allow_redirects=False, **kwargs)
+        except requests.Timeout:
+            raise SlackAPIError(label, "timeout", timed_out=True) from None
+        except requests.RequestException as e:
+            logger.warning("slack: %s network error (%s)", label, type(e).__name__)
+            raise SlackAPIError(label, "network_error") from None
+
+    def download(self, url: str, *, max_bytes: int) -> tuple[bytes, str]:
+        """A Slack-hosted file's bytes and content type (see :func:`_download`)."""
+        return _download(self, url, max_bytes=max_bytes)
+
+    def upload_external(self, upload_url: str, data: bytes) -> None:
+        """POST bytes to a v2 upload URL (see :func:`_upload`)."""
+        _upload(self, upload_url, data)
+
     def call(
         self,
         method: str,
@@ -158,11 +183,13 @@ class SlackWebClient:
         json_body: bool = False,
         idempotent: bool = False,
         retry: bool = True,
+        files: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Call one Web API method; return Slack's payload (``ok`` is true) or
         raise :class:`SlackAPIError`. ``None`` arguments are dropped.
         ``idempotent`` calls (reads) are also retried on server errors;
-        ``retry=False`` never retries."""
+        ``retry=False`` never retries. ``files`` (``{field: (name, bytes,
+        mime)}``) sends a multipart form, as ``users.setPhoto`` needs."""
         if not _METHOD.match(method):
             raise ValueError(f"not a Slack method name: {method!r}")
         fields = {k: v for k, v in (args or {}).items() if v is not None}
@@ -183,7 +210,13 @@ class SlackWebClient:
             started = time.monotonic()
             try:
                 response = self._session.request(
-                    "POST", url, data=body, headers=headers, timeout=timeout, allow_redirects=False
+                    "POST",
+                    url,
+                    data=body,
+                    files=dict(files) if files else None,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=False,
                 )
             except requests.Timeout:  # before RequestException: ConnectTimeout is both
                 raise SlackAPIError(method, "timeout", timed_out=True) from None
@@ -254,6 +287,108 @@ def _outcome(
         retry_wait = _SERVER_ERROR_WAIT * (2**attempt) if server_error and idempotent else None
         return payload, error, retry_wait
     return payload, None, None
+
+
+# --------------------------------------------------------------------------
+# File bytes (plan §4.8): downloads from files.slack.com, v2 upload POSTs
+# --------------------------------------------------------------------------
+
+#: The only host a download may send the token to.
+DOWNLOAD_HOST = "files.slack.com"
+#: Redirects a download follows (by hand, so the token never leaves the host).
+MAX_DOWNLOAD_REDIRECTS = 3
+#: Read size while streaming a download.
+DOWNLOAD_CHUNK = 64 * 1024
+
+
+def _https_host(url: Any) -> str | None:
+    """The lower-cased host of an ``https`` URL, else None."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    return (parts.hostname or "").lower() or None if parts.scheme == "https" else None
+
+
+def is_slack_upload_url(url: Any) -> bool:
+    """A pre-signed v2 upload URL: ``https`` on ``slack.com`` or a subdomain."""
+    host = _https_host(url)
+    return bool(host) and (host == "slack.com" or str(host).endswith(".slack.com"))
+
+
+def _download(
+    client: SlackWebClient, url: str, *, max_bytes: int
+) -> tuple[bytes, str]:
+    """GET a Slack-hosted file: ``(bytes, content type)``. The token goes only
+    to ``https://files.slack.com``; redirects are followed by hand (at most
+    :data:`MAX_DOWNLOAD_REDIRECTS`), each must be ``https``, and the token is
+    dropped for any other host. The byte cap is enforced while reading and
+    the time budget is checked between reads. Raises :class:`SlackAPIError`
+    (method ``files.download``)."""
+    method = "files.download"
+    if _https_host(url) != DOWNLOAD_HOST:
+        raise SlackAPIError(method, "invalid_download_url", status=200)
+    for _ in range(MAX_DOWNLOAD_REDIRECTS + 1):
+        host = _https_host(url)
+        if host is None:
+            raise SlackAPIError(method, "insecure_redirect", status=302)
+        headers = {"User-Agent": USER_AGENT}
+        if host == DOWNLOAD_HOST:
+            headers["Authorization"] = f"Bearer {client._token}"
+        response = client._send(method, "GET", url, headers=headers, stream=True)
+        try:
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not isinstance(location, str) or not location:
+                    raise SlackAPIError(method, "bad_redirect", status=response.status_code)
+                url = urllib.parse.urljoin(url, location)
+                continue
+            if response.status_code == 429:
+                raise SlackAPIError(
+                    method, "ratelimited", status=429, retry_after=retry_after_seconds(response)
+                )
+            if not 200 <= response.status_code < 300:
+                raise SlackAPIError(method, f"http_{response.status_code}", status=response.status_code)
+            content_type = str(response.headers.get("Content-Type") or "")
+            chunks: list[bytes] = []
+            size = 0
+            for chunk in response.iter_content(DOWNLOAD_CHUNK):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise SlackAPIError(method, "file_too_large", status=response.status_code)
+                chunks.append(chunk)
+                remaining = client._remaining()
+                if remaining is not None and remaining <= 0:
+                    raise SlackAPIError(method, "timeout", timed_out=True)
+            return b"".join(chunks), content_type
+        finally:
+            response.close()
+    raise SlackAPIError(method, "too_many_redirects", status=302)
+
+
+def _upload(client: SlackWebClient, upload_url: str, data: bytes) -> None:
+    """POST the bytes to a v2 ``upload_url``: pre-signed, so no token is
+    sent; ``https`` on a ``slack.com`` host only, no redirects. Anything but
+    HTTP 200 fails (method ``files.upload``)."""
+    method = "files.upload"
+    if not is_slack_upload_url(upload_url):
+        raise SlackAPIError(method, "invalid_upload_url", status=200)
+    response = client._send(
+        method,
+        "POST",
+        upload_url,
+        headers={"User-Agent": USER_AGENT, "Content-Type": "application/octet-stream"},
+        data=data,
+    )
+    try:
+        if response.status_code == 429:
+            raise SlackAPIError(method, "ratelimited", status=429, retry_after=retry_after_seconds(response))
+        if response.status_code != 200:
+            raise SlackAPIError(method, f"http_{response.status_code}", status=response.status_code)
+    finally:
+        response.close()
 
 
 def parse_body(response: requests.Response) -> Any:
