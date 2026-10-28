@@ -12,8 +12,9 @@ import requests
 from aisquare.pipe import get_toolkit
 
 from aisquare_pipe_slack import SlackToolkit
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.constants import RESULT_CHAR_CAP
-from aisquare_pipe_slack.tools import TOOLS, slim_message
+from aisquare_pipe_slack.tools import slim_message
 
 from .fakes import (
     ALL_TIERS,

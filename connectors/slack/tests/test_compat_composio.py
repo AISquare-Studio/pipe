@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from aisquare_pipe_slack.tools import TOOLS
+from aisquare_pipe_slack.catalog import TOOLS
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "composio_slack_args.json").read_text())
 COMPOSIO = FIXTURE["tools"]

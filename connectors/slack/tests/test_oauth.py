@@ -17,8 +17,8 @@ from aisquare_pipe_slack import (
     SlackToolkit,
     scopes_for,
 )
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.scopes import AREAS, resolve_scopes
-from aisquare_pipe_slack.tools import TOOLS
 
 from .fakes import BOT_TOKEN, USER_TOKEN, FakeSession, ok, query, response, slack_error
 

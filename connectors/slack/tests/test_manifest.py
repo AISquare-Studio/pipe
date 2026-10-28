@@ -9,8 +9,8 @@ import re
 from pathlib import Path
 
 from aisquare_pipe_slack import BOT_SCOPES, USER_SCOPES
+from aisquare_pipe_slack.catalog import TOOLS
 from aisquare_pipe_slack.constants import TOKEN_ROTATION
-from aisquare_pipe_slack.tools import TOOLS
 
 MANIFEST = json.loads((Path(__file__).parent.parent / "slack-app-manifest.json").read_text())
 #: Each method's scopes as docs.slack.dev's page header lists them (frozen

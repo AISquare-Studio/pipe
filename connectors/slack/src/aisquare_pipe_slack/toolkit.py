@@ -31,6 +31,7 @@ from aisquare.pipe import (
 )
 from aisquare.pipe.core.oauth import build_authorize_url as core_build_authorize_url
 
+from aisquare_pipe_slack.catalog import TOOL_SPECS, TOOLS
 from aisquare_pipe_slack.config import (
     SlackConfigError,
     SlackSettings,
@@ -59,7 +60,7 @@ from aisquare_pipe_slack.rest import (
     SlackWebClient,
 )
 from aisquare_pipe_slack.scopes import OAuthIdentity, scopes_for
-from aisquare_pipe_slack.tools import TOOL_SPECS, TOOLS, SlackCall, SlackTool
+from aisquare_pipe_slack.tools import SlackCall, SlackTool
 
 # --------------------------------------------------------------------------
 # Errors: Slack's ok:false codes -> ERROR_*

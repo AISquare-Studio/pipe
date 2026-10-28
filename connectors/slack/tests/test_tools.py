@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from aisquare_pipe_slack import SlackToolkit
-from aisquare_pipe_slack.tools import TOOLS
+from aisquare_pipe_slack.catalog import TOOLS
 
 from .fakes import ALL_TIERS, harness, ok, response, slack_error
 
