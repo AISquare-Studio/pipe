@@ -122,40 +122,29 @@ class OneDriveClient:
     ) -> Iterator[dict[str, Any]]:
         """List folder contents with automatic pagination.
 
-        Yields item dicts from the Graph API (files and folders).
+        Yields item dicts from the Graph API (files and folders). With
+        ``recursive``, subfolders found on *every* page are descended into
+        (each listing paginated too) after this folder's items.
         """
         if path and path != "/":
             url = f"{GRAPH_BASE_URL}/me/drive/root:/{path.strip('/')}:/children"
         else:
             url = f"{GRAPH_BASE_URL}/me/drive/root/children"
 
-        try:
-            while url:
-                resp = self._request("GET", url)
-                data = resp.json()
-                yield from data.get("value", [])
+        subfolders: list[str] = []
+        while url:
+            resp = self._request("GET", url)
+            data = resp.json()
+            for item in data.get("value", []):
+                if recursive and "folder" in item:
+                    subfolders.append(f"{path.strip('/')}/{item['name']}".strip("/"))
+                yield item
 
-                # Handle pagination
-                url = data.get("@odata.nextLink")
+            # Handle pagination
+            url = data.get("@odata.nextLink")
 
-            # If recursive, descend into subfolders
-            if recursive:
-                # Re-list to find folders (we already yielded everything)
-                if path and path != "/":
-                    folder_url = f"{GRAPH_BASE_URL}/me/drive/root:/{path.strip('/')}:/children"
-                else:
-                    folder_url = f"{GRAPH_BASE_URL}/me/drive/root/children"
-
-                resp = self._request("GET", folder_url)
-                items = resp.json().get("value", [])
-                for item in items:
-                    if "folder" in item:
-                        item_path = f"{path.strip('/')}/{item['name']}".strip("/")
-                        yield from self.list_folder(item_path, recursive=True)
-        except ConfigValidationError:
-            raise
-        except PipelineError:
-            raise
+        for subfolder in subfolders:
+            yield from self.list_folder(subfolder, recursive=True)
 
     def download(self, item_id: str) -> tuple[dict[str, Any], bytes]:
         """Download a file by item ID. Returns (metadata_dict, content_bytes)."""
