@@ -494,6 +494,51 @@ class TestGetAndSearch:
         assert kit.search_tools("delete an item")[0].slug == "MOCK_DELETE_ITEM"
 
 
+class _ReadOnlyByConfig(_Base):
+    """Lists only ACME_GET when the config says ``read_only``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[object] = []
+
+    def available_tools(self, config=None):
+        self.seen.append(config)
+        if config and config.get("read_only"):
+            return [t for t in self.tools() if t.slug == "ACME_GET"]
+        return self.tools()
+
+
+class TestAvailableTools:
+    def test_default_is_every_tool(self):
+        kit = MockToolkit()
+        assert kit.available_tools() == kit.tools()
+        assert kit.available_tools(None) == kit.tools()
+        assert kit.available_tools({"access_token": "t", "anything": 1}) == kit.tools()
+
+    def test_search_ranks_what_the_config_makes_available(self):
+        kit = _ReadOnlyByConfig()
+        assert [t.slug for t in kit.search_tools("boom", config={"read_only": True})] == ["ACME_GET"]
+        assert kit.search_tools("boom", limit=1, config={"read_only": False})[0].slug == "ACME_BOOM"
+        assert kit.seen == [{"read_only": True}, {"read_only": False}]
+
+    def test_search_without_config_asks_for_none(self):
+        kit = _ReadOnlyByConfig()
+        assert kit.search_tools("boom", 1)[0].slug == "ACME_BOOM"
+        assert kit.seen == [None]
+
+    def test_config_is_keyword_only(self):
+        with pytest.raises(TypeError):
+            MockToolkit().search_tools("item", 2, {"read_only": True})  # type: ignore[misc]
+
+    def test_listing_does_not_gate_lookup_or_calls(self):
+        # call_tool enforces on its own; available_tools only shapes listings.
+        kit = _ReadOnlyByConfig()
+        config = {**TOKEN, "read_only": True}
+        assert kit.get_tool("ACME_BOOM") is not None
+        assert kit.call_tool("ACME_GET", {"id": "7"}, config).successful
+        assert kit.seen == []
+
+
 class TestCallTool:
     def test_success_applies_defaults(self):
         kit = _Base()

@@ -48,6 +48,7 @@ full = [
     "aisquare-pipe-docusign",
     "aisquare-pipe-composio",
     "aisquare-pipe-github",
+    "aisquare-pipe-slack",
 ]
 
 [project.scripts]

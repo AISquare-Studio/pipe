@@ -1,0 +1,139 @@
+{
+  "_metadata": {
+    "major_version": 2,
+    "minor_version": 1
+  },
+  "display_information": {
+    "name": "YOUR_APP_NAME",
+    "description": "Let your agents search, read and act in Slack, with the permissions you grant.",
+    "background_color": "#1F2937",
+    "long_description": "Connect Slack to the AI agents you run. Once connected, an agent can search messages and files, read channels and threads, post, reply and schedule messages, react and pin, manage channels and DMs, and work with canvases, bookmarks and Slack Lists — either as you, only where you already have access and with a visible 'Sent by' line on what it posts, or as this app's bot, which can also answer when you mention it or message it directly. Risky actions such as deleting or archiving stay off unless your administrator turns them on. You can disconnect at any time."
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "your-app-bot",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "https://YOUR_HOST/v1/connections/callback"
+    ],
+    "scopes": {
+      "user": [
+        "bookmarks:read",
+        "bookmarks:write",
+        "canvases:read",
+        "canvases:write",
+        "channels:history",
+        "channels:read",
+        "channels:write",
+        "channels:write.invites",
+        "channels:write.topic",
+        "chat:write",
+        "dnd:read",
+        "dnd:write",
+        "emoji:read",
+        "files:read",
+        "files:write",
+        "groups:history",
+        "groups:read",
+        "groups:write",
+        "groups:write.invites",
+        "groups:write.topic",
+        "im:history",
+        "im:read",
+        "im:write",
+        "lists:read",
+        "lists:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "pins:read",
+        "pins:write",
+        "reactions:read",
+        "reactions:write",
+        "reminders:read",
+        "reminders:write",
+        "remote_files:read",
+        "search:read",
+        "team:read",
+        "usergroups:read",
+        "usergroups:write",
+        "users.profile:read",
+        "users.profile:write",
+        "users:read",
+        "users:read.email",
+        "users:write"
+      ],
+      "bot": [
+        "app_mentions:read",
+        "bookmarks:read",
+        "bookmarks:write",
+        "canvases:read",
+        "canvases:write",
+        "channels:history",
+        "channels:join",
+        "channels:manage",
+        "channels:read",
+        "channels:write.invites",
+        "channels:write.topic",
+        "chat:write",
+        "chat:write.public",
+        "dnd:read",
+        "emoji:read",
+        "files:read",
+        "files:write",
+        "groups:history",
+        "groups:read",
+        "groups:write",
+        "groups:write.invites",
+        "groups:write.topic",
+        "im:history",
+        "im:read",
+        "im:write",
+        "lists:read",
+        "lists:write",
+        "mpim:history",
+        "mpim:read",
+        "pins:read",
+        "pins:write",
+        "reactions:read",
+        "reactions:write",
+        "remote_files:read",
+        "remote_files:share",
+        "remote_files:write",
+        "team:read",
+        "usergroups:read",
+        "usergroups:write",
+        "users.profile:read",
+        "users:read",
+        "users:read.email",
+        "users:write"
+      ]
+    },
+    "pkce_enabled": false,
+    "token_management_enabled": true
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "https://YOUR_HOST/v1/slack/events",
+      "bot_events": [
+        "app_mention",
+        "message.im",
+        "reaction_added",
+        "reaction_removed",
+        "app_uninstalled",
+        "tokens_revoked"
+      ]
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

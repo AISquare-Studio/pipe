@@ -1,0 +1,688 @@
+# aisquare-pipe-slack
+
+Slack for [aisquare.pipe](../../README.md): `SlackToolkit`, registered as toolkit
+`slack` (`aisquare_pipe.toolkits`). It has 111 LLM-callable tools over Slack's Web API —
+messages, history and threads, search, channels and DMs, reactions, pins, people and
+presence, plus files (upload and download), canvases, bookmarks, Do Not Disturb,
+reminders, user groups, Slack Lists and remote files — and Slack's OAuth v2 spec. It
+acts **as the user** who connected, or **as the app's bot**. Which one is a config
+option.
+
+Two more pieces use the same connection config:
+
+- [`SlackMessageSink`](#message-sink), registered as connector `slack-message-sink`
+  (`aisquare_pipe.connectors`): a pipeline sink that posts messages and files.
+- [`aisquare_pipe_slack.events`](#inbound-events-events-api): pure helpers for a
+  host's Events API endpoint — signature check, replay window, typed events.
+
+pipe is app-agnostic. The host registers one Slack app and passes its client ID and
+secret, and its choices, into pipe. Which app that is (prod, staging, …) is the
+host's business.
+
+## Install
+
+```bash
+cd connectors/slack
+pip install -e ".[dev]"
+```
+
+## Quick start
+
+```python
+from aisquare_pipe_slack import SlackToolkit
+
+slack = SlackToolkit()
+config = {"access_token": "xoxp-…"}          # the user's token; see Config below
+
+slack.available_tools(config)                 # what this connection may call
+result = slack.call_tool(
+    "SLACK_SEND_MESSAGE", {"channel": "#general", "markdown_text": "Standup in 5"}, config
+)
+result.successful, result.data, result.error, result.error_code
+```
+
+`call_tool` never raises. Slugs and argument names follow Composio's Slack toolkit
+word for word (frozen in `tests/fixtures/composio_slack_args.json`; the few arguments
+left out are listed with reasons in `tests/test_compat_composio.py`).
+
+## Config
+
+Everything except `access_token` is optional and non-secret. The defaults are the
+safe choices.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `access_token` | string | — (required) | The token for `identity`: a user token (`xoxp-…`) or the app's bot token (`xoxb-…`). Never put it anywhere else. |
+| `identity` | `"user"` \| `"bot"` | `"user"` | `user`: act as the person who connected, with their access, under their name. `bot`: post as the app's bot user. |
+| `enabled_tiers` | list of tier names | user: `["read", "send"]`; bot: `["send"]` | The risk tiers this connection may call. It **replaces** the default, so list every tier you want. A comma-separated string works too. There is no wildcard. **Read under the bot exposes other people's conversations** (see Identity). |
+| `enabled_tools` | list of slugs | `[]` | Extra tools enabled one at a time, whatever their tier (e.g. `["SLACK_ADD_REACTION_TO_AN_ITEM"]`). |
+| `attribution_name` | string | `"pipe"` | The `<name>` in the "Sent by <name>" line (e.g. `"aisquare"` or `"pipe by aisquare"`). Whitespace is collapsed, and it is cut at 80 characters. |
+| `bot_attribution` | bool | `false` | Also add the line to messages the bot sends. The line is always added for the user identity. |
+| `timeout_seconds` | number | none | Set by hosts. It bounds the whole call, including retries and rate-limit sleeps. |
+
+A value the toolkit can't use (an unknown tier such as `"destrucive"`, an identity
+of `"app"`, a bot token with identity `"user"`, …) fails every call with
+`forbidden`, before its arguments are looked at, and the message names the key.
+`available_tools` / `search_tools` list nothing for such a config. `forbidden` was
+chosen over `upstream_error`, because a host may retry the latter and this is the
+host's misconfiguration, not a Slack failure. It was chosen over `invalid_arguments`
+because the model can't fix it by changing its arguments.
+
+The toolkit never guesses what you meant. Two values are ignored rather than refused:
+
+- an unknown slug in `enabled_tools` enables nothing;
+- an unusable `timeout_seconds` is ignored, as core's `time_budget` does.
+
+### Risk tiers
+
+Every tool has exactly one tier:
+
+| Tier | What it covers | On by default |
+|---|---|:-:|
+| `read` | No side effects | ✓ |
+| `send` | Posting into a conversation: a message, reply, DM (incl. opening the DM), ephemeral, scheduled or `/me` message; uploading a file into chosen conversations (it reaches nobody else) | ✓ |
+| `write` | Changes that delete nothing: editing a message, reactions, pins, channel admin (create, join, invite, rename, topic, purpose, unarchive), closing a DM, the read cursor, bookmarks, canvases (create, give access), profile/status/photo, presence, DnD, reminders, user groups (create, update, enable), turning a file's public link off, Slack Lists (create, edit items, share), remote files (add, update, share into conversations) | |
+| `destructive` | Things the caller can't undo, or that reach beyond Slack: deleting a message, scheduled message, file, file comment, canvas, canvas access, bookmark, reminder or profile photo; archiving a channel, removing someone, leaving a channel; editing a canvas (an edit can replace or delete content); disabling a user group or replacing its members; making a file public; deleting List items, removing access to a List, removing a remote file | |
+
+If a connection calls a tool whose tier it hasn't enabled, the call fails with
+`forbidden` **before any request is made**. The message names the setting that
+would allow it:
+
+> `SLACK_ARCHIVE_CONVERSATION is a 'destructive' tool and is not enabled for this Slack connection: the host enables it by adding 'destructive' to config['enabled_tiers'] or 'SLACK_ARCHIVE_CONVERSATION' to config['enabled_tools']`
+
+To show a model only what it may call, **list and search through the connection's
+config**:
+
+- `available_tools(config)` is core's config-aware listing hook.
+- `search_tools(query, limit, config=config)` ranks `available_tools(config)`.
+
+Without a config, both give the **default exposure: read + send only**. A host that
+lists without passing the connection's config therefore never offers a write or
+destructive tool. `search_tools` is defined on `SlackToolkit` too, so this also holds
+on an older core. Only `tools()` returns the full catalog, for browsing.
+`SlackToolkit.tier_of(slug)` gives a tool's tier.
+
+`ToolSpec.read_only` is true exactly for the `read` tier, and `destructive` is true
+for the `destructive` tier. The exceptions are the writes that overwrite content:
+`SLACK_UPDATES_A_SLACK_MESSAGE` (the message), `SLACK_UPDATE_SLACK_LIST_ITEM` (cell
+values) and `SLACK_UPDATE_REMOTE_FILE` (the file's URL and searchable text) are also
+flagged `destructive`. They still sit in the `write` tier, because the owner put
+edits there. Renames, topics and descriptions are not flagged.
+
+Sharing a remote file into a conversation (`SLACK_SHARE_REMOTE_FILE`) posts it, so it
+is **bot-only**, like the other remote-file writes. Remote files are the app's, and a
+share as the user would appear under the user's name with no room for the "Sent by"
+line that every posting `send` tool adds. It is `write`, so opt-in.
+
+### Identity
+
+| | `identity: "user"` | `identity: "bot"` |
+|---|---|---|
+| Token | user token (`xoxp-…`) | bot token (`xoxb-…`) |
+| Posts appear as | the user, with "Sent by <name>" | the app's bot (marker only with `bot_attribution`) |
+| Default tiers | read + send | **send only** |
+| Can read (with `read` enabled) | what that user can see | **every conversation the bot is in, whoever they belong to** |
+| User-only tools | all available | `SLACK_SEARCH_*`, `SLACK_SET_USER_PROFILE`, `SLACK_UNARCHIVE_CHANNEL`, the profile-photo, DnD-write and reminder tools, and `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` fail as `forbidden` without calling Slack: Slack accepts only user tokens for them. The two unread tools are user-only by design, because they read the user's own read position. `available_tools` leaves them out. |
+| Bot-only tools | `SLACK_ADD_REMOTE_FILE`, `SLACK_UPDATE_REMOTE_FILE`, `SLACK_REMOVE_REMOTE_FILE` (Slack accepts only the bot token for them) and `SLACK_SHARE_REMOTE_FILE` (by owner decision: a share as the user would post without the "Sent by" line) fail as `forbidden` without calling Slack. `available_tools` leaves them out. | all available (with `write` / `destructive` enabled) |
+| Group DMs | ✓ | DMs only (the bot does not request `mpim:write`) |
+
+> **Warning: reading as the bot crosses users.** One bot token serves the whole
+> workspace, and a host typically stores it once per team. With `read` enabled
+> under `identity: "bot"`, anyone given that connection can read every
+> conversation the bot is in. That includes other people's DMs with the bot, and
+> private channels that other people added it to. This is why `read` is off by
+> default for the bot. Enable it only for workspace admins or the person who
+> installed the app.
+
+`SLACK_OPEN_DM` is a send step, so it returns only what sending needs: the channel ID
+(plus `is_im` / `user` and `already_open` / `no_op`). This holds for every identity
+and tier. Composio's `return_im` is not accepted, because the full DM object carries
+the latest message and read state.
+
+`identity` comes from config. Tokens aren't validated by prefix, because Slack has
+changed prefixes before. A token that is *positively* a bot token (`xoxb-…`,
+`xoxe.xoxb-…`) is used to fail safe:
+- **with `identity` unset, it acts as the bot**: send-only defaults, never the user's
+  read access;
+- **with `identity: "user"`, it is a config error**: calls fail as `forbidden`, and
+  listing returns nothing;
+- **the "Sent by" marker is dropped only for such a token.** A user token configured
+  as `bot` still marks its messages, since they still appear under the user's name.
+
+### Attribution
+
+Messages sent with the user identity show a visible "Sent by <name>" line, like
+Claude's "Sent using Claude". This covers `SEND_MESSAGE`, `SEND_EPHEMERAL_MESSAGE`,
+`SCHEDULE_MESSAGE`, `SEND_ME_MESSAGE`, edits through `UPDATES_A_SLACK_MESSAGE`, and
+the share message of a file uploaded into a conversation. How the line is
+added depends on the content:
+
+- **`blocks`:** a context block (small grey text) goes after the blocks. This leaves
+  room for at most 49 blocks of your own.
+- **`markdown_text`:** a final italic line, `_Sent by pipe_`. Slack won't combine
+  `markdown_text` with blocks, so a context block isn't possible here.
+- **plain `text`:** a final italic line.
+
+The name is escaped for each format:
+
+- **mrkdwn** (`text`, context blocks): `&`, `<` and `>` become entities.
+- **`markdown_text`**: only the characters markdown would read as markup get a
+  backslash: `` \ ` * _ ~ [ ] < > ``. A typical name such as `pipe.ai (R&D)` gets
+  none, so it shows as written either way. Slack doesn't document whether
+  `markdown_text` honours CommonMark escapes; `tests/test_live.py` checks the posted
+  message for stray backslashes. Slack caps `markdown_text` at 12,000
+characters including the marker line, so the toolkit refuses longer content with
+`invalid_arguments` before sending. The error says how much room is left.
+
+## Results
+
+You get Slack's payload without `ok`, `response_metadata` or `warning`. Paged reads
+put their hints **first**, so they survive a caller truncating the result:
+
+```python
+{"has_more": True, "next_cursor": "dXNlcjpVMDYx…", "messages": [...]}  # cursor methods
+{"has_more": True, "next_page": 2, "messages": {"matches": [...]}}    # search.*
+```
+
+- **`has_more`** comes from `next_cursor`, never from the page size. Slack pages can
+  come back short in the middle of a collection.
+- **Message lists are slimmed.** The `rich_text` mirror of `text`, `user_profile`
+  and bot icons are dropped.
+- **Long message lists are cut** at 100,000 characters. When that happens, the
+  result has `truncated: true` and a resume hint: `resume_latest` for history,
+  `resume_oldest` for threads.
+- **Channel arguments** take an ID (`C…`, `G…`, `D…`, or a user ID `U…` for
+  `chat.postMessage`) or a name (`general` or `#general`). A name is looked up with
+  `conversations.list`, which costs an extra call; IDs avoid that. If a name is
+  ambiguous (on Enterprise Grid, two workspaces can each have `#general`), the call
+  is **refused** with `invalid_arguments`, never guessed.
+  - The same applies when the lookup stops at its cap (2,000 channels) with more
+    left: one match so far isn't proof there's no second one.
+  - An ID-shaped value containing a digit (`C04PRODUCT`) is used as an ID straight
+    away. An all-caps value without one (`GENERAL`, `CABCDEFGH`) is tried as a name
+    first, and used as an ID if no channel has that name, since channel names are
+    never uppercase. Slack doesn't promise IDs contain a digit: Slackbot is
+    `USLACKBOT`. `SLACK_FIND_USERS` does the same with `users.info`.
+
+## Files
+
+Files travel as real bytes (plan §4.8).
+
+- **`SLACK_DOWNLOAD_SLACK_FILE`** returns the file in `ToolResult.files` as a
+  `DataEnvelope`: `content_type` is the MIME type and `metadata` holds the filename,
+  file ID and size. `data` describes the file and also carries small text inline.
+  - The token is sent only to `https://files.slack.com`. Redirects are followed by
+    hand, and the token is dropped for any other host.
+  - The download is capped at 100 MiB, checked before downloading and again while
+    streaming.
+  - External (remote) files are refused: their URL belongs to the third party.
+  - If Slack returns a sign-in page instead of the file, the result is `forbidden`
+    (the connection lacks `files:read`).
+- **`SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK`** uploads text `content` with Slack's v2
+  flow:
+  1. get a pre-signed URL;
+  2. POST the bytes to it, with no token, `https` `*.slack.com` only;
+  3. complete the upload exactly once.
+
+  `channels` is **required**: uploading is a send, so it must post somewhere. A
+  private-only upload isn't offered. A share as the user carries the "Sent by" line:
+  - with `blocks`, as a context block, and then no `initial_comment` is sent, because
+    Slack ignores blocks when there is one;
+  - otherwise, as an italic last line of `initial_comment`.
+
+  `initial_comment` and `blocks` together are refused, as is `thread_ts` with more
+  than one channel. Host-staged `file` arguments are not supported yet.
+  `aisquare_pipe_slack.files.upload_file` is the same helper, for sinks.
+- **Downloads and HTML:** an HTML answer counts as the file only when the file is
+  HTML and its length matches what `files.info` declared. Otherwise it is Slack's
+  sign-in page (`forbidden`).
+- **URLs:** every file URL must be one where urllib3 (what requests uses) and the
+  stdlib agree on the host. Backslashes, userinfo, odd ports and whitespace are
+  refused, so a URL can't name `files.slack.com` to one parser and another host to
+  the other.
+- **`SLACK_SET_PROFILE_PHOTO`** takes the image as `{"base64": …, "mimetype": …}`.
+- **Canvases:**
+  - `SLACK_GET_CANVAS_CONTENT` cuts a canvas whose result would exceed 100,000
+    characters of JSON (`truncated: true`, `total_length`). The rest can't be read
+    through this tool. `SLACK_LOOKUP_CANVAS_SECTIONS` only finds section IDs, for
+    targeted edits.
+  - Access: `SLACK_SET_CANVAS_ACCESS` takes 1–20 IDs, and
+    `SLACK_DELETE_CANVAS_ACCESS` takes exactly one. Both limits are checked before
+    the call.
+
+## Errors
+
+Slack reports almost every failure as **HTTP 200 with `{"ok": false, "error":
+"<code>"}`**. Only rate limits are guaranteed to use HTTP 429. The client folds the
+HTTP status and the `ok` field into one error type, and `error_code` is decided in
+this order:
+
+1. **Transport.** A client timeout is `timeout`; a network failure is `upstream_error`.
+2. **HTTP status.** 429 is `rate_limited`; 408/504 is `timeout`; any other 5xx is
+   `upstream_error`; any other non-2xx goes through core's `error_code_for_status`.
+3. **Slack's code.** For example: `invalid_auth`/`token_revoked` are `unauthorized`;
+   `missing_scope`/`not_in_channel`/`not_allowed_token_type` are `forbidden`;
+   `*_not_found` is `not_found`; `already_reacted`/`is_archived` are `conflict`;
+   `invalid_cursor`/`msg_too_long` are `invalid_arguments`; unknown codes are
+   `upstream_error`. The full table is in `toolkit.py`.
+
+`conflict` reads as **"already in that state; no change needed"** only where the
+change really is in place: `already_reacted`, `no_reaction`, `already_pinned`,
+`not_pinned`, `already_archived`, `not_archived` and `already_in_channel`. Other
+conflicts mean nothing happened, and each has its own hint:
+
+- `is_archived` / `is_inactive`: the channel is archived or frozen;
+- `name_taken`: pick another name;
+- `too_many_pins` / `too_many_reactions`: Slack's limit.
+
+Workspace settings and plan limits (`edit_window_closed`, `message_limit_exceeded`,
+`messages_tab_disabled`) are `forbidden`. `SLACK_API_TEST` reports an echoed
+`error` as `upstream_error` and never retries, so a model can't make a healthy
+connection look revoked or rate limited.
+
+`missing_scope` is `forbidden`, **not** `unauthorized`. Its message says
+"reconnect Slack to grant `<scope>`", so a host doesn't loop through refreshes.
+Messages look like `"<method>: <slack code> — <what to do>"`, and `data` is
+`{"slack_error": code, "status": http_status}`. Neither ever carries arguments or
+the token. Slack's code is passed on only if it looks like one (`[a-z0-9_]+`, and
+the same for `needed` scopes); anything else is reported as `unknown_error`.
+
+A `not_in_channel` hint points to `SLACK_JOIN_AN_EXISTING_CONVERSATION` only when
+that write-tier tool is enabled for the connection. Otherwise the hint says to ask a
+member for an invite, and names the config keys that would enable joining.
+
+**Rate limits.** A 429 (or `ok: false, error: ratelimited`) is retried up to twice
+for up to 60 s in total, within `timeout_seconds`.
+
+- `Retry-After` is parsed defensively. A finite value of 0 or more is used and capped
+  at 3600 s; anything else counts as 60 s.
+- When the wait wouldn't leave time for the retried request, the call fails at once
+  as `rate_limited`, with `retry_after`.
+- Retrying a 429 is safe for writes too, because Slack didn't process the request.
+- Server errors are retried only for reads. Retrying a post could send it twice.
+
+**History limit for apps outside the Marketplace.** Since 2025-05-29, Slack limits
+`conversations.history` and `conversations.replies` to **1 call a minute and 15
+messages a page** for new installs of commercially distributed apps that aren't in
+the Marketplace. The tool descriptions steer models toward `SLACK_SEARCH_MESSAGES`,
+or toward one narrow page.
+
+**Unread messages.** `SLACK_LIST_UNREAD_CHANNEL_MESSAGES` relies on the
+`last_read` field from `conversations.info`, and Slack documents that field for DMs.
+If a conversation doesn't report it, the tool fails with `invalid_arguments` and
+points to `SLACK_FETCH_CONVERSATION_HISTORY`. It does not use `upstream_error`,
+because retrying won't help. The live test checks a channel and an optional DM.
+
+## Scopes
+
+Every tool declares the scopes it needs for each identity, so the scope lists are
+derived from the catalog rather than kept by hand. `USER_SCOPES` (44) and
+`BOT_SCOPES` (43) are the full unions, and they are what a consent asks for by
+default: one consent screen, and no re-consent later, because Slack scopes only
+ever add up. `BOT_SCOPES` also holds `app_mentions:read`, which no tool uses but the
+`app_mention` event subscription needs (`events.EVENTS_ONLY_BOT_SCOPES`).
+
+To ask for less, pass `scopes` to `build_authorize_url`. It takes **scope group**
+names, raw Slack scopes, or both:
+
+- By area: `messages`, `history`, `search`, `conversations`, `dms`, `reactions`,
+  `pins`, `users`, `workspace`, `bookmarks`, `dnd`, `files`, `canvases`, `reminders`,
+  `usergroups`, `lists`, `remote_files`.
+- By tier: `read`, `send`, `write`, `destructive`. For example,
+  `scopes_for(["read", "send"], "user")` is exactly what the user's default tiers
+  need. The bot's default is `["send"]`, and `scopes_for(["send", "events"], "bot")`
+  adds what receiving events needs. Under the default `identity="both"`, a group
+  applies to both token kinds.
+- `events`: the bot scopes the subscribed events need (`app_mentions:read`,
+  `im:history`, `reactions:read`).
+
+```python
+from aisquare_pipe_slack import SCOPE_GROUPS, scopes_for
+
+scopes_for(["read", "send"], "user")       # -> (user_scopes, ())
+scopes_for(["messages", "pins:read"], "both")
+```
+
+An unknown group, or a raw scope that no tool of that identity uses, raises
+`OAuthError(error="invalid_scope")`. It isn't sent to Slack, where it would fail the
+whole consent screen.
+
+## Connecting (OAuth)
+
+`SLACK_OAUTH` is Slack's OAuth v2:
+
+- authorize at `https://slack.com/oauth/v2/authorize`, exchange at `oauth.v2.access`;
+- comma-separated scopes;
+- PKCE off: turning it on in Slack makes the app a public client permanently, and caps
+  refresh tokens at 30 days;
+- token rotation off.
+
+One consent can mint a user token, a bot token, or both. **The default is both, with
+every scope.** That makes it one consent screen: switching `config["identity"]`
+later needs no re-consent.
+
+```python
+url = slack.build_authorize_url(
+    client_id=…, redirect_uri=…, state=csrf, scopes=None
+)  # identity: "both" (default) | "user" | "bot"; user scopes go in user_scope, bot scopes in scope
+
+token = slack.exchange_code(client_id=…, client_secret=…, code=…, redirect_uri=…)
+# -> core's OAuthToken: the user token, or the bot token when no user token was minted;
+#    identity="bot" picks the bot token
+
+installation = slack.exchange_installation(client_id=…, client_secret=…, code=…, redirect_uri=…)
+# -> SlackInstallation(user_token, bot_token, team_id, enterprise_id, user_id, bot_user_id, app_id)
+```
+
+- **`refresh_access_token`** is only used if the app turns on token rotation. Slack's
+  `invalid_refresh_token` comes back as `OAuthError(error="invalid_grant")`, a dead
+  grant.
+- **`revoke_token`** revokes **one user token** with `auth.revoke`. It never revokes
+  a bot token: `auth.test` identifies one, and it returns `False` without revoking,
+  because the bot token is shared by every connection in that workspace. It never
+  calls `apps.uninstall`.
+- **Whether to revoke on disconnect is the host's decision.** If Slack gives the same
+  user token to two connections of one person, revoking it from one breaks the other.
+
+## The Slack app
+
+[`slack-app-manifest.json`](slack-app-manifest.json) is an app manifest template:
+user and bot scopes, the bot user (with its Messages tab on, so people can DM it),
+the bot event subscriptions, PKCE off, token rotation off. pipe is app-agnostic, so
+first replace the placeholders `YOUR_APP_NAME`, `your-app-bot`,
+`https://YOUR_HOST/v1/connections/callback` and the Events request URL
+`https://YOUR_HOST/v1/slack/events` with your app's values. Then go to
+<https://api.slack.com/apps?new_app=1>, choose **From a manifest**, and use the JSON
+tab. Slack asks you to verify the request URL (the `url_verification` handshake,
+see [Inbound events](#inbound-events-events-api)) once the host's endpoint is up;
+until then, delete `settings.event_subscriptions` or leave it unverified — the tools
+and the sink don't need it.
+`tests/test_manifest.py` keeps its scopes equal to what the tools and the event
+subscriptions declare. It also checks every declared scope against Slack's own method
+docs, frozen in `tests/fixtures/slack_method_scopes.json`.
+
+Other workspaces can't install the app until you turn on **Manage Distribution →
+Activate Public Distribution**. Until then, installs fail with
+`invalid_team_for_non_distributed_app`.
+
+## Tools
+
+| Tool | Tier | Slack method(s) | Identity |
+|---|---|---|---|
+| **messages** | | | |
+| `SLACK_SEND_MESSAGE` | send | `chat.postMessage` | user, bot |
+| `SLACK_UPDATES_A_SLACK_MESSAGE` | write | `chat.update` | user, bot |
+| `SLACK_DELETES_A_MESSAGE_FROM_A_CHAT` | destructive | `chat.delete` | user, bot |
+| `SLACK_SEND_EPHEMERAL_MESSAGE` | send | `chat.postEphemeral` | user, bot |
+| `SLACK_SCHEDULE_MESSAGE` | send | `chat.scheduleMessage` | user, bot |
+| `SLACK_LIST_SCHEDULED_MESSAGES` | read | `chat.scheduledMessages.list` | user, bot |
+| `SLACK_DELETE_SCHEDULED_MESSAGE` | destructive | `chat.deleteScheduledMessage` | user, bot |
+| `SLACK_RETRIEVE_MESSAGE_PERMALINK_URL` | read | `chat.getPermalink` | user, bot |
+| **history** | | | |
+| `SLACK_FETCH_CONVERSATION_HISTORY` | read | `conversations.history` | user, bot |
+| `SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION` | read | `conversations.replies` | user, bot |
+| `SLACK_LIST_UNREAD_CHANNEL_MESSAGES` | read | `conversations.info`, `conversations.history` | user |
+| **search** | | | |
+| `SLACK_SEARCH_MESSAGES` | read | `search.messages` | user |
+| `SLACK_SEARCH_FILES` | read | `search.files` | user |
+| `SLACK_SEARCH_ALL` | read | `search.all` | user |
+| `SLACK_FIND_CHANNELS` | read | `conversations.list` | user, bot |
+| `SLACK_FIND_USERS` | read | `users.info`, `users.lookupByEmail`, `users.list` | user, bot |
+| **conversations** | | | |
+| `SLACK_LIST_ALL_CHANNELS` | read | `conversations.list` | user, bot |
+| `SLACK_LIST_CONVERSATIONS` | read | `users.conversations` | user, bot |
+| `SLACK_RETRIEVE_CONVERSATION_INFORMATION` | read | `conversations.info` | user, bot |
+| `SLACK_RETRIEVE_CONVERSATION_MEMBERS_LIST` | read | `conversations.members` | user, bot |
+| `SLACK_CREATE_CHANNEL` | write | `conversations.create` | user, bot |
+| `SLACK_JOIN_AN_EXISTING_CONVERSATION` | write | `conversations.join` | user, bot |
+| `SLACK_LEAVE_CONVERSATION` | destructive | `conversations.leave` | user, bot |
+| `SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL` | write | `conversations.invite` | user, bot |
+| `SLACK_REMOVE_USER_FROM_CONVERSATION` | destructive | `conversations.kick` | user, bot |
+| `SLACK_ARCHIVE_CONVERSATION` | destructive | `conversations.archive` | user, bot |
+| `SLACK_UNARCHIVE_CHANNEL` | write | `conversations.unarchive` | user |
+| `SLACK_RENAME_CONVERSATION` | write | `conversations.rename` | user, bot |
+| `SLACK_SET_THE_TOPIC_OF_A_CONVERSATION` | write | `conversations.setTopic` | user, bot |
+| `SLACK_SET_CONVERSATION_PURPOSE` | write | `conversations.setPurpose` | user, bot |
+| **dms** | | | |
+| `SLACK_OPEN_DM` | send | `conversations.open` | user, bot |
+| `SLACK_CLOSE_DM` | write | `conversations.close` | user, bot |
+| **reactions** | | | |
+| `SLACK_ADD_REACTION_TO_AN_ITEM` | write | `reactions.add` | user, bot |
+| `SLACK_REMOVE_REACTION_FROM_ITEM` | write | `reactions.remove` | user, bot |
+| `SLACK_FETCH_ITEM_REACTIONS` | read | `reactions.get` | user, bot |
+| `SLACK_LIST_USER_REACTIONS` | read | `reactions.list` | user, bot |
+| **pins** | | | |
+| `SLACK_PIN_ITEM` | write | `pins.add` | user, bot |
+| `SLACK_UNPIN_ITEM` | write | `pins.remove` | user, bot |
+| `SLACK_LIST_PINNED_ITEMS` | read | `pins.list` | user, bot |
+| **users** | | | |
+| `SLACK_LIST_ALL_USERS` | read | `users.list` | user, bot |
+| `SLACK_RETRIEVE_DETAILED_USER_INFORMATION` | read | `users.info` | user, bot |
+| `SLACK_FIND_USER_BY_EMAIL_ADDRESS` | read | `users.lookupByEmail` | user, bot |
+| `SLACK_RETRIEVE_USER_PROFILE_INFORMATION` | read | `users.profile.get` | user, bot |
+| `SLACK_SET_USER_PROFILE` | write | `users.profile.set` | user |
+| `SLACK_GET_USER_PRESENCE` | read | `users.getPresence` | user, bot |
+| `SLACK_SET_USER_PRESENCE` | write | `users.setPresence` | user, bot |
+| **workspace** | | | |
+| `SLACK_FETCH_TEAM_INFO` | read | `team.info` | user, bot |
+| `SLACK_LIST_CUSTOM_EMOJIS` | read | `emoji.list` | user, bot |
+| `SLACK_TEST_AUTH` | read | `auth.test` | user, bot |
+| `SLACK_WHO_AM_I` | read | `auth.test`, `team.info` | user, bot |
+| `SLACK_API_TEST` | read | `api.test` | user, bot |
+| **messages** | | | |
+| `SLACK_SEND_ME_MESSAGE` | send | `chat.meMessage` | user, bot |
+| **history** | | | |
+| `SLACK_GET_UNREAD_MESSAGES_FROM_USER` | read | `users.conversations`, `conversations.info`, `conversations.history` | user |
+| `SLACK_SET_READ_CURSOR_IN_A_CONVERSATION` | write | `conversations.mark` | user, bot |
+| **bookmarks** | | | |
+| `SLACK_ADD_BOOKMARK` | write | `bookmarks.add` | user, bot |
+| `SLACK_EDIT_BOOKMARK` | write | `bookmarks.edit` | user, bot |
+| `SLACK_REMOVE_BOOKMARK` | destructive | `bookmarks.remove` | user, bot |
+| `SLACK_LIST_BOOKMARKS` | read | `bookmarks.list` | user, bot |
+| **users** | | | |
+| `SLACK_GET_TEAM_PROFILE` | read | `team.profile.get` | user, bot |
+| `SLACK_SET_PROFILE_PHOTO` | write | `users.setPhoto` | user |
+| `SLACK_DELETE_USER_PROFILE_PHOTO` | destructive | `users.deletePhoto` | user |
+| `SLACK_GET_BOT_USER` | read | `bots.info` | user, bot |
+| **dnd** | | | |
+| `SLACK_RETRIEVE_CURRENT_USER_DND_STATUS` | read | `dnd.info` | user, bot |
+| `SLACK_GET_USER_DND_STATUS` | read | `dnd.teamInfo` | user, bot |
+| `SLACK_SET_DND_DURATION` | write | `dnd.setSnooze` | user |
+| `SLACK_END_DND` | write | `dnd.endDnd` | user |
+| `SLACK_END_SNOOZE` | write | `dnd.endSnooze` | user |
+| **files** | | | |
+| `SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK` | send | `files.getUploadURLExternal`, `files.completeUploadExternal` | user, bot |
+| `SLACK_DOWNLOAD_SLACK_FILE` | read | `files.info` | user, bot |
+| `SLACK_RETRIEVE_DETAILED_INFORMATION_ABOUT_A_FILE` | read | `files.info` | user, bot |
+| `SLACK_LIST_FILES_WITH_FILTERS_IN_SLACK` | read | `files.list` | user, bot |
+| `SLACK_DELETE_FILE` | destructive | `files.delete` | user, bot |
+| `SLACK_DELETE_FILE_COMMENT` | destructive | `files.comments.delete` | user, bot |
+| `SLACK_ENABLE_PUBLIC_SHARING_OF_A_FILE` | destructive | `files.sharedPublicURL` | user |
+| `SLACK_REVOKE_FILE_PUBLIC_SHARING` | write | `files.revokePublicURL` | user, bot |
+| **canvases** | | | |
+| `SLACK_CREATE_CANVAS` | write | `canvases.create` | user, bot |
+| `SLACK_EDIT_CANVAS` | destructive | `canvases.edit` | user, bot |
+| `SLACK_DELETE_CANVAS` | destructive | `canvases.delete` | user, bot |
+| `SLACK_LOOKUP_CANVAS_SECTIONS` | read | `canvases.sections.lookup` | user, bot |
+| `SLACK_GET_CANVAS_CONTENT` | read | `canvases.getContent` | user, bot |
+| `SLACK_CREATE_CHANNEL_CANVAS` | write | `conversations.canvases.create` | user, bot |
+| `SLACK_SET_CANVAS_ACCESS` | write | `canvases.access.set` | user, bot |
+| `SLACK_DELETE_CANVAS_ACCESS` | destructive | `canvases.access.delete` | user, bot |
+| **reminders** | | | |
+| `SLACK_CREATE_A_REMINDER` | write | `reminders.add` | user |
+| `SLACK_GET_REMINDER` | read | `reminders.info` | user |
+| `SLACK_LIST_REMINDERS` | read | `reminders.list` | user |
+| `SLACK_DELETE_REMINDER` | destructive | `reminders.delete` | user |
+| **usergroups** | | | |
+| `SLACK_CREATE_USER_GROUP` | write | `usergroups.create` | user, bot |
+| `SLACK_UPDATE_USER_GROUP` | write | `usergroups.update` | user, bot |
+| `SLACK_DISABLE_USER_GROUP` | destructive | `usergroups.disable` | user, bot |
+| `SLACK_ENABLE_USER_GROUP` | write | `usergroups.enable` | user, bot |
+| `SLACK_LIST_USER_GROUPS` | read | `usergroups.list` | user, bot |
+| `SLACK_LIST_USER_GROUP_MEMBERS` | read | `usergroups.users.list` | user, bot |
+| `SLACK_UPDATE_USER_GROUP_MEMBERS` | destructive | `usergroups.users.update` | user, bot |
+| **workspace** | | | |
+| `SLACK_LIST_AUTH_TEAMS` | read | `auth.teams.list` | user, bot |
+| **lists** (paid workspaces) | | | |
+| `SLACK_CREATE_SLACK_LIST` | write | `slackLists.create` | user, bot |
+| `SLACK_UPDATE_SLACK_LIST` | write | `slackLists.update` | user, bot |
+| `SLACK_CREATE_SLACK_LIST_ITEM` | write | `slackLists.items.create` | user, bot |
+| `SLACK_GET_SLACK_LIST_ITEM` | read | `slackLists.items.info` | user, bot |
+| `SLACK_LIST_SLACK_LIST_ITEMS` | read | `slackLists.items.list` | user, bot |
+| `SLACK_UPDATE_SLACK_LIST_ITEM` | write | `slackLists.items.update` | user, bot |
+| `SLACK_DELETE_SLACK_LIST_ITEM` | destructive | `slackLists.items.delete` | user, bot |
+| `SLACK_DELETE_MULTIPLE_SLACK_LIST_ITEMS` | destructive | `slackLists.items.deleteMultiple` | user, bot |
+| `SLACK_SET_SLACK_LIST_ACCESS` | write | `slackLists.access.set` | user, bot |
+| `SLACK_DELETE_SLACK_LIST_ACCESS` | destructive | `slackLists.access.delete` | user, bot |
+| **remote files** | | | |
+| `SLACK_ADD_REMOTE_FILE` | write | `files.remote.add` | bot |
+| `SLACK_UPDATE_REMOTE_FILE` | write | `files.remote.update` | bot |
+| `SLACK_REMOVE_REMOTE_FILE` | destructive | `files.remote.remove` | bot |
+| `SLACK_GET_REMOTE_FILE` | read | `files.remote.info` | user, bot |
+| `SLACK_LIST_REMOTE_FILES` | read | `files.remote.list` | user, bot |
+| `SLACK_SHARE_REMOTE_FILE` | write | `files.remote.share` | bot |
+
+Slack Lists text cells and descriptions are Block Kit `rich_text`. As in Composio, a
+plain string is wrapped for you: a cell may be `{"column_id": "Col…", "text": "Ship
+it"}`. Remote-file tools name the file by `file` **or** `external_id`, never both:
+`files.remote.info` refuses both (`too_many_ids`), and the others need only one, so
+the toolkit asks for exactly one everywhere rather than guess which Slack would use.
+Composio's `preview_image` is not offered: Slack takes it only as a multipart image
+upload.
+
+## Message sink
+
+`SlackMessageSink` (connector `slack-message-sink`) posts a pipeline's envelopes. Its
+`config` is the toolkit's (`access_token`, `identity`, `attribution_name`,
+`bot_attribution`, `enabled_tiers` / `enabled_tools`, `timeout_seconds`), so one
+stored connection serves both.
+
+```python
+from aisquare.pipe import DataEnvelope, PushParams
+from aisquare_pipe_slack import SlackMessageSink
+
+sink = SlackMessageSink()
+result = sink.push(
+    DataEnvelope(content_type="text/markdown", data="**Build green** :white_check_mark:", source_id="ci"),
+    {"access_token": "xoxb-…", "identity": "bot"},
+    PushParams({"channel": "#deploys", "thread_ts": "1761312000.004100"}),
+)
+result.success, result.ref  # ref: the new message's ts
+```
+
+| Envelope | Goes to | `PushResult.ref` |
+|---|---|---|
+| `str` with `text/plain` (Slack mrkdwn) or `text/markdown` (standard markdown) | `chat.postMessage` | `ts` |
+| `dict` with `application/json`: `text` and/or `blocks`, or `markdown_text` alone (`metadata["blocks"]` overrides) | `chat.postMessage` | `ts` |
+| either of the above, with `params["ephemeral_user"]` | `chat.postEphemeral` | `message_ts` |
+| anything else: `bytes`, a `stream`, a `str` of another type (JSON text, CSV…), a `dict` of another type | v2 file upload into the channel (or thread) | file ID |
+
+- **`params`:** `channel` (required; an ID or a name), `thread_ts`,
+  `reply_broadcast`, `ephemeral_user`, `unfurl_links`, `unfurl_media`; for files
+  `filename`, `title` and `initial_comment` (`envelope.metadata["filename"]` /
+  `["title"]` work too). They are checked before any request: the strings must be
+  non-empty strings (a float `thread_ts` would lose digits) and the flags booleans,
+  otherwise the push fails with `invalid_arguments`. A config the toolkit can't
+  read fails as `forbidden`, naming the key.
+- **Attribution** is the toolkit's: as the user, every message gets the "Sent by
+  <name>" line, and a file's `initial_comment` gets it as its last line.
+- **Tiers:** a push is a `send` action. If a host's config leaves `send` out of
+  `enabled_tiers`, the push fails as `forbidden` before any request, unless the
+  matching tool (`SLACK_SEND_MESSAGE`, `SLACK_SEND_EPHEMERAL_MESSAGE`,
+  `SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK`) is in `enabled_tools`.
+- **Failures** never raise: `success=False`, an `error` that names no secret, and
+  `metadata["error_code"]` (the same `ERROR_*` codes as the tools; `retry_after`
+  for `rate_limited`). Files are capped at 100 MiB.
+- `validate_config` is an offline shape check (a usable `access_token` and readable
+  options); it calls nothing.
+
+## Inbound events (Events API)
+
+pipe ships **pure helpers**; the host owns the HTTP route, the app's **Signing
+Secret**, the dedupe ledger and the 3-second ack. In `aisquare_pipe_slack.events`:
+
+```python
+from aisquare_pipe_slack.events import (
+    EventCallback, PostedMessage, SlackEventError, SlackSignatureError, UrlVerification,
+    event_to_envelope, parse_request,
+)
+
+def slack_events(request):                       # the host's POST /v1/slack/events
+    try:
+        event = parse_request(request.headers, request.raw_body, SIGNING_SECRET)
+    except SlackSignatureError:                  # not Slack's, or replayed: e.reason says why
+        return 401
+    except SlackEventError:                      # signed, but not an Events API body
+        return 400
+    if isinstance(event, UrlVerification):
+        return 200, event.response()             # {"challenge": "..."}
+    if isinstance(event, PostedMessage) and event.is_from_this_app:
+        return 200                               # the app's own post: never answer it
+    if isinstance(event, EventCallback) and not ledger.seen(event.event_id):
+        queue.put(event_to_envelope(event))      # do the work after acking
+    return 200
+```
+
+- **`verify_request(headers, raw_body, signing_secret, now=None)`** checks the
+  timestamp (whole seconds, at most 15 digits, within 300 s either way) and the v0
+  signature (`HMAC-SHA256` over `v0:<ts>:<raw body>`, with `<ts>` the header exactly
+  as sent, compared in constant time) in one call,
+  so a host can't skip the replay check. Headers are matched case-insensitively
+  in a mapping, anything with `items()` (`http.server`'s `http.client.HTTPMessage`,
+  `email.message.Message`, multi-dicts), or ASGI-style `(name, value)` pairs; a
+  headers object that fails to read counts as missing headers. It raises
+  `SlackSignatureError` with a `reason`: `missing_timestamp`, `missing_signature`,
+  `bad_timestamp`, `stale_timestamp`, `bad_signature`, `bad_body`,
+  `no_signing_secret`. Pass the **raw** body bytes: a re-serialized JSON body no
+  longer matches. `verify_slack_signature` and `timestamp_in_window` are the two
+  checks on their own. Both return a bool and never raise, even for a huge
+  `int(header)`.
+- **`parse_event(body, headers=None)`** (and `parse_request`, which verifies first)
+  returns a typed object: `UrlVerification` (`challenge`), `AppRateLimited`, or an
+  `EventCallback` — `AppMention`, `Message` (`message.im`, and the channel variants
+  if subscribed), `Reaction` (`reaction_added` / `reaction_removed`),
+  `TokensRevoked`, `AppUninstalled`, or a plain `EventCallback` for any other event
+  type. An unknown outer type gives a plain `SlackEvent`.
+  `event_id` is the dedupe key; `retry_num` / `retry_reason` come from Slack's retry
+  headers. **Skip `is_from_this_app` messages and mentions** (the app's own posts,
+  as Bolt's `ignoreSelf` does), or the bot answers itself in a loop. Other bots'
+  messages are kept; `is_from_bot` tells them apart. Both are also in the
+  envelope's metadata.
+- **`event_to_envelope(event)`** gives a pipeline a `DataEnvelope` whose
+  `metadata["trigger_slug"]` uses Composio's trigger names, so existing
+  subscriptions keep their vocabulary:
+
+  | Event | `trigger_slug` |
+  |---|---|
+  | `message` in a DM (`message.im`) | `SLACK_DIRECT_MESSAGE_RECEIVED` |
+  | `message` in a channel, private channel or group DM (`channel_type` `channel`, `group`, `mpim`) | `SLACK_CHANNEL_MESSAGE_RECEIVED` |
+  | `reaction_added` / `reaction_removed` on a message | `SLACK_MESSAGE_REACTION_ADDED` / `_REMOVED` |
+  | `channel_created` | `SLACK_CHANNEL_CREATED` |
+  | `app_mention` | `SLACK_APP_MENTION_RECEIVED` (pipe's; Composio has none) |
+
+  Only new messages trigger: plain messages and the subtypes `bot_message`,
+  `file_share`, `thread_broadcast` and `me_message`. The app's own posts, edits,
+  deletions and every other subtype, messages with any other `channel_type` (such as
+  `app_home`), and reactions to files carry no trigger (`None`). `data` is the trigger payload in Composio's field names.
+
+**Host duties** ([Slack's Events API docs](https://docs.slack.dev/apis/events-api)):
+
+- answer within **3 seconds**, then do the work;
+- Slack **retries** an unanswered event 3 times (at once, after 1 min, after 5 min)
+  with the same `event_id`, so dedupe on it;
+- event deliveries are **disabled** when more than 95% fail within an hour;
+- Slack sends at most **30,000 events per workspace per app per hour**
+  (`app_rate_limited` tells you when it starts dropping);
+- on **`tokens_revoked`** delete the listed users' stored tokens, and on
+  **`app_uninstalled`** every token stored for that workspace.
+
+## Tests
+
+Every test is hermetic: an autouse guard fails any test that opens a socket. The
+live checks are opt-in and post to, then delete from, a dedicated test channel:
+
+```bash
+cd connectors/slack
+pytest                                   # unit + compliance (no network, no credentials)
+SLACK_TEST_USER_TOKEN=xoxp-… SLACK_TEST_CHANNEL=C… [SLACK_TEST_BOT_TOKEN=xoxb-…] [SLACK_TEST_DM=D…] pytest -m live
+```

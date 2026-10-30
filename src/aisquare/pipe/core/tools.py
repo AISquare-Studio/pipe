@@ -494,9 +494,24 @@ class Toolkit(ABC):
                 return tool
         return None
 
-    def search_tools(self, query: str, limit: int = 6) -> list[ToolSpec]:
-        """Tools most relevant to a natural-language ``query`` (see :func:`rank_tools`)."""
-        return rank_tools(self.tools(), query, limit)
+    def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
+        """The tools a connection with this ``config`` may call — what a host
+        lists to a model. Default: every tool (:meth:`tools`). A toolkit
+        whose config switches tools off overrides it.
+
+        An override returns a subset of :meth:`tools` (the same ToolSpecs).
+        It must not raise for any ``config``, including None, ``{}`` and
+        garbage: return ``[]`` when the config can't be read. Like
+        :meth:`tools`, it must not touch the network. Listing is advisory:
+        :meth:`call_tool` enforces on its own, whatever was listed."""
+        return self.tools()
+
+    def search_tools(
+        self, query: str, limit: int = 6, *, config: Mapping[str, Any] | None = None
+    ) -> list[ToolSpec]:
+        """Tools most relevant to a natural-language ``query`` among
+        :meth:`available_tools` for ``config`` (see :func:`rank_tools`)."""
+        return rank_tools(self.available_tools(config), query, limit)
 
     # -- execution -----------------------------------------------------------
 
