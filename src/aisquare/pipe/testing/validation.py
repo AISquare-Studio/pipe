@@ -35,6 +35,7 @@ from aisquare.pipe.core.tools import (
     Toolkit,
     ToolResult,
     ToolSpec,
+    risk_contradicts_flags,
 )
 from aisquare.pipe.errors import PipeError
 from aisquare.pipe.testing.fixtures import (
@@ -881,8 +882,9 @@ def check_toolkit_tool_metadata(cls: type) -> list[CheckResult]:
         if tool.risk not in RISKS:
             problems.append(f"{tool.slug}: risk {tool.risk!r} is not one of: {', '.join(RISKS)}")
             continue
-        floor = "destructive" if tool.destructive else "read" if tool.read_only else "write"
-        if RISKS.index(tool.risk) < RISKS.index(floor) or (tool.read_only and tool.risk != "read"):
+        # ToolSpec refuses this at construction; a spec changed afterwards
+        # (object.__setattr__, a subclass) is still caught here.
+        if risk_contradicts_flags(tool.risk, read_only=tool.read_only, destructive=tool.destructive):
             problems.append(
                 f"{tool.slug}: risk {tool.risk!r} contradicts read_only={tool.read_only}, "
                 f"destructive={tool.destructive}"

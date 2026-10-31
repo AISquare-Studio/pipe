@@ -17,6 +17,7 @@ from aisquare_pipe_googledrive.rest import (
     GoogleDriveRestClient,
     error_details,
     escape_query,
+    is_insufficient_scope,
     is_rate_limited,
     multipart_body,
     quote_id,
@@ -195,6 +196,22 @@ class TestHelpers:
     )
     def test_is_rate_limited(self, answer, limited):
         assert is_rate_limited(answer) is limited
+
+    @pytest.mark.parametrize(
+        ("answer", "scope"),
+        [
+            (drive_error(403, "x", "insufficientPermissions"), True),
+            (response(403, {"error": {"code": 403, "message": "x", "details": [{"reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}), True),
+            (response(403, content=b"", headers={"WWW-Authenticate": 'Bearer error="insufficient_scope"'}), True),
+            (response(403, {"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}), True),
+            (drive_error(403, "x", "insufficientFilePermissions"), False),
+            (drive_error(403, "x", "userRateLimitExceeded"), False),
+            (drive_error(401, "x", "insufficientPermissions"), False),
+            (response(403, content=b"<html>", content_type="text/html"), False),
+        ],
+    )
+    def test_is_insufficient_scope(self, answer, scope):
+        assert is_insufficient_scope(answer) is scope
 
     def test_retry_wait(self):
         assert [retry_wait(response(429, content=b""), n) for n in range(4)] == [1.0, 2.0, 4.0, 8.0]

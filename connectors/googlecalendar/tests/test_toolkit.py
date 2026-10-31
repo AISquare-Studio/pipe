@@ -108,7 +108,9 @@ class TestCatalog:
             "GOOGLECALENDAR_QUICK_ADD",
             "GOOGLECALENDAR_DELETE_EVENT",
         }
-        assert {s for s, (_, d) in flags.items() if d} == {"GOOGLECALENDAR_DELETE_EVENT"}
+        # An update overwrites (attendees and recurrence replace the whole
+        # list), so it is destructive like a delete: the cross-toolkit rule.
+        assert {s for s, (_, d) in flags.items() if d} == {"GOOGLECALENDAR_DELETE_EVENT", "GOOGLECALENDAR_UPDATE_EVENT"}
 
     def test_descriptions_fit_and_name_their_scope(self):
         for tool in GoogleCalendarToolkit().tools():

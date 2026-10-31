@@ -6,6 +6,8 @@ from __future__ import annotations
 import email
 import email.policy
 
+import pytest
+
 from .fakes import google_error, harness, message, raw_message, response
 
 SENT = {"id": "m9", "threadId": "t1", "labelIds": ["SENT"]}
@@ -185,6 +187,40 @@ class TestLabels:
         h = harness(response(200, {"id": "m1"}))
         h.call("GMAIL_ADD_LABEL_TO_EMAIL", {"message_id": "m1", "add_label_ids": ["STARRED", "starred"]})
         assert h.session.last.json == {"addLabelIds": ["STARRED"]}
+
+    # The label tools are rated 'write'. Adding TRASH or SPAM would trash or spam
+    # mail without the destructive GMAIL_MOVE_TO_TRASH, so a host that gates
+    # destructive tools could be bypassed: both tools refuse it, with no request.
+    @pytest.mark.parametrize(
+        ("slug", "target"),
+        [("GMAIL_ADD_LABEL_TO_EMAIL", {"message_id": "m1"}), ("GMAIL_MODIFY_THREAD_LABELS", {"thread_id": "t1"})],
+    )
+    @pytest.mark.parametrize("labels", [["TRASH"], ["spam"], "STARRED, Trash", '["INBOX", "SPAM"]'])
+    def test_adding_trash_or_spam_is_refused(self, slug, target, labels):
+        h = harness()
+        result = h.call(slug, {**target, "add_label_ids": labels})
+        assert result.error_code == "invalid_arguments"
+        assert "GMAIL_MOVE_TO_TRASH" in result.error
+        assert h.session.calls == []
+
+    def test_a_label_name_resolving_to_trash_is_refused(self):
+        # Defence in depth: the check also runs on the resolved ids.
+        h = harness(response(200, {"labels": [{"id": "TRASH", "name": "Bin"}]}))
+        result = h.call("GMAIL_MODIFY_THREAD_LABELS", {"thread_id": "t1", "add_label_ids": ["Bin"]})
+        assert result.error_code == "invalid_arguments"
+        assert [c.path for c in h.session.calls] == ["/me/labels"]
+
+    @pytest.mark.parametrize(
+        ("slug", "target", "path"),
+        [
+            ("GMAIL_ADD_LABEL_TO_EMAIL", {"message_id": "m1"}, "/me/messages/m1/modify"),
+            ("GMAIL_MODIFY_THREAD_LABELS", {"thread_id": "t1"}, "/me/threads/t1/modify"),
+        ],
+    )
+    def test_removing_trash_or_spam_stays_allowed(self, slug, target, path):
+        h = harness(response(200, {"id": "x", "labelIds": ["INBOX"]}))
+        assert h.call(slug, {**target, "remove_label_ids": ["TRASH", "SPAM"]}).successful
+        assert (h.session.last.path, h.session.last.json) == (path, {"removeLabelIds": ["TRASH", "SPAM"]})
 
 
 class TestTrash:

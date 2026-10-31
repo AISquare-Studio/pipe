@@ -216,12 +216,44 @@ class TestSlugPrefixConflicts:
     def test_real_install_has_none(self, fresh_cache):
         assert slug_prefix_conflicts(installed_toolkits()) == []
 
-    def test_discovery_asserts_uniqueness(self, installed):
+    def test_clashing_toolkits_are_left_out_not_fatal(self, installed, caplog):
+        # One clashing pair (a third-party "one" with ONE_ vs ONE_DRIVE_) must
+        # not take the router down: both are left out, the rest stays.
+        installed(
+            _kit("one", ["ONE_X"]),
+            _kit("one_drive", ["ONE_DRIVE_X"]),
+            _kit("mail", ["MAIL_SEND_EMAIL"]),
+        )
+        with caplog.at_level("WARNING", logger="aisquare.pipe"):
+            assert list(catalogue()) == ["mail"]
+            assert [q.connector for q in search_tools_across("x", limit=None)] == ["mail"]
+            assert list(installed_toolkits()) == ["mail"]
+        warnings = [r.getMessage() for r in caplog.records if "slug prefixes collide" in r.getMessage()]
+        assert warnings == ["Left out toolkits whose slug prefixes collide (`pipe validate` fails on this): one (ONE_) and one_drive (ONE_DRIVE_)"]
+
+    def test_a_clash_is_cached_like_any_discovery(self, monkeypatch, fresh_cache):
+        calls = []
+
+        def discover():
+            calls.append(1)
+            return {"github": _kit("github", ["GITHUB_X"]), "gh2": _kit("gh2", ["GITHUB_Y"], prefix="GITHUB_")}
+
+        monkeypatch.setattr(registry_mod, "discover_toolkits", discover)
+        assert catalogue() == {}
+        assert catalogue() == {}
+        search_tools_across("x")
+        assert len(calls) == 1
+
+    def test_strict_discovery_raises(self, installed):
         installed(_kit("github", ["GITHUB_X"]), _kit("gh2", ["GITHUB_Y"], prefix="GITHUB_"))
         with pytest.raises(ToolkitConflictError, match=r"gh2 \(GITHUB_\) and github \(GITHUB_\)"):
-            catalogue()
-        with pytest.raises(ToolkitConflictError):
-            search_tools_across("x")
+            installed_toolkits(strict=True)
+        assert installed_toolkits() == {}
+
+    def test_naming_a_left_out_toolkit_says_why(self, installed):
+        installed(_kit("github", ["GITHUB_X"]), _kit("gh2", ["GITHUB_Y"], prefix="GITHUB_"))
+        with pytest.raises(ToolkitNotFoundError, match=r"'github' not found.*slug prefixes collide: gh2"):
+            search_tools_across("x", ["github"])
 
     def test_conflict_is_a_pipe_error(self):
         assert issubclass(ToolkitConflictError, PipeError)

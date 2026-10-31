@@ -53,7 +53,7 @@ is limited to 100 test users.
 
 **One OAuth client for Drive, Gmail and Calendar.** Each Google toolkit gets
 its own token and consent, and one OAuth client may serve all three. That is
-why this spec — unlike Google Drive's — does not set
+why this spec, like Drive's and Gmail's, does not set
 `include_granted_scopes=true`: with it, a Calendar token would also carry
 every Drive or Gmail scope the user granted the same client. Revoking is
 grant-wide, though: Google's revoke endpoint ends the user's whole grant to
@@ -213,7 +213,7 @@ Writes (`calendar.events`; create and update also `calendar.readonly`):
 | Slug | Calendar endpoint | Notes |
 |---|---|---|
 | `GOOGLECALENDAR_CREATE_EVENT` | `POST calendars/{id}/events` | timed or all-day; guests, recurrence, Meet link |
-| `GOOGLECALENDAR_UPDATE_EVENT` | `GET` + `PATCH calendars/{id}/events/{id}` | only the given fields change; `start_date`/`end_date` make it all-day |
+| `GOOGLECALENDAR_UPDATE_EVENT` | `GET` + `PATCH calendars/{id}/events/{id}` | **destructive** (`attendees` and `recurrence` replace the whole list); only the given fields change; `start_date`/`end_date` make it all-day |
 | `GOOGLECALENDAR_QUICK_ADD` | `POST calendars/{id}/events/quickAdd` | one line of text, parsed by Google |
 | `GOOGLECALENDAR_DELETE_EVENT` | `DELETE calendars/{id}/events/{id}` | **destructive**; a series id deletes every instance |
 

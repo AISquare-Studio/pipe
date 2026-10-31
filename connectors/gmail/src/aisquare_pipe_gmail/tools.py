@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime
+import email.errors
 import html
 import json
 import re
@@ -57,8 +58,10 @@ from aisquare_pipe_gmail.mime import (
     attachments_of,
     body_text,
     build_message,
+    decode_words,
     guess_mimetype,
     headers_of,
+    msg_ids,
     parse_addresses,
     reply_subject,
     safe_filename,
@@ -118,6 +121,12 @@ SYSTEM_LABELS = frozenset(
         "CATEGORY_FORUMS",
     }
 )
+#: System labels the label tools refuse to add. Adding TRASH trashes the mail (a
+#: whole conversation, through the thread tool) and adding SPAM moves it out of
+#: the inbox. Both are destructive, and the label tools are rated 'write':
+#: GMAIL_MOVE_TO_TRASH is the destructive tool for that. Removing them (untrash,
+#: not spam) stays allowed.
+REFUSED_ADD_LABELS = frozenset({"TRASH", "SPAM"})
 _USER_LABEL_ID = re.compile(r"^Label_\d+$")
 _USER_ID = re.compile(r"^(me|[^@\s/]+@[^@\s/]+)$")
 
@@ -660,7 +669,13 @@ def _one_line(value: str) -> str:
 def _thread_context(client: GmailRestClient, user: str, thread_id: str) -> dict[str, str]:
     """What a reply in ``thread_id`` needs: its subject, the Message-ID and
     References of the last message, and who to answer (that message's
-    Reply-To/From — or its To when the user sent it)."""
+    Reply-To/From — or its To when the user sent it).
+
+    These come from mail anyone can send. The msg-ids are decoded and
+    checked (:func:`msg_ids`): an unsafe one (an encoded line break, double
+    encoding) refuses the reply, and anything that is not a msg-id is left
+    out of In-Reply-To/References. The subject is checked where it is used,
+    in :func:`_apply_thread`."""
     thread = json_object(
         client.get(f"/{user}/threads/{thread_id}", {"format": "metadata", "metadataHeaders": list(REPLY_HEADERS)})
     )
@@ -672,12 +687,16 @@ def _thread_context(client: GmailRestClient, user: str, thread_id: str) -> dict[
     last = messages[-1]
     headers = {k: _one_line(v) for k, v in headers_of(last.get("payload") or {}).items()}
     first = headers_of(messages[0].get("payload") or {})
-    message_id = headers.get("message-id", "")
+    try:
+        own = msg_ids(headers.get("message-id", ""), "the thread's Message-ID")[:1]
+        references = msg_ids(" ".join((headers.get("references", ""), *own)), "the thread's References")
+    except ValueError as e:
+        raise _invalid(f"{e}, so a reply can't be threaded safely") from None
     sent_by_user = "SENT" in (last.get("labelIds") or [])
     return {
         "subject": _one_line(first.get("subject") or headers.get("subject", "")),
-        "in_reply_to": message_id,
-        "references": " ".join(x for x in (headers.get("references", ""), message_id) if x),
+        "in_reply_to": own[0] if own else "",
+        "references": " ".join(references),
         "reply_to": headers.get("to", "") if sent_by_user else headers.get("reply-to") or headers.get("from", ""),
     }
 
@@ -708,7 +727,11 @@ def _apply_thread(client: GmailRestClient, user: str, args: dict[str, Any], draf
     thread_id = _path_id(args, "thread_id")
     context = _thread_context(client, user, thread_id)
     if not draft.subject:
-        draft.subject = reply_subject(context["subject"])
+        # Decoded before "Re:" is added, so an encoded "Re: ..." doesn't stack.
+        try:
+            draft.subject = reply_subject(decode_words(context["subject"], "the thread's subject"))
+        except ValueError as e:
+            raise _invalid(f"{e}; give a subject for the reply") from None
     draft.in_reply_to = context["in_reply_to"] or None
     draft.references = context["references"] or None
     if not (draft.to or draft.cc or draft.bcc) and context["reply_to"]:
@@ -744,6 +767,10 @@ def _raw(args: dict[str, Any], draft: _Draft) -> bytes:
         )
     except ValueError as e:
         raise _invalid(str(e)) from None
+    except email.errors.MessageError:
+        # The generator refusing a header it can't write safely
+        # (HeaderWriteError on Pythons with the CVE-2024-6923 fix).
+        raise _invalid("a header can't be written safely: check the recipients and subject") from None
     if len(raw) > MESSAGE_MAX:
         raise _invalid(f"the message is {len(raw):,} bytes, over Gmail's {MESSAGE_MAX:,}-byte limit")
     return raw
@@ -790,15 +817,27 @@ def _reply_to_thread(client: GmailRestClient, args: dict[str, Any]) -> ToolResul
 # --------------------------------------------------------------------------
 
 
+def _refuse_trash_and_spam(labels: list[str]) -> None:
+    for label in labels:
+        if label.upper() in REFUSED_ADD_LABELS:
+            raise _invalid(
+                f"add_label_ids can't include {label.upper()}: the label tools don't trash or "
+                "spam mail. To trash a message use GMAIL_MOVE_TO_TRASH"
+            )
+
+
 def _label_change(client: GmailRestClient, user: str, args: dict[str, Any]) -> dict[str, Any]:
     add = _string_list(args.get("add_label_ids"), "add_label_ids")
     remove = _string_list(args.get("remove_label_ids"), "remove_label_ids")
     if not add and not remove:
         raise _invalid("give add_label_ids or remove_label_ids")
+    # Checked before any label lookup, and again on the resolved ids.
+    _refuse_trash_and_spam(add)
     body: dict[str, Any] = {}
     known: dict[str, str] = {}
     if add:
         body["addLabelIds"] = _resolve_labels(client, user, add, "add_label_ids", known)
+        _refuse_trash_and_spam(body["addLabelIds"])
     if remove:
         body["removeLabelIds"] = _resolve_labels(client, user, remove, "remove_label_ids", known)
     return body
@@ -1072,7 +1111,8 @@ CATALOG: tuple[GmailTool, ...] = (
         "GMAIL_ADD_LABEL_TO_EMAIL",
         "Change a Gmail message's labels: add_label_ids and/or remove_label_ids. Mark read = "
         "remove UNREAD; mark unread = add UNREAD; star = add STARRED; archive = remove INBOX. "
-        "User labels by id (Label_123) or exact name. Returns the message's labelIds.",
+        "User labels by id (Label_123) or exact name. TRASH and SPAM can't be added here: to "
+        "trash a message use GMAIL_MOVE_TO_TRASH. Returns the message's labelIds.",
         _schema(
             {
                 "message_id": MESSAGE_ID,
@@ -1089,7 +1129,8 @@ CATALOG: tuple[GmailTool, ...] = (
     _write(
         "GMAIL_MODIFY_THREAD_LABELS",
         "Change the labels of every message in a Gmail thread: add_label_ids and/or "
-        "remove_label_ids (remove UNREAD = mark the conversation read; remove INBOX = archive it).",
+        "remove_label_ids (remove UNREAD = mark the conversation read; remove INBOX = archive it). "
+        "TRASH and SPAM can't be added here.",
         _schema(
             {
                 "thread_id": THREAD_ID,

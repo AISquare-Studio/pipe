@@ -151,6 +151,7 @@ answered:
 |---|---|---|
 | 401 | `unauthorized` | `401: Invalid Credentials — … refresh it, or the Google Drive connection must be reconnected` |
 | 429, or a 403 with reason `rateLimitExceeded` / `userRateLimitExceeded`, once retries or the budget run out | `rate_limited` (+ `retry_after`) | `403: User Rate Limit Exceeded — Google Drive rate limit; retry in about 8s` |
+| 403 for a missing scope (`insufficientPermissions`, `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, or `WWW-Authenticate: … insufficient_scope`) | `insufficient_scope` | `403: … — this Google Drive connection was not granted the access this tool needs (drive); reconnect Google Drive and approve it`; `data` adds `insufficient_scope: true` and the tool's `required_scopes` |
 | any other 403 (`insufficientFilePermissions`, `dailyLimitExceeded`, `storageQuotaExceeded`, `domainPolicy`, …) | `forbidden` | `403: … — this Google Drive connection is not allowed to do that (…)` |
 | 404, 410 | `not_found` | `404: File not found: … — it does not exist, or this Google Drive connection cannot see it` |
 | 400, and arguments the toolkit refuses (`.`/`..` ids, a folder given to a download, bad base64, a file over the download cap, …) | `invalid_arguments` | Google's message, or the refusal |

@@ -236,6 +236,14 @@ class MyServiceToolkit(Toolkit):
         raise ToolError(f"{tool.slug} is not implemented", code=ERROR_UPSTREAM_ERROR)
 ```
 
+**Rating `risk` (every toolkit).** A delete, or an edit that overwrites (a
+body, file contents, a message's text, or a whole list such as attendees,
+recurrence or members), is `destructive=True` even though the object
+survives, as `GITHUB_UPDATE_AN_ISSUE`, `GOOGLEDRIVE_EDIT_FILE`,
+`SLACK_UPDATES_A_SLACK_MESSAGE` and `GOOGLECALENDAR_UPDATE_EVENT` are, while
+setting a label, name, topic or other metadata the caller can set back stays
+`write`.
+
 What the base class does for you:
 
 - **`call_tool(slug, arguments, config)` never raises.** It resolves the slug,

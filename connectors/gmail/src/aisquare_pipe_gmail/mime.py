@@ -4,8 +4,12 @@
 Building uses the standard library's :class:`email.message.EmailMessage`
 under the SMTP policy: non-ASCII subjects and names are RFC 2047-encoded,
 bodies get a fitting transfer encoding, and an HTML body also carries a
-plain-text alternative. Header values with a CR or LF are refused (header
-injection), as are recipients that are not ``name@domain`` addresses.
+plain-text alternative. Header values with a line break or another control
+character are refused (header injection; a tab is whitespace and becomes a
+space), as are recipients that are not ``name@domain`` addresses.
+Encoded-words in display names, Subject, In-Reply-To and References are
+decoded and the result checked the same way; In-Reply-To and References must
+also be msg-ids.
 
 Reading walks ``payload.parts`` recursively. Gmail hands each part's body
 already transfer-decoded, base64url-encoded, in the part's charset; text is
@@ -24,6 +28,8 @@ import mimetypes
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.headerregistry import Address
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -35,6 +41,17 @@ from aisquare_pipe_gmail.rest import decode_base64url
 TEXT_MAX = 20_000
 
 _ADDR_SPEC = re.compile(r"^[^@\s<>()\[\]\\,;:\"]+@[^@\s<>()\[\]\\,;:\"]+$")
+#: Never allowed in a header value: every C0 control but HTAB (CR, LF, NUL, VT,
+#: FF, the FS/GS/RS separators...), DEL, and the line breaks str.splitlines()
+#: knows. HTAB is RFC 5322 whitespace: check_header turns it into a space.
+_HEADER_UNSAFE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_ENCODED_WORD = re.compile(r"=\?[^?]*\?[bBqQ]\?[^?]*\?=")
+#: An RFC 5322 msg-id, ``<id-left@id-right>``: dot-atom text on both sides (dots
+#: anywhere, as real mailers write them), or a ``[...]`` literal on the right.
+_ID_TEXT = r"[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~.]+"
+_MSG_ID = re.compile(rf"<{_ID_TEXT}@(?:{_ID_TEXT}|\[[!-Z^-~]*\])>")
+#: Headers build_message sets, re-checked as the standard library parsed them.
+_BUILT_HEADERS = ("From", "To", "Cc", "Bcc", "Subject", "In-Reply-To", "References")
 _BLOCK_TAGS = frozenset(
     {
         "p", "div", "br", "li", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -59,15 +76,67 @@ class Attachment:
 
 
 def check_header(value: str, what: str) -> str:
-    """``value`` for a header; ValueError when it carries a line break."""
-    if "\r" in value or "\n" in value:
-        raise ValueError(f"{what} must not contain line breaks")
-    return value
+    """``value`` for a header, each tab (HTAB, whitespace in RFC 5322) turned
+    into a single space; ValueError when it carries a line break (CR, LF or a
+    Unicode line separator), any other C0 control character, or DEL."""
+    if _HEADER_UNSAFE.search(value):
+        raise ValueError(f"{what} must not contain line breaks or control characters")
+    return value.replace("\t", " ")
+
+
+def decode_words(value: str, what: str) -> str:
+    """``value`` checked (:func:`check_header`), with any RFC 2047
+    encoded-words decoded and the decoded text checked again. ValueError when
+    it can't be decoded or is still encoded after one decoding (double
+    encoding).
+
+    The standard library decodes encoded-words when it sets a Subject,
+    In-Reply-To, References or display name, and on Pythons without the
+    CVE-2024-6923 fix (3.11.0-3.11.9, 3.12.0-3.12.4) its generator writes a
+    decoded CRLF out as a real line break: ``=?utf-8?b?...?=`` could add a
+    Bcc. So the decoded text is what gets checked and used."""
+    value = check_header(value, what)
+    if "=?" not in value:
+        return value
+    try:
+        decoded = str(make_header(decode_header(value)))
+    except (HeaderParseError, LookupError, UnicodeError, ValueError):
+        raise ValueError(f"{what} has an encoded-word that can't be decoded") from None
+    decoded = check_header(decoded, what)
+    if _ENCODED_WORD.search(decoded):
+        raise ValueError(f"{what} is encoded more than once")
+    return decoded
+
+
+def _display_name(name: str, what: str) -> str:
+    """A display name, decoded and checked (:func:`decode_words`). Display
+    names are set from :class:`Address` objects, which skip the line-break
+    check the SMTP policy applies to plain headers."""
+    return decode_words(name, f"{what} display name")
+
+
+def msg_ids(value: str, what: str) -> list[str]:
+    """The msg-ids (``<id@domain>``) in a Message-ID, In-Reply-To or
+    References value from another mailer, in order and without repeats.
+    ValueError when the value is unsafe (:func:`decode_words`); anything
+    else that is not a msg-id (a comment, a malformed id) is left out."""
+    return list(dict.fromkeys(_MSG_ID.findall(decode_words(value, what))))
+
+
+def check_msg_ids(value: str, what: str, *, single: bool = False) -> str:
+    """``value`` for In-Reply-To (``single``: one msg-id) or References
+    (msg-ids separated by spaces), after :func:`decode_words`. ValueError for
+    anything else."""
+    ids = decode_words(value, what).split()
+    if not ids or not all(_MSG_ID.fullmatch(i) for i in ids) or (single and len(ids) != 1):
+        raise ValueError(f"{what} must be {'one msg-id' if single else 'msg-ids'} like <id@example.com>")
+    return " ".join(ids)
 
 
 def parse_addresses(values: Iterable[str], what: str) -> list[Address]:
     """Each value is one or more addresses (``a@x.co``, ``Ann <a@x.co>``,
-    ``a@x.co, b@y.co``); ValueError for anything that is not an address."""
+    ``a@x.co, b@y.co``); ValueError for anything that is not an address.
+    Encoded-word display names are decoded and checked like any header."""
     out: list[Address] = []
     for value in values:
         text = check_header(str(value), what).strip()
@@ -77,7 +146,7 @@ def parse_addresses(values: Iterable[str], what: str) -> list[Address]:
             if not _ADDR_SPEC.match(addr):
                 raise ValueError(f"{what} has something that is not an email address")
             local, _, domain = addr.rpartition("@")
-            out.append(Address(display_name=name, username=local, domain=domain))
+            out.append(Address(display_name=_display_name(name, what), username=local, domain=domain))
     return out
 
 
@@ -94,18 +163,28 @@ def build_message(
     references: str | None = None,
     attachments: Iterable[Attachment] = (),
 ) -> bytes:
-    """An RFC 2822 message (CRLF line endings) ready for Gmail's ``raw``."""
+    """An RFC 2822 message (CRLF line endings) ready for Gmail's ``raw``.
+
+    ValueError for an unsafe header: Subject goes through
+    :func:`decode_words`, In-Reply-To and References through
+    :func:`check_msg_ids`, and every header is checked again as the standard
+    library parsed it."""
     msg = EmailMessage(policy=email.policy.SMTP)
     if sender is not None:
         msg["From"] = sender
     for name, addresses in (("To", tuple(to)), ("Cc", tuple(cc)), ("Bcc", tuple(bcc))):
         if addresses:
             msg[name] = addresses
-    msg["Subject"] = check_header(subject, "subject")
+    msg["Subject"] = decode_words(subject, "subject")
     if in_reply_to:
-        msg["In-Reply-To"] = check_header(in_reply_to, "In-Reply-To")
+        msg["In-Reply-To"] = check_msg_ids(in_reply_to, "In-Reply-To", single=True)
     if references:
-        msg["References"] = check_header(references, "References")
+        msg["References"] = check_msg_ids(references, "References")
+    # What the standard library parsed is what its generator writes, so check
+    # that too: it doesn't rest on decode_header agreeing with the parser.
+    for name in _BUILT_HEADERS:
+        if name in msg:
+            check_header(str(msg[name]), name)
     if is_html:
         msg.set_content(html_to_text(body) or " ")
         msg.add_alternative(body, subtype="html")

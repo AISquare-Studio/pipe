@@ -68,6 +68,9 @@ GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
 
 #: 403/429 reasons that mean "slow down" (retried); every other 403 is final.
 RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+#: 403 reasons that mean the token lacks an OAuth scope (the same set Gmail and
+#: Calendar use). ``insufficientFilePermissions`` is not one: that is the file.
+SCOPE_REASONS = frozenset({"insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT"})
 _RETRYABLE_SERVER_ERRORS = frozenset({500, 502, 503, 504})
 _BACKOFF_BASE = 1.0
 _MAX_MESSAGE = 500
@@ -86,7 +89,8 @@ class GoogleDriveAPIError(Exception):
     ``errors[].reason`` (``notFound``, ``insufficientFilePermissions``,
     ``userRateLimitExceeded``, ...); ``retry_after`` is set when the failure is
     a rate limit, in seconds; ``timed_out`` when Google did not answer in time
-    (or the budget ran out).
+    (or the budget ran out); ``insufficient_scope`` when a 403 says the token
+    lacks an OAuth scope (see :func:`is_insufficient_scope`).
     """
 
     def __init__(
@@ -97,6 +101,7 @@ class GoogleDriveAPIError(Exception):
         reason: str | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
+        insufficient_scope: bool = False,
     ) -> None:
         super().__init__(f"{status}: {message}" if status else message)
         self.status = status
@@ -104,6 +109,7 @@ class GoogleDriveAPIError(Exception):
         self.reason = reason
         self.retry_after = retry_after
         self.timed_out = timed_out
+        self.insufficient_scope = insufficient_scope
 
     @property
     def rate_limited(self) -> bool:
@@ -274,10 +280,15 @@ class GoogleDriveRestClient:
             if wait is None or attempt >= self.max_retries or not fits:
                 status = response.status_code
                 message, reason = error_details(response)
+                scope = is_insufficient_scope(response)
                 if stream:
                     response.close()
                 raise GoogleDriveAPIError(
-                    status, message, reason=reason, retry_after=wait if limited else None
+                    status,
+                    message,
+                    reason=reason,
+                    retry_after=wait if limited else None,
+                    insufficient_scope=scope,
                 )
             attempt += 1
             logger.warning(
@@ -630,6 +641,29 @@ def error_details(response: requests.Response) -> tuple[str, str | None]:
                 break
     message = message or response.reason or "HTTP error"
     return message[:_MAX_MESSAGE], reason
+
+
+def is_insufficient_scope(response: requests.Response) -> bool:
+    """Whether a 403 says the token lacks an OAuth scope: an
+    ``insufficientPermissions`` reason, an ``ACCESS_TOKEN_SCOPE_INSUFFICIENT``
+    ErrorInfo, a ``WWW-Authenticate: ... error="insufficient_scope"`` header,
+    or Google's "insufficient authentication scopes" message. The same
+    detection as the Gmail and Calendar toolkits."""
+    if response.status_code != 403:
+        return False
+    error = _error_payload(response)
+    reasons: set[str] = set()
+    for key in ("errors", "details"):
+        items = error.get(key)
+        if isinstance(items, list):
+            reasons.update(str(i["reason"]) for i in items if isinstance(i, dict) and i.get("reason"))
+    challenge = str(response.headers.get("WWW-Authenticate") or "")
+    message = str(error.get("message") or "")
+    return (
+        bool(reasons & SCOPE_REASONS)
+        or "insufficient_scope" in challenge
+        or "insufficient authentication scopes" in message.lower()
+    )
 
 
 def is_rate_limited(response: requests.Response) -> bool:
