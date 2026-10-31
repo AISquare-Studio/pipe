@@ -30,6 +30,7 @@ from aisquare.pipe import (
     AuthType,
     DataEnvelope,
     OAuthError,
+    OAuthToken,
     QualifiedTool,
     Toolkit,
     ToolResult,
@@ -128,6 +129,15 @@ class TestToolResult:
 
 
 class TestErrorCodes:
+    def test_new_codes_are_exported_from_the_package(self):
+        # Toolkits read them as getattr(aisquare.pipe, "ERROR_INSUFFICIENT_SCOPE", ...).
+        import aisquare.pipe
+
+        assert aisquare.pipe.ERROR_INSUFFICIENT_SCOPE == "insufficient_scope"
+        assert aisquare.pipe.ERROR_NOT_CONNECTED == "not_connected"
+        assert {"ERROR_INSUFFICIENT_SCOPE", "ERROR_NOT_CONNECTED"} <= set(aisquare.pipe.__all__)
+        assert {aisquare.pipe.ERROR_INSUFFICIENT_SCOPE, aisquare.pipe.ERROR_NOT_CONNECTED} <= ERROR_CODES
+
     def test_canonical_set(self):
         assert ERROR_CODES == {
             "unauthorized",
@@ -1098,6 +1108,25 @@ class TestToolSpecMetadata:
     def test_explicit_risk_wins(self):
         assert spec("X_SEND", read_only=False, risk="destructive").risk == "destructive"
 
+    def test_replace_rederives_an_implicit_risk(self):
+        tool = spec("X_A", read_only=True)
+        assert dataclasses.replace(tool, read_only=False, destructive=True).risk == "destructive"
+        assert dataclasses.replace(tool, read_only=False).risk == "write"
+        assert dataclasses.replace(dataclasses.replace(tool, read_only=False), read_only=True).risk == "read"
+
+    def test_replace_keeps_an_explicit_risk(self):
+        tool = spec("X_SEND", read_only=False, risk="destructive")
+        assert dataclasses.replace(tool, tags=("x",)).risk == "destructive"
+        assert dataclasses.replace(spec("X_A"), risk="write").risk == "write"
+        assert dataclasses.replace(dataclasses.replace(spec("X_A"), risk="write"), read_only=True).risk == "write"
+
+    def test_risk_is_a_plain_string(self):
+        tool = spec("X_A")
+        assert tool.risk == "read" and tool == spec("X_A", risk="read")
+        assert hash(tool) == hash(spec("X_A", risk="read"))
+        assert type(tool.to_dict(metadata=True)["risk"]) is str
+        assert repr(tool).count("risk='read'") == 1
+
     def test_unknown_risk_is_refused(self):
         with pytest.raises(ValueError, match="risk"):
             spec("X_DO", risk="spicy")
@@ -1239,7 +1268,10 @@ class TestCard:
 
 
 class TestScopeAwareListing:
-    @pytest.mark.parametrize("config", [None, {}, TOKEN, {"granted_scopes": None}, "garbage"])
+    @pytest.mark.parametrize(
+        "config",
+        [None, {}, TOKEN, {"granted_scopes": None}, {"granted_scopes": ""}, {"granted_scopes": " \t"}, "garbage"],
+    )
     def test_no_grant_info_lists_everything(self, config):
         assert [t.slug for t in _Scoped().available_tools(config)] == ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]
 
@@ -1249,8 +1281,8 @@ class TestScopeAwareListing:
             (["files.read"], ["SCOPED_LIST", "SCOPED_PING"]),
             ("files.read files.write", ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]),
             ("files.write,files.read", ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]),
-            ([], ["SCOPED_PING"]),
-            ("", ["SCOPED_PING"]),
+            ([], ["SCOPED_PING"]),  # known: nothing granted
+            ((), ["SCOPED_PING"]),
             (42, ["SCOPED_PING"]),  # unreadable grants nothing
         ],
     )
@@ -1308,6 +1340,21 @@ class TestConnectionErrors:
     def test_no_grant_info_runs(self):
         kit = _Scoped()
         assert kit.call_tool("SCOPED_WRITE", {}, TOKEN).successful
+
+    @pytest.mark.parametrize("scope", ["", "   "])
+    def test_a_token_whose_provider_omitted_scope_is_not_locked_out(self, scope):
+        # RFC 6749 §5.1: no scope in the response means "what was asked".
+        token = OAuthToken(access_token="tok-secret-123456", scope=scope)
+        for granted in (token.granted_scopes, token.scope):
+            config = {"access_token": token.access_token, "granted_scopes": granted}
+            assert len(_Scoped().available_tools(config)) == 3
+            assert _Scoped().call_tool("SCOPED_WRITE", {}, config).successful
+
+    def test_token_granted_scopes_is_what_to_pass(self):
+        token = OAuthToken(access_token="tok-secret-123456", scope="files.read")
+        config = {"access_token": token.access_token, "granted_scopes": token.granted_scopes}
+        assert [t.slug for t in _Scoped().available_tools(config)] == ["SCOPED_LIST", "SCOPED_PING"]
+        assert _Scoped().call_tool("SCOPED_WRITE", {}, config).error_code == ERROR_INSUFFICIENT_SCOPE
 
     def test_not_connected_wins_over_scope(self):
         out = _Scoped().call_tool("SCOPED_WRITE", {}, {"granted_scopes": []})

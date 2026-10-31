@@ -144,6 +144,9 @@ def installed(monkeypatch, fresh_cache):
 
 class TestCatalogue:
     def test_real_install_is_offline(self, fresh_cache):
+        # The first discovery imports the plugin modules; their import-time
+        # side effects (urllib3 probes for IPv6) are theirs, not catalogue()'s.
+        installed_toolkits()
         with no_network() as log:
             cards = catalogue()
         assert log.attempts == []
@@ -276,6 +279,7 @@ class TestSearchToolsAcross:
         assert {q.connector for q in search_tools_across(None, limit=None)} == {"mail"}
 
     def test_real_install_is_offline(self, fresh_cache):
+        installed_toolkits()  # import the plugins first (see TestCatalogue)
         with no_network() as log:
             found = search_tools_across("list files", limit=10)
         assert log.attempts == []

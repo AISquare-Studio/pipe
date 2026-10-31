@@ -138,7 +138,12 @@ def installed_toolkits(*, refresh: bool = False) -> dict[str, type[Toolkit]]:
     """Every installed toolkit class by name, sorted. Entry points are read
     once per process; ``refresh=True`` reads them again (after installing a
     plugin). Raises :class:`ToolkitConflictError` when two toolkits'
-    slug prefixes collide (see :func:`slug_prefix_conflicts`)."""
+    slug prefixes collide (see :func:`slug_prefix_conflicts`).
+
+    The first discovery imports every plugin module. What those imports do
+    is the plugins' own business: urllib3, which the Slack toolkit imports,
+    opens an IPv6 socket at import to see whether the host supports IPv6. A
+    host that must stay offline afterwards calls this once at startup."""
     if refresh:
         _installed_toolkits.cache_clear()
     return dict(_installed_toolkits())
@@ -147,9 +152,10 @@ def installed_toolkits(*, refresh: bool = False) -> dict[str, type[Toolkit]]:
 def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     """One :meth:`Toolkit.card` per installed toolkit, by name — what a
     router shows a model to pick connectors. Offline and cheap: the
-    discovery is cached (see :func:`installed_toolkits`) and cards are read
-    from class attributes. A toolkit whose card fails is left out (and
-    logged). Each call returns fresh dicts."""
+    discovery is cached and cards are read from class attributes. The first
+    call imports the plugins (see :func:`installed_toolkits`). A toolkit
+    whose card fails is left out (and logged). Each call returns fresh
+    dicts."""
     cards: dict[str, dict[str, Any]] = {}
     for name, cls in installed_toolkits(refresh=refresh).items():
         try:
@@ -172,7 +178,8 @@ def search_tools_across(
     ``config`` (so each lists only its :meth:`Toolkit.available_tools`, e.g.
     filtered by ``granted_scopes``), an iterable of names (no config), or None
     for every installed toolkit. An unknown name raises
-    :class:`ToolkitNotFoundError`. Offline, like ``available_tools``."""
+    :class:`ToolkitNotFoundError`. Offline, like ``available_tools``, once
+    the plugins are imported (see :func:`installed_toolkits`)."""
     installed = installed_toolkits()
     if connectors is None:
         chosen: dict[str, Mapping[str, Any] | None] = dict.fromkeys(installed)

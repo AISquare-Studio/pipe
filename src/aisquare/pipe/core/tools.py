@@ -165,6 +165,15 @@ def parse_scopes(value: Any) -> frozenset[str]:
     return frozenset()
 
 
+class _DerivedRisk(str):
+    """A ``ToolSpec.risk`` the flags decided rather than the author. It
+    compares, hashes and serializes as the plain string; the type only tells
+    ``__post_init__`` to derive it again, so ``dataclasses.replace(spec,
+    destructive=True)`` gets ``destructive``."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """One tool in a toolkit's catalog.
@@ -178,6 +187,8 @@ class ToolSpec:
     ``required_scopes`` are the OAuth scopes the tool needs, all of them
     (empty: none declared). ``risk`` defaults from the flags: ``destructive``
     when ``destructive``, else ``read`` when ``read_only``, else ``write``.
+    A defaulted risk follows the flags through ``dataclasses.replace``; an
+    explicit one is kept.
     """
 
     slug: str
@@ -195,11 +206,9 @@ class ToolSpec:
         object.__setattr__(
             self, "required_scopes", (scopes,) if isinstance(scopes, str) else tuple(scopes)
         )
-        if self.risk is None:
-            risk: Risk = (
-                "destructive" if self.destructive else "read" if self.read_only else "write"
-            )
-            object.__setattr__(self, "risk", risk)
+        if self.risk is None or isinstance(self.risk, _DerivedRisk):
+            risk = "destructive" if self.destructive else "read" if self.read_only else "write"
+            object.__setattr__(self, "risk", _DerivedRisk(risk))
         elif self.risk not in RISKS:
             raise ValueError(f"ToolSpec risk {self.risk!r} is not one of: {', '.join(RISKS)}")
 
@@ -224,7 +233,7 @@ class ToolSpec:
         }
         if metadata:
             data["required_scopes"] = list(self.required_scopes)
-            data["risk"] = self.risk
+            data["risk"] = str(self.risk)
         return data
 
 
@@ -653,9 +662,11 @@ class Toolkit(ABC):
         A toolkit whose config switches tools off overrides it.
 
         ``config["granted_scopes"]`` is the scopes the connection's token
-        holds: a list of strings, or the stored scope string (space- or
-        comma-separated). Absent or None means "not known" and filters
-        nothing; any other unreadable value grants nothing.
+        holds. Pass the stored token's ``OAuthToken.granted_scopes``: a
+        tuple of strings, or None when the provider did not say (RFC 6749
+        §5.1: it granted what was asked). A list or a space/comma-separated
+        string works too. Absent, None or a blank string means "not known"
+        and filters nothing; any other unreadable value grants nothing.
 
         An override returns a subset of :meth:`tools` (the same ToolSpecs).
         It must not raise for any ``config``, including None, ``{}`` and
@@ -663,7 +674,7 @@ class Toolkit(ABC):
         :meth:`tools`, it must not touch the network. Listing is advisory:
         :meth:`call_tool` enforces on its own, whatever was listed."""
         catalog = self.tools()
-        if not isinstance(config, Mapping) or config.get("granted_scopes") is None:
+        if _granted_scopes(config) is None:
             return catalog
         return [tool for tool in catalog if not self.missing_scopes(tool, config)]
 
@@ -675,10 +686,11 @@ class Toolkit(ABC):
 
     def missing_scopes(self, tool: ToolSpec, config: Mapping[str, Any] | None) -> list[str]:
         """The tool's ``required_scopes`` that ``config["granted_scopes"]``
-        does not cover; empty when the config does not say what was granted."""
-        if not isinstance(config, Mapping) or config.get("granted_scopes") is None:
+        does not cover; empty when the config does not say what was granted
+        (see :meth:`available_tools`)."""
+        granted = _granted_scopes(config)
+        if granted is None:
             return []
-        granted = parse_scopes(config["granted_scopes"])
         return [s for s in tool.required_scopes if not self.scope_granted(s, granted)]
 
     def search_tools(
@@ -892,6 +904,18 @@ class Toolkit(ABC):
             token=token,
             token_type_hint=token_type_hint,
         )
+
+
+def _granted_scopes(config: Any) -> frozenset[str] | None:
+    """``config["granted_scopes"]`` parsed, or None when it is not known:
+    absent, None or a blank string (like ``OAuthToken.granted_scopes`` for a
+    response without ``scope``)."""
+    if not isinstance(config, Mapping):
+        return None
+    value = config.get("granted_scopes")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return parse_scopes(value)
 
 
 def _as_list(value: Any) -> list[Any]:

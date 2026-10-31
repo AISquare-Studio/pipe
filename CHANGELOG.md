@@ -20,18 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `keywords`, `examples` and `auth_type` from class attributes alone.
   - **Per-tool scopes and risk.** `ToolSpec` gains `required_scopes` (all
     needed; default none) and `risk` (`read` / `write` / `destructive`,
-    derived from `read_only` / `destructive` unless set).
+    derived from `read_only` / `destructive` unless set, and re-derived by
+    `dataclasses.replace` when it was not set).
     `ToolSpec.to_dict(metadata=True)` adds both; the default shape is
     unchanged.
-  - **Scope-aware listing.** When `config["granted_scopes"]` is present (a
-    list, or the stored space/comma-separated scope string), the default
-    `available_tools(config)` leaves out tools whose `required_scopes` it
-    doesn't grant, and `call_tool` refuses them as `insufficient_scope`
-    before any request. A toolkit with broader scopes that imply narrower
+  - **Scope-aware listing.** When `config["granted_scopes"]` is present (pass
+    the stored token's `OAuthToken.granted_scopes`; a list or a space/comma
+    string works too), the default `available_tools(config)` leaves out
+    tools whose `required_scopes` it doesn't grant, and `call_tool` refuses
+    them as `insufficient_scope` before any request. None or a blank string
+    means "not known" and filters nothing. A toolkit with broader scopes that imply narrower
     ones overrides `scope_granted()`. Without the key nothing changes.
   - **Cross-toolkit catalogue.** `catalogue()` returns one card per
     installed toolkit, discovered once per process (`refresh=True` to
-    re-read; `installed_toolkits()` for the classes). The
+    re-read; `installed_toolkits()` for the classes). The first discovery
+    imports the plugin modules, and their import-time side effects are the
+    plugins' own (urllib3 probes for IPv6), so a host that must stay offline
+    discovers once at startup. The
     `search_tools_across(query, connectors)` function ranks tools across
     several toolkits and returns `QualifiedTool(connector, tool)`; the pure
     ranker is `rank_across()`. Discovery raises the new
