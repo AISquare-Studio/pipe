@@ -63,6 +63,18 @@ Set up: Google Cloud console → APIs & Services → enable the **Google Drive
 API** → OAuth consent screen → Credentials → *OAuth client ID* (Web
 application) with your callback as an authorized redirect URI.
 
+**Router metadata.** `GoogleDriveToolkit.card()` is the connector's card for a router —
+category `files`, plus `keywords` and `examples` phrased as users ask
+("the deck Sam shared", "find the Q3 budget spreadsheet"). Each tool's `required_scopes` and `risk` (`read` / `write` /
+`destructive`, from its flags) are on its `ToolSpec`. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+Read tools need `drive.readonly` and write tools `drive`; `drive` covers
+`drive.readonly` (and the metadata and per-file scopes), so the default
+consent covers every tool. A `drive.file`-only connection lists none of
+them: they reach files the app did not create.
+
 ## Toolkit
 
 ```python

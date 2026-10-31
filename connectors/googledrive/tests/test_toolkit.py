@@ -66,7 +66,7 @@ class TestCatalog:
 
     def test_identity(self):
         toolkit = GoogleDriveToolkit()
-        assert (toolkit.name, toolkit.slug_prefix, toolkit.version) == ("googledrive", "GOOGLEDRIVE_", "0.2.0")
+        assert (toolkit.name, toolkit.slug_prefix, toolkit.version) == ("googledrive", "GOOGLEDRIVE_", "0.3.0")
         assert toolkit.auth_type is AuthType.OAUTH2
 
     def test_composio_slugs_exactly(self):
