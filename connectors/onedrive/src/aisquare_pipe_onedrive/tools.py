@@ -771,8 +771,35 @@ def _create_link(client: OneDriveRestClient, args: dict[str, Any]) -> ToolResult
 # --------------------------------------------------------------------------
 
 
+#: Microsoft Graph delegated permissions. The read tools reach files shared
+#: with the user and other drives too, so they need the ``.All`` forms.
+FILES_READ_ALL = "Files.Read.All"
+FILES_READWRITE_ALL = "Files.ReadWrite.All"
+_GRAPH = "https://graph.microsoft.com/"
+#: Graph's file permission hierarchy, by lower-cased short name: the broader
+#: permissions that cover each one.
+COVERING_SCOPES: dict[str, frozenset[str]] = {
+    "files.read": frozenset({"files.read.all", "files.readwrite", "files.readwrite.all"}),
+    "files.read.all": frozenset({"files.readwrite.all"}),
+    "files.readwrite": frozenset({"files.readwrite.all"}),
+}
+
+
+def graph_scope(scope: str) -> str:
+    """A Graph scope's short, lower-cased name: Microsoft's token responses
+    may say ``https://graph.microsoft.com/Files.Read.All`` or
+    ``files.read.all`` for ``Files.Read.All``."""
+    text = scope.strip()
+    if text.lower().startswith(_GRAPH):
+        text = text[len(_GRAPH):]
+    return text.lower()
+
+
 def _read(slug: str, description: str, schema: dict[str, Any], handler: Handler, *tags: str) -> OneDriveTool:
-    return OneDriveTool(ToolSpec(slug, description, schema, read_only=True, tags=tags), handler)
+    return OneDriveTool(
+        ToolSpec(slug, description, schema, read_only=True, tags=tags, required_scopes=(FILES_READ_ALL,)),
+        handler,
+    )
 
 
 def _write(
@@ -784,7 +811,15 @@ def _write(
     destructive: bool = False,
 ) -> OneDriveTool:
     return OneDriveTool(
-        ToolSpec(slug, description, schema, read_only=False, destructive=destructive, tags=tags),
+        ToolSpec(
+            slug,
+            description,
+            schema,
+            read_only=False,
+            destructive=destructive,
+            tags=tags,
+            required_scopes=(FILES_READWRITE_ALL,),
+        ),
         handler,
     )
 
