@@ -211,13 +211,17 @@ class TestHeaderInjection:
 
     def test_a_header_the_generator_refuses_is_invalid_arguments(self, monkeypatch):
         # On Pythons with the CVE-2024-6923 fix the generator raises
-        # HeaderWriteError, which is not a ValueError.
+        # HeaderWriteError, which is not a ValueError. Older Pythons
+        # (requires-python allows them) have no HeaderWriteError: any
+        # MessageError stands in.
         import email.errors
 
         from aisquare_pipe_gmail import tools
 
+        refused = getattr(email.errors, "HeaderWriteError", email.errors.MessageError)
+
         def refuse(**_: object) -> bytes:
-            raise email.errors.HeaderWriteError("folded header contains newline")
+            raise refused("folded header contains newline")
 
         monkeypatch.setattr(tools, "build_message", refuse)
         self._refused({"recipient_email": "a@x.co"})
@@ -251,6 +255,160 @@ class TestHeaderInjection:
         with pytest.raises(ValueError, match="control characters"):
             mime.check_header(f"a{chr(code)}b", "subject")
 
+
+
+#: ENCODED_CRLF encoded once more, as a sender would to get past one decoding.
+DOUBLY_ENCODED = "=?utf-8?b?PT91dGYtOD9iP1FXNXVEUXBDWTJNNklHVjJhV3hBZUM1amJ3PT0/PQ==?="
+
+
+@pytest.fixture
+def unpatched_generator(monkeypatch):
+    """Stand in for a Python without the CVE-2024-6923 fix (3.11.0-3.11.9,
+    3.12.0-3.12.4). Those write a short header as the standard library parsed
+    it, encoded-words decoded and line breaks kept, and their generator
+    doesn't check what it writes."""
+    import email.headerregistry
+
+    def fold(self, *, policy):
+        return f"{self.name}: {self}{policy.linesep}"
+
+    monkeypatch.setattr(email.headerregistry.BaseHeader, "fold", fold)
+    if hasattr(email.policy.SMTP, "verify_generated_headers"):  # patched Pythons only
+        monkeypatch.setattr(email.policy, "SMTP", email.policy.SMTP.clone(verify_generated_headers=False))
+
+
+def _injected(raw: bytes) -> bool:
+    """Whether the header block got a Bcc line of its own."""
+    head = raw.split(b"\r\n\r\n", 1)[0]
+    return any(line.lower().startswith(b"bcc:") for line in head.split(b"\r\n"))
+
+
+def _reply(incoming: dict, **args):
+    h = harness(response(200, {"id": "t1", "messages": [incoming]}), response(200, SENT))
+    return h, h.call("GMAIL_REPLY_TO_THREAD", {"thread_id": "t1", "message_body": "x", **args})
+
+
+class TestEncodedWordsInUnstructuredHeaders:
+    """An encoded-word in Subject, In-Reply-To or References is decoded by the
+    standard library when the header is set, and an unpatched generator
+    writes the decoded CRLF out: a sender could Bcc themselves on the user's
+    reply. These headers are decoded and checked like display names, and
+    In-Reply-To/References must be msg-ids."""
+
+    def test_the_stand_in_injects_like_an_unpatched_python(self, unpatched_generator):
+        msg = email.message.EmailMessage(policy=email.policy.SMTP)
+        msg["To"] = "a@x.co"
+        msg["Subject"] = ENCODED_CRLF
+        msg.set_content("x")
+        assert _injected(msg.as_bytes())
+
+    # The tester's three repros (board seq 6072).
+    def test_repro_1_caller_subject(self, unpatched_generator):
+        h = harness()
+        result = h.call("GMAIL_SEND_EMAIL", {"recipient_email": "a@x.co", "subject": ENCODED_CRLF, "body": "x"})
+        assert result.error_code == "invalid_arguments" and "line breaks" in result.error
+        assert h.session.calls == []
+
+    def test_repro_2_inbound_subject_on_a_reply(self, unpatched_generator):
+        h, result = _reply(message("m1", thread_id="t1", subject=ENCODED_CRLF, extra_headers={"Message_ID": "<a@b>"}))
+        assert result.error_code == "invalid_arguments" and "give a subject" in result.error
+        assert [c.method for c in h.session.calls] == ["GET"]
+
+    def test_repro_3_inbound_message_id_on_a_reply(self, unpatched_generator):
+        h, result = _reply(message("m1", thread_id="t1", extra_headers={"Message_ID": f"<a@b> {ENCODED_CRLF}"}))
+        assert result.error_code == "invalid_arguments" and "Message-ID" in result.error
+        assert [c.method for c in h.session.calls] == ["GET"]
+
+    @pytest.mark.parametrize("value", [ENCODED_CRLF, DOUBLY_ENCODED, f"<{ENCODED_CRLF}@x>", f"<{DOUBLY_ENCODED}@x>"])
+    def test_inbound_references_are_checked_too(self, unpatched_generator, value):
+        incoming = message("m1", thread_id="t1", extra_headers={"Message_ID": "<a@b>", "References": f"<x@y> {value}"})
+        h, result = _reply(incoming)
+        assert result.error_code == "invalid_arguments"
+        assert [c.method for c in h.session.calls] == ["GET"]
+
+    def test_a_given_subject_replaces_an_unsafe_inbound_one(self, unpatched_generator):
+        h, result = _reply(
+            message("m1", thread_id="t1", subject=ENCODED_CRLF, extra_headers={"Message_ID": "<a@b>"}), subject="Re: plan"
+        )
+        assert result.successful, result.error
+        assert not _injected(raw_message(h.session.last))
+
+    @pytest.mark.parametrize(
+        "subject",
+        [
+            DOUBLY_ENCODED,  # one decoding still leaves an encoded-word
+            "=?x-unknown?q?Ann=0D=0ABcc:_e@x.co?=",  # decode_header can't, the stdlib parser can
+            "=?utf-8*en?q?Ann=0D=0ABcc:_e@x.co?=",  # an RFC 2231 language tag: the same
+            f"Re: x{ENCODED_CRLF}",  # not delimited by whitespace
+        ],
+    )
+    def test_undecodable_or_doubly_encoded_subjects(self, unpatched_generator, subject):
+        h = harness()
+        assert h.call("GMAIL_SEND_EMAIL", {"recipient_email": "a@x.co", "subject": subject, "body": "x"}).error_code == "invalid_arguments"
+        assert h.session.calls == []
+
+    @pytest.mark.parametrize("field", ["in_reply_to", "references"])
+    @pytest.mark.parametrize("value", [f"<{ENCODED_CRLF}@x>", f"<{DOUBLY_ENCODED}@x>"])
+    def test_build_message_decodes_msg_id_headers(self, unpatched_generator, field, value):
+        # An encoded-word inside <...> is msg-id syntax, so only decoding stops it.
+        with pytest.raises(ValueError):
+            mime.build_message(to=mime.parse_addresses(["a@x.co"], "to"), subject="x", **{field: value})
+
+    def test_what_the_stdlib_parsed_is_checked_too(self, unpatched_generator, monkeypatch):
+        # Second layer: with decoding switched off, the parsed header still
+        # carries the CRLF, and build_message refuses it.
+        monkeypatch.setattr(mime, "decode_words", lambda value, what: mime.check_header(value, what))
+        to = mime.parse_addresses(["a@x.co"], "to")
+        for kwargs in ({"subject": ENCODED_CRLF}, {"subject": "x", "references": f"<{ENCODED_CRLF}@x>"}):
+            with pytest.raises(ValueError, match="line breaks"):
+                mime.build_message(to=to, **kwargs)
+
+    def test_decode_words(self):
+        assert mime.decode_words("=?utf-8?q?Caf=C3=A9?= plan", "subject") == "Café plan"
+        assert mime.decode_words("50% =? maybe", "subject") == "50% =? maybe"
+        for value in (ENCODED_CRLF, DOUBLY_ENCODED, "=?x-unknown?q?Ann?="):
+            with pytest.raises(ValueError):
+                mime.decode_words(value, "subject")
+
+    # Real stdlib from here on: legitimate encoded-words still work.
+    @pytest.mark.parametrize(
+        ("inbound", "expected"),
+        [("=?utf-8?q?Caf=C3=A9_plan?=", "Re: Café plan"), ("=?utf-8?q?Re:_Plan?=", "Re: Plan")],
+    )
+    def test_an_encoded_inbound_subject_is_decoded_for_the_reply(self, inbound, expected):
+        h, result = _reply(message("m1", thread_id="t1", subject=inbound, extra_headers={"Message_ID": "<a@b>"}))
+        assert result.successful, result.error
+        sent = email.message_from_bytes(raw_message(h.session.last), policy=email.policy.default)
+        assert sent["Subject"] == expected
+
+    def test_malformed_inbound_ids_are_left_out_not_fatal(self):
+        incoming = message(
+            "m1", thread_id="t1", extra_headers={"Message_ID": "no-brackets@x", "References": "<x@y> (a comment) junk <z@[10.0.0.1]>"}
+        )
+        h, result = _reply(incoming)
+        assert result.successful, result.error
+        sent = email.message_from_bytes(raw_message(h.session.last), policy=email.policy.default)
+        assert sent["In-Reply-To"] is None
+        assert sent["References"] == "<x@y> <z@[10.0.0.1]>"
+
+    @pytest.mark.parametrize(
+        ("kwargs", "ok"),
+        [
+            ({"in_reply_to": "<CAF1.x+y@mail.example.com>", "references": "<a@b> <c.d@[127.0.0.1]>"}, True),
+            ({"in_reply_to": "not-a-msg-id"}, False),
+            ({"in_reply_to": "<a@b> <c@d>"}, False),  # In-Reply-To is one msg-id
+            ({"in_reply_to": "<no-at-sign>"}, False),
+            ({"references": "<a@b> junk"}, False),
+            ({"references": "<a@b>, <c@d>"}, False),
+        ],
+    )
+    def test_build_message_wants_msg_ids(self, kwargs, ok):
+        to = mime.parse_addresses(["a@x.co"], "to")
+        if ok:
+            assert mime.build_message(to=to, subject="x", **kwargs)
+        else:
+            with pytest.raises(ValueError, match="msg-id"):
+                mime.build_message(to=to, subject="x", **kwargs)
 
 class TestRead:
     def test_plain_text_is_preferred_over_html(self):

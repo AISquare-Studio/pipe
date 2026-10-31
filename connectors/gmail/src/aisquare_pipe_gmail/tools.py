@@ -58,8 +58,10 @@ from aisquare_pipe_gmail.mime import (
     attachments_of,
     body_text,
     build_message,
+    decode_words,
     guess_mimetype,
     headers_of,
+    msg_ids,
     parse_addresses,
     reply_subject,
     safe_filename,
@@ -667,7 +669,13 @@ def _one_line(value: str) -> str:
 def _thread_context(client: GmailRestClient, user: str, thread_id: str) -> dict[str, str]:
     """What a reply in ``thread_id`` needs: its subject, the Message-ID and
     References of the last message, and who to answer (that message's
-    Reply-To/From — or its To when the user sent it)."""
+    Reply-To/From — or its To when the user sent it).
+
+    These come from mail anyone can send. The msg-ids are decoded and
+    checked (:func:`msg_ids`): an unsafe one (an encoded line break, double
+    encoding) refuses the reply, and anything that is not a msg-id is left
+    out of In-Reply-To/References. The subject is checked where it is used,
+    in :func:`_apply_thread`."""
     thread = json_object(
         client.get(f"/{user}/threads/{thread_id}", {"format": "metadata", "metadataHeaders": list(REPLY_HEADERS)})
     )
@@ -679,12 +687,16 @@ def _thread_context(client: GmailRestClient, user: str, thread_id: str) -> dict[
     last = messages[-1]
     headers = {k: _one_line(v) for k, v in headers_of(last.get("payload") or {}).items()}
     first = headers_of(messages[0].get("payload") or {})
-    message_id = headers.get("message-id", "")
+    try:
+        own = msg_ids(headers.get("message-id", ""), "the thread's Message-ID")[:1]
+        references = msg_ids(" ".join((headers.get("references", ""), *own)), "the thread's References")
+    except ValueError as e:
+        raise _invalid(f"{e}, so a reply can't be threaded safely") from None
     sent_by_user = "SENT" in (last.get("labelIds") or [])
     return {
         "subject": _one_line(first.get("subject") or headers.get("subject", "")),
-        "in_reply_to": message_id,
-        "references": " ".join(x for x in (headers.get("references", ""), message_id) if x),
+        "in_reply_to": own[0] if own else "",
+        "references": " ".join(references),
         "reply_to": headers.get("to", "") if sent_by_user else headers.get("reply-to") or headers.get("from", ""),
     }
 
@@ -715,7 +727,11 @@ def _apply_thread(client: GmailRestClient, user: str, args: dict[str, Any], draf
     thread_id = _path_id(args, "thread_id")
     context = _thread_context(client, user, thread_id)
     if not draft.subject:
-        draft.subject = reply_subject(context["subject"])
+        # Decoded before "Re:" is added, so an encoded "Re: ..." doesn't stack.
+        try:
+            draft.subject = reply_subject(decode_words(context["subject"], "the thread's subject"))
+        except ValueError as e:
+            raise _invalid(f"{e}; give a subject for the reply") from None
     draft.in_reply_to = context["in_reply_to"] or None
     draft.references = context["references"] or None
     if not (draft.to or draft.cc or draft.bcc) and context["reply_to"]:

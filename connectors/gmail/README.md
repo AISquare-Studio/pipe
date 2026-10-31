@@ -128,11 +128,15 @@ a different id for the same attachment on each read, and every one works.
 library's `email` package. Recipients may be `a@x.co`, `Ann <a@x.co>` or
 comma-separated lists; anything else is refused, as is a header value
 (display names included) with a line break, any other control character, DEL
-or a Unicode line separator. A tab is whitespace: it is sent as a space. A
-display name sent RFC 2047-encoded
-(`=?utf-8?…?=`) is decoded and checked the same way. Non-ASCII subjects and
-names are RFC 2047-encoded. `is_html`
-sends HTML with a plain-text alternative. `attachment` is
+or a Unicode line separator. A tab is whitespace: it is sent as a space.
+RFC 2047 encoded-words (`=?utf-8?…?=`) in a display name, the subject,
+`In-Reply-To` or `References` are decoded and the result is checked the same
+way. A value that can't be decoded, or is still encoded after one decoding,
+is refused: on Pythons without the CVE-2024-6923 fix (3.11.0–3.11.9,
+3.12.0–3.12.4) the standard library would write a decoded line break out as
+a header of its own. `In-Reply-To` must be one msg-id and `References`
+msg-ids (`<id@example.com>`). Non-ASCII subjects and names are RFC
+2047-encoded. `is_html` sends HTML with a plain-text alternative. `attachment` is
 `{name, mimetype, file_content_bytes}` (base64) or a list of them, 25 MB in
 total; Composio's `s3key` is not supported. Messages up to 4 MB go as JSON
 `raw`; larger ones as one `multipart/related` upload (Gmail's limit: 35 MB).
@@ -141,7 +145,11 @@ total; Composio's `s3key` is not supported. Messages up to 4 MB go as JSON
 thread's headers first. The reply goes to the last message's `Reply-To` or
 `From` — or, when the user sent that message, to its `To` — unless
 `recipient_email`/`cc`/`bcc` are given. It carries `Re: <subject>`,
-`In-Reply-To` and `References`, so it threads for every recipient.
+`In-Reply-To` and `References`, so it threads for every recipient. Those
+headers come from mail anyone can send. The thread's subject is decoded
+before `Re:` is added, and an unsafe one refuses the reply unless `subject`
+is given. Only well-formed msg-ids are kept for threading, and an unsafe
+`Message-ID` or `References` refuses the reply.
 
 **Labels.** `add_label_ids` / `remove_label_ids` take system label ids in
 any case (`unread` → `UNREAD`), user label ids (`Label_12`), or a user

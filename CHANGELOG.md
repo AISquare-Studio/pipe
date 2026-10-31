@@ -127,9 +127,13 @@ First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
     attachments, header-injection and address checks); large messages go as
     one multipart upload. Header values, recipient display names included,
     refuse every control character but tab (sent as a space) and every
-    Unicode line break, and an encoded-word display name is decoded and
-    checked before use. Read messages come back with `messageText` (plain
-    text preferred, HTML converted, charsets honoured) and `attachmentList`.
+    Unicode line break. Encoded-words in display names, the subject,
+    `In-Reply-To` and `References` are decoded and checked before use (an
+    undecodable or doubly encoded one is refused), so an encoded CRLF can't
+    add a header on Pythons without the CVE-2024-6923 fix; replies take
+    their threading ids from the inbound mail as checked msg-ids only.
+    Read messages come back with `messageText` (plain text preferred, HTML
+    converted, charsets honoured) and `attachmentList`.
   - **Least privilege.** Read-only consent by default (`gmail.readonly`);
     each write tool names the scopes it needs (`gmail.compose`, `gmail.send`,
     `gmail.modify`; plus `gmail.readonly` for the tools that read the thread
