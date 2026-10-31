@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-engine = ["graphifyy==0.9.72"]
+engine = ["graphifyy==0.9.97"]
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
 
 [project.entry-points."aisquare_pipe.connectors"]
