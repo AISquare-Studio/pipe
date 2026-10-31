@@ -196,6 +196,8 @@ SEARCH = ToolSpec(
     },
     read_only=True,                        # destructive=True for deletes/overwrites
     tags=("files",),
+    required_scopes=("files.read",),       # OAuth scopes the tool needs (all of them)
+    # risk defaults from the flags: "read" here; "write" or "destructive" otherwise
 )
 
 
@@ -204,6 +206,9 @@ class MyServiceToolkit(Toolkit):
     version = "0.1.0"                      # == pyproject version
     display_name = "My Service"
     description = "Files in My Service"
+    category = "files"                     # one of aisquare.pipe.CATEGORIES (default "other")
+    keywords = ("files", "folders", "documents")
+    examples = ("find my budget spreadsheet", "what's in the shared folder?")   # 2-4 asks
     auth_type = AuthType.OAUTH2
     # slug_prefix defaults to name.upper() + "_"  ->  "MYSVC_"
     oauth = OAuthSpec(
@@ -241,7 +246,9 @@ What the base class does for you:
   failure — unknown slug, bad arguments, no credentials, a `ToolError`, any
   other exception — comes back as `ToolResult(successful=False, error=...,
   error_code=...)`, with `error_code` set to `unknown_tool`,
-  `invalid_arguments` or `unauthorized` (missing credentials) by the base
+  `invalid_arguments`, `not_connected` (no usable credentials) or
+  `insufficient_scope` (the tool's `required_scopes` are not in
+  `config["granted_scopes"]`) by the base
   class, to the `ToolError`'s `code`, to `timeout` for a `TimeoutError`,
   to `error_code_for_status(status)` for an `urllib.error.HTTPError` (a
   `rate_limited` one also gets `retry_after` from `Retry-After`, capped at
@@ -252,8 +259,17 @@ What the base class does for you:
   escaped and `Bearer`-prefixed forms — are masked out of every error
   message. A malformed result (non-string `error`, unknown `error_code`) is
   normalized rather than raised.
+- **`card()`** (a classmethod) is the connector's short description for a
+  router that picks connectors before tools: `name`, `display_name`,
+  `description`, `category`, `keywords`, `examples`, `auth_type`. It reads
+  class attributes only. `aisquare.pipe.catalogue()` returns one card per
+  installed toolkit, and `search_tools_across(query, {name: config})` ranks
+  tools over several toolkits, each result naming its connector.
 - **`available_tools(config=None)`** is what a host lists to a model for one
-  connection. The default is every tool (`tools()`). Override it when config
+  connection. The default is every tool (`tools()`), minus the tools whose
+  `required_scopes` are not in `config["granted_scopes"]` when the host
+  passes that key (override `scope_granted` when a broad scope implies
+  narrower ones). Override it when config
   switches tools off (for example, risk tiers). Keep it offline. Listing is
   advisory, so `call_tool` must still refuse a switched-off tool. An override
   returns a subset of `tools()` and never raises (`[]` for an unreadable
@@ -297,10 +313,14 @@ Conventions:
 - Raise `ToolError("human-readable message", code=...)` for expected
   failures. `code` is one of the canonical `ERROR_*` constants —
   `unauthorized` (token rejected/expired: the host refreshes, then asks the
-  user to reconnect), `forbidden`, `not_found`, `rate_limited` (pass
+  user to reconnect), `not_connected` (no credentials at all),
+  `forbidden`, `insufficient_scope` (the token lacks a scope the call
+  needs: the user must reconnect and grant it), `not_found`, `rate_limited` (pass
   `retry_after` seconds), `invalid_arguments`, `conflict`, `timeout`, or
   `upstream_error` (the default). `error_code_for_status(status)` maps an
-  HTTP status; override it where the provider is quirky (e.g. GitHub's
+  HTTP status; pass `www_authenticate=` the response's `WWW-Authenticate`
+  header so an RFC 6750 `insufficient_scope` 403 is told apart from a plain
+  `forbidden`. Override it where the provider is quirky (e.g. GitHub's
   rate-limit 403). Never put tokens or the raw argument payload in the
   message, and never log them — log slugs, counts, timings.
 - A host may bound a whole call with `config["timeout_seconds"]`.
@@ -334,7 +354,12 @@ entry-point name equals `name`, slugs are unique and carry `slug_prefix`,
 every `input_schema` is `{"type": "object", "properties": {...}}` with
 `required` ⊆ `properties`, descriptions are non-empty and ≤ 1024 chars,
 `call_tool` of an unknown slug and of every real slug with `({}, {})` returns
-a failed `ToolResult`, and OAuth endpoints are `https`.
+a failed `ToolResult`, OAuth endpoints are `https`, `card()` is offline and
+well-formed, `category` is one of `CATEGORIES`, `examples` is empty or 2-4
+short asks, every `required_scopes` entry looks like an OAuth scope, and
+`risk` does not contradict `read_only`/`destructive`. `pipe validate` also
+fails two installed toolkits whose slug prefixes collide (equal, or one
+starting the other).
 
 For hermetic tests of code that *hosts* toolkits, use
 `aisquare.pipe.testing.mock_connectors.MockToolkit` (registered as toolkit

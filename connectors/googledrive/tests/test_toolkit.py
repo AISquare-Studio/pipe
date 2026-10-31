@@ -110,7 +110,7 @@ class TestCatalog:
     def test_no_credentials_means_no_request(self):
         h = harness()
         result = h.call("GOOGLEDRIVE_FIND_FILE", {"q": "x"}, config={"access_token": " "})
-        assert result.error_code == "unauthorized"
+        assert result.error_code == "not_connected"
         assert h.session.calls == []
 
 

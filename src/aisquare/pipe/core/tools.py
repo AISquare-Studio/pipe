@@ -27,7 +27,7 @@ import urllib.error
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from aisquare.pipe.core.connector import AuthType
 from aisquare.pipe.core.envelope import DataEnvelope
@@ -53,12 +53,21 @@ _MAX_RETRY_AFTER = 3600.0
 # exactly these; ``ToolError(code=...)`` rejects anything else.
 # --------------------------------------------------------------------------
 
-#: The token was rejected or has expired (HTTP 401). Hosts refresh the token
-#: once and retry, then ask the user to reconnect. ``call_tool`` also uses it
-#: when ``config`` carries no usable credentials.
+#: The provider rejected the credentials, or the token has expired (HTTP 401).
+#: Hosts refresh the token once and retry, then ask the user to reconnect.
 ERROR_UNAUTHORIZED = "unauthorized"
-#: Authenticated, but not allowed (HTTP 403 / missing scope).
+#: ``config`` carries no usable credentials, so nothing was sent to the
+#: provider: the user has not connected this toolkit. Hosts ask the user to
+#: connect; a refresh cannot help.
+ERROR_NOT_CONNECTED = "not_connected"
+#: Authenticated, but not allowed (HTTP 403).
 ERROR_FORBIDDEN = "forbidden"
+#: The token is valid but lacks a scope the call needs: a tool whose
+#: ``required_scopes`` are not in ``config["granted_scopes"]``, or a provider
+#: 403 known to be about scope (an RFC 6750 ``insufficient_scope``
+#: challenge). Hosts ask the user to reconnect and grant the scope; a refresh
+#: or a retry cannot help.
+ERROR_INSUFFICIENT_SCOPE = "insufficient_scope"
 #: The addressed resource does not exist (HTTP 404/410).
 ERROR_NOT_FOUND = "not_found"
 #: Throttled (HTTP 429, or a provider's rate-limit 403). Set ``retry_after``.
@@ -77,7 +86,9 @@ ERROR_TIMEOUT = "timeout"
 ERROR_CODES = frozenset(
     {
         ERROR_UNAUTHORIZED,
+        ERROR_NOT_CONNECTED,
         ERROR_FORBIDDEN,
+        ERROR_INSUFFICIENT_SCOPE,
         ERROR_NOT_FOUND,
         ERROR_RATE_LIMITED,
         ERROR_INVALID_ARGUMENTS,
@@ -103,10 +114,27 @@ _STATUS_CODES = {
 }
 
 
-def error_code_for_status(status: int) -> str:
+#: RFC 6750 §3.1's ``insufficient_scope`` error in a ``WWW-Authenticate`` challenge.
+_INSUFFICIENT_SCOPE_CHALLENGE = re.compile(
+    r'\berror\s*=\s*"?insufficient_scope"?(?![\w-])', re.IGNORECASE
+)
+
+
+def error_code_for_status(status: int, *, www_authenticate: str | None = None) -> str:
     """The canonical ``error_code`` for a provider HTTP status
     (401 -> ``unauthorized``, 429 -> ``rate_limited``, ...). Statuses with no
-    specific kind map to ``upstream_error``."""
+    specific kind map to ``upstream_error``.
+
+    Pass the response's ``WWW-Authenticate`` header to tell scope apart: a 403
+    whose challenge carries RFC 6750's ``error="insufficient_scope"`` (Google
+    APIs send one) maps to ``insufficient_scope``. Any other 403 stays
+    ``forbidden``."""
+    if (
+        status == 403
+        and isinstance(www_authenticate, str)
+        and _INSUFFICIENT_SCOPE_CHALLENGE.search(www_authenticate)
+    ):
+        return ERROR_INSUFFICIENT_SCOPE
     return _STATUS_CODES.get(status, ERROR_UPSTREAM_ERROR)
 
 
@@ -120,6 +148,32 @@ def time_budget(config: Mapping[str, Any]) -> float | None:
     return float(value) if math.isfinite(value) and value > 0 else None
 
 
+#: How much a tool can change: ``read`` never changes remote state, ``write``
+#: creates or edits, ``destructive`` deletes or overwrites.
+Risk = Literal["read", "write", "destructive"]
+RISKS: tuple[Risk, ...] = ("read", "write", "destructive")
+
+
+def parse_scopes(value: Any) -> frozenset[str]:
+    """A set of OAuth scopes from a stored scope string (space- or
+    comma-separated, as providers return it) or a list/tuple/set of strings.
+    Anything else is the empty set."""
+    if isinstance(value, str):
+        return frozenset(s for s in re.split(r"[\s,]+", value) if s)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return frozenset(s.strip() for s in value if isinstance(s, str) and s.strip())
+    return frozenset()
+
+
+class _DerivedRisk(str):
+    """A ``ToolSpec.risk`` the flags decided rather than the author. It
+    compares, hashes and serializes as the plain string; the type only tells
+    ``__post_init__`` to derive it again, so ``dataclasses.replace(spec,
+    destructive=True)`` gets ``destructive``."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """One tool in a toolkit's catalog.
@@ -129,6 +183,12 @@ class ToolSpec:
     (``{"type": "object", "properties": {...}, "required": [...]}``).
     ``read_only`` tools never change remote state; ``destructive`` ones
     delete or overwrite.
+
+    ``required_scopes`` are the OAuth scopes the tool needs, all of them
+    (empty: none declared). ``risk`` defaults from the flags: ``destructive``
+    when ``destructive``, else ``read`` when ``read_only``, else ``write``.
+    A defaulted risk follows the flags through ``dataclasses.replace``; an
+    explicit one is kept.
     """
 
     slug: str
@@ -137,9 +197,20 @@ class ToolSpec:
     read_only: bool
     destructive: bool = False
     tags: tuple[str, ...] = ()
+    required_scopes: tuple[str, ...] = ()
+    risk: Risk = None  # type: ignore[assignment]  # derived in __post_init__
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tags", tuple(self.tags))
+        scopes = self.required_scopes
+        object.__setattr__(
+            self, "required_scopes", (scopes,) if isinstance(scopes, str) else tuple(scopes)
+        )
+        if self.risk is None or isinstance(self.risk, _DerivedRisk):
+            risk = "destructive" if self.destructive else "read" if self.read_only else "write"
+            object.__setattr__(self, "risk", _DerivedRisk(risk))
+        elif self.risk not in RISKS:
+            raise ValueError(f"ToolSpec risk {self.risk!r} is not one of: {', '.join(RISKS)}")
 
     def to_llm_tool(self) -> dict[str, Any]:
         """The ``{name, description, input_schema}`` shape LLM tool-use APIs take."""
@@ -149,8 +220,10 @@ class ToolSpec:
             "input_schema": copy.deepcopy(dict(self.input_schema)),
         }
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, *, metadata: bool = False) -> dict[str, Any]:
+        """The spec as JSON. ``metadata=True`` adds the router metadata,
+        ``required_scopes`` and ``risk``; the default keeps the 0.3 shape."""
+        data: dict[str, Any] = {
             "slug": self.slug,
             "description": self.description,
             "input_schema": copy.deepcopy(dict(self.input_schema)),
@@ -158,6 +231,22 @@ class ToolSpec:
             "destructive": self.destructive,
             "tags": list(self.tags),
         }
+        if metadata:
+            data["required_scopes"] = list(self.required_scopes)
+            data["risk"] = str(self.risk)
+        return data
+
+
+@dataclass(frozen=True)
+class QualifiedTool:
+    """A tool together with the connector (toolkit name) it belongs to, as
+    a cross-toolkit search returns it."""
+
+    connector: str
+    tool: ToolSpec
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"connector": self.connector, **self.tool.to_dict(metadata=True)}
 
 
 @dataclass
@@ -253,16 +342,53 @@ def rank_tools(
     if not query or not query.strip():
         return list(tools[:cap])
     terms = query_terms(query)
-
-    def _score(tool: ToolSpec) -> int:
-        slug = tool.slug.lower()
-        text = " ".join((tool.description, *tool.tags)).lower()
-        return sum(2 for t in terms if t in slug) + sum(1 for t in terms if t in text)
-
-    scored = sorted(((_score(t), t) for t in tools), key=lambda pair: pair[0], reverse=True)
+    scored = sorted(((_score(t, terms), t) for t in tools), key=lambda pair: pair[0], reverse=True)
     matched = [t for score, t in scored if score > 0]
     chosen = matched or [t for _, t in scored]
     return chosen[:cap]
+
+
+def _score(tool: ToolSpec, terms: set[str]) -> int:
+    slug = tool.slug.lower()
+    text = " ".join((tool.description, *tool.tags)).lower()
+    return sum(2 for t in terms if t in slug) + sum(1 for t in terms if t in text)
+
+
+def rank_across(
+    catalogs: Mapping[str, Sequence[ToolSpec]],
+    query: str | None,
+    limit: int | None = 6,
+    *,
+    keywords: Mapping[str, Sequence[str]] | None = None,
+) -> list[QualifiedTool]:
+    """:func:`rank_tools` over several toolkits at once; each result names
+    its connector. ``catalogs`` maps connector name -> its tools.
+
+    A tool scores as in :func:`rank_tools`, plus 1 per query term found in
+    its connector's ``keywords`` (connector name -> words, e.g. its name,
+    category and keywords). Ties keep connector order, then catalog order.
+    With no query, or no match, the connectors take turns, so each one is
+    represented in the head."""
+    entries = [(name, tool) for name, tools in catalogs.items() for tool in tools]
+    cap = len(entries) if limit is None else max(limit, 0)
+    terms = query_terms(query) if query and query.strip() else set()
+    boost = {
+        name: sum(1 for t in terms if t in " ".join(words).lower())
+        for name, words in (keywords or {}).items()
+    }
+    scored = [
+        (_score(tool, terms) + boost.get(name, 0), QualifiedTool(name, tool))
+        for name, tool in entries
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    matched = [qualified for score, qualified in scored if score > 0]
+    if matched:
+        return matched[:cap]
+    turns: list[QualifiedTool] = []
+    columns = [[QualifiedTool(name, tool) for tool in tools] for name, tools in catalogs.items()]
+    for row in range(max((len(c) for c in columns), default=0)):
+        turns.extend(column[row] for column in columns if row < len(column))
+    return turns[:cap]
 
 
 # --------------------------------------------------------------------------
@@ -443,6 +569,16 @@ def default_slug_prefix(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") + "_"
 
 
+#: The values ``Toolkit.category`` may take.
+CATEGORIES = frozenset(
+    {"code", "files", "email", "calendar", "chat", "docs", "project", "crm", "data", "other"}
+)
+#: The keys of :meth:`Toolkit.card`.
+CARD_FIELDS = (
+    "name", "display_name", "description", "category", "keywords", "examples", "auth_type",
+)
+
+
 class Toolkit(ABC):
     """Base class for a connector's tool catalog and connection logic.
 
@@ -453,6 +589,10 @@ class Toolkit(ABC):
     ``slug_prefix`` defaults to ``name.upper() + "_"``. The OAuth methods
     delegate to :mod:`aisquare.pipe.core.oauth` using ``oauth``; override
     them for provider quirks.
+
+    ``category`` (one of :data:`CATEGORIES`), ``keywords`` and ``examples``
+    (2-4 short things a user might ask) describe the connector to a router
+    that picks connectors before tools; :meth:`card` bundles them.
     """
 
     name: str
@@ -463,6 +603,9 @@ class Toolkit(ABC):
     slug_prefix: str = ""
     oauth: OAuthSpec | None = None
     docs_url: str = ""
+    category: str = "other"
+    keywords: tuple[str, ...] = ()
+    examples: tuple[str, ...] = ()
 
     _auto_slug_prefix: bool = True
 
@@ -474,6 +617,23 @@ class Toolkit(ABC):
             cls.slug_prefix = default_slug_prefix(cls.name)
 
     # -- catalog -----------------------------------------------------------
+
+    @classmethod
+    def card(cls) -> dict[str, Any]:
+        """A short description of the connector for a router: the
+        :data:`CARD_FIELDS` as JSON. Read from class attributes only — no
+        instance, no tools, no network. ``display_name`` falls back to
+        ``name``."""
+        name = getattr(cls, "name", "")
+        return {
+            "name": name,
+            "display_name": cls.display_name or name,
+            "description": cls.description,
+            "category": cls.category,
+            "keywords": _as_list(cls.keywords),
+            "examples": _as_list(cls.examples),
+            "auth_type": getattr(cls.auth_type, "value", str(cls.auth_type)),
+        }
 
     @abstractmethod
     def tools(self) -> list[ToolSpec]:
@@ -496,15 +656,42 @@ class Toolkit(ABC):
 
     def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
         """The tools a connection with this ``config`` may call — what a host
-        lists to a model. Default: every tool (:meth:`tools`). A toolkit
-        whose config switches tools off overrides it.
+        lists to a model. Default: every tool (:meth:`tools`), minus, when
+        ``config["granted_scopes"]`` is present, the tools whose
+        ``required_scopes`` it does not grant (see :meth:`missing_scopes`).
+        A toolkit whose config switches tools off overrides it.
+
+        ``config["granted_scopes"]`` is the scopes the connection's token
+        holds. Pass the stored token's ``OAuthToken.granted_scopes``: a
+        tuple of strings, or None when the provider did not say (RFC 6749
+        §5.1: it granted what was asked). A list or a space/comma-separated
+        string works too. Absent, None or a blank string means "not known"
+        and filters nothing; any other unreadable value grants nothing.
 
         An override returns a subset of :meth:`tools` (the same ToolSpecs).
         It must not raise for any ``config``, including None, ``{}`` and
         garbage: return ``[]`` when the config can't be read. Like
         :meth:`tools`, it must not touch the network. Listing is advisory:
         :meth:`call_tool` enforces on its own, whatever was listed."""
-        return self.tools()
+        catalog = self.tools()
+        if _granted_scopes(config) is None:
+            return catalog
+        return [tool for tool in catalog if not self.missing_scopes(tool, config)]
+
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``. Default: exact match. A
+        toolkit whose provider has broader scopes that imply narrower ones
+        (``drive`` covering ``drive.readonly``) overrides it."""
+        return scope in granted
+
+    def missing_scopes(self, tool: ToolSpec, config: Mapping[str, Any] | None) -> list[str]:
+        """The tool's ``required_scopes`` that ``config["granted_scopes"]``
+        does not cover; empty when the config does not say what was granted
+        (see :meth:`available_tools`)."""
+        granted = _granted_scopes(config)
+        if granted is None:
+            return []
+        return [s for s in tool.required_scopes if not self.scope_granted(s, granted)]
 
     def search_tools(
         self, query: str, limit: int = 6, *, config: Mapping[str, Any] | None = None
@@ -581,7 +768,15 @@ class Toolkit(ABC):
             return ToolResult.fail(
                 f"{self.display_name or self.name} is not connected: "
                 "config is missing valid credentials",
-                code=ERROR_UNAUTHORIZED,
+                code=ERROR_NOT_CONNECTED,
+            )
+        missing = self.missing_scopes(tool, config)
+        if missing:
+            return ToolResult.fail(
+                f"{tool.slug} needs scope(s) this connection was not granted: "
+                f"{', '.join(missing)} — reconnect {self.display_name or self.name} "
+                "and grant them",
+                code=ERROR_INSUFFICIENT_SCOPE,
             )
         run_config = dict(config)
         token = run_config.get("access_token")
@@ -711,6 +906,23 @@ class Toolkit(ABC):
         )
 
 
+def _granted_scopes(config: Any) -> frozenset[str] | None:
+    """``config["granted_scopes"]`` parsed, or None when it is not known:
+    absent, None or a blank string (like ``OAuthToken.granted_scopes`` for a
+    response without ``scope``)."""
+    if not isinstance(config, Mapping):
+        return None
+    value = config.get("granted_scopes")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return parse_scopes(value)
+
+
+def _as_list(value: Any) -> list[Any]:
+    """A card field as a JSON list: a tuple/list's items, else ``[value]``."""
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
 #: Longest exception text the catch-all passes through.
 _MAX_EXCEPTION_TEXT = 300
 _URL_QUERY = re.compile(r"(https?://[^\s?#'\"]+)[?#][^\s'\"]*")
@@ -745,21 +957,32 @@ def _http_failure(slug: str, e: urllib.error.HTTPError) -> ToolResult:
         phrase = f" {http.HTTPStatus(status).phrase}"
     except ValueError:
         phrase = ""
-    code = error_code_for_status(status)
+    code = error_code_for_status(status, www_authenticate=_header(e, "WWW-Authenticate"))
     retry_after = _retry_after(e) if code == ERROR_RATE_LIMITED else None
-    return ToolResult.fail(
-        f"{slug} failed (HTTP {status}{phrase})", code=code, retry_after=retry_after
+    hint = (
+        " — the connection lacks a scope this call needs; reconnect and grant it"
+        if code == ERROR_INSUFFICIENT_SCOPE
+        else ""
     )
+    return ToolResult.fail(
+        f"{slug} failed (HTTP {status}{phrase}){hint}", code=code, retry_after=retry_after
+    )
+
+
+def _header(e: urllib.error.HTTPError, name: str) -> str | None:
+    """A response header of the error, or None when absent or unreadable."""
+    try:
+        value = e.headers.get(name) if e.headers is not None else None
+    except Exception:  # noqa: BLE001 — odd headers mean "unknown", not a crash
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _retry_after(e: urllib.error.HTTPError) -> float | None:
     """Seconds from the error's ``Retry-After`` header — delta-seconds or an
     HTTP-date (a past date is 0), capped at :data:`_MAX_RETRY_AFTER` — or
     None when absent or unusable."""
-    try:
-        value = e.headers.get("Retry-After") if e.headers is not None else None
-    except Exception:  # noqa: BLE001 — odd headers mean "unknown", not a crash
-        return None
+    value = _header(e, "Retry-After")
     if not isinstance(value, str) or not value.strip():
         return None
     try:

@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 import aisquare.pipe.cli.validate as validate_mod
 import aisquare.pipe.testing.hygiene as hygiene_mod
+from aisquare.pipe import Toolkit, ToolResult, ToolSpec
 from aisquare.pipe.cli.main import cli
 from aisquare.pipe.cli.validate import SuiteResult
 from aisquare.pipe.testing.hygiene import DistInfo
@@ -297,3 +298,67 @@ def test_legacy_file_mode_validates_toolkits(tmp_path):
     assert result.exit_code == 0, result.output
     assert "Validating TempToolkit" in result.output
     assert "Validating Toolkit" not in result.output  # the abstract base is skipped
+
+
+class _TwinKit(MockToolkit):
+    name = "twin"
+    slug_prefix = "MOCK_"  # collides with the framework's mock toolkit
+
+
+class _OtherKit(Toolkit):
+    name = "other"
+    version = "0.1.0"
+    oauth = MockToolkit.oauth
+
+    def tools(self) -> list[ToolSpec]:
+        return [ToolSpec("OTHER_PING", "Ping.", {"type": "object", "properties": {}}, read_only=True)]
+
+    def run_tool(self, tool, arguments, config):
+        return ToolResult.ok("pong")
+
+
+class TestSlugPrefixUniqueness:
+    def test_colliding_toolkits_fail_validate(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_toolkit_entry_points",
+            lambda: [
+                _toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"),
+                _toolkit_ep("twin", _TwinKit),
+            ],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--skip-tests"])
+        assert result.exit_code == 1
+        assert "contract.toolkit.slug-prefix-unique@twin" in result.output
+        assert "contract.toolkit.slug-prefix-unique@mock" in result.output
+
+    def test_distinct_prefixes_pass(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_toolkit_entry_points",
+            lambda: [_toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"), _toolkit_ep("other", _OtherKit)],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json", "--skip-tests"])
+        assert result.exit_code == 0, result.output
+        framework = next(c for c in json.loads(result.output)["connectors"] if c["name"] == "framework")
+        check = next(
+            c for c in framework["layers"]["contract"]["checks"] if c["id"] == "contract.toolkit.slug-prefix-unique@mock"
+        )
+        assert check["passed"] is True
+
+    def test_installed_only_mode_compares_across_dists(self, monkeypatch):
+        monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
+        monkeypatch.setattr(validate_mod, "discover_connector_entry_points", list)
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_toolkit_entry_points",
+            lambda: [
+                _toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"),
+                _toolkit_ep("twin", _TwinKit, dist_name="aisquare-pipe-twin"),
+            ],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json"])
+        assert result.exit_code == 1
+        reports = {r["name"]: r for r in json.loads(result.output)["connectors"]}
+        failed = {c["id"] for c in reports["twin"]["layers"]["contract"]["checks"] if not c["passed"]}
+        assert "contract.toolkit.slug-prefix-unique@twin" in failed

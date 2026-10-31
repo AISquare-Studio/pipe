@@ -13,6 +13,7 @@ guard; no current connector uses one.
 
 from __future__ import annotations
 
+import json
 import re
 import socket
 from collections.abc import Iterator, Mapping
@@ -25,7 +26,16 @@ from typing import Any
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
 from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, OAuthSpec
-from aisquare.pipe.core.tools import ERROR_CODES, Toolkit, ToolResult, ToolSpec
+from aisquare.pipe.core.registry import slug_prefix_conflicts
+from aisquare.pipe.core.tools import (
+    CARD_FIELDS,
+    CATEGORIES,
+    ERROR_CODES,
+    RISKS,
+    Toolkit,
+    ToolResult,
+    ToolSpec,
+)
 from aisquare.pipe.errors import PipeError
 from aisquare.pipe.testing.fixtures import (
     make_binary_envelope,
@@ -770,6 +780,174 @@ def check_toolkit_available_tools(cls: type) -> list[CheckResult]:
     return [CheckResult(check_id, not problems, message="; ".join(problems))]
 
 
+#: An OAuth scope token (RFC 6749 §3.3: printable ASCII but space, ``"`` and
+#: ``\``), minus the comma some providers separate scopes with.
+_SCOPE_RE = re.compile(r"^[\x21\x23-\x2b\x2d-\x5b\x5d-\x7e]{1,256}$")
+#: Longest keyword and example a card may carry.
+MAX_KEYWORD = 40
+MAX_EXAMPLE = 120
+
+
+def check_toolkit_card(cls: type) -> list[CheckResult]:
+    """``card()`` runs offline and returns a JSON-serializable dict with
+    exactly :data:`CARD_FIELDS`, typed as documented, naming the toolkit."""
+    check_id = "contract.toolkit.card"
+    try:
+        with no_network() as log:
+            card = cls.card()  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001
+        return [CheckResult(check_id, False, message=f"card() raised {type(e).__name__}: {e}")]
+    if log.attempts:
+        return [CheckResult(check_id, False, message=f"network in card(): {log.attempts[0]}")]
+    if not isinstance(card, dict):
+        return [CheckResult(check_id, False, message=f"card() returned {type(card).__name__}, expected dict")]
+    problems: list[str] = []
+    if set(card) != set(CARD_FIELDS):
+        problems.append(f"card() keys {sorted(card)} != {sorted(CARD_FIELDS)}")
+    for key in ("name", "display_name", "description", "category", "auth_type"):
+        if key in card and not isinstance(card[key], str):
+            problems.append(f"card()[{key!r}] must be a string")
+    for key in ("keywords", "examples"):
+        if key in card and not (
+            isinstance(card[key], list) and all(isinstance(v, str) for v in card[key])
+        ):
+            problems.append(f"card()[{key!r}] must be a list of strings")
+    if card.get("name") != getattr(cls, "name", None):
+        problems.append(f"card()['name'] {card.get('name')!r} != toolkit name {getattr(cls, 'name', None)!r}")
+    try:
+        json.dumps(card)
+    except (TypeError, ValueError) as e:
+        problems.append(f"card() is not JSON-serializable: {e}")
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
+def check_toolkit_category(cls: type) -> list[CheckResult]:
+    category = getattr(cls, "category", None)
+    ok = category in CATEGORIES
+    return [
+        CheckResult(
+            "contract.toolkit.category",
+            ok,
+            message="" if ok else f"category {category!r} is not one of: {', '.join(sorted(CATEGORIES))}",
+        )
+    ]
+
+
+def check_toolkit_card_text(cls: type) -> list[CheckResult]:
+    """``keywords`` is a tuple of short words; ``examples`` is empty or 2-4
+    short user asks. Neither may be a bare string."""
+    problems: list[str] = []
+    keywords = getattr(cls, "keywords", ())
+    if not isinstance(keywords, (tuple, list)):
+        problems.append(f"keywords must be a tuple of strings, got {type(keywords).__name__}")
+    else:
+        bad = [k for k in keywords if not (isinstance(k, str) and k.strip() and len(k) <= MAX_KEYWORD)]
+        if bad:
+            problems.append(f"keywords must be non-empty strings of at most {MAX_KEYWORD} chars: {bad[:3]!r}")
+    examples = getattr(cls, "examples", ())
+    if not isinstance(examples, (tuple, list)):
+        problems.append(f"examples must be a tuple of strings, got {type(examples).__name__}")
+    elif examples:
+        if not 2 <= len(examples) <= 4:
+            problems.append(f"examples must hold 2-4 user asks, got {len(examples)}")
+        bad = [e for e in examples if not (isinstance(e, str) and e.strip() and len(e) <= MAX_EXAMPLE)]
+        if bad:
+            problems.append(f"examples must be non-empty strings of at most {MAX_EXAMPLE} chars: {bad[:2]!r}")
+    return [CheckResult("contract.toolkit.card-text", not problems, message="; ".join(problems))]
+
+
+def check_toolkit_tool_metadata(cls: type) -> list[CheckResult]:
+    """Every tool's ``required_scopes`` is a tuple of distinct, real-looking
+    OAuth scope strings, and its ``risk`` is a known value no lower than its
+    flags say (a ``read_only`` tool is ``read``, a ``destructive`` one
+    ``destructive``)."""
+    check_id = "contract.toolkit.tool-metadata"
+    catalog, problem = _toolkit_catalog(cls)
+    if catalog is None:
+        return [CheckResult(check_id, False, message=f"not evaluated — {problem}")]
+    problems: list[str] = []
+    for tool in catalog:
+        if not isinstance(tool, ToolSpec):
+            continue
+        scopes = tool.required_scopes
+        if not isinstance(scopes, tuple):
+            problems.append(f"{tool.slug}: required_scopes must be a tuple")
+        else:
+            bad = [s for s in scopes if not (isinstance(s, str) and _SCOPE_RE.match(s))]
+            if bad:
+                problems.append(f"{tool.slug}: required_scopes {bad[:3]!r} do not look like OAuth scopes")
+            if len(set(scopes)) != len(scopes):
+                problems.append(f"{tool.slug}: required_scopes has duplicates")
+        if tool.risk not in RISKS:
+            problems.append(f"{tool.slug}: risk {tool.risk!r} is not one of: {', '.join(RISKS)}")
+            continue
+        floor = "destructive" if tool.destructive else "read" if tool.read_only else "write"
+        if RISKS.index(tool.risk) < RISKS.index(floor) or (tool.read_only and tool.risk != "read"):
+            problems.append(
+                f"{tool.slug}: risk {tool.risk!r} contradicts read_only={tool.read_only}, "
+                f"destructive={tool.destructive}"
+            )
+    return [CheckResult(check_id, not problems, message="; ".join(problems))]
+
+
+def check_toolkit_scopes_requested(cls: type) -> list[CheckResult]:
+    """Warning: a tool needs a scope the toolkit's default consent
+    (``oauth.default_scopes``) does not ask for, so a connection made with
+    the defaults never lists it. Skipped without default scopes."""
+    check_id = "contract.toolkit.scopes-requested"
+    inst = cls()
+    spec = getattr(inst, "oauth", None)
+    defaults = frozenset(spec.default_scopes) if isinstance(spec, OAuthSpec) else frozenset()
+    catalog, _ = _toolkit_catalog(cls)
+    if not defaults or not catalog:
+        return [CheckResult(check_id, True, severity=Severity.WARNING)]
+    missing = sorted(
+        {
+            s
+            for tool in catalog
+            if isinstance(tool, ToolSpec)
+            for s in tool.required_scopes
+            if isinstance(s, str) and not inst.scope_granted(s, defaults)
+        }
+    )
+    return [
+        CheckResult(
+            check_id,
+            not missing,
+            severity=Severity.WARNING,
+            message="" if not missing else (
+                f"tools need scopes oauth.default_scopes does not request: {', '.join(missing[:5])}"
+            ),
+        )
+    ]
+
+
+def check_toolkit_slug_prefix_unique(cls: type, installed: Mapping[str, type]) -> list[CheckResult]:
+    """The toolkit's ``slug_prefix`` collides with no other installed
+    toolkit's (``installed``: name -> class): not equal, and neither starts
+    the other, so a bare slug names one toolkit."""
+    name = getattr(cls, "name", None)
+    others = {n: c for n, c in installed.items() if n != name and c is not cls}
+    clashes = sorted(
+        other
+        for pair in slug_prefix_conflicts({**others, str(name): cls})
+        if str(name) in pair
+        for other in pair
+        if other != str(name)
+    )
+    ok = not clashes
+    return [
+        CheckResult(
+            "contract.toolkit.slug-prefix-unique",
+            ok,
+            message="" if ok else (
+                f"slug_prefix {getattr(cls, 'slug_prefix', None)!r} collides with "
+                + ", ".join(f"{o} ({getattr(others[o], 'slug_prefix', None)!r})" for o in clashes)
+            ),
+        )
+    ]
+
+
 def _is_https(url: Any) -> bool:
     return isinstance(url, str) and url.startswith("https://") and len(url) > len("https://")
 
@@ -808,18 +986,27 @@ def check_toolkit_oauth(cls: type) -> list[CheckResult]:
     return [CheckResult("contract.toolkit.oauth", not problems, message="; ".join(problems))]
 
 
-def run_toolkit_contract_checks(cls: type, entry_point_name: str | None = None) -> list[CheckResult]:
-    """All Layer A checks for one toolkit class (logging muted, as for connectors)."""
+def run_toolkit_contract_checks(
+    cls: type,
+    entry_point_name: str | None = None,
+    *,
+    installed: Mapping[str, type] | None = None,
+) -> list[CheckResult]:
+    """All Layer A checks for one toolkit class (logging muted, as for
+    connectors). With ``installed`` (name -> class of every installed
+    toolkit) the slug prefix is also checked against the others."""
     import logging
 
     logging.disable(logging.ERROR)
     try:
-        return _run_toolkit_contract_checks(cls, entry_point_name)
+        return _run_toolkit_contract_checks(cls, entry_point_name, installed)
     finally:
         logging.disable(logging.NOTSET)
 
 
-def _run_toolkit_contract_checks(cls: type, entry_point_name: str | None) -> list[CheckResult]:
+def _run_toolkit_contract_checks(
+    cls: type, entry_point_name: str | None, installed: Mapping[str, type] | None
+) -> list[CheckResult]:
     if not (isinstance(cls, type) and issubclass(cls, Toolkit)):
         return [
             CheckResult(
@@ -845,4 +1032,11 @@ def _run_toolkit_contract_checks(cls: type, entry_point_name: str | None) -> lis
     results += check_toolkit_call_no_creds(cls)
     results += check_toolkit_validate_config(cls)
     results += check_toolkit_oauth(cls)
+    results += check_toolkit_card(cls)
+    results += check_toolkit_category(cls)
+    results += check_toolkit_card_text(cls)
+    results += check_toolkit_tool_metadata(cls)
+    results += check_toolkit_scopes_requested(cls)
+    if installed is not None:
+        results += check_toolkit_slug_prefix_unique(cls, installed)
     return results
