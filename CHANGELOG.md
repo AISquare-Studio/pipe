@@ -5,7 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-10-31
+
+The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and
+0.3.0. PyPI goes from `aisquare-pipe` 0.1.1 straight to 0.4.0, and 0.1.1 has
+no Toolkit API at all, so everything under 0.3.0 below is new on PyPI too.
+First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
+`-slack`, `-gmail` and `-googlecalendar` 0.1.0. Also uploaded:
+`aisquare-pipe-github` and `-onedrive` 0.3.0, and `aisquare-pipe-graphify`
+0.2.1.
 
 ### Added
 
@@ -21,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `public_repo`/`notifications`, `user` covers `read:user`, and
       `admin:org`/`write:org` cover `read:org`.
     - Google Drive: `drive.readonly` to read and `drive` to write; `drive`
-      covers the rest.
+      covers the rest. A 403 for a missing scope is `insufficient_scope`
+      (with `data.required_scopes`), as in Gmail and Calendar; any other
+      403 stays `forbidden`.
     - OneDrive: `Files.Read.All` / `Files.ReadWrite.All`. Graph names
       compare short and case-insensitively.
     - Slack: its per-identity scope map, promoted. `required_scopes` holds
@@ -32,8 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     → `write`, destructive and edits → `destructive`).
   - **GitHub grant revoke.** `GitHubToolkit.revoke_grant()` (`DELETE
     /applications/{client_id}/grant`) removes the app from the user's GitHub
-    and ends every token they gave it. `revoke_token` still revokes one
-    connection's token.
+    and ends every token they gave it, in every partition that shares the
+    app. Call it only on the user's explicit request to remove the app from
+    their GitHub, never on a disconnect or an account deletion while the app
+    is shared. `revoke_token` still revokes one connection's token and is
+    the routine path.
   - **Google Drive OAuth.** `GOOGLEDRIVE_OAUTH` no longer sends
     `include_granted_scopes=true`, like Gmail's and Calendar's specs. One
     Google OAuth client can serve all three without a Drive token carrying
@@ -53,7 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Per-tool scopes and risk.** `ToolSpec` gains `required_scopes` (all
     needed; default none) and `risk` (`read` / `write` / `destructive`,
     derived from `read_only` / `destructive` unless set, and re-derived by
-    `dataclasses.replace` when it was not set).
+    `dataclasses.replace` when it was not set). An explicit `risk` may raise
+    the risk above the flags but not lower it: one below them, or not
+    `read` on a `read_only` tool, raises `ValueError`, also through
+    `dataclasses.replace`.
     `ToolSpec.to_dict(metadata=True)` adds both; the default shape is
     unchanged.
   - **Scope-aware listing.** When `config["granted_scopes"]` is present (pass
@@ -71,10 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     discovers once at startup. The
     `search_tools_across(query, connectors)` function ranks tools across
     several toolkits and returns `QualifiedTool(connector, tool)`; the pure
-    ranker is `rank_across()`. Discovery raises the new
-    `ToolkitConflictError` when two installed toolkits' slug prefixes
-    collide (equal, or one starting the other); see
-    `slug_prefix_conflicts()`.
+    ranker is `rank_across()`. Toolkits whose slug prefixes collide (equal,
+    or one starting the other; see `slug_prefix_conflicts()`) are left out
+    of discovery with one warning, so one clashing pair cannot take down
+    the catalogue. `installed_toolkits(strict=True)` raises the new
+    `ToolkitConflictError` instead, and `pipe validate` fails on it.
   - **Error codes.** `not_connected` (no usable credentials; nothing was
     sent) and `insufficient_scope` (the token lacks a scope the call needs)
     join `ERROR_CODES` and `ToolError`.
@@ -103,11 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     as a file envelope, like Google Drive downloads), labels and the profile;
     drafts, sending and threaded replies (`In-Reply-To` / `References`, the
     last sender by default); label changes (mark read, archive, star) and
-    trash.
+    trash. The label tools are `write` and refuse to add `TRASH` or `SPAM`:
+    trashing is `GMAIL_MOVE_TO_TRASH`, the destructive tool.
   - **MIME.** Messages are built with the standard library's `email`
     package (RFC 2047 headers, an HTML body with a text alternative,
     attachments, header-injection and address checks); large messages go as
-    one multipart upload. Read messages come back with `messageText` (plain
+    one multipart upload. Header values, recipient display names included,
+    refuse every control character and Unicode line break, and an
+    encoded-word display name is decoded and checked before use. Read messages come back with `messageText` (plain
     text preferred, HTML converted, charsets honoured) and `attachmentList`.
   - **Least privilege.** Read-only consent by default (`gmail.readonly`);
     each write tool names the scopes it needs (`gmail.compose`, `gmail.send`,
@@ -117,13 +137,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `gmail.modify` over read/compose/send, `gmail.compose` over send).
 - **Google Calendar** (`aisquare-pipe-googlecalendar` 0.1.0, first
   release): `GoogleCalendarToolkit` (`googlecalendar`, 14 tools: 10 read,
-  4 write, 1 destructive) and `GOOGLECALENDAR_OAUTH`. Slugs and argument
+  4 write, 2 of them destructive) and `GOOGLECALENDAR_OAUTH`. Slugs and argument
   names follow Composio's Google Calendar toolkit.
   - **Tools.** Calendars, events (by range and text, expanded or not),
     recurring-event instances, events across every calendar, free/busy and
     free slots, the current time in a zone; create, update (a patch that
     keeps unmentioned fields and converts all-day <-> timed), quick-add and
-    delete events.
+    delete events. Update is destructive like delete: `attendees` and
+    `recurrence` replace the whole list (CONTRIBUTING: an edit that
+    overwrites is destructive, in every toolkit).
   - **Time zones.** Times without an offset are read in the given zone or
     the calendar's own; query bounds get the zone's offset for that date
     (daylight saving included); event times stay wall-clock with an IANA
@@ -188,7 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `app_uninstalled`.
     - `event_to_envelope` maps events to Composio's trigger names. The app's
       own posts get no trigger.
-  - **Packaging.** It requires `aisquare-pipe>=0.3.0`, `requests` and
+  - **Packaging.** It requires `aisquare-pipe>=0.4.0`, `requests` and
     `urllib3`. It ships an app manifest template and joins `[full]`.
 
 ### Changed
@@ -199,7 +221,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Hosts that branched on `unauthorized` to prompt a first connection should
   branch on `not_connected` as well.
 
-## [0.3.0] - 2026-10-15
+## [0.3.0] - 2026-10-15 [NOT PUBLISHED]
+
+Never published to PyPI and never tagged. Its changes first ship on PyPI in
+0.4.0 above (`aisquare-pipe-graphify` 0.2.1 too).
 
 ### Added
 
@@ -344,8 +369,7 @@ Initial public release.
 - Install extras: `[popular]`, `[full]`, and per-connector packages
   (`aisquare-pipe-<service>`).
 
-[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...v0.3.0
+[0.4.0]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/AISquare-Studio/pipe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/AISquare-Studio/pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/AISquare-Studio/pipe/releases/tag/v0.1.0
