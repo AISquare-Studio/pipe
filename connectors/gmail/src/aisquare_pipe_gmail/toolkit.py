@@ -9,9 +9,8 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import requests
-from aisquare import pipe
 from aisquare.pipe import (
-    ERROR_FORBIDDEN,
+    ERROR_INSUFFICIENT_SCOPE,
     ERROR_RATE_LIMITED,
     ERROR_TIMEOUT,
     ERROR_UPSTREAM_ERROR,
@@ -33,6 +32,7 @@ from aisquare_pipe_gmail.rest import (
     GmailRestClient,
 )
 from aisquare_pipe_gmail.tools import (
+    COVERING_SCOPES,
     READONLY_SCOPE,
     SCOPE_BASE,
     TOOL_SPECS,
@@ -42,13 +42,9 @@ from aisquare_pipe_gmail.tools import (
 
 logger = logging.getLogger("aisquare.pipe.gmail")
 
-#: Core's ``insufficient_scope`` error code once core has one, else
-#: ``forbidden`` — a 403 for a missing scope maps to it either way.
-ERROR_INSUFFICIENT_SCOPE: str = getattr(pipe, "ERROR_INSUFFICIENT_SCOPE", ERROR_FORBIDDEN)
-
 #: A Google OAuth 2.0 web client, consented for read-only mail by default
 #: (``gmail.readonly``). Hosts that enable drafts, sending or labels request
-#: the extra scope each tool lists (see ``tools.REQUIRED_SCOPES``) alongside
+#: the extra scope each tool lists (its ``ToolSpec.required_scopes``) alongside
 #: it. Every Gmail scope except ``gmail.send`` is Google-*restricted*:
 #: production apps need OAuth verification plus a security assessment.
 #: ``access_type=offline`` + ``prompt=consent`` make Google return a refresh
@@ -110,7 +106,7 @@ def error_code(error: GmailAPIError) -> str:
     """The canonical ``ToolResult.error_code`` for a Gmail failure: rate
     limits (429, or a 403 with reason ``rateLimitExceeded`` /
     ``userRateLimitExceeded``) are ``rate_limited``, a 403 for a missing
-    OAuth scope is :data:`ERROR_INSUFFICIENT_SCOPE` and client-side timeouts
+    OAuth scope is ``insufficient_scope`` and client-side timeouts
     ``timeout``; HTTP statuses map through core's ``error_code_for_status``
     (401 unauthorized, any other 403 forbidden, 404 not_found, 400
     invalid_arguments, ...); network failures and 5xx are ``upstream_error``."""
@@ -159,8 +155,11 @@ class GmailToolkit(Toolkit):
     ``config`` needs ``access_token`` — a Google OAuth access token from
     :data:`GMAIL_OAUTH` (it expires after an hour; hosts refresh it). Tool
     slugs and argument names match Composio's Gmail toolkit. Each tool's
-    OAuth scopes are in ``tools.REQUIRED_SCOPES`` and its description; the
-    default consent covers the read tools only.
+    OAuth scopes are its ``ToolSpec.required_scopes`` (and in its
+    description). The default consent covers the read tools only; with
+    ``config["granted_scopes"]``, a tool whose scopes were not granted is
+    neither listed nor run (:meth:`scope_granted` counts Google's broader
+    scopes).
 
     ``config["timeout_seconds"]`` (optional, set by hosts) bounds a whole
     call: request timeouts and rate-limit sleeps all fit inside it.
@@ -201,6 +200,13 @@ class GmailToolkit(Toolkit):
 
     def tools(self) -> list[ToolSpec]:
         return list(TOOL_SPECS)
+
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``, counting Google's broader
+        Gmail scopes: ``https://mail.google.com/`` covers every one,
+        ``gmail.modify`` covers read, compose and send, ``gmail.compose``
+        covers send (each Gmail method's documented scope list)."""
+        return scope in granted or not COVERING_SCOPES.get(scope, frozenset()).isdisjoint(granted)
 
     def call_tool(
         self, slug: str, arguments: Mapping[str, Any] | None, config: Mapping[str, Any] | None

@@ -25,8 +25,9 @@ Result shapes (``ToolResult.data``):
   ``content`` for small UTF-8 text) — the shape Google Drive downloads use;
 * writes return Gmail's resource (``id``, ``threadId``, ``labelIds``).
 
-Scopes: every tool lists the OAuth scopes it needs in :attr:`GmailTool.scopes`
-and its description. The default connection is read-only
+Scopes: every tool lists the OAuth scopes it needs in
+``ToolSpec.required_scopes`` (also :attr:`GmailTool.scopes`) and its
+description. The default connection is read-only
 (``gmail.readonly``); drafts need ``gmail.compose``, sending ``gmail.send``,
 labels and trash ``gmail.modify``.
 """
@@ -83,6 +84,15 @@ COMPOSE_SCOPE = SCOPE_BASE + "gmail.compose"
 SEND_SCOPE = SCOPE_BASE + "gmail.send"
 #: Read and change mail (labels, trash) — not permanent delete. Restricted.
 MODIFY_SCOPE = SCOPE_BASE + "gmail.modify"
+#: Full mailbox access, permanent delete included. No tool asks for it.
+FULL_SCOPE = "https://mail.google.com/"
+#: The broader scopes Google accepts in place of each scope a tool lists.
+COVERING_SCOPES: dict[str, frozenset[str]] = {
+    READONLY_SCOPE: frozenset({FULL_SCOPE, MODIFY_SCOPE}),
+    COMPOSE_SCOPE: frozenset({FULL_SCOPE, MODIFY_SCOPE}),
+    SEND_SCOPE: frozenset({FULL_SCOPE, MODIFY_SCOPE, COMPOSE_SCOPE}),
+    MODIFY_SCOPE: frozenset({FULL_SCOPE}),
+}
 
 DEFAULT_PAGE_SIZE = 10
 #: Messages/threads per page when each one is fetched in detail (one request each).
@@ -839,7 +849,9 @@ def _tool(
 ) -> GmailTool:
     text = f"{description} Needs scope: {_short(scopes)}."
     return GmailTool(
-        ToolSpec(slug, text, schema, read_only=read_only, destructive=destructive, tags=tags),
+        ToolSpec(
+            slug, text, schema, read_only=read_only, destructive=destructive, tags=tags, required_scopes=scopes
+        ),
         handler,
         scopes,
         aliases or {},

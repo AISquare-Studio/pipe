@@ -229,8 +229,8 @@ def test_bad_arguments_are_refused_before_any_request(slug, args):
 
 
 @pytest.mark.parametrize("slug", SLUGS)
-def test_no_credentials_means_no_request(slug):
+def test_no_credentials_is_not_connected_and_sends_nothing(slug):
     args, _, _ = CASES[slug]
     h = harness()
-    assert h.call(slug, args, config={}).error_code == "unauthorized"
+    assert h.call(slug, args, config={}).error_code == "not_connected"
     assert h.session.calls == []

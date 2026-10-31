@@ -97,11 +97,8 @@ def test_error_code_per_failure_class(call, answers, code, retry_after):
     assert result.to_dict()["error_code"] == code
 
 
-def test_scope_code_follows_core():
-    """``insufficient_scope`` once core defines it (P1), else ``forbidden``."""
-    from aisquare import pipe
-
-    assert ERROR_INSUFFICIENT_SCOPE == getattr(pipe, "ERROR_INSUFFICIENT_SCOPE", "forbidden")
+def test_scope_code_is_cores():
+    assert ERROR_INSUFFICIENT_SCOPE == "insufficient_scope"
 
 
 def test_get_5xx_is_retried_then_succeeds():

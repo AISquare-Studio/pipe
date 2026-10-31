@@ -79,7 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     text preferred, HTML converted, charsets honoured) and `attachmentList`.
   - **Least privilege.** Read-only consent by default (`gmail.readonly`);
     each write tool names the scope it needs (`gmail.compose`, `gmail.send`,
-    `gmail.modify`) in `REQUIRED_SCOPES` and its description.
+    `gmail.modify`) in `ToolSpec.required_scopes` and its description.
+    `scope_granted` counts Google's broader scopes (`https://mail.google.com/`,
+    `gmail.modify` over read/compose/send, `gmail.compose` over send).
 - **Google Calendar** (`aisquare-pipe-googlecalendar` 0.1.0, first
   release): `GoogleCalendarToolkit` (`googlecalendar`, 14 tools: 10 read,
   4 write, 1 destructive) and `GOOGLECALENDAR_OAUTH`. Slugs and argument
@@ -93,13 +95,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (daylight saving included); event times stay wall-clock with an IANA
     zone so recurring events expand correctly.
   - **Least privilege.** Read-only consent by default (`calendar.readonly`);
-    writes need `calendar.events`.
-- Both Google toolkits tell a 403 for a missing OAuth scope apart from
-  other 403s (`data.insufficient_scope`, `data.required_scopes`) and map it
-  to core's `insufficient_scope` code once core has one (`forbidden` until
-  then). Their OAuth specs omit `include_granted_scopes`, so one Google OAuth
-  client can serve Drive, Gmail and Calendar without one connector's token
-  carrying another's scopes.
+    writes need `calendar.events` (`ToolSpec.required_scopes`; the full
+    `calendar` scope covers both).
+- Both Google toolkits need `aisquare-pipe>=0.4.0`. They tell a 403 for a
+  missing OAuth scope apart from other 403s and return core's
+  `insufficient_scope` (with `data.insufficient_scope` and
+  `data.required_scopes`). Their OAuth specs omit `include_granted_scopes`,
+  so one Google OAuth client can serve Drive, Gmail and Calendar without one
+  connector's token carrying another's scopes.
 - **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
   (`slack`, 111 tools: 47 read, 6 send, 38 write, 20 destructive),
   `SLACK_OAUTH`, `SlackMessageSink` (`slack-message-sink`) and Events API

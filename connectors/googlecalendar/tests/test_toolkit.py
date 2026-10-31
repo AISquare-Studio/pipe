@@ -127,6 +127,38 @@ class TestScopes:
     def test_no_tool_needs_full_calendar_access(self):
         assert all(not s.endswith("/calendar") for scopes in REQUIRED_SCOPES.values() for s in scopes)
 
+    def test_tool_specs_carry_their_scopes_and_risk(self):
+        for tool in GoogleCalendarToolkit().tools():
+            assert tool.required_scopes == REQUIRED_SCOPES[tool.slug]
+            assert tool.risk == ("destructive" if tool.destructive else "read" if tool.read_only else "write")
+
+    @pytest.mark.parametrize(
+        ("granted", "count"),
+        [([READONLY_SCOPE], 10), ([READONLY_SCOPE, EVENTS_SCOPE], 14), (["https://www.googleapis.com/auth/calendar"], 14), ([EVENTS_SCOPE], 4)],
+    )
+    def test_granted_scopes_decide_what_is_listed(self, granted, count):
+        listed = GoogleCalendarToolkit().available_tools({"access_token": "t", "granted_scopes": granted})
+        assert len(listed) == count
+        if count == 10:
+            assert all(t.read_only for t in listed)
+
+    def test_a_write_without_its_scope_is_refused_before_any_request(self):
+        h = harness()
+        result = h.call(
+            "GOOGLECALENDAR_DELETE_EVENT", {"event_id": "e"}, config={"access_token": "t", "granted_scopes": f"{READONLY_SCOPE}"}
+        )
+        assert result.error_code == "insufficient_scope"
+        assert h.session.calls == []
+
+    def test_full_calendar_scope_covers_writes(self):
+        h = harness(response(204))
+        result = h.call(
+            "GOOGLECALENDAR_DELETE_EVENT",
+            {"event_id": "e"},
+            config={"access_token": "t", "granted_scopes": "https://www.googleapis.com/auth/calendar"},
+        )
+        assert result.successful, result.error
+
 
 class TestAliases:
     def test_other_casing(self):

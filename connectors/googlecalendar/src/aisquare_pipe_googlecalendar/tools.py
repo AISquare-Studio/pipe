@@ -21,7 +21,8 @@ Result shapes (``ToolResult.data``):
 * writes return the event; a delete returns ``{"deleted": true, ...}``.
 
 Scopes: every tool lists the OAuth scopes it needs in
-:attr:`GoogleCalendarTool.scopes` and its description. The default
+``ToolSpec.required_scopes`` (also :attr:`GoogleCalendarTool.scopes`) and
+its description. The default
 connection is read-only (``calendar.readonly``); creating, changing and
 deleting events needs ``calendar.events``.
 """
@@ -54,6 +55,13 @@ SCOPE_BASE = "https://www.googleapis.com/auth/"
 READONLY_SCOPE = SCOPE_BASE + "calendar.readonly"
 #: View and edit events on every calendar the user can access. Sensitive.
 EVENTS_SCOPE = SCOPE_BASE + "calendar.events"
+#: Full access, calendars and sharing included. No tool asks for it.
+FULL_SCOPE = SCOPE_BASE + "calendar"
+#: The broader scopes Google accepts in place of each scope a tool lists.
+COVERING_SCOPES: dict[str, frozenset[str]] = {
+    READONLY_SCOPE: frozenset({FULL_SCOPE}),
+    EVENTS_SCOPE: frozenset({FULL_SCOPE}),
+}
 
 DEFAULT_EVENTS_PAGE = 50
 MAX_EVENTS_PAGE = 2500
@@ -985,7 +993,9 @@ def _tool(
 ) -> GoogleCalendarTool:
     text = f"{description} Needs scope: {_short(scopes)}."
     return GoogleCalendarTool(
-        ToolSpec(slug, text, schema, read_only=read_only, destructive=destructive, tags=tags),
+        ToolSpec(
+            slug, text, schema, read_only=read_only, destructive=destructive, tags=tags, required_scopes=scopes
+        ),
         handler,
         scopes,
         aliases or {},

@@ -27,6 +27,7 @@ from aisquare_pipe_googlecalendar.rest import (
     GoogleCalendarRestClient,
 )
 from aisquare_pipe_googlecalendar.tools import (
+    COVERING_SCOPES,
     READONLY_SCOPE,
     TOOL_SPECS,
     TOOLS,
@@ -38,7 +39,7 @@ logger = logging.getLogger("aisquare.pipe.googlecalendar")
 #: A Google OAuth 2.0 web client, consented read-only by default
 #: (``calendar.readonly``: calendars, events, free/busy). Hosts that enable
 #: creating, changing or deleting events request ``calendar.events`` alongside
-#: it (see ``tools.REQUIRED_SCOPES``). Both are Google-*sensitive* scopes:
+#: it (each tool's ``ToolSpec.required_scopes``). Both are Google-*sensitive* scopes:
 #: production apps need OAuth verification. ``access_type=offline`` +
 #: ``prompt=consent`` make Google return a refresh token on every consent;
 #: access tokens expire after an hour. Google does not rotate refresh tokens.
@@ -68,8 +69,11 @@ class GoogleCalendarToolkit(Toolkit):
     ``config`` needs ``access_token`` — a Google OAuth access token from
     :data:`GOOGLECALENDAR_OAUTH` (it expires after an hour; hosts refresh it).
     Tool slugs and argument names match Composio's Google Calendar toolkit.
-    Each tool's OAuth scopes are in ``tools.REQUIRED_SCOPES`` and its
-    description; the default consent covers the read tools only.
+    Each tool's OAuth scopes are its ``ToolSpec.required_scopes`` (and in its
+    description). The default consent covers the read tools only; with
+    ``config["granted_scopes"]``, a tool whose scopes were not granted is
+    neither listed nor run (:meth:`scope_granted` counts Google's full
+    ``calendar`` scope).
 
     ``config["timeout_seconds"]`` (optional, set by hosts) bounds a whole
     call: request timeouts and rate-limit sleeps all fit inside it.
@@ -110,6 +114,11 @@ class GoogleCalendarToolkit(Toolkit):
 
     def tools(self) -> list[ToolSpec]:
         return list(TOOL_SPECS)
+
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``, counting Google's full
+        ``calendar`` scope, which covers both scopes the tools list."""
+        return scope in granted or not COVERING_SCOPES.get(scope, frozenset()).isdisjoint(granted)
 
     def call_tool(
         self, slug: str, arguments: Mapping[str, Any] | None, config: Mapping[str, Any] | None

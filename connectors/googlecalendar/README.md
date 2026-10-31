@@ -31,8 +31,11 @@ Google OAuth 2.0 *web application* client:
 **Least privilege.** The default consent covers the read tools only. A host
 that turns on writing requests `calendar.events` together with
 `calendar.readonly` (`scopes=[...]` to `build_authorize_url`). Every tool
-lists its scopes in `REQUIRED_SCOPES[slug]` and at the end of its
-description:
+lists its scopes in `ToolSpec.required_scopes` (also `REQUIRED_SCOPES[slug]`)
+and at the end of its description. With the connection's granted scopes in
+`config["granted_scopes"]`, `available_tools` lists only the tools they
+cover, and `call_tool` refuses the others as `insufficient_scope` before any
+request. Google's full `calendar` scope covers both scopes below.
 
 | Scope | Google class | Tools |
 |---|---|---|
@@ -155,7 +158,7 @@ human-readable `error`, `retry_after` (seconds) when rate limited, and
 | Failure | `error_code` | Notes |
 |---|---|---|
 | 401 | `unauthorized` | refresh the token, or reconnect |
-| 403 for a missing scope (`insufficientPermissions`, `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, or `WWW-Authenticate: … insufficient_scope`) | `insufficient_scope` once core defines it, `forbidden` until then | `data` adds `insufficient_scope: true` and the tool's `required_scopes` |
+| 403 for a missing scope (`insufficientPermissions`, `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, or `WWW-Authenticate: … insufficient_scope`) | `insufficient_scope` | `data` adds `insufficient_scope: true` and the tool's `required_scopes` |
 | 429, or a 403 `rateLimitExceeded` / `userRateLimitExceeded`, once retries or the budget run out | `rate_limited` (+ `retry_after`) | |
 | other 403 (`requiredAccessLevel`: no write access to that calendar; quotas) | `forbidden` | |
 | 404, 410 (deleted event, expired sync token) | `not_found` | |

@@ -31,7 +31,13 @@ application* client:
 **Least privilege.** The default consent covers the read tools only. A host
 that turns on writing requests the extra scope each tool needs together with
 `gmail.readonly` (`scopes=[...]` to `build_authorize_url`). Every tool lists
-its scopes in `REQUIRED_SCOPES[slug]` and at the end of its description:
+its scopes in `ToolSpec.required_scopes` (also `REQUIRED_SCOPES[slug]`) and at
+the end of its description. With the connection's granted scopes in
+`config["granted_scopes"]`, `available_tools` lists only the tools they
+cover, and `call_tool` refuses the others as `insufficient_scope` before any
+request. Google's broader scopes count: `https://mail.google.com/` covers
+every scope below, `gmail.modify` covers read, compose and send, and
+`gmail.compose` covers send.
 
 | Scope | Google class | Tools |
 |---|---|---|
@@ -147,7 +153,7 @@ when Google answered:
 | Failure | `error_code` | Notes |
 |---|---|---|
 | 401 | `unauthorized` | refresh the token, or reconnect |
-| 403 for a missing scope (`insufficientPermissions`, `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, or `WWW-Authenticate: … insufficient_scope`) | `insufficient_scope` once core defines it, `forbidden` until then | `data` adds `insufficient_scope: true` and the tool's `required_scopes` |
+| 403 for a missing scope (`insufficientPermissions`, `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, or `WWW-Authenticate: … insufficient_scope`) | `insufficient_scope` | `data` adds `insufficient_scope: true` and the tool's `required_scopes` |
 | 429, or a 403 `rateLimitExceeded` / `userRateLimitExceeded`, once retries or the budget run out | `rate_limited` (+ `retry_after`) | |
 | other 403 (delegation denied, daily limit, domain policy) | `forbidden` | |
 | 404, 410 | `not_found` | |

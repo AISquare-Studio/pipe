@@ -6,9 +6,8 @@ import math
 from collections.abc import Iterable
 from typing import Any
 
-from aisquare import pipe
 from aisquare.pipe import (
-    ERROR_FORBIDDEN,
+    ERROR_INSUFFICIENT_SCOPE,
     ERROR_RATE_LIMITED,
     ERROR_TIMEOUT,
     ERROR_UPSTREAM_ERROR,
@@ -17,10 +16,6 @@ from aisquare.pipe import (
 )
 
 from aisquare_pipe_googlecalendar.rest import GoogleCalendarAPIError
-
-#: Core's ``insufficient_scope`` error code once core has one, else
-#: ``forbidden`` — a 403 for a missing scope maps to it either way.
-ERROR_INSUFFICIENT_SCOPE: str = getattr(pipe, "ERROR_INSUFFICIENT_SCOPE", ERROR_FORBIDDEN)
 
 _SCOPE_BASE = "https://www.googleapis.com/auth/"
 
@@ -71,7 +66,7 @@ def error_code(error: GoogleCalendarAPIError) -> str:
     """The canonical ``ToolResult.error_code`` for a Calendar failure: rate
     limits (429, or a 403 with reason ``rateLimitExceeded`` /
     ``userRateLimitExceeded``) are ``rate_limited``, a 403 for a missing
-    OAuth scope is :data:`ERROR_INSUFFICIENT_SCOPE` and client-side timeouts
+    OAuth scope is ``insufficient_scope`` and client-side timeouts
     ``timeout``; HTTP statuses map through core's ``error_code_for_status``
     (401 unauthorized, any other 403 forbidden, 404/410 not_found, 400
     invalid_arguments, 409/412 conflict, ...); network failures and 5xx are

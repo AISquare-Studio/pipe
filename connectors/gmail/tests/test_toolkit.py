@@ -107,6 +107,50 @@ class TestScopes:
     def test_no_tool_needs_full_mailbox_access(self):
         assert all("mail.google.com" not in s for scopes in REQUIRED_SCOPES.values() for s in scopes)
 
+    def test_tool_specs_carry_their_scopes_and_risk(self):
+        for tool in GmailToolkit().tools():
+            assert tool.required_scopes == REQUIRED_SCOPES[tool.slug]
+            assert tool.risk == ("destructive" if tool.destructive else "read" if tool.read_only else "write")
+
+    @pytest.mark.parametrize(
+        ("granted", "writes"),
+        [
+            ([READONLY_SCOPE], set()),
+            ([READONLY_SCOPE, SEND_SCOPE], {"GMAIL_SEND_EMAIL", "GMAIL_REPLY_TO_THREAD"}),
+            ([READONLY_SCOPE, COMPOSE_SCOPE], {"GMAIL_CREATE_EMAIL_DRAFT", "GMAIL_SEND_EMAIL", "GMAIL_REPLY_TO_THREAD"}),
+            ([MODIFY_SCOPE], {"GMAIL_CREATE_EMAIL_DRAFT", "GMAIL_SEND_EMAIL", "GMAIL_REPLY_TO_THREAD", "GMAIL_ADD_LABEL_TO_EMAIL", "GMAIL_MODIFY_THREAD_LABELS", "GMAIL_MOVE_TO_TRASH"}),
+            (["https://mail.google.com/"], {"GMAIL_CREATE_EMAIL_DRAFT", "GMAIL_SEND_EMAIL", "GMAIL_REPLY_TO_THREAD", "GMAIL_ADD_LABEL_TO_EMAIL", "GMAIL_MODIFY_THREAD_LABELS", "GMAIL_MOVE_TO_TRASH"}),
+        ],
+    )
+    def test_granted_scopes_decide_what_is_listed(self, granted, writes):
+        """``gmail.modify`` covers read, compose and send; ``gmail.compose``
+        covers send; ``https://mail.google.com/`` covers everything."""
+        listed = {t.slug for t in GmailToolkit().available_tools({"access_token": "t", "granted_scopes": granted})}
+        reads = {t.slug for t in GmailToolkit().tools() if t.read_only}
+        assert listed == reads | writes
+
+    def test_send_only_connection_lists_only_send(self):
+        listed = [t.slug for t in GmailToolkit().available_tools({"granted_scopes": SEND_SCOPE})]
+        assert listed == ["GMAIL_SEND_EMAIL"]
+
+    def test_unknown_grants_filter_nothing(self):
+        assert len(GmailToolkit().available_tools({"access_token": "t"})) == 13
+
+    def test_a_write_without_its_scope_is_refused_before_any_request(self):
+        h = harness()
+        result = h.call(
+            "GMAIL_SEND_EMAIL",
+            {"recipient_email": "a@x.co", "body": "x"},
+            config={"access_token": "t", "granted_scopes": [READONLY_SCOPE]},
+        )
+        assert result.error_code == "insufficient_scope"
+        assert h.session.calls == []
+
+    def test_a_covered_write_runs(self):
+        h = harness(response(200, {"id": "m1", "threadId": "t1", "labelIds": ["TRASH"]}))
+        result = h.call("GMAIL_MOVE_TO_TRASH", {"message_id": "m1"}, config={"access_token": "t", "granted_scopes": ["https://mail.google.com/"]})
+        assert result.successful, result.error
+
 
 class TestAliases:
     def test_camel_case_ids(self):
