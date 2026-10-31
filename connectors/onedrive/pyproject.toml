@@ -13,7 +13,7 @@ authors = [{name = "AISquare Studio"}]
 dependencies = [
     "aisquare-pipe>=0.3.0",
     "azure-identity>=1.15.0",
-    "requests>=2.20.0",
+    "requests>=2.34.2",
 ]
 
 [project.optional-dependencies]
