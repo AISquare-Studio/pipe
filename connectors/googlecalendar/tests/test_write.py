@@ -170,13 +170,54 @@ class TestUpdate:
         assert result.error_code == "invalid_arguments"  # nothing left to change
 
     def test_all_day_event_becomes_timed(self):
+        """Google merges nested objects on PATCH: the stored date is nulled."""
         all_day = event("evt2", start="2026-11-02", end="2026-11-03")
         h = harness(response(200, all_day), zone_reply("Europe/Rome"), response(200, all_day))
         h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt2", "start_datetime": "2026-11-02T10:00"})
         assert h.session.last.json == {
-            "start": {"dateTime": "2026-11-02T10:00:00", "timeZone": "Europe/Rome"},
-            "end": {"dateTime": "2026-11-02T10:30:00", "timeZone": "Europe/Rome"},
+            "start": {"dateTime": "2026-11-02T10:00:00", "timeZone": "Europe/Rome", "date": None},
+            "end": {"dateTime": "2026-11-02T10:30:00", "timeZone": "Europe/Rome", "date": None},
         }
+
+    def test_timed_event_becomes_all_day(self):
+        """...and the stored dateTime and timeZone are nulled the other way."""
+        h = harness(response(200, self.CURRENT), response(200, self.CURRENT))
+        h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt1", "start_date": "2026-11-05"})
+        assert h.session.last.json == {
+            "start": {"date": "2026-11-05", "dateTime": None, "timeZone": None},
+            "end": {"date": "2026-11-06", "dateTime": None, "timeZone": None},
+        }
+
+    def test_timed_event_becomes_a_multi_day_all_day_event_in_a_zone(self):
+        h = harness(response(200, self.CURRENT), response(200, self.CURRENT))
+        h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt1", "start_date": "2026-11-05", "end_date": "2026-11-08", "timezone": "Europe/Oslo"})
+        assert h.session.last.json == {
+            "start": {"date": "2026-11-05", "timeZone": "Europe/Oslo", "dateTime": None},
+            "end": {"date": "2026-11-08", "timeZone": "Europe/Oslo", "dateTime": None},
+        }
+
+    def test_all_day_event_moves_and_keeps_its_length(self):
+        trip = event("evt3", start="2026-11-02", end="2026-11-05")
+        h = harness(response(200, trip), response(200, trip))
+        h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt3", "start_date": "2026-12-01"})
+        assert h.session.last.json == {"start": {"date": "2026-12-01"}, "end": {"date": "2026-12-04"}}  # nothing to clear
+
+    def test_all_day_event_gets_a_new_end(self):
+        trip = event("evt3", start="2026-11-02", end="2026-11-05")
+        h = harness(response(200, trip), response(200, trip))
+        h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt3", "end_date": "2026-11-03"})
+        assert h.session.last.json == {"start": {"date": "2026-11-02"}, "end": {"date": "2026-11-03"}}
+
+    def test_timed_event_needs_a_start_date_to_become_all_day(self):
+        h = harness(response(200, self.CURRENT))
+        result = h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt1", "end_date": "2026-11-09"})
+        assert result.error_code == "invalid_arguments"
+        assert [c.method for c in h.session.calls] == ["GET"]
+
+    def test_timed_to_timed_sends_no_nulls(self):
+        h = harness(response(200, self.CURRENT), response(200, self.CURRENT))
+        h.call("GOOGLECALENDAR_UPDATE_EVENT", {"event_id": "evt1", "start_datetime": "2026-11-03T14:00:00-05:00"})
+        assert all(None not in moment.values() for moment in (h.session.last.json["start"], h.session.last.json["end"]))
 
     def test_all_day_event_needs_a_start_to_get_an_end(self):
         h = harness(response(200, event("evt2", start="2026-11-02", end="2026-11-03")))

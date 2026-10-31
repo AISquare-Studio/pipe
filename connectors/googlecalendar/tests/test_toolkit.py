@@ -63,6 +63,7 @@ COMPOSIO_ARGUMENTS = {
         "event_duration_minutes", "timezone", "attendees", "recurrence", "visibility", "transparency", "send_updates",
         "guestsCanModify", "guestsCanInviteOthers", "guestsCanSeeOtherGuests", "extended_properties", "calendar_id",
         "create_meeting_room",
+        "start_date", "end_date",  # added: all-day <-> timed
     },
     "GOOGLECALENDAR_QUICK_ADD": {"text", "calendar_id", "send_updates"},
     "GOOGLECALENDAR_DELETE_EVENT": {"event_id", "calendar_id", "send_updates", "send_notifications"},
@@ -121,8 +122,10 @@ class TestScopes:
         assert GOOGLECALENDAR_OAUTH.default_scopes == (READONLY_SCOPE,)
 
     def test_reads_need_the_default_writes_need_events(self):
+        both = {"GOOGLECALENDAR_CREATE_EVENT", "GOOGLECALENDAR_UPDATE_EVENT"}  # also read the calendar's zone
         for tool in GoogleCalendarToolkit().tools():
-            assert REQUIRED_SCOPES[tool.slug] == ((READONLY_SCOPE,) if tool.read_only else (EVENTS_SCOPE,)), tool.slug
+            expected = (READONLY_SCOPE,) if tool.read_only else (READONLY_SCOPE, EVENTS_SCOPE) if tool.slug in both else (EVENTS_SCOPE,)
+            assert REQUIRED_SCOPES[tool.slug] == expected, tool.slug
 
     def test_no_tool_needs_full_calendar_access(self):
         assert all(not s.endswith("/calendar") for scopes in REQUIRED_SCOPES.values() for s in scopes)
@@ -134,7 +137,7 @@ class TestScopes:
 
     @pytest.mark.parametrize(
         ("granted", "count"),
-        [([READONLY_SCOPE], 10), ([READONLY_SCOPE, EVENTS_SCOPE], 14), (["https://www.googleapis.com/auth/calendar"], 14), ([EVENTS_SCOPE], 4)],
+        [([READONLY_SCOPE], 10), ([READONLY_SCOPE, EVENTS_SCOPE], 14), (["https://www.googleapis.com/auth/calendar"], 14), ([EVENTS_SCOPE], 2)],
     )
     def test_granted_scopes_decide_what_is_listed(self, granted, count):
         listed = GoogleCalendarToolkit().available_tools({"access_token": "t", "granted_scopes": granted})

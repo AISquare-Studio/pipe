@@ -1020,7 +1020,7 @@ CATALOG: tuple[GmailTool, ...] = (
         ),
         _create_draft,
         "draft", "compose", "write", "email", "prepare",
-        scopes=(COMPOSE_SCOPE,),
+        scopes=(READONLY_SCOPE, COMPOSE_SCOPE),  # read: thread_id reads the thread it answers
         aliases=_SEND_ALIASES,
     ),
     _write(

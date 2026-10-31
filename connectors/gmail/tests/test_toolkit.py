@@ -98,7 +98,7 @@ class TestScopes:
                 assert REQUIRED_SCOPES[tool.slug] == (READONLY_SCOPE,), tool.slug
 
     def test_writes_name_their_extra_scope(self):
-        assert REQUIRED_SCOPES["GMAIL_CREATE_EMAIL_DRAFT"] == (COMPOSE_SCOPE,)
+        assert REQUIRED_SCOPES["GMAIL_CREATE_EMAIL_DRAFT"] == (READONLY_SCOPE, COMPOSE_SCOPE)  # thread_id reads
         assert REQUIRED_SCOPES["GMAIL_SEND_EMAIL"] == (SEND_SCOPE,)
         assert REQUIRED_SCOPES["GMAIL_REPLY_TO_THREAD"] == (READONLY_SCOPE, SEND_SCOPE)
         for slug in ("GMAIL_ADD_LABEL_TO_EMAIL", "GMAIL_MODIFY_THREAD_LABELS", "GMAIL_MOVE_TO_TRASH"):

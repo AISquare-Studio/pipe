@@ -78,8 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one multipart upload. Read messages come back with `messageText` (plain
     text preferred, HTML converted, charsets honoured) and `attachmentList`.
   - **Least privilege.** Read-only consent by default (`gmail.readonly`);
-    each write tool names the scope it needs (`gmail.compose`, `gmail.send`,
-    `gmail.modify`) in `ToolSpec.required_scopes` and its description.
+    each write tool names the scopes it needs (`gmail.compose`, `gmail.send`,
+    `gmail.modify`; plus `gmail.readonly` for the tools that read the thread
+    they answer) in `ToolSpec.required_scopes` and its description.
     `scope_granted` counts Google's broader scopes (`https://mail.google.com/`,
     `gmail.modify` over read/compose/send, `gmail.compose` over send).
 - **Google Calendar** (`aisquare-pipe-googlecalendar` 0.1.0, first
@@ -89,14 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Tools.** Calendars, events (by range and text, expanded or not),
     recurring-event instances, events across every calendar, free/busy and
     free slots, the current time in a zone; create, update (a patch that
-    keeps unmentioned fields), quick-add and delete events.
+    keeps unmentioned fields and converts all-day <-> timed), quick-add and
+    delete events.
   - **Time zones.** Times without an offset are read in the given zone or
     the calendar's own; query bounds get the zone's offset for that date
     (daylight saving included); event times stay wall-clock with an IANA
     zone so recurring events expand correctly.
   - **Least privilege.** Read-only consent by default (`calendar.readonly`);
-    writes need `calendar.events` (`ToolSpec.required_scopes`; the full
-    `calendar` scope covers both).
+    writes need `calendar.events`, and create and update also
+    `calendar.readonly` (they read the calendar's time zone and the event)
+    (`ToolSpec.required_scopes`; the full `calendar` scope covers both).
 - Both Google toolkits need `aisquare-pipe>=0.4.0`. They tell a 403 for a
   missing OAuth scope apart from other 403s and return core's
   `insufficient_scope` (with `data.insufficient_scope` and

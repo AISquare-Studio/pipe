@@ -41,7 +41,7 @@ every scope below, `gmail.modify` covers read, compose and send, and
 
 | Scope | Google class | Tools |
 |---|---|---|
-| `gmail.readonly` | **restricted** | every read tool; also `GMAIL_REPLY_TO_THREAD` (reads the thread it answers) |
+| `gmail.readonly` | **restricted** | every read tool; also `GMAIL_REPLY_TO_THREAD` and `GMAIL_CREATE_EMAIL_DRAFT`, which read the thread they answer (`thread_id`) |
 | `gmail.compose` | **restricted** | `GMAIL_CREATE_EMAIL_DRAFT` |
 | `gmail.send` | sensitive | `GMAIL_SEND_EMAIL`, `GMAIL_REPLY_TO_THREAD` |
 | `gmail.modify` | **restricted** | `GMAIL_ADD_LABEL_TO_EMAIL`, `GMAIL_MODIFY_THREAD_LABELS`, `GMAIL_MOVE_TO_TRASH` |
@@ -195,7 +195,7 @@ Writes:
 
 | Slug | Gmail endpoint | Scope | Notes |
 |---|---|---|---|
-| `GMAIL_CREATE_EMAIL_DRAFT` | `POST drafts` | `gmail.compose` | `thread_id` makes it a reply draft |
+| `GMAIL_CREATE_EMAIL_DRAFT` | `GET threads/{id}` (with `thread_id`) + `POST drafts` | `gmail.readonly` + `gmail.compose` | `thread_id` makes it a reply draft |
 | `GMAIL_SEND_EMAIL` | `POST messages/send` | `gmail.send` | `from_email`: a send-as alias |
 | `GMAIL_REPLY_TO_THREAD` | `GET threads/{id}` + `POST messages/send` | `gmail.readonly` + `gmail.send` | |
 | `GMAIL_ADD_LABEL_TO_EMAIL` | `POST messages/{id}/modify` | `gmail.modify` | mark read/unread, star, archive |

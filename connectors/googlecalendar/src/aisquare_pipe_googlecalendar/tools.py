@@ -909,6 +909,28 @@ def _existing_start(event: Mapping[str, Any]) -> tuple[datetime.datetime | None,
     return begin, span, start.get("timeZone")
 
 
+def _existing_days(event: Mapping[str, Any]) -> tuple[datetime.date | None, int | None]:
+    """An all-day event's first day and its length in days (None, None for a timed one)."""
+    start = (event.get("start") or {}).get("date")
+    end = (event.get("end") or {}).get("date")
+    try:
+        first = times.parse_date(str(start)) if start else None
+        last = times.parse_date(str(end)) if end else None
+    except ValueError:
+        return None, None
+    return first, (last - first).days if first and last else None
+
+
+def _clear(moments: tuple[dict[str, Any], dict[str, Any]], *keys: str) -> None:
+    """Null ``keys`` in a patch's start/end: Google merges nested objects on
+    PATCH, so a field of the event's old form (``date`` when it becomes
+    timed, ``dateTime`` / ``timeZone`` when it becomes all-day) would
+    otherwise survive next to the new one."""
+    for moment in moments:
+        for key in keys:
+            moment.setdefault(key, None)
+
+
 def _update_event(client: GoogleCalendarRestClient, args: dict[str, Any]) -> ToolResult:
     calendar = _calendar(args, "calendar_id")
     path = f"/calendars/{calendar}/events/{_segment(args.get('event_id'), 'event_id')}"
@@ -917,12 +939,21 @@ def _update_event(client: GoogleCalendarRestClient, args: dict[str, Any]) -> Too
     new_start = _parse(args, "start_datetime")
     new_end = _parse(args, "end_datetime")
     span = _duration(args)
+    new_day = _date(args, "start_date")
+    new_last_day = _date(args, "end_date")
     tz_given = _zone_arg(args, "timezone")
-    if not (patch or new_start or new_end or span or tz_given or args.get("create_meeting_room")):
+    timed = bool(new_start or new_end or span)
+    all_day = bool(new_day or new_last_day)
+    if timed and all_day:
+        raise _invalid(
+            "give start_date/end_date (all-day) or start_datetime/end_datetime/a duration (timed), not both"
+        )
+    if not (patch or timed or all_day or tz_given or args.get("create_meeting_room")):
         raise _invalid("nothing to update: give the fields to change")
     current = json_object(client.get(path))
     old_start, old_span, old_zone = _existing_start(current)
-    if new_start or new_end or span:
+    old_day, old_days = _existing_days(current)
+    if timed:
         start = new_start or old_start
         if start is None:
             raise _invalid("the event is all-day; give start_datetime to make it a timed event")
@@ -933,6 +964,20 @@ def _update_event(client: GoogleCalendarRestClient, args: dict[str, Any]) -> Too
         if not tz_name and (naive or patch.get("recurrence") or current.get("recurrence")):
             tz_name = _calendar_zone(client, calendar)
         patch["start"], patch["end"] = _timed(start, new_end, span, tz_name)
+        if old_day is not None:
+            _clear((patch["start"], patch["end"]), "date")
+    elif all_day:
+        first = new_day or old_day
+        if first is None:
+            raise _invalid("the event is timed; give start_date to make it an all-day event")
+        last = new_last_day
+        if last is None and new_day and old_day and old_days:
+            last = new_day + datetime.timedelta(days=old_days)  # keep its length in days
+        patch["start"], patch["end"] = _all_day(first, last)
+        if tz_given:
+            patch["start"]["timeZone"] = patch["end"]["timeZone"] = tz_given
+        if old_day is None:
+            _clear((patch["start"], patch["end"]), "dateTime", "timeZone")
     elif tz_given:
         for key in ("start", "end"):
             moment = dict(current.get(key) or {})
@@ -1003,7 +1048,13 @@ def _tool(
 
 
 def _write(slug: str, description: str, schema: dict[str, Any], handler: Handler, *tags: str, **kw: Any) -> GoogleCalendarTool:
-    return _tool(slug, description, schema, handler, *tags, scopes=(EVENTS_SCOPE,), read_only=False, **kw)
+    scopes = kw.pop("scopes", (EVENTS_SCOPE,))
+    return _tool(slug, description, schema, handler, *tags, scopes=scopes, read_only=False, **kw)
+
+
+#: Scopes of a write that also reads: the calendar's zone (``calendars.get``,
+#: which ``calendar.events`` does not allow) and, for an update, the event.
+_READ_WRITE = (READONLY_SCOPE, EVENTS_SCOPE)
 
 
 _EVENT_WRITE_FIELDS: dict[str, Any] = {
@@ -1267,24 +1318,28 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         ),
         _create_event,
         "create", "schedule", "add", "book", "new", "event", "meeting", "invite", "appointment",
+        scopes=_READ_WRITE,
         aliases={"title": "summary", "start_time": "start_datetime", "end_time": "end_datetime", "time_zone": "timezone"},
     ),
     _write(
         "GOOGLECALENDAR_UPDATE_EVENT",
         "Change an event (event_id): only the fields given change, the rest is kept. New "
-        "start_datetime keeps the event's length unless end_datetime or a duration is given. "
-        "attendees and recurrence replace the whole list. On a recurring series every instance "
+        "start_datetime keeps the event's length unless end_datetime or a duration is given; "
+        "start_date/end_date make it all-day. attendees and recurrence replace the whole list. On a recurring series every instance "
         "changes; pass an instance id (from EVENTS_INSTANCES) to change one. Returns the event.",
         _schema(
             {
                 "event_id": EVENT_ID,
                 **_EVENT_WRITE_FIELDS,
+                "start_date": _string("Make it all-day from this date, YYYY-MM-DD (or move an all-day event)."),
+                "end_date": _string("All-day end date, exclusive; default: the same length (one day for a timed event)."),
                 "create_meeting_room": _boolean("Add a Google Meet link if the event has none."),
             },
             ["event_id"],
         ),
         _update_event,
         "update", "change", "reschedule", "move", "edit", "rename", "event", "meeting",
+        scopes=_READ_WRITE,
         aliases={"title": "summary", "start_time": "start_datetime", "end_time": "end_datetime", "time_zone": "timezone"},
     ),
     _write(

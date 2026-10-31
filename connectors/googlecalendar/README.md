@@ -39,7 +39,7 @@ request. Google's full `calendar` scope covers both scopes below.
 
 | Scope | Google class | Tools |
 |---|---|---|
-| `calendar.readonly` | **sensitive** | every read tool (calendars, events, free/busy) |
+| `calendar.readonly` | **sensitive** | every read tool (calendars, events, free/busy); also `GOOGLECALENDAR_CREATE_EVENT` and `GOOGLECALENDAR_UPDATE_EVENT`, which look up the calendar's time zone (`calendars.get`, which `calendar.events` does not allow) and, for an update, read the event |
 | `calendar.events` | **sensitive** | `GOOGLECALENDAR_CREATE_EVENT`, `GOOGLECALENDAR_UPDATE_EVENT`, `GOOGLECALENDAR_QUICK_ADD`, `GOOGLECALENDAR_DELETE_EVENT` |
 
 No tool needs `https://www.googleapis.com/auth/calendar` (full access,
@@ -147,6 +147,10 @@ minutes when there is no end or duration, invitations emailed to every guest
 not for focus time, out-of-office, working-location or birthday events).
 `GOOGLECALENDAR_UPDATE_EVENT` is a patch: it reads the event, changes only
 the fields given and keeps the rest — a new start keeps the event's length.
+`start_datetime` turns an all-day event into a timed one and `start_date` /
+`end_date` the reverse; because Google merges nested objects on PATCH, the
+old form's fields are sent as `null` (`date`, or `dateTime` and `timeZone`)
+so they do not survive next to the new ones.
 (Composio's update replaces the whole event; this one never clears fields
 you did not mention.) Other writes email nobody unless `send_updates` says
 so (Google's default).
@@ -200,12 +204,12 @@ Read-only (`calendar.readonly`):
 | `GOOGLECALENDAR_FREE_BUSY_QUERY` | `POST freeBusy` | busy blocks of calendars or people |
 | `GOOGLECALENDAR_FIND_FREE_SLOTS` | `POST freeBusy` | free gaps across calendars or people |
 
-Writes (`calendar.events`):
+Writes (`calendar.events`; create and update also `calendar.readonly`):
 
 | Slug | Calendar endpoint | Notes |
 |---|---|---|
 | `GOOGLECALENDAR_CREATE_EVENT` | `POST calendars/{id}/events` | timed or all-day; guests, recurrence, Meet link |
-| `GOOGLECALENDAR_UPDATE_EVENT` | `GET` + `PATCH calendars/{id}/events/{id}` | only the given fields change |
+| `GOOGLECALENDAR_UPDATE_EVENT` | `GET` + `PATCH calendars/{id}/events/{id}` | only the given fields change; `start_date`/`end_date` make it all-day |
 | `GOOGLECALENDAR_QUICK_ADD` | `POST calendars/{id}/events/quickAdd` | one line of text, parsed by Google |
 | `GOOGLECALENDAR_DELETE_EVENT` | `DELETE calendars/{id}/events/{id}` | **destructive**; a series id deletes every instance |
 
