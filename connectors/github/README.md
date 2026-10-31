@@ -149,6 +149,27 @@ Writes:
   inside `repo` is refused (`invalid_arguments`) rather than guessed, so a
   write never lands on a fork by accident. `.`/`..` path segments are refused.
 
+**Router metadata.** `GitHubToolkit.card()` is the connector's card for a router —
+category `code`, plus `keywords` and `examples` phrased as users ask
+("my open PRs", "issues assigned to me in the api repo"). Each tool's `required_scopes` and `risk` (`read` / `write` /
+`destructive`, from its flags) are on its `ToolSpec`. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+
+| Tools | `required_scopes` |
+|---|---|
+| everything on repositories (code, contents, issues, pull requests, commits, releases, Actions runs, stars, repository search) | `repo` — public repositories need no scope, but the tools must work on private ones |
+| `GITHUB_GET_THE_AUTHENTICATED_USER` | `read:user` |
+| `GITHUB_LIST_ORGANIZATIONS_FOR_THE_AUTHENTICATED_USER` | `read:org` |
+| `GITHUB_LIST_NOTIFICATIONS_FOR_THE_AUTHENTICATED_USER` | `notifications` |
+
+`scope_granted` counts GitHub's hierarchy: `repo` covers `public_repo` and
+`notifications`, `user` covers `read:user`, `admin:org` and `write:org` cover
+`read:org`. The default consent (`repo read:user read:org`) covers every tool.
+A connection granted only `public_repo` lists no repository tools: they would
+fail on private repositories.
+
 ### Connecting (GitHub OAuth App)
 
 `GitHubToolkit.oauth` is `GITHUB_OAUTH`:
@@ -160,7 +181,8 @@ Writes:
 | default scopes | `repo read:user read:org` |
 | PKCE | on (`pkce=True`, S256; GitHub does not support `plain`). Build the authorize URL with `code_challenge`, and exchange with the matching `code_verifier`, both from core's `make_pkce_pair()`. Core refuses either step without them. The client secret is still sent, because GitHub requires it for OAuth Apps |
 | expiry | none: OAuth App tokens do not expire and carry no refresh token (`token_expires=False`) |
-| disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/token` (HTTP Basic `client_id:client_secret`), which revokes only this connection's token. Revoking the whole grant (`/grant`) would also break every other AISquare connection the same GitHub user made to the app. The app stays in the user's GitHub *Authorized OAuth Apps* list until they remove it there |
+| disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/token` (HTTP Basic `client_id:client_secret`), which revokes only this connection's token. The app stays in the user's GitHub *Authorized OAuth Apps* list until they remove it there |
+| remove the app | `GitHubToolkit.revoke_grant` → `DELETE /applications/{client_id}/grant` (same auth, any live token of the grant): every token that GitHub user gave the app dies — **their other AISquare connections too** — and the app leaves their *Authorized OAuth Apps*. For "remove AISquare from my GitHub" or account deletion, not a routine disconnect |
 
 Run the flow with the toolkit's `build_authorize_url` / `exchange_code` /
 `revoke_token`. Core handles GitHub's form-encoded token response and its

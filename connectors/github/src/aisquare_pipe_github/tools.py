@@ -70,6 +70,44 @@ class GitHubTool:
 
 
 # --------------------------------------------------------------------------
+# OAuth scopes (docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps)
+# --------------------------------------------------------------------------
+
+#: Full access to private and public repositories: code, issues, pull
+#: requests, commits, releases, Actions runs, stars. Public repositories need
+#: no scope to read, but a connection's tools must also work on private ones.
+REPO_SCOPE = "repo"
+#: The authenticated user's profile.
+READ_USER_SCOPE = "read:user"
+#: The user's organization memberships.
+READ_ORG_SCOPE = "read:org"
+#: The user's notifications (the API accepts ``repo`` too).
+NOTIFICATIONS_SCOPE = "notifications"
+
+#: The scopes each tool needs: ``repo`` unless listed here.
+_TOOL_SCOPES: dict[str, tuple[str, ...]] = {
+    "GITHUB_GET_THE_AUTHENTICATED_USER": (READ_USER_SCOPE,),
+    "GITHUB_LIST_ORGANIZATIONS_FOR_THE_AUTHENTICATED_USER": (READ_ORG_SCOPE,),
+    "GITHUB_LIST_NOTIFICATIONS_FOR_THE_AUTHENTICATED_USER": (NOTIFICATIONS_SCOPE,),
+}
+
+#: GitHub's scope hierarchy: the broader scopes that cover each scope a tool lists.
+COVERING_SCOPES: dict[str, frozenset[str]] = {
+    "public_repo": frozenset({REPO_SCOPE}),
+    "repo:status": frozenset({REPO_SCOPE}),
+    NOTIFICATIONS_SCOPE: frozenset({REPO_SCOPE}),
+    READ_USER_SCOPE: frozenset({"user"}),
+    "user:email": frozenset({"user"}),
+    READ_ORG_SCOPE: frozenset({"write:org", "admin:org"}),
+    "write:org": frozenset({"admin:org"}),
+}
+
+
+def tool_scopes(slug: str) -> tuple[str, ...]:
+    return _TOOL_SCOPES.get(slug, (REPO_SCOPE,))
+
+
+# --------------------------------------------------------------------------
 # Schema helpers
 # --------------------------------------------------------------------------
 
@@ -482,7 +520,10 @@ def _star_a_repository(client: GitHubRestClient, args: dict[str, Any]) -> ToolRe
 
 
 def _read(slug: str, description: str, schema: dict[str, Any], handler: Handler, *tags: str) -> GitHubTool:
-    return GitHubTool(ToolSpec(slug, description, schema, read_only=True, tags=tags), handler)
+    return GitHubTool(
+        ToolSpec(slug, description, schema, read_only=True, tags=tags, required_scopes=tool_scopes(slug)),
+        handler,
+    )
 
 
 def _write(
@@ -494,7 +535,15 @@ def _write(
     destructive: bool = False,
 ) -> GitHubTool:
     return GitHubTool(
-        ToolSpec(slug, description, schema, read_only=False, destructive=destructive, tags=tags),
+        ToolSpec(
+            slug,
+            description,
+            schema,
+            read_only=False,
+            destructive=destructive,
+            tags=tags,
+            required_scopes=tool_scopes(slug),
+        ),
         handler,
     )
 

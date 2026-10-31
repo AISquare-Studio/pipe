@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe-github"
-version = "0.2.0"
+version = "0.3.0"
 description = "GitHub toolkit (repos, code, issues, pull requests) and single-repo checkout source for aisquare.pipe"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "A-Square"}]
 dependencies = [
-    "aisquare-pipe>=0.3.0",
+    "aisquare-pipe>=0.4.0",
     "requests>=2.31",
 ]
 

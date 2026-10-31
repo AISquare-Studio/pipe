@@ -334,9 +334,38 @@ def revoke_access_token(
     working; the app stays in the user's authorized-apps list until they
     remove it. Authenticated with the app's client id/secret (HTTP Basic).
     True on 204; False on anything else. Never raises."""
+    return _delete_application("token", client_id, client_secret, access_token, session, base_url, timeout)
+
+
+def revoke_grant(
+    *,
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+    session: requests.Session | None = None,
+    base_url: str = API_BASE,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> bool:
+    """``DELETE /applications/{client_id}/grant``: revoke the user's whole
+    grant to the app — every token that GitHub user gave it, on every
+    connection, and the app leaves their authorized-apps list. Identified by
+    one of those tokens; authenticated with the app's client id/secret (HTTP
+    Basic). True on 204; False on anything else. Never raises."""
+    return _delete_application("grant", client_id, client_secret, access_token, session, base_url, timeout)
+
+
+def _delete_application(
+    what: str,
+    client_id: str,
+    client_secret: str,
+    access_token: str,
+    session: requests.Session | None,
+    base_url: str,
+    timeout: float,
+) -> bool:
     http = session if session is not None else requests.Session()
     try:
-        url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/token"
+        url = f"{base_url.rstrip('/')}/applications/{urllib.parse.quote(client_id, safe='')}/{what}"
         status = http.request(
             "DELETE",
             url,
@@ -350,12 +379,12 @@ def revoke_access_token(
             timeout=timeout,
         ).status_code
     except Exception as e:  # noqa: BLE001 — never raises (e.g. a non-latin-1 secret in Basic auth)
-        logger.warning("github: token revoke failed (%s)", type(e).__name__)
+        logger.warning("github: %s revoke failed (%s)", what, type(e).__name__)
         return False
     finally:
         if session is None:
             http.close()
     if status == 204:
         return True
-    logger.warning("github: token revoke returned HTTP %s", status)
+    logger.warning("github: %s revoke returned HTTP %s", what, status)
     return False
