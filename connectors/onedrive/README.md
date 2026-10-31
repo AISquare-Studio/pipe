@@ -86,6 +86,20 @@ The URLs contain a `{tenant}` placeholder: `https://login.microsoftonline.com/{t
 - **In Python**, pass the tenant to the constructor, as in `OneDriveToolkit(tenant="organizations")`, or use `microsoft_oauth("<tenant>")` to get a filled spec. If nothing fills the placeholder, the toolkit's flow methods use `common`.
 - **Valid tenant values** are `common` (any account), `organizations` (work and school accounts only), `consumers` (personal accounts only), a tenant ID (GUID), or a verified domain.
 
+**Router metadata.** `OneDriveToolkit.card()` is the connector's card for a router —
+category `files`, plus `keywords` and `examples` phrased as users ask
+("my recent Excel files", "share the budget workbook with a view-only link"). Each tool's `required_scopes` and `risk` (`read` / `write` /
+`destructive`, from its flags) are on its `ToolSpec`. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+Read tools need `Files.Read.All` and write tools `Files.ReadWrite.All` (the
+`.All` forms: the tools reach items shared with the user and other drives).
+Graph permissions compare by short name and case-insensitively — Microsoft's
+token responses may spell them `https://graph.microsoft.com/files.read.all` —
+and `Files.ReadWrite.All` covers the read permissions, so the default consent
+covers every tool.
+
 **Disconnecting:** `revoke_token` always returns `False` and sends nothing. The Microsoft identity platform has no endpoint that revokes one app's delegated tokens, so the host forgets the token pair and the access token lapses within about an hour. `revokeSignInSessions` is deliberately not called, because it signs the user out of every app on every device. Users can withdraw consent at <https://myapps.microsoft.com> (work and school accounts) or <https://account.live.com/consent/Manage> (personal accounts).
 
 #### Azure app registration

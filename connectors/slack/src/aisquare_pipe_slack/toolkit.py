@@ -407,6 +407,17 @@ class SlackToolkit(Toolkit):
     auth_type = AuthType.OAUTH2
     oauth = SLACK_OAUTH
     docs_url = "https://docs.slack.dev/reference/methods"
+    category = "chat"
+    keywords = (
+        "slack", "channel", "message", "DM", "direct message", "thread", "mention", "reply",
+        "post", "search messages", "workspace", "team chat", "reaction", "canvas",
+    )
+    examples = (
+        "what did the team say in #launch today",
+        "DM Priya that the build is green",
+        "search Slack for the outage postmortem",
+        "summarize the thread I was mentioned in",
+    )
 
     def __init__(
         self,
@@ -438,7 +449,29 @@ class SlackToolkit(Toolkit):
             settings = settings_from_config(config or {})
         except SlackConfigError:
             return []
-        return [TOOLS[spec.slug].spec for spec in TOOL_SPECS if gate(TOOLS[spec.slug], settings) is None]
+        return [
+            TOOLS[spec.slug].spec
+            for spec in TOOL_SPECS
+            if gate(TOOLS[spec.slug], settings) is None and not self.missing_scopes(spec, config)
+        ]
+
+    def missing_scopes(self, tool: ToolSpec, config: Mapping[str, Any] | None) -> list[str]:
+        """Core's check against ``config["granted_scopes"]`` (nothing is
+        missing when the config does not say), with the scopes of the
+        connection's identity: ``required_scopes`` lists a tool's user-token
+        scopes (its bot ones for a bot-only tool), but a bot connection holds
+        bot scopes, so it is checked against those."""
+        row = TOOLS.get(tool.slug)
+        if row is None or not isinstance(config, Mapping):
+            return super().missing_scopes(tool, config)
+        try:
+            identity = settings_from_config(config).identity
+        except SlackConfigError:
+            return super().missing_scopes(tool, config)
+        scopes = row.user_scopes if identity == IDENTITY_USER else row.bot_scopes
+        if scopes is None:  # not runnable as this identity: the gate refuses it
+            return super().missing_scopes(tool, config)
+        return super().missing_scopes(dataclasses.replace(tool, required_scopes=scopes), config)
 
     def available_tools(self, config: Mapping[str, Any] | None = None) -> list[ToolSpec]:
         """Core's listing hook: :meth:`tools_for`. Without a config that is

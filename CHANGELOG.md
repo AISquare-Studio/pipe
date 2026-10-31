@@ -5,10 +5,166 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-10-31
+
+The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and
+0.3.0. PyPI goes from `aisquare-pipe` 0.1.1 straight to 0.4.0, and 0.1.1 has
+no Toolkit API at all, so everything under 0.3.0 below is new on PyPI too.
+First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
+`-slack`, `-gmail` and `-googlecalendar` 0.1.0. Also uploaded:
+`aisquare-pipe-github` and `-onedrive` 0.3.0, and `aisquare-pipe-graphify`
+0.2.1.
 
 ### Added
 
+- **Router metadata on every native toolkit** — github, googledrive,
+  onedrive, slack, gmail and googlecalendar — so `catalogue()` returns six
+  cards and scope filtering works on all of them.
+  - **Cards.** Each sets `category` (`code`, `files`, `files`, `chat`,
+    `email`, `calendar`), `keywords` and 3-4 `examples` phrased as users ask.
+  - **Scopes.** Every tool carries `required_scopes`, and each toolkit's
+    `scope_granted` counts its provider's broader scopes:
+    - GitHub: `repo`, except `read:user`, `read:org` and `notifications`
+      for the profile, orgs and notifications. `repo` covers
+      `public_repo`/`notifications`, `user` covers `read:user`, and
+      `admin:org`/`write:org` cover `read:org`.
+    - Google Drive: `drive.readonly` to read and `drive` to write; `drive`
+      covers the rest. A 403 for a missing scope is `insufficient_scope`
+      (with `data.required_scopes`), as in Gmail and Calendar; any other
+      403 stays `forbidden`.
+    - OneDrive: `Files.Read.All` / `Files.ReadWrite.All`. Graph names
+      compare short and case-insensitively.
+    - Slack: its per-identity scope map, promoted. `required_scopes` holds
+      the user scopes (the bot ones for bot-only tools), and a bot
+      connection is checked against the bot scopes. Behaviour without
+      `granted_scopes` is unchanged.
+  - **Risk** follows each tool's flags (Slack: read → `read`, send and write
+    → `write`, destructive and edits → `destructive`).
+  - **GitHub grant revoke.** `GitHubToolkit.revoke_grant()` (`DELETE
+    /applications/{client_id}/grant`) removes the app from the user's GitHub
+    and ends every token they gave it, in every partition that shares the
+    app. Call it only on the user's explicit request to remove the app from
+    their GitHub, never on a disconnect or an account deletion while the app
+    is shared. `revoke_token` still revokes one connection's token and is
+    the routine path.
+  - **Google Drive OAuth.** `GOOGLEDRIVE_OAUTH` no longer sends
+    `include_granted_scopes=true`, like Gmail's and Calendar's specs. One
+    Google OAuth client can serve all three without a Drive token carrying
+    their scopes. Revoke stays grant-wide.
+  - **Versions.** `aisquare-pipe-github`, `-googledrive` and `-onedrive` go to
+    0.3.0. Slack, Gmail and Google Calendar stay at their unreleased 0.1.0.
+    All six need `aisquare-pipe>=0.4.0`.
+- **Router metadata in core** (`aisquare-pipe` 0.4.0), for a host that
+  picks connectors from short cards and then tools from the chosen ones. No
+  LLM or model dependency.
+  - **Connector cards.** `Toolkit` gains `category` (one of `CATEGORIES`:
+    code, files, email, calendar, chat, docs, project, crm, data, other;
+    default `other`), `keywords` and `examples` (2–4 short user asks), all
+    defaulted so existing toolkits are unchanged. The `Toolkit.card()`
+    classmethod returns `name`, `display_name`, `description`, `category`,
+    `keywords`, `examples` and `auth_type` from class attributes alone.
+  - **Per-tool scopes and risk.** `ToolSpec` gains `required_scopes` (all
+    needed; default none) and `risk` (`read` / `write` / `destructive`,
+    derived from `read_only` / `destructive` unless set, and re-derived by
+    `dataclasses.replace` when it was not set). An explicit `risk` may raise
+    the risk above the flags but not lower it: one below them, or not
+    `read` on a `read_only` tool, raises `ValueError`, also through
+    `dataclasses.replace`.
+    `ToolSpec.to_dict(metadata=True)` adds both; the default shape is
+    unchanged.
+  - **Scope-aware listing.** When `config["granted_scopes"]` is present (pass
+    the stored token's `OAuthToken.granted_scopes`; a list or a space/comma
+    string works too), the default `available_tools(config)` leaves out
+    tools whose `required_scopes` it doesn't grant, and `call_tool` refuses
+    them as `insufficient_scope` before any request. None or a blank string
+    means "not known" and filters nothing. A toolkit with broader scopes that imply narrower
+    ones overrides `scope_granted()`. Without the key nothing changes.
+  - **Cross-toolkit catalogue.** `catalogue()` returns one card per
+    installed toolkit, discovered once per process (`refresh=True` to
+    re-read; `installed_toolkits()` for the classes). The first discovery
+    imports the plugin modules, and their import-time side effects are the
+    plugins' own (urllib3 probes for IPv6), so a host that must stay offline
+    discovers once at startup. The
+    `search_tools_across(query, connectors)` function ranks tools across
+    several toolkits and returns `QualifiedTool(connector, tool)`; the pure
+    ranker is `rank_across()`. Toolkits whose slug prefixes collide (equal,
+    or one starting the other; see `slug_prefix_conflicts()`) are left out
+    of discovery with one warning, so one clashing pair cannot take down
+    the catalogue. `installed_toolkits(strict=True)` raises the new
+    `ToolkitConflictError` instead, and `pipe validate` fails on it.
+  - **Error codes.** `not_connected` (no usable credentials; nothing was
+    sent) and `insufficient_scope` (the token lacks a scope the call needs)
+    join `ERROR_CODES` and `ToolError`.
+    `error_code_for_status(status, www_authenticate=...)` maps a 403 with an
+    RFC 6750 `insufficient_scope` challenge to `insufficient_scope`.
+    `call_tool` does the same for an `HTTPError` raised from `run_tool`.
+  - **OAuth identity and grants.** `OAuthToken.granted_scopes` parses the
+    granted `scope` (space- or comma-separated; None when the provider
+    didn't say). `OAuthToken.account` is an `OAuthAccount` (`id`, `email`,
+    `name`, `tenant`), filled when the token response carries an OpenID
+    Connect `id_token` issued to this client. The claims are read but not
+    verified, so use them as a label. `to_dict()` adds `account` only when
+    it is known.
+  - **Compliance.** New toolkit contract checks: `contract.toolkit.card`,
+    `contract.toolkit.category`, `contract.toolkit.card-text`,
+    `contract.toolkit.tool-metadata` (scope strings, risk consistent with the
+    flags), `contract.toolkit.scopes-requested` (a warning) and, in
+    `pipe validate`, `contract.toolkit.slug-prefix-unique`.
+  - **CLI.** `pipe tools --json` rows add the card fields, and
+    `pipe tools <toolkit> --json` specs add `required_scopes` and `risk`.
+    Existing keys are unchanged.
+- **Gmail** (`aisquare-pipe-gmail` 0.1.0, first release): `GmailToolkit`
+  (`gmail`, 13 tools: 7 read, 6 write, 1 destructive) and `GMAIL_OAUTH`.
+  Slugs and argument names follow Composio's Gmail toolkit.
+  - **Tools.** Search and read messages and threads, attachments (returned
+    as a file envelope, like Google Drive downloads), labels and the profile;
+    drafts, sending and threaded replies (`In-Reply-To` / `References`, the
+    last sender by default); label changes (mark read, archive, star) and
+    trash. The label tools are `write` and refuse to add `TRASH` or `SPAM`:
+    trashing is `GMAIL_MOVE_TO_TRASH`, the destructive tool.
+  - **MIME.** Messages are built with the standard library's `email`
+    package (RFC 2047 headers, an HTML body with a text alternative,
+    attachments, header-injection and address checks); large messages go as
+    one multipart upload. Header values, recipient display names included,
+    refuse every control character but tab (sent as a space) and every
+    Unicode line break. Encoded-words in display names, the subject,
+    `In-Reply-To` and `References` are decoded and checked before use (an
+    undecodable or doubly encoded one is refused), so an encoded CRLF can't
+    add a header on Pythons without the CVE-2024-6923 fix; replies take
+    their threading ids from the inbound mail as checked msg-ids only.
+    Read messages come back with `messageText` (plain text preferred, HTML
+    converted, charsets honoured) and `attachmentList`.
+  - **Least privilege.** Read-only consent by default (`gmail.readonly`);
+    each write tool names the scopes it needs (`gmail.compose`, `gmail.send`,
+    `gmail.modify`; plus `gmail.readonly` for the tools that read the thread
+    they answer) in `ToolSpec.required_scopes` and its description.
+    `scope_granted` counts Google's broader scopes (`https://mail.google.com/`,
+    `gmail.modify` over read/compose/send, `gmail.compose` over send).
+- **Google Calendar** (`aisquare-pipe-googlecalendar` 0.1.0, first
+  release): `GoogleCalendarToolkit` (`googlecalendar`, 14 tools: 10 read,
+  4 write, 2 of them destructive) and `GOOGLECALENDAR_OAUTH`. Slugs and argument
+  names follow Composio's Google Calendar toolkit.
+  - **Tools.** Calendars, events (by range and text, expanded or not),
+    recurring-event instances, events across every calendar, free/busy and
+    free slots, the current time in a zone; create, update (a patch that
+    keeps unmentioned fields and converts all-day <-> timed), quick-add and
+    delete events. Update is destructive like delete: `attendees` and
+    `recurrence` replace the whole list (CONTRIBUTING: an edit that
+    overwrites is destructive, in every toolkit).
+  - **Time zones.** Times without an offset are read in the given zone or
+    the calendar's own; query bounds get the zone's offset for that date
+    (daylight saving included); event times stay wall-clock with an IANA
+    zone so recurring events expand correctly.
+  - **Least privilege.** Read-only consent by default (`calendar.readonly`);
+    writes need `calendar.events`, and create and update also
+    `calendar.readonly` (they read the calendar's time zone and the event)
+    (`ToolSpec.required_scopes`; the full `calendar` scope covers both).
+- Both Google toolkits need `aisquare-pipe>=0.4.0`. They tell a 403 for a
+  missing OAuth scope apart from other 403s and return core's
+  `insufficient_scope` (with `data.insufficient_scope` and
+  `data.required_scopes`). Their OAuth specs omit `include_granted_scopes`,
+  so one Google OAuth client can serve Drive, Gmail and Calendar without one
+  connector's token carrying another's scopes.
 - **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
   (`slack`, 111 tools: 47 read, 6 send, 38 write, 20 destructive),
   `SLACK_OAUTH`, `SlackMessageSink` (`slack-message-sink`) and Events API
@@ -59,10 +215,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `app_uninstalled`.
     - `event_to_envelope` maps events to Composio's trigger names. The app's
       own posts get no trigger.
-  - **Packaging.** It requires `aisquare-pipe>=0.3.0`, `requests` and
+  - **Packaging.** It requires `aisquare-pipe>=0.4.0`, `requests` and
     `urllib3`. It ships an app manifest template and joins `[full]`.
 
-## [0.3.0] - 2026-10-15
+### Changed
+
+- `Toolkit.call_tool` now reports a config with no usable credentials
+  (`validate_config` false) as `not_connected` instead of `unauthorized`.
+  `unauthorized` now means only that the provider rejected the credentials.
+  Hosts that branched on `unauthorized` to prompt a first connection should
+  branch on `not_connected` as well.
+
+## [0.3.0] - 2026-10-15 [NOT PUBLISHED]
+
+Never published to PyPI and never tagged. Its changes first ship on PyPI in
+0.4.0 above (`aisquare-pipe-graphify` 0.2.1 too).
 
 ### Added
 
@@ -207,8 +374,7 @@ Initial public release.
 - Install extras: `[popular]`, `[full]`, and per-connector packages
   (`aisquare-pipe-<service>`).
 
-[Unreleased]: https://github.com/AISquare-Studio/pipe/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...v0.3.0
+[0.4.0]: https://github.com/AISquare-Studio/pipe/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/AISquare-Studio/pipe/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/AISquare-Studio/pipe/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/AISquare-Studio/pipe/releases/tag/v0.1.0

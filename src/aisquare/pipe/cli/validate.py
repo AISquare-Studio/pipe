@@ -199,15 +199,28 @@ def _discover_entry_points() -> list[DiscoveredConnector]:
     return discover_connector_entry_points() + discover_toolkit_entry_points()
 
 
+def _installed_toolkits(discovered: list[DiscoveredConnector]) -> dict[str, type]:
+    """Every loaded toolkit entry point, name -> class (for the cross-toolkit
+    slug-prefix check)."""
+    return {d.ep_name: d.cls for d in discovered if d.is_toolkit and d.cls is not None}
+
+
 def _contract_layer(
-    discovered: list[DiscoveredConnector], dist_name: str | None
+    discovered: list[DiscoveredConnector],
+    dist_name: str | None,
+    installed: dict[str, type] | None = None,
 ) -> LayerReport:
+    if installed is None:
+        installed = _installed_toolkits(discovered)
     checks: list[CheckResult] = []
     for d in discovered:
         if d.dist_name != dist_name or d.cls is None:
             continue
-        run_checks = run_toolkit_contract_checks if d.is_toolkit else run_contract_checks
-        for check in run_checks(d.cls, d.ep_name):
+        if d.is_toolkit:
+            found = run_toolkit_contract_checks(d.cls, d.ep_name, installed=installed)
+        else:
+            found = run_contract_checks(d.cls, d.ep_name)
+        for check in found:
             # Attribute each check to its entry point for the report.
             check.id = f"{check.id}@{d.ep_name}" if "@" not in check.id else check.id
             checks.append(check)
@@ -388,7 +401,7 @@ def validate_installed_only(
             for d in eps
             if d.load_error
         ]
-        report.contract = _contract_layer(eps, dist_name)
+        report.contract = _contract_layer(eps, dist_name, _installed_toolkits(discovered))
         if load_failures:
             report.contract.checks.extend(load_failures)
             report.contract.status = STATUS_FAIL

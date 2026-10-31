@@ -128,9 +128,9 @@ def test_argument_errors_are_invalid_arguments(slug, args, answers):
     assert len(h.session.calls) == len(answers)
 
 
-def test_missing_credentials_are_unauthorized():
+def test_missing_credentials_are_not_connected():
     result = harness().call("GITHUB_GET_THE_AUTHENTICATED_USER", {}, config={})
-    assert result.error_code == "unauthorized"
+    assert result.error_code == "not_connected"
 
 
 def test_unknown_slug():

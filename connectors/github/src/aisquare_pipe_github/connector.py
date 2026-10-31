@@ -24,7 +24,7 @@ class GitHubRepoSource(SourceConnector):
     """
 
     name = "github"  # config-dict key (class attr, NOT the entry-point name)
-    version = "0.2.0"
+    version = "0.3.0"
     output_types = [CHECKOUT_CONTENT_TYPE]  # noqa: RUF012 — framework contract: class-level spec, never mutated
     auth_type = AuthType.API_KEY
     description = "Single-repo shallow checkout source for GitHub."

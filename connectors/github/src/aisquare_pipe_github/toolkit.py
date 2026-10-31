@@ -28,8 +28,14 @@ from aisquare_pipe_github.rest import (
     GitHubAPIError,
     GitHubRestClient,
     revoke_access_token,
+    revoke_grant,
 )
-from aisquare_pipe_github.tools import HANDLERS, TOOL_SPECS, normalize_arguments
+from aisquare_pipe_github.tools import (
+    COVERING_SCOPES,
+    HANDLERS,
+    TOOL_SPECS,
+    normalize_arguments,
+)
 
 #: A GitHub OAuth App. Its tokens do not expire and come without a refresh
 #: token; GitHub answers the token endpoint form-encoded unless asked for
@@ -125,7 +131,7 @@ class GitHubToolkit(Toolkit):
     """
 
     name = "github"
-    version = "0.2.0"
+    version = "0.3.0"
     display_name = "GitHub"
     description = (
         "GitHub repositories, code search and file contents, issues, pull requests and "
@@ -134,6 +140,17 @@ class GitHubToolkit(Toolkit):
     auth_type = AuthType.OAUTH2
     oauth = GITHUB_OAUTH
     docs_url = "https://docs.github.com/en/rest"
+    category = "code"
+    keywords = (
+        "github", "repo", "repository", "code", "pull request", "PR", "review", "issue", "bug",
+        "commit", "branch", "release", "actions", "CI", "workflow run", "notifications",
+    )
+    examples = (
+        "my open PRs",
+        "issues assigned to me in the api repo",
+        "what changed in the last commit on main",
+        "open an issue about the login bug",
+    )
 
     def __init__(
         self,
@@ -174,6 +191,33 @@ class GitHubToolkit(Toolkit):
             sleep=self._sleep,
         )
 
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``, counting GitHub's scope
+        hierarchy: ``repo`` covers ``public_repo`` and ``notifications``,
+        ``user`` covers ``read:user``, ``admin:org`` / ``write:org`` cover
+        ``read:org``."""
+        return scope in granted or not COVERING_SCOPES.get(scope, frozenset()).isdisjoint(granted)
+
+    def revoke_grant(self, *, client_id: str, client_secret: str | None, token: str) -> bool:
+        """Remove the app from the user's GitHub account
+        (``DELETE /applications/{client_id}/grant``): every token that GitHub
+        user granted this app dies — the user's other connections to it as
+        well, in every partition that shares the app — and the app leaves their
+        authorized OAuth apps. Only for the user's explicit request to remove
+        the app from their GitHub; never on a disconnect or an account deletion
+        while the app is shared, since other partitions may hold tokens of the
+        same grant. The routine path is :meth:`revoke_token`. ``token`` is any
+        live token of the grant. False without a client secret (nothing is
+        sent). Never raises."""
+        if not client_secret:
+            return False
+        return revoke_grant(
+            client_id=client_id,
+            client_secret=client_secret,
+            access_token=token,
+            session=self._session,
+        )
+
     def revoke_token(
         self,
         *,
@@ -185,8 +229,9 @@ class GitHubToolkit(Toolkit):
         """Disconnect: revoke this connection's access token
         (``DELETE /applications/{client_id}/token``). Only this token dies;
         revoking the whole grant would also break every other connection the
-        same GitHub user made to this app. GitHub has no RFC 7009 endpoint,
-        and ``token_type_hint`` does not apply. Never raises."""
+        same GitHub user made to this app (that is :meth:`revoke_grant`).
+        GitHub has no RFC 7009 endpoint, and ``token_type_hint`` does not
+        apply. Never raises."""
         if not client_secret:
             return False
         return revoke_access_token(
