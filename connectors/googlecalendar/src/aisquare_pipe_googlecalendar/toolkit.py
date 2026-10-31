@@ -98,6 +98,17 @@ class GoogleCalendarToolkit(Toolkit):
     auth_type = AuthType.OAUTH2
     oauth = GOOGLECALENDAR_OAUTH
     docs_url = "https://developers.google.com/calendar/api/v3/reference"
+    category = "calendar"
+    keywords = (
+        "google calendar", "calendar", "gcal", "event", "meeting", "schedule", "agenda",
+        "availability", "free time", "busy", "invite", "reschedule", "recurring", "appointment",
+    )
+    examples = (
+        "what's on my calendar Friday",
+        "when am I free tomorrow afternoon",
+        "schedule a 30 minute call with Ann on Tuesday",
+        "move my 3pm meeting to 4",
+    )
 
     def __init__(
         self,

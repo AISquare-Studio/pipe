@@ -88,6 +88,17 @@ class TestCatalog:
                 assert scope.rsplit("/", 1)[-1] in tool.description, tool.slug
 
 
+class TestCard:
+    def test_card(self):
+        from aisquare.pipe import CATEGORIES
+
+        card = GmailToolkit.card()
+        assert (card["name"], card["category"]) == ("gmail", "email")
+        assert card["category"] in CATEGORIES
+        assert 2 <= len(card["examples"]) <= 4
+        assert {"gmail", "email", "inbox"} <= set(card["keywords"])
+
+
 class TestScopes:
     def test_default_consent_is_read_only(self):
         assert GMAIL_OAUTH.default_scopes == (READONLY_SCOPE,)
