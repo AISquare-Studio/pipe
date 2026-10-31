@@ -42,6 +42,8 @@ Each connector is its own independently published pip package under `connectors/
 | Composio | `aisquare-pipe-composio` |   | ✓ |
 | GitHub | `aisquare-pipe-github` |   | ✓ |
 | Slack | `aisquare-pipe-slack` |   | ✓ |
+| Gmail | `aisquare-pipe-gmail` |   | ✓ |
+| Google Calendar | `aisquare-pipe-googlecalendar` |   | ✓ |
 
 Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 

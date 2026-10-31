@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aisquare-pipe-googlecalendar"
+version = "0.1.0"
+description = "Google Calendar toolkit (events, recurring instances, free/busy, free slots, create/update/delete) for aisquare.pipe"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "AISquare Studio"}]
+dependencies = [
+    "aisquare-pipe>=0.4.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "types-requests"]
+
+[project.entry-points."aisquare_pipe.toolkits"]
+googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff.lint.isort]
+# Same import grouping whatever directory ruff runs from (the repo root sees
+# src/aisquare as first-party otherwise).
+known-first-party = ["aisquare_pipe_googlecalendar"]
+known-third-party = ["aisquare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
