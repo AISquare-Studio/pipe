@@ -169,11 +169,11 @@ class TestLabels:
     def test_label_lookup_happens_once(self):
         h = harness(
             response(200, {"labels": [{"id": "Label_1", "name": "A"}, {"id": "Label_2", "name": "B"}]}),
-            response(200, {"labels": [{"id": "Label_1", "name": "A"}, {"id": "Label_2", "name": "B"}]}),
             response(200, {"id": "m1"}),
         )
         h.call("GMAIL_ADD_LABEL_TO_EMAIL", {"message_id": "m1", "add_label_ids": ["A"], "remove_label_ids": ["B"]})
-        assert [c.path for c in h.session.calls] == ["/me/labels", "/me/labels", "/me/messages/m1/modify"]
+        assert [c.path for c in h.session.calls] == ["/me/labels", "/me/messages/m1/modify"]
+        assert h.session.last.json == {"addLabelIds": ["Label_1"], "removeLabelIds": ["Label_2"]}
 
     def test_json_encoded_list(self):
         h = harness(response(200, {"id": "t1", "messages": [{"id": "m1", "labelIds": []}, {"id": "m2", "labelIds": []}]}))

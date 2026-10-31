@@ -280,9 +280,17 @@ def _string_list(value: Any, what: str) -> list[str]:
     return [v.strip() for v in value if v.strip()]
 
 
-def _resolve_labels(client: GmailRestClient, user: str, values: list[str], what: str) -> list[str]:
+def _resolve_labels(
+    client: GmailRestClient,
+    user: str,
+    values: list[str],
+    what: str,
+    known: dict[str, str] | None = None,
+) -> list[str]:
     """Label ids for ``values``: system labels (any case) and ``Label_<n>``
-    ids pass through; anything else is looked up by exact name (case-insensitive)."""
+    ids pass through; anything else is looked up by exact name
+    (case-insensitive). ``known`` caches the mailbox's labels (lower-cased
+    name -> id) across calls in one tool call."""
     ids: list[str] = []
     pending: list[tuple[int, str]] = []
     for index, value in enumerate(values):
@@ -294,8 +302,12 @@ def _resolve_labels(client: GmailRestClient, user: str, values: list[str], what:
             ids.append("")
             pending.append((index, value))
     if pending:
-        labels = json_object(client.get(f"/{user}/labels")).get("labels") or []
-        by_name = {str(label.get("name", "")).lower(): str(label.get("id")) for label in labels if isinstance(label, dict)}
+        by_name = known if known is not None else {}
+        if not by_name:
+            labels = json_object(client.get(f"/{user}/labels")).get("labels") or []
+            by_name.update(
+                (str(label.get("name", "")).lower(), str(label.get("id"))) for label in labels if isinstance(label, dict)
+            )
         known_ids = set(by_name.values())
         for index, value in pending:
             label_id = value if value in known_ids else by_name.get(value.lower())
@@ -774,10 +786,11 @@ def _label_change(client: GmailRestClient, user: str, args: dict[str, Any]) -> d
     if not add and not remove:
         raise _invalid("give add_label_ids or remove_label_ids")
     body: dict[str, Any] = {}
+    known: dict[str, str] = {}
     if add:
-        body["addLabelIds"] = _resolve_labels(client, user, add, "add_label_ids")
+        body["addLabelIds"] = _resolve_labels(client, user, add, "add_label_ids", known)
     if remove:
-        body["removeLabelIds"] = _resolve_labels(client, user, remove, "remove_label_ids")
+        body["removeLabelIds"] = _resolve_labels(client, user, remove, "remove_label_ids", known)
     return body
 
 
