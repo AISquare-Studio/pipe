@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "types-requests"]
+dev = ["pytest>=9.2.0", "pytest-cov", "ruff", "mypy", "types-requests"]
 
 [project.entry-points."aisquare_pipe.connectors"]
 github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
