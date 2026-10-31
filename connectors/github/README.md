@@ -182,7 +182,7 @@ fail on private repositories.
 | PKCE | on (`pkce=True`, S256; GitHub does not support `plain`). Build the authorize URL with `code_challenge`, and exchange with the matching `code_verifier`, both from core's `make_pkce_pair()`. Core refuses either step without them. The client secret is still sent, because GitHub requires it for OAuth Apps |
 | expiry | none: OAuth App tokens do not expire and carry no refresh token (`token_expires=False`) |
 | disconnect | `GitHubToolkit.revoke_token` → `DELETE /applications/{client_id}/token` (HTTP Basic `client_id:client_secret`), which revokes only this connection's token. The app stays in the user's GitHub *Authorized OAuth Apps* list until they remove it there |
-| remove the app | `GitHubToolkit.revoke_grant` → `DELETE /applications/{client_id}/grant` (same auth, any live token of the grant): every token that GitHub user gave the app dies — **their other AISquare connections too** — and the app leaves their *Authorized OAuth Apps*. For "remove AISquare from my GitHub" or account deletion, not a routine disconnect |
+| remove the app | `GitHubToolkit.revoke_grant` → `DELETE /applications/{client_id}/grant` (same auth, any live token of the grant): every token that GitHub user gave the app dies — **their other AISquare connections too** — and the app leaves their *Authorized OAuth Apps*. Only on the user's explicit request to remove the app from their GitHub. Never on a disconnect or an account deletion while the app is shared: another partition may hold tokens of the same grant. `revoke_token` is the routine path |
 
 Run the flow with the toolkit's `build_authorize_url` / `exchange_code` /
 `revoke_token`. Core handles GitHub's form-encoded token response and its

@@ -202,10 +202,13 @@ class GitHubToolkit(Toolkit):
         """Remove the app from the user's GitHub account
         (``DELETE /applications/{client_id}/grant``): every token that GitHub
         user granted this app dies — the user's other connections to it as
-        well — and the app leaves their authorized OAuth apps. For "remove
-        AISquare from my GitHub" or account deletion; a plain disconnect is
-        :meth:`revoke_token`. ``token`` is any live token of the grant. False
-        without a client secret (nothing is sent). Never raises."""
+        well, in every partition that shares the app — and the app leaves their
+        authorized OAuth apps. Only for the user's explicit request to remove
+        the app from their GitHub; never on a disconnect or an account deletion
+        while the app is shared, since other partitions may hold tokens of the
+        same grant. The routine path is :meth:`revoke_token`. ``token`` is any
+        live token of the grant. False without a client secret (nothing is
+        sent). Never raises."""
         if not client_secret:
             return False
         return revoke_grant(
