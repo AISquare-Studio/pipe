@@ -128,7 +128,8 @@ a different id for the same attachment on each read, and every one works.
 library's `email` package. Recipients may be `a@x.co`, `Ann <a@x.co>` or
 comma-separated lists; anything else is refused, as is a header value
 (display names included) with a line break, any other control character, DEL
-or a Unicode line separator. A display name sent RFC 2047-encoded
+or a Unicode line separator. A tab is whitespace: it is sent as a space. A
+display name sent RFC 2047-encoded
 (`=?utf-8?…?=`) is decoded and checked the same way. Non-ASCII subjects and
 names are RFC 2047-encoded. `is_html`
 sends HTML with a plain-text alternative. `attachment` is

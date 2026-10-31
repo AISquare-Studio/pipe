@@ -177,7 +177,7 @@ class TestHeaderInjection:
     def test_control_characters_in_a_display_name(self, char):
         self._refused({"recipient_email": f'"Ann{char}Bcc: evil@x.co" <a@x.co>'})
 
-    @pytest.mark.parametrize("char", ["\x00", "\x7f", "\x0b", "\u2028"])
+    @pytest.mark.parametrize("char", ["\x00", "\x7f", "\x0b", "\x0c", "\x85", "\u2028", "\u2029"])
     def test_control_characters_in_the_subject(self, char):
         self._refused({"recipient_email": "a@x.co", "subject": f"Hi{char}there"})
 
@@ -222,10 +222,34 @@ class TestHeaderInjection:
         monkeypatch.setattr(tools, "build_message", refuse)
         self._refused({"recipient_email": "a@x.co"})
 
-    @pytest.mark.parametrize("value", ["Ann\tLee <a@x.co>", "a@x.co\x00"])
+    @pytest.mark.parametrize("value", ["Ann\x0bLee <a@x.co>", "Ann\x0cLee <a@x.co>", "a@x.co\x00"])
     def test_parse_addresses_refuses_control_characters(self, value):
         with pytest.raises(ValueError, match="control characters"):
             mime.parse_addresses([value], "to")
+
+    # HTAB is RFC 5322 whitespace, not a control to refuse: it becomes a space.
+    def test_a_tabbed_subject_is_sent_with_spaces(self):
+        h = harness(response(200, SENT))
+        assert h.call("GMAIL_SEND_EMAIL", {"recipient_email": "a@x.co", "subject": "Q3\tplan\t\tdraft", "body": "x"}).successful
+        assert email.message_from_bytes(raw_message(h.session.last), policy=email.policy.default)["Subject"] == "Q3 plan  draft"
+        assert b"\t" not in raw_message(h.session.last).split(b"\r\n\r\n", 1)[0]
+
+    @pytest.mark.parametrize(
+        "recipient", ["Ann\tLee <a@x.co>", '"Ann\tLee" <a@x.co>', "=?utf-8?q?Ann=09Lee?= <a@x.co>"]
+    )
+    def test_a_tab_in_a_display_name_becomes_a_space(self, recipient):
+        # Checked before the stdlib, whose reparse would fold the tab anyway.
+        assert mime.parse_addresses([recipient], "to")[0].display_name == "Ann Lee"
+        h = harness(response(200, SENT))
+        assert h.call("GMAIL_SEND_EMAIL", {"recipient_email": recipient, "body": "x"}).successful
+        headers = raw_message(h.session.last).split(b"\r\n\r\n", 1)[0]
+        assert b"\t" not in headers and b"To: Ann Lee <a@x.co>" in headers
+
+    @pytest.mark.parametrize("code", [c for c in range(0x20) if c != 0x09] + [0x7F, 0x85, 0x2028, 0x2029])
+    def test_check_header_refuses_every_other_control(self, code):
+        assert mime.check_header("a\tb", "subject") == "a b"
+        with pytest.raises(ValueError, match="control characters"):
+            mime.check_header(f"a{chr(code)}b", "subject")
 
 
 class TestRead:

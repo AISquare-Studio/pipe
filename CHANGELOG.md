@@ -126,8 +126,9 @@ First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
     package (RFC 2047 headers, an HTML body with a text alternative,
     attachments, header-injection and address checks); large messages go as
     one multipart upload. Header values, recipient display names included,
-    refuse every control character and Unicode line break, and an
-    encoded-word display name is decoded and checked before use. Read messages come back with `messageText` (plain
+    refuse every control character but tab (sent as a space) and every
+    Unicode line break, and an encoded-word display name is decoded and
+    checked before use. Read messages come back with `messageText` (plain
     text preferred, HTML converted, charsets honoured) and `attachmentList`.
   - **Least privilege.** Read-only consent by default (`gmail.readonly`);
     each write tool names the scopes it needs (`gmail.compose`, `gmail.send`,

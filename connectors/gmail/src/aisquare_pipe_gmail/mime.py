@@ -5,7 +5,8 @@ Building uses the standard library's :class:`email.message.EmailMessage`
 under the SMTP policy: non-ASCII subjects and names are RFC 2047-encoded,
 bodies get a fitting transfer encoding, and an HTML body also carries a
 plain-text alternative. Header values with a line break or another control
-character are refused (header injection), as are recipients that are not
+character are refused (header injection; a tab is whitespace and becomes a
+space), as are recipients that are not
 ``name@domain`` addresses. Encoded-word display names are decoded and checked
 the same way.
 
@@ -39,9 +40,10 @@ from aisquare_pipe_gmail.rest import decode_base64url
 TEXT_MAX = 20_000
 
 _ADDR_SPEC = re.compile(r"^[^@\s<>()\[\]\\,;:\"]+@[^@\s<>()\[\]\\,;:\"]+$")
-#: Never allowed in a header value: every C0 control (CR, LF, NUL, VT, FF, the
-#: FS/GS/RS separators...), DEL, and the line breaks str.splitlines() knows.
-_HEADER_UNSAFE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+#: Never allowed in a header value: every C0 control but HTAB (CR, LF, NUL, VT,
+#: FF, the FS/GS/RS separators...), DEL, and the line breaks str.splitlines()
+#: knows. HTAB is RFC 5322 whitespace: check_header turns it into a space.
+_HEADER_UNSAFE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
 _ENCODED_WORD = re.compile(r"=\?[^?]*\?[bBqQ]\?[^?]*\?=")
 _BLOCK_TAGS = frozenset(
     {
@@ -67,11 +69,12 @@ class Attachment:
 
 
 def check_header(value: str, what: str) -> str:
-    """``value`` for a header; ValueError when it carries a line break (CR,
-    LF or a Unicode line separator), any other C0 control character, or DEL."""
+    """``value`` for a header, each tab (HTAB, whitespace in RFC 5322) turned
+    into a single space; ValueError when it carries a line break (CR, LF or a
+    Unicode line separator), any other C0 control character, or DEL."""
     if _HEADER_UNSAFE.search(value):
         raise ValueError(f"{what} must not contain line breaks or control characters")
-    return value
+    return value.replace("\t", " ")
 
 
 def _display_name(name: str, what: str) -> str:
@@ -88,7 +91,7 @@ def _display_name(name: str, what: str) -> str:
         decoded = str(make_header(decode_header(name)))
     except (HeaderParseError, LookupError, UnicodeError, ValueError):
         raise ValueError(f"{what} has a display name that can't be decoded") from None
-    check_header(decoded, what)
+    decoded = check_header(decoded, what)
     if _ENCODED_WORD.search(decoded):
         raise ValueError(f"{what} has a display name encoded more than once")
     return decoded
