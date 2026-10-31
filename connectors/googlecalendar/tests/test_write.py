@@ -262,6 +262,14 @@ class TestDelete:
         spec = GoogleCalendarToolkit().get_tool("GOOGLECALENDAR_DELETE_EVENT")
         assert spec is not None and spec.destructive and not spec.read_only
 
+    def test_update_is_destructive(self):
+        # attendees/recurrence replace the whole list: an update can cancel
+        # meetings, like GITHUB_UPDATE_AN_ISSUE or SLACK_UPDATES_A_SLACK_MESSAGE.
+        from aisquare_pipe_googlecalendar import GoogleCalendarToolkit
+
+        spec = GoogleCalendarToolkit().get_tool("GOOGLECALENDAR_UPDATE_EVENT")
+        assert spec is not None and spec.risk == "destructive" and not spec.read_only
+
 
 class TestFreeBusy:
     def test_query(self):

@@ -1341,6 +1341,9 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         "update", "change", "reschedule", "move", "edit", "rename", "event", "meeting",
         scopes=_READ_WRITE,
         aliases={"title": "summary", "start_time": "start_datetime", "end_time": "end_datetime", "time_zone": "timezone"},
+        # It overwrites: attendees and recurrence replace the whole list, so an
+        # update can cancel meetings (guests notified) or cut a series short.
+        destructive=True,
     ),
     _write(
         "GOOGLECALENDAR_QUICK_ADD",
