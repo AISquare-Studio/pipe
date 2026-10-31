@@ -44,6 +44,8 @@ logger = logging.getLogger("aisquare.pipe.googledrive")
 #: A Google OAuth 2.0 web client. ``access_type=offline`` + ``prompt=consent``
 #: make Google return a refresh token on every consent (not only the first);
 #: access tokens expire after an hour. Google does not rotate refresh tokens.
+#: No ``include_granted_scopes``: one OAuth client may serve Drive, Gmail and
+#: Calendar, and a Drive token must carry Drive's scopes only.
 GOOGLEDRIVE_OAUTH = OAuthSpec(
     provider="google",
     authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
@@ -53,7 +55,6 @@ GOOGLEDRIVE_OAUTH = OAuthSpec(
     extra_authorize_params={
         "access_type": "offline",
         "prompt": "consent",
-        "include_granted_scopes": "true",
     },
     pkce=True,
     token_expires=True,

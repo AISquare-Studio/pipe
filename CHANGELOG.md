@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     /applications/{client_id}/grant`) removes the app from the user's GitHub
     and ends every token they gave it. `revoke_token` still revokes one
     connection's token.
+  - **Google Drive OAuth.** `GOOGLEDRIVE_OAUTH` no longer sends
+    `include_granted_scopes=true`, like Gmail's and Calendar's specs. One
+    Google OAuth client can serve all three without a Drive token carrying
+    their scopes. Revoke stays grant-wide.
   - **Versions.** `aisquare-pipe-github`, `-googledrive` and `-onedrive` go to
     0.3.0. Slack, Gmail and Google Calendar stay at their unreleased 0.1.0.
     All six need `aisquare-pipe>=0.4.0`.
