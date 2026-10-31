@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Router metadata in core** (`aisquare-pipe` 0.4.0), for a host that
+  picks connectors from short cards and then tools from the chosen ones. No
+  LLM or model dependency.
+  - **Connector cards.** `Toolkit` gains `category` (one of `CATEGORIES`:
+    code, files, email, calendar, chat, docs, project, crm, data, other;
+    default `other`), `keywords` and `examples` (2–4 short user asks), all
+    defaulted so existing toolkits are unchanged. The `Toolkit.card()`
+    classmethod returns `name`, `display_name`, `description`, `category`,
+    `keywords`, `examples` and `auth_type` from class attributes alone.
+  - **Per-tool scopes and risk.** `ToolSpec` gains `required_scopes` (all
+    needed; default none) and `risk` (`read` / `write` / `destructive`,
+    derived from `read_only` / `destructive` unless set).
+    `ToolSpec.to_dict(metadata=True)` adds both; the default shape is
+    unchanged.
+  - **Scope-aware listing.** When `config["granted_scopes"]` is present (a
+    list, or the stored space/comma-separated scope string), the default
+    `available_tools(config)` leaves out tools whose `required_scopes` it
+    doesn't grant, and `call_tool` refuses them as `insufficient_scope`
+    before any request. A toolkit with broader scopes that imply narrower
+    ones overrides `scope_granted()`. Without the key nothing changes.
+  - **Cross-toolkit catalogue.** `catalogue()` returns one card per
+    installed toolkit, discovered once per process (`refresh=True` to
+    re-read; `installed_toolkits()` for the classes). The
+    `search_tools_across(query, connectors)` function ranks tools across
+    several toolkits and returns `QualifiedTool(connector, tool)`; the pure
+    ranker is `rank_across()`. Discovery raises the new
+    `ToolkitConflictError` when two installed toolkits' slug prefixes
+    collide (equal, or one starting the other); see
+    `slug_prefix_conflicts()`.
+  - **Error codes.** `not_connected` (no usable credentials; nothing was
+    sent) and `insufficient_scope` (the token lacks a scope the call needs)
+    join `ERROR_CODES` and `ToolError`.
+    `error_code_for_status(status, www_authenticate=...)` maps a 403 with an
+    RFC 6750 `insufficient_scope` challenge to `insufficient_scope`.
+    `call_tool` does the same for an `HTTPError` raised from `run_tool`.
+  - **OAuth identity and grants.** `OAuthToken.granted_scopes` parses the
+    granted `scope` (space- or comma-separated; None when the provider
+    didn't say). `OAuthToken.account` is an `OAuthAccount` (`id`, `email`,
+    `name`, `tenant`), filled when the token response carries an OpenID
+    Connect `id_token` issued to this client. The claims are read but not
+    verified, so use them as a label. `to_dict()` adds `account` only when
+    it is known.
+  - **Compliance.** New toolkit contract checks: `contract.toolkit.card`,
+    `contract.toolkit.category`, `contract.toolkit.card-text`,
+    `contract.toolkit.tool-metadata` (scope strings, risk consistent with the
+    flags), `contract.toolkit.scopes-requested` (a warning) and, in
+    `pipe validate`, `contract.toolkit.slug-prefix-unique`.
+  - **CLI.** `pipe tools --json` rows add the card fields, and
+    `pipe tools <toolkit> --json` specs add `required_scopes` and `risk`.
+    Existing keys are unchanged.
+
 - **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
   (`slack`, 111 tools: 47 read, 6 send, 38 write, 20 destructive),
   `SLACK_OAUTH`, `SlackMessageSink` (`slack-message-sink`) and Events API
@@ -61,6 +112,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       own posts get no trigger.
   - **Packaging.** It requires `aisquare-pipe>=0.3.0`, `requests` and
     `urllib3`. It ships an app manifest template and joins `[full]`.
+
+### Changed
+
+- `Toolkit.call_tool` now reports a config with no usable credentials
+  (`validate_config` false) as `not_connected` instead of `unauthorized`.
+  `unauthorized` now means only that the provider rejected the credentials.
+  Hosts that branched on `unauthorized` to prompt a first connection should
+  branch on `not_connected` as well.
 
 ## [0.3.0] - 2026-10-15
 
