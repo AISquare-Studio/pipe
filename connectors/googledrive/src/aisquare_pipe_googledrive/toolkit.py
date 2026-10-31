@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import requests
 from aisquare.pipe import (
+    ERROR_INSUFFICIENT_SCOPE,
     ERROR_RATE_LIMITED,
     ERROR_TIMEOUT,
     ERROR_UPSTREAM_ERROR,
@@ -61,8 +62,9 @@ GOOGLEDRIVE_OAUTH = OAuthSpec(
 )
 
 
-def describe_error(error: GoogleDriveAPIError) -> str:
-    """``"<status>: <Google's message>"`` plus what the caller should do."""
+def describe_error(error: GoogleDriveAPIError, scopes: Iterable[str] = ()) -> str:
+    """``"<status>: <Google's message>"`` plus what the caller should do;
+    ``scopes`` are the tool's, named when Google says one is missing."""
     if not error.status:
         return error.message
     text = f"{error.status}: {error.message}"
@@ -75,6 +77,13 @@ def describe_error(error: GoogleDriveAPIError) -> str:
         seconds = whole_seconds(error.retry_after)
         when = f"in about {seconds:.0f}s" if seconds is not None else "later"
         return f"{text} — Google Drive rate limit; retry {when}"
+    if error.status == 403 and error.insufficient_scope:
+        needed = ", ".join(s.rsplit("/", 1)[-1] for s in scopes)
+        return (
+            f"{text} — this Google Drive connection was not granted the access this tool needs"
+            + (f" ({needed})" if needed else "")
+            + "; reconnect Google Drive and approve it"
+        )
     if error.status == 403:
         return (
             f"{text} — this Google Drive connection is not allowed to do that (missing scope, "
@@ -88,8 +97,9 @@ def describe_error(error: GoogleDriveAPIError) -> str:
 def error_code(error: GoogleDriveAPIError) -> str:
     """The canonical ``ToolResult.error_code`` for a Drive failure: rate
     limits (429, or a 403 with reason ``rateLimitExceeded`` /
-    ``userRateLimitExceeded``) are ``rate_limited`` and client-side timeouts
-    ``timeout``; HTTP statuses map through core's ``error_code_for_status``
+    ``userRateLimitExceeded``) are ``rate_limited``, a 403 for a missing
+    OAuth scope is ``insufficient_scope`` (as in Gmail and Calendar) and
+    client-side timeouts ``timeout``; HTTP statuses map through core's ``error_code_for_status``
     (401 unauthorized, any other 403 forbidden, 404 not_found, 400
     invalid_arguments, 409/412 conflict, ...); network failures and 5xx are
     ``upstream_error``."""
@@ -99,6 +109,8 @@ def error_code(error: GoogleDriveAPIError) -> str:
         return ERROR_TIMEOUT
     if not error.status:
         return ERROR_UPSTREAM_ERROR
+    if error.status == 403 and error.insufficient_scope:
+        return ERROR_INSUFFICIENT_SCOPE
     return error_code_for_status(error.status)
 
 
@@ -110,17 +122,21 @@ def whole_seconds(value: float | None) -> float | None:
     return float(math.ceil(value))
 
 
-def failure(error: GoogleDriveAPIError) -> ToolResult:
+def failure(error: GoogleDriveAPIError, scopes: Iterable[str] = ()) -> ToolResult:
     """A failed ToolResult: message, canonical ``error_code``, ``retry_after``
     (whole seconds) on a rate limit, and ``data={"status", "reason"}`` when
-    Google answered."""
+    Google answered — plus ``required_scopes`` (the tool's ``scopes``) when a
+    scope was missing."""
     data: dict[str, Any] | None = None
     if error.status:
         data = {"status": error.status}
         if error.reason:
             data["reason"] = error.reason
+        if error.insufficient_scope:
+            data["insufficient_scope"] = True
+            data["required_scopes"] = list(scopes)
     return ToolResult.fail(
-        describe_error(error),
+        describe_error(error, scopes),
         data=data,
         code=error_code(error),
         retry_after=whole_seconds(error.retry_after),
@@ -218,7 +234,7 @@ class GoogleDriveToolkit(Toolkit):
             try:
                 return entry.handler(client, normalize_arguments(arguments))
             except GoogleDriveAPIError as e:
-                return failure(e)
+                return failure(e, tool.required_scopes)
 
     def client(self, config: Mapping[str, Any]) -> GoogleDriveRestClient:
         """A REST client bound to ``config["access_token"]``."""
@@ -240,8 +256,10 @@ class GoogleDriveToolkit(Toolkit):
         token_type_hint: str = "access_token",
     ) -> bool:
         """Disconnect: revoke the token at ``oauth2.googleapis.com/revoke``.
-        Revoking either token of a grant (access or refresh) revokes the whole
-        grant. Never raises."""
+        Revoking either token of a grant (access or refresh) revokes the
+        user's whole grant to the OAuth client: with one client shared by
+        several Google toolkits, this also ends the user's other Google
+        connections (Gmail, Calendar; see the README). Never raises."""
         if self.oauth is None:
             return False
         try:

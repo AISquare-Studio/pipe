@@ -350,7 +350,7 @@ class TestWrites:
         assert h.session.last.json["parents"] == ["rep1234567"]
 
     def test_create_folder_parent_lookup_failure_other_than_404_is_reported(self):
-        h = harness(drive_error(403, "Forbidden", "insufficientPermissions"))
+        h = harness(drive_error(403, "Forbidden", "insufficientFilePermissions"))
         result = h.call("GOOGLEDRIVE_CREATE_FOLDER", {"name": "Q3", "parent_id": "par1234567"})
         assert result.error_code == "forbidden"
 
