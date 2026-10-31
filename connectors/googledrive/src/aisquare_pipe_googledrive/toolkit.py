@@ -31,6 +31,8 @@ from aisquare_pipe_googledrive.rest import (
     GoogleDriveRestClient,
 )
 from aisquare_pipe_googledrive.tools import (
+    COVERING_SCOPES,
+    DRIVE_SCOPE,
     TOOL_SPECS,
     TOOLS,
     apply_aliases,
@@ -39,14 +41,11 @@ from aisquare_pipe_googledrive.tools import (
 
 logger = logging.getLogger("aisquare.pipe.googledrive")
 
-#: The full Drive scope. Google classes it as *restricted*: production apps
-#: need OAuth verification plus a security assessment (see the README for
-#: the narrower alternatives).
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
-
 #: A Google OAuth 2.0 web client. ``access_type=offline`` + ``prompt=consent``
 #: make Google return a refresh token on every consent (not only the first);
 #: access tokens expire after an hour. Google does not rotate refresh tokens.
+#: No ``include_granted_scopes``: one OAuth client may serve Drive, Gmail and
+#: Calendar, and a Drive token must carry Drive's scopes only.
 GOOGLEDRIVE_OAUTH = OAuthSpec(
     provider="google",
     authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
@@ -56,7 +55,6 @@ GOOGLEDRIVE_OAUTH = OAuthSpec(
     extra_authorize_params={
         "access_type": "offline",
         "prompt": "consent",
-        "include_granted_scopes": "true",
     },
     pkce=True,
     token_expires=True,
@@ -152,7 +150,7 @@ class GoogleDriveToolkit(Toolkit):
     """
 
     name = "googledrive"
-    version = "0.2.0"
+    version = "0.3.0"
     display_name = "Google Drive"
     description = (
         "Google Drive: search, read and download files (Google Docs, Sheets and Slides "
@@ -162,6 +160,17 @@ class GoogleDriveToolkit(Toolkit):
     auth_type = AuthType.OAUTH2
     oauth = GOOGLEDRIVE_OAUTH
     docs_url = "https://developers.google.com/drive/api/reference/rest/v3"
+    category = "files"
+    keywords = (
+        "google drive", "drive", "gdrive", "file", "folder", "google docs", "doc", "sheets",
+        "spreadsheet", "slides", "deck", "pdf", "upload", "share", "shared drive",
+    )
+    examples = (
+        "the deck Sam shared",
+        "find the Q3 budget spreadsheet",
+        "upload this report to the Marketing folder",
+        "who has access to the roadmap doc",
+    )
 
     def __init__(
         self,
@@ -178,6 +187,12 @@ class GoogleDriveToolkit(Toolkit):
 
     def tools(self) -> list[ToolSpec]:
         return list(TOOL_SPECS)
+
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``, counting Google's Drive
+        hierarchy: ``drive`` covers ``drive.readonly`` (and the narrower
+        metadata and per-file scopes)."""
+        return scope in granted or not COVERING_SCOPES.get(scope, frozenset()).isdisjoint(granted)
 
     def call_tool(
         self, slug: str, arguments: Mapping[str, Any] | None, config: Mapping[str, Any] | None

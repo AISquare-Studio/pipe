@@ -187,6 +187,10 @@ a shared one). The token rides the `Authorization` header only — never a URL,
 log line, error or repr. Logs carry method, status and timing, never paths,
 calendar ids or queries.
 
+**Router card.** `GoogleCalendarToolkit.card()` gives a router the
+connector's category (`calendar`), keywords and example asks ("what's on my
+calendar Friday", "when am I free tomorrow afternoon").
+
 ### Tools
 
 Read-only (`calendar.readonly`):

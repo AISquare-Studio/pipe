@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Router metadata on every native toolkit** — github, googledrive,
+  onedrive, slack, gmail and googlecalendar — so `catalogue()` returns six
+  cards and scope filtering works on all of them.
+  - **Cards.** Each sets `category` (`code`, `files`, `files`, `chat`,
+    `email`, `calendar`), `keywords` and 3-4 `examples` phrased as users ask.
+  - **Scopes.** Every tool carries `required_scopes`, and each toolkit's
+    `scope_granted` counts its provider's broader scopes:
+    - GitHub: `repo`, except `read:user`, `read:org` and `notifications`
+      for the profile, orgs and notifications. `repo` covers
+      `public_repo`/`notifications`, `user` covers `read:user`, and
+      `admin:org`/`write:org` cover `read:org`.
+    - Google Drive: `drive.readonly` to read and `drive` to write; `drive`
+      covers the rest.
+    - OneDrive: `Files.Read.All` / `Files.ReadWrite.All`. Graph names
+      compare short and case-insensitively.
+    - Slack: its per-identity scope map, promoted. `required_scopes` holds
+      the user scopes (the bot ones for bot-only tools), and a bot
+      connection is checked against the bot scopes. Behaviour without
+      `granted_scopes` is unchanged.
+  - **Risk** follows each tool's flags (Slack: read → `read`, send and write
+    → `write`, destructive and edits → `destructive`).
+  - **GitHub grant revoke.** `GitHubToolkit.revoke_grant()` (`DELETE
+    /applications/{client_id}/grant`) removes the app from the user's GitHub
+    and ends every token they gave it. `revoke_token` still revokes one
+    connection's token.
+  - **Google Drive OAuth.** `GOOGLEDRIVE_OAUTH` no longer sends
+    `include_granted_scopes=true`, like Gmail's and Calendar's specs. One
+    Google OAuth client can serve all three without a Drive token carrying
+    their scopes. Revoke stays grant-wide.
+  - **Versions.** `aisquare-pipe-github`, `-googledrive` and `-onedrive` go to
+    0.3.0. Slack, Gmail and Google Calendar stay at their unreleased 0.1.0.
+    All six need `aisquare-pipe>=0.4.0`.
 - **Router metadata in core** (`aisquare-pipe` 0.4.0), for a host that
   picks connectors from short cards and then tools from the chosen ones. No
   LLM or model dependency.

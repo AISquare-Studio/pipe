@@ -25,7 +25,7 @@ cd connectors/googledrive && pip install -e ".[dev]"   # development
 
 | | |
 |---|---|
-| authorize | `https://accounts.google.com/o/oauth2/v2/auth` with `access_type=offline`, `prompt=consent`, `include_granted_scopes=true` |
+| authorize | `https://accounts.google.com/o/oauth2/v2/auth` with `access_type=offline`, `prompt=consent` |
 | token | `https://oauth2.googleapis.com/token` |
 | revoke | `https://oauth2.googleapis.com/revoke` |
 | PKCE | required (S256) |
@@ -38,12 +38,15 @@ revokes the user's whole grant to your OAuth client: Google has no narrower
 per-token revocation, so two connections made by the same Google user for the
 same OAuth client end together.
 
-**Other Google toolkits need their own OAuth client.** `include_granted_scopes=true`
-merges every scope a user has granted to an OAuth client into each new token.
-So if a future Gmail or Google Calendar port reused this Drive client, a Drive
-token would carry their scopes, and a Drive disconnect (a grant-wide revoke)
-would end those connections too. Give each Google toolkit its own OAuth client,
-or drop `include_granted_scopes` there.
+**One OAuth client for Drive, Gmail and Calendar.** Each Google toolkit gets
+its own token and consent, and one OAuth client may serve all three. That is
+why none of their specs sets `include_granted_scopes=true`: with it, each new
+token would carry every scope the user had granted the client, so a Drive
+token would also hold Gmail's or Calendar's scopes. Revoking stays
+grant-wide, though: a Drive disconnect that calls `revoke_token` also ends the
+user's Gmail and Calendar connections on the same client. Delete one
+connector's stored tokens on disconnect, and revoke only when it is the
+user's last Google connection.
 
 **Scope and Google verification.** The default `drive` scope (full access to
 every file) is a Google **restricted** scope. A production app that requests it
@@ -62,6 +65,18 @@ warning, and the app is limited to 100 test users. Narrower scopes, passed as
 Set up: Google Cloud console → APIs & Services → enable the **Google Drive
 API** → OAuth consent screen → Credentials → *OAuth client ID* (Web
 application) with your callback as an authorized redirect URI.
+
+**Router metadata.** `GoogleDriveToolkit.card()` is the connector's card for a router —
+category `files`, plus `keywords` and `examples` phrased as users ask
+("the deck Sam shared", "find the Q3 budget spreadsheet"). Each tool's `required_scopes` and `risk` (`read` / `write` /
+`destructive`, from its flags) are on its `ToolSpec`. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+Read tools need `drive.readonly` and write tools `drive`; `drive` covers
+`drive.readonly` (and the metadata and per-file scopes), so the default
+consent covers every tool. A `drive.file`-only connection lists none of
+them: they reach files the app did not create.
 
 ## Toolkit
 

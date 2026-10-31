@@ -177,6 +177,10 @@ one). The token rides the `Authorization` header only — never a URL, log
 line, error or repr. Logs carry method, status and timing, never paths,
 queries or addresses.
 
+**Router card.** `GmailToolkit.card()` gives a router the connector's
+category (`email`), keywords and example asks ("my unread emails from today",
+"reply to Ann's last email").
+
 ### Tools
 
 Read-only (`gmail.readonly`):

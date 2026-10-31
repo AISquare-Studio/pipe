@@ -184,6 +184,17 @@ class GmailToolkit(Toolkit):
     auth_type = AuthType.OAUTH2
     oauth = GMAIL_OAUTH
     docs_url = "https://developers.google.com/gmail/api/reference/rest"
+    category = "email"
+    keywords = (
+        "gmail", "email", "mail", "inbox", "unread", "message", "thread", "attachment", "draft",
+        "send", "reply", "label", "archive", "invoice", "newsletter",
+    )
+    examples = (
+        "my unread emails from today",
+        "find the invoice email from Acme and get the PDF",
+        "reply to Ann's last email",
+        "draft an email to the team about Friday",
+    )
 
     def __init__(
         self,

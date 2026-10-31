@@ -86,11 +86,9 @@ class TestSpec:
         assert spec.token_url == "https://oauth2.googleapis.com/token"
         assert spec.revoke_url == "https://oauth2.googleapis.com/revoke"
         assert spec.default_scopes == (DRIVE_SCOPE,) == ("https://www.googleapis.com/auth/drive",)
-        assert dict(spec.extra_authorize_params) == {
-            "access_type": "offline",
-            "prompt": "consent",
-            "include_granted_scopes": "true",
-        }
+        # No include_granted_scopes: a Drive token carries Drive scopes only,
+        # even when the OAuth client also serves Gmail and Calendar.
+        assert dict(spec.extra_authorize_params) == {"access_type": "offline", "prompt": "consent"}
         assert (spec.pkce, spec.token_expires, spec.rotates_refresh_token) == (True, True, False)
         assert spec.token_auth_method == "client_secret_post"
 
@@ -107,7 +105,6 @@ class TestSpec:
         assert dict(urllib.parse.parse_qsl(parts.query)) == {
             "access_type": "offline",
             "prompt": "consent",
-            "include_granted_scopes": "true",
             "scope": DRIVE_SCOPE,
             "response_type": "code",
             "client_id": CLIENT_ID,
