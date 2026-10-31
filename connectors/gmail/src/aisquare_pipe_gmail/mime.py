@@ -4,8 +4,10 @@
 Building uses the standard library's :class:`email.message.EmailMessage`
 under the SMTP policy: non-ASCII subjects and names are RFC 2047-encoded,
 bodies get a fitting transfer encoding, and an HTML body also carries a
-plain-text alternative. Header values with a CR or LF are refused (header
-injection), as are recipients that are not ``name@domain`` addresses.
+plain-text alternative. Header values with a line break or another control
+character are refused (header injection), as are recipients that are not
+``name@domain`` addresses. Encoded-word display names are decoded and checked
+the same way.
 
 Reading walks ``payload.parts`` recursively. Gmail hands each part's body
 already transfer-decoded, base64url-encoded, in the part's charset; text is
@@ -24,6 +26,8 @@ import mimetypes
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.headerregistry import Address
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -35,6 +39,10 @@ from aisquare_pipe_gmail.rest import decode_base64url
 TEXT_MAX = 20_000
 
 _ADDR_SPEC = re.compile(r"^[^@\s<>()\[\]\\,;:\"]+@[^@\s<>()\[\]\\,;:\"]+$")
+#: Never allowed in a header value: every C0 control (CR, LF, NUL, VT, FF, the
+#: FS/GS/RS separators...), DEL, and the line breaks str.splitlines() knows.
+_HEADER_UNSAFE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]")
+_ENCODED_WORD = re.compile(r"=\?[^?]*\?[bBqQ]\?[^?]*\?=")
 _BLOCK_TAGS = frozenset(
     {
         "p", "div", "br", "li", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -59,15 +67,37 @@ class Attachment:
 
 
 def check_header(value: str, what: str) -> str:
-    """``value`` for a header; ValueError when it carries a line break."""
-    if "\r" in value or "\n" in value:
-        raise ValueError(f"{what} must not contain line breaks")
+    """``value`` for a header; ValueError when it carries a line break (CR,
+    LF or a Unicode line separator), any other C0 control character, or DEL."""
+    if _HEADER_UNSAFE.search(value):
+        raise ValueError(f"{what} must not contain line breaks or control characters")
     return value
+
+
+def _display_name(name: str, what: str) -> str:
+    """``name`` with any RFC 2047 encoded-words decoded, then checked.
+
+    Display names are set from :class:`Address` objects, which skip the
+    line-break check the SMTP policy applies to plain headers, and the
+    standard library decodes encoded-words when it reparses them: an
+    encoded CRLF would come back as a real one on Pythons without the
+    CVE-2024-6923 fix. So the decoded text is what gets checked and used."""
+    if "=?" not in name:
+        return name
+    try:
+        decoded = str(make_header(decode_header(name)))
+    except (HeaderParseError, LookupError, UnicodeError, ValueError):
+        raise ValueError(f"{what} has a display name that can't be decoded") from None
+    check_header(decoded, what)
+    if _ENCODED_WORD.search(decoded):
+        raise ValueError(f"{what} has a display name encoded more than once")
+    return decoded
 
 
 def parse_addresses(values: Iterable[str], what: str) -> list[Address]:
     """Each value is one or more addresses (``a@x.co``, ``Ann <a@x.co>``,
-    ``a@x.co, b@y.co``); ValueError for anything that is not an address."""
+    ``a@x.co, b@y.co``); ValueError for anything that is not an address.
+    Encoded-word display names are decoded and checked like any header."""
     out: list[Address] = []
     for value in values:
         text = check_header(str(value), what).strip()
@@ -77,7 +107,7 @@ def parse_addresses(values: Iterable[str], what: str) -> list[Address]:
             if not _ADDR_SPEC.match(addr):
                 raise ValueError(f"{what} has something that is not an email address")
             local, _, domain = addr.rpartition("@")
-            out.append(Address(display_name=name, username=local, domain=domain))
+            out.append(Address(display_name=_display_name(name, what), username=local, domain=domain))
     return out
 
 

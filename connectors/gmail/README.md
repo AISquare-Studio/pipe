@@ -56,7 +56,7 @@ warning, and the app is limited to 100 test users.
 
 **One OAuth client for Drive, Gmail and Calendar.** Each Google toolkit gets
 its own token and consent, and one OAuth client may serve all three. That is
-why this spec — unlike Google Drive's — does not set
+why this spec, like Drive's and Calendar's, does not set
 `include_granted_scopes=true`: with it, a Gmail token would also carry every
 Drive or Calendar scope the user granted the same client. Two caveats remain
 for a host that shares the client:
@@ -126,8 +126,11 @@ a different id for the same attachment on each read, and every one works.
 **Composing.** `GMAIL_SEND_EMAIL`, `GMAIL_CREATE_EMAIL_DRAFT` and
 `GMAIL_REPLY_TO_THREAD` build an RFC 2822 message with the standard
 library's `email` package. Recipients may be `a@x.co`, `Ann <a@x.co>` or
-comma-separated lists; anything else is refused, as is a header value with a
-line break. Non-ASCII subjects and names are RFC 2047-encoded. `is_html`
+comma-separated lists; anything else is refused, as is a header value
+(display names included) with a line break, any other control character, DEL
+or a Unicode line separator. A display name sent RFC 2047-encoded
+(`=?utf-8?…?=`) is decoded and checked the same way. Non-ASCII subjects and
+names are RFC 2047-encoded. `is_html`
 sends HTML with a plain-text alternative. `attachment` is
 `{name, mimetype, file_content_bytes}` (base64) or a list of them, 25 MB in
 total; Composio's `s3key` is not supported. Messages up to 4 MB go as JSON
@@ -202,8 +205,8 @@ Writes:
 | `GMAIL_CREATE_EMAIL_DRAFT` | `GET threads/{id}` (with `thread_id`) + `POST drafts` | `gmail.readonly` + `gmail.compose` | `thread_id` makes it a reply draft |
 | `GMAIL_SEND_EMAIL` | `POST messages/send` | `gmail.send` | `from_email`: a send-as alias |
 | `GMAIL_REPLY_TO_THREAD` | `GET threads/{id}` + `POST messages/send` | `gmail.readonly` + `gmail.send` | |
-| `GMAIL_ADD_LABEL_TO_EMAIL` | `POST messages/{id}/modify` | `gmail.modify` | mark read/unread, star, archive |
-| `GMAIL_MODIFY_THREAD_LABELS` | `POST threads/{id}/modify` | `gmail.modify` | the same for a conversation |
+| `GMAIL_ADD_LABEL_TO_EMAIL` | `POST messages/{id}/modify` | `gmail.modify` | mark read/unread, star, archive; adding `TRASH` or `SPAM` is refused (`invalid_arguments`; trash with `GMAIL_MOVE_TO_TRASH`), removing them is allowed |
+| `GMAIL_MODIFY_THREAD_LABELS` | `POST threads/{id}/modify` | `gmail.modify` | the same for a conversation, `TRASH`/`SPAM` included |
 | `GMAIL_MOVE_TO_TRASH` | `POST messages/{id}/trash` | `gmail.modify` | **destructive**; restorable from Trash for 30 days |
 
 ## Tests

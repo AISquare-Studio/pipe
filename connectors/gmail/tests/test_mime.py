@@ -153,6 +153,81 @@ class TestBuild:
         assert mime.reply_subject(subject) == expected
 
 
+#: An RFC 2047 encoded-word whose text is "Ann\r\nBcc: evil@x.co".
+ENCODED_CRLF = "=?utf-8?b?QW5uDQpCY2M6IGV2aWxAeC5jbw==?="
+
+
+class TestHeaderInjection:
+    """Display names are set from Address objects, which skip the SMTP
+    policy's line-break check, so the toolkit checks them itself: every C0
+    control, DEL and Unicode line break is refused, and encoded-words are
+    decoded before the check. Nothing is sent."""
+
+    @staticmethod
+    def _refused(args: dict) -> str:
+        h = harness()
+        result = h.call("GMAIL_SEND_EMAIL", {"body": "x", **args})
+        assert result.error_code == "invalid_arguments", result.error
+        assert h.session.calls == []
+        return result.error
+
+    @pytest.mark.parametrize(
+        "char", ["\x0b", "\x0c", "\x00", "\x1c", "\x1d", "\x1e", "\x7f", "\x85", "\u2028", "\u2029", "\r", "\n"]
+    )
+    def test_control_characters_in_a_display_name(self, char):
+        self._refused({"recipient_email": f'"Ann{char}Bcc: evil@x.co" <a@x.co>'})
+
+    @pytest.mark.parametrize("char", ["\x00", "\x7f", "\x0b", "\u2028"])
+    def test_control_characters_in_the_subject(self, char):
+        self._refused({"recipient_email": "a@x.co", "subject": f"Hi{char}there"})
+
+    @pytest.mark.parametrize("field", ["recipient_email", "cc", "bcc", "from_email"])
+    def test_an_encoded_crlf_display_name(self, field):
+        args = {"recipient_email": "a@x.co", field: f"{ENCODED_CRLF} <b@x.co>"}
+        assert "line breaks" in self._refused(args)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "=?utf-8?b?PT91dGYtOD9iP1FXNXVEUXBDWTJNNklHVjJhV3hBZUM1amJ3PT0/PQ==?=",  # ENCODED_CRLF, encoded again
+            "=?no-such-charset?q?Ann?=",
+        ],
+    )
+    def test_undecodable_or_doubly_encoded_names(self, name):
+        self._refused({"recipient_email": f"{name} <a@x.co>"})
+
+    def test_an_encoded_name_is_decoded_and_sent_re_encoded(self):
+        msg = _send({"recipient_email": "=?utf-8?q?J=C3=BCrgen?= <j@x.de>", "body": "x"})
+        assert msg["To"].addresses[0].display_name == "Jürgen"
+        assert (msg["To"].addresses[0].addr_spec, len(msg["To"].addresses)) == ("j@x.de", 1)
+
+    def test_a_reply_to_an_encoded_crlf_sender_is_refused(self):
+        # The reply path takes Reply-To from an untrusted inbound mail.
+        incoming = message("m1", thread_id="t1", extra_headers={"Reply_To": f"{ENCODED_CRLF} <a@x.co>", "Message_ID": "<a@b>"})
+        h = harness(response(200, {"id": "t1", "messages": [incoming]}))
+        result = h.call("GMAIL_REPLY_TO_THREAD", {"thread_id": "t1", "message_body": "x"})
+        assert result.error_code == "invalid_arguments"
+        assert [c.method for c in h.session.calls] == ["GET"]
+
+    def test_a_header_the_generator_refuses_is_invalid_arguments(self, monkeypatch):
+        # On Pythons with the CVE-2024-6923 fix the generator raises
+        # HeaderWriteError, which is not a ValueError.
+        import email.errors
+
+        from aisquare_pipe_gmail import tools
+
+        def refuse(**_: object) -> bytes:
+            raise email.errors.HeaderWriteError("folded header contains newline")
+
+        monkeypatch.setattr(tools, "build_message", refuse)
+        self._refused({"recipient_email": "a@x.co"})
+
+    @pytest.mark.parametrize("value", ["Ann\tLee <a@x.co>", "a@x.co\x00"])
+    def test_parse_addresses_refuses_control_characters(self, value):
+        with pytest.raises(ValueError, match="control characters"):
+            mime.parse_addresses([value], "to")
+
+
 class TestRead:
     def test_plain_text_is_preferred_over_html(self):
         alt = {"partId": "", "mimeType": "multipart/alternative", "filename": "", "headers": [], "body": {"size": 0},

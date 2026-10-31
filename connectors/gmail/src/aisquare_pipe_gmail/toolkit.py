@@ -49,8 +49,8 @@ logger = logging.getLogger("aisquare.pipe.gmail")
 #: production apps need OAuth verification plus a security assessment.
 #: ``access_type=offline`` + ``prompt=consent`` make Google return a refresh
 #: token on every consent; access tokens expire after an hour. Google does
-#: not rotate refresh tokens. Unlike Google Drive's spec there is no
-#: ``include_granted_scopes``: one OAuth client may serve Drive, Gmail and
+#: not rotate refresh tokens. No ``include_granted_scopes`` (none of the
+#: Google specs sets it): one OAuth client may serve Drive, Gmail and
 #: Calendar, and a Gmail token must carry Gmail's scopes only.
 GMAIL_OAUTH = OAuthSpec(
     provider="google",
