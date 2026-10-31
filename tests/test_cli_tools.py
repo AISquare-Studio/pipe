@@ -7,7 +7,7 @@ import json
 from click.testing import CliRunner
 
 from aisquare.pipe.cli.main import cli
-from aisquare.pipe.testing.mock_connectors import MOCK_TOOLS
+from aisquare.pipe.testing.mock_connectors import MOCK_TOOLS, MockToolkit
 
 
 def invoke(*args: str):
@@ -70,3 +70,23 @@ def test_unknown_toolkit_exit_one():
     result = invoke("nope")
     assert result.exit_code == 1
     assert "Toolkit 'nope' not found" in result.output
+
+
+def test_toolkit_rows_keep_their_keys_and_add_the_card():
+    result = invoke("--json")
+    assert result.exit_code == 0, result.output
+    mock = next(row for row in json.loads(result.output) if row["name"] == "mock")
+    assert {"name", "version", "auth", "tools", "oauth", "description"} <= set(mock)
+    assert {k: mock[k] for k in MockToolkit.card()} == MockToolkit.card()
+
+
+def test_tool_json_keeps_its_keys_and_adds_scopes_and_risk():
+    result = invoke("mock", "--json")
+    assert result.exit_code == 0, result.output
+    tools = json.loads(result.output)
+    for tool in tools:
+        assert set(tool) == {
+            "slug", "description", "input_schema", "read_only", "destructive", "tags", "required_scopes", "risk",
+        }
+    delete = next(t for t in tools if t["slug"] == "MOCK_DELETE_ITEM")
+    assert (delete["risk"], delete["required_scopes"]) == ("destructive", [])

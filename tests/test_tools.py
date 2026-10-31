@@ -14,10 +14,13 @@ import urllib.error
 import pytest
 
 from aisquare.pipe import (
+    CATEGORIES,
     ERROR_CODES,
     ERROR_CONFLICT,
     ERROR_FORBIDDEN,
+    ERROR_INSUFFICIENT_SCOPE,
     ERROR_INVALID_ARGUMENTS,
+    ERROR_NOT_CONNECTED,
     ERROR_NOT_FOUND,
     ERROR_RATE_LIMITED,
     ERROR_TIMEOUT,
@@ -27,10 +30,14 @@ from aisquare.pipe import (
     AuthType,
     DataEnvelope,
     OAuthError,
+    OAuthToken,
+    QualifiedTool,
     Toolkit,
     ToolResult,
     ToolSpec,
     error_code_for_status,
+    parse_scopes,
+    rank_across,
     rank_tools,
     time_budget,
     validate_arguments,
@@ -122,10 +129,21 @@ class TestToolResult:
 
 
 class TestErrorCodes:
+    def test_new_codes_are_exported_from_the_package(self):
+        # Toolkits read them as getattr(aisquare.pipe, "ERROR_INSUFFICIENT_SCOPE", ...).
+        import aisquare.pipe
+
+        assert aisquare.pipe.ERROR_INSUFFICIENT_SCOPE == "insufficient_scope"
+        assert aisquare.pipe.ERROR_NOT_CONNECTED == "not_connected"
+        assert {"ERROR_INSUFFICIENT_SCOPE", "ERROR_NOT_CONNECTED"} <= set(aisquare.pipe.__all__)
+        assert {aisquare.pipe.ERROR_INSUFFICIENT_SCOPE, aisquare.pipe.ERROR_NOT_CONNECTED} <= ERROR_CODES
+
     def test_canonical_set(self):
         assert ERROR_CODES == {
             "unauthorized",
+            "not_connected",
             "forbidden",
+            "insufficient_scope",
             "not_found",
             "rate_limited",
             "invalid_arguments",
@@ -577,7 +595,7 @@ class TestCallTool:
         kit = _Base()
         result = kit.call_tool("ACME_GET", {"id": "7"}, config)
         assert not result.successful and "not connected" in (result.error or "")
-        assert result.error_code == ERROR_UNAUTHORIZED
+        assert result.error_code == ERROR_NOT_CONNECTED
         assert kit.calls == []
 
     def test_validate_config_crash_means_not_connected(self):
@@ -809,7 +827,7 @@ class TestTokenWhitespace:
     @pytest.mark.parametrize("token", [f"{SECRET[:10]} {SECRET[10:]}", "a\nb-token", "\t\n"])
     def test_inner_whitespace_is_not_a_valid_token(self, token):
         out = _Returns(ToolResult.ok(1)).call_tool("RET_DO", {}, {"access_token": token})
-        assert out.error_code == ERROR_UNAUTHORIZED
+        assert out.error_code == ERROR_NOT_CONNECTED
 
     def test_header_style_leak_is_masked(self):
         leak = ValueError(f"Invalid header value b'Bearer {SECRET}\\n'")
@@ -1071,3 +1089,373 @@ class TestHTTPErrorClassification:
         exc = _http_error(status)
         out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
         assert (out.error, out.error_code) == ("RET_DO failed (HTTPError)", ERROR_UPSTREAM_ERROR)
+
+
+# --------------------------------------------------------------------------
+# Router metadata: ToolSpec scopes/risk, Toolkit card, scope-aware listing,
+# not_connected / insufficient_scope, cross-toolkit ranking
+# --------------------------------------------------------------------------
+
+
+class TestToolSpecMetadata:
+    @pytest.mark.parametrize(
+        ("read_only", "destructive", "risk"),
+        [(True, False, "read"), (False, False, "write"), (False, True, "destructive"), (True, True, "destructive")],
+    )
+    def test_risk_defaults_from_flags(self, read_only, destructive, risk):
+        assert spec("X_DO", read_only=read_only, destructive=destructive).risk == risk
+
+    def test_explicit_risk_wins(self):
+        assert spec("X_SEND", read_only=False, risk="destructive").risk == "destructive"
+
+    def test_replace_rederives_an_implicit_risk(self):
+        tool = spec("X_A", read_only=True)
+        assert dataclasses.replace(tool, read_only=False, destructive=True).risk == "destructive"
+        assert dataclasses.replace(tool, read_only=False).risk == "write"
+        assert dataclasses.replace(dataclasses.replace(tool, read_only=False), read_only=True).risk == "read"
+
+    def test_replace_keeps_an_explicit_risk(self):
+        tool = spec("X_SEND", read_only=False, risk="destructive")
+        assert dataclasses.replace(tool, tags=("x",)).risk == "destructive"
+        assert dataclasses.replace(spec("X_A"), risk="write").risk == "write"
+        assert dataclasses.replace(dataclasses.replace(spec("X_A"), risk="write"), read_only=True).risk == "write"
+
+    def test_risk_is_a_plain_string(self):
+        tool = spec("X_A")
+        assert tool.risk == "read" and tool == spec("X_A", risk="read")
+        assert hash(tool) == hash(spec("X_A", risk="read"))
+        assert type(tool.to_dict(metadata=True)["risk"]) is str
+        assert repr(tool).count("risk='read'") == 1
+
+    def test_unknown_risk_is_refused(self):
+        with pytest.raises(ValueError, match="risk"):
+            spec("X_DO", risk="spicy")
+
+    def test_required_scopes_default_and_normalisation(self):
+        assert spec("X_DO").required_scopes == ()
+        assert spec("X_DO", required_scopes=["a", "b"]).required_scopes == ("a", "b")
+        assert spec("X_DO", required_scopes="repo").required_scopes == ("repo",)  # not ("r", "e", ...)
+
+    def test_still_frozen_and_hashable(self):
+        tool = spec("X_GET", required_scopes=("a",))
+        assert hash(tool) == hash(spec("X_GET", required_scopes=["a"]))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            tool.risk = "write"  # type: ignore[misc]
+
+    def test_to_dict_metadata_adds_scopes_and_risk(self):
+        tool = spec("X_DELETE", read_only=False, destructive=True, required_scopes=("files.write",))
+        plain = tool.to_dict()
+        full = tool.to_dict(metadata=True)
+        assert "required_scopes" not in plain and "risk" not in plain
+        assert full == {**plain, "required_scopes": ["files.write"], "risk": "destructive"}
+
+    def test_qualified_tool_to_dict(self):
+        tool = spec("X_GET")
+        assert QualifiedTool("x", tool).to_dict() == {"connector": "x", **tool.to_dict(metadata=True)}
+
+
+class TestParseScopes:
+    @pytest.mark.parametrize(
+        ("value", "scopes"),
+        [
+            ("a b", {"a", "b"}),
+            ("a,b , c", {"a", "b", "c"}),
+            (["a", " b ", "", 3, None], {"a", "b"}),
+            (("a",), {"a"}),
+            ({"a"}, {"a"}),
+            (None, set()),
+            (42, set()),
+            ({"a": 1}, set()),
+        ],
+    )
+    def test_parse(self, value, scopes):
+        assert parse_scopes(value) == scopes
+
+
+class _Plain(Toolkit):
+    """Sets none of the router fields."""
+
+    name = "plain"
+    version = "1.0.0"
+    description = "Plain things"
+
+    def tools(self) -> list[ToolSpec]:
+        return [spec("PLAIN_GET")]
+
+    def run_tool(self, tool, arguments, config):
+        return ToolResult.ok(1)
+
+
+class _Scoped(Toolkit):
+    name = "scoped"
+    version = "1.0.0"
+    display_name = "Scoped"
+    description = "Files with scopes"
+    category = "files"
+    keywords = ("files", "folders")
+    examples = ("find my report", "share the budget folder")
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def tools(self) -> list[ToolSpec]:
+        return [
+            spec("SCOPED_LIST", required_scopes=("files.read",)),
+            spec("SCOPED_WRITE", read_only=False, required_scopes=("files.read", "files.write")),
+            spec("SCOPED_PING"),
+        ]
+
+    def run_tool(self, tool, arguments, config):
+        self.calls.append(tool.slug)
+        return ToolResult.ok(tool.slug)
+
+
+class _Implying(_Scoped):
+    """``files.all`` covers every ``files.*`` scope."""
+
+    name = "implying"
+
+    def scope_granted(self, scope, granted):
+        return scope in granted or ("files.all" in granted and scope.startswith("files."))
+
+
+class TestCard:
+    def test_defaults_for_a_toolkit_that_sets_nothing(self):
+        assert _Plain.card() == {
+            "name": "plain",
+            "display_name": "plain",
+            "description": "Plain things",
+            "category": "other",
+            "keywords": [],
+            "examples": [],
+            "auth_type": "oauth2",
+        }
+
+    def test_declared_fields(self):
+        assert _Scoped.card() == {
+            "name": "scoped",
+            "display_name": "Scoped",
+            "description": "Files with scopes",
+            "category": "files",
+            "keywords": ["files", "folders"],
+            "examples": ["find my report", "share the budget folder"],
+            "auth_type": "oauth2",
+        }
+
+    def test_card_needs_no_instance(self):
+        class NoInit(_Scoped):
+            def __init__(self) -> None:
+                raise AssertionError("card() must not instantiate")
+
+        assert NoInit.card()["name"] == "scoped"
+
+    def test_card_is_a_fresh_dict(self):
+        _Scoped.card()["keywords"].append("x")
+        assert _Scoped.card()["keywords"] == ["files", "folders"]
+        assert _Scoped.keywords == ("files", "folders")
+
+    def test_categories(self):
+        assert CATEGORIES == {
+            "code", "files", "email", "calendar", "chat", "docs", "project", "crm", "data", "other",
+        }
+
+    def test_mock_toolkit_card_is_offline(self):
+        from aisquare.pipe.testing.validation import no_network
+
+        with no_network() as log:
+            card = MockToolkit.card()
+        assert log.attempts == [] and card["name"] == "mock"
+
+
+class TestScopeAwareListing:
+    @pytest.mark.parametrize(
+        "config",
+        [None, {}, TOKEN, {"granted_scopes": None}, {"granted_scopes": ""}, {"granted_scopes": " \t"}, "garbage"],
+    )
+    def test_no_grant_info_lists_everything(self, config):
+        assert [t.slug for t in _Scoped().available_tools(config)] == ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]
+
+    @pytest.mark.parametrize(
+        ("granted", "listed"),
+        [
+            (["files.read"], ["SCOPED_LIST", "SCOPED_PING"]),
+            ("files.read files.write", ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]),
+            ("files.write,files.read", ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]),
+            ([], ["SCOPED_PING"]),  # known: nothing granted
+            ((), ["SCOPED_PING"]),
+            (42, ["SCOPED_PING"]),  # unreadable grants nothing
+        ],
+    )
+    def test_filters_by_granted_scopes(self, granted, listed):
+        config = {**TOKEN, "granted_scopes": granted}
+        assert [t.slug for t in _Scoped().available_tools(config)] == listed
+        assert {t.slug for t in _Scoped().search_tools("files", limit=10, config=config)} <= set(listed)
+
+    def test_listed_tools_are_the_catalog_specs(self):
+        kit = _Scoped()
+        for tool in kit.available_tools({"granted_scopes": ["files.read"]}):
+            assert kit.get_tool(tool.slug) == tool
+
+    def test_scope_granted_hook(self):
+        config = {"granted_scopes": ["files.all"]}
+        assert [t.slug for t in _Implying().available_tools(config)] == ["SCOPED_LIST", "SCOPED_WRITE", "SCOPED_PING"]
+        assert [t.slug for t in _Scoped().available_tools(config)] == ["SCOPED_PING"]
+
+    def test_missing_scopes(self):
+        kit = _Scoped()
+        write = kit.get_tool("SCOPED_WRITE")
+        assert write is not None
+        assert kit.missing_scopes(write, {"granted_scopes": "files.read"}) == ["files.write"]
+        assert kit.missing_scopes(write, {}) == []
+        assert kit.missing_scopes(write, None) == []
+
+
+class TestConnectionErrors:
+    @pytest.mark.parametrize("config", [None, {}, {"access_token": ""}, {"access_token": "  "}, {"access_token": 5}])
+    def test_no_credentials_is_not_connected(self, config):
+        kit = _Scoped()
+        out = kit.call_tool("SCOPED_PING", {}, config)
+        assert (out.successful, out.error_code) == (False, ERROR_NOT_CONNECTED)
+        assert out.error == "Scoped is not connected: config is missing valid credentials"
+        assert kit.calls == []
+
+    def test_provider_rejection_stays_unauthorized(self):
+        out = _Returns(raise_exc=_http_error(401)).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.error_code == ERROR_UNAUTHORIZED
+        out = MockToolkit().call_tool("MOCK_GET_AUTHENTICATED_USER", {}, {"access_token": MOCK_EXPIRED_TOKEN})
+        assert out.error_code == ERROR_UNAUTHORIZED
+
+    def test_ungranted_scope_is_refused_before_any_request(self):
+        kit = _Scoped()
+        out = kit.call_tool("SCOPED_WRITE", {}, {**TOKEN, "granted_scopes": "files.read"})
+        assert (out.successful, out.error_code) == (False, ERROR_INSUFFICIENT_SCOPE)
+        assert "files.write" in (out.error or "") and "reconnect Scoped" in (out.error or "")
+        assert kit.calls == []
+
+    def test_granted_scope_runs(self):
+        kit = _Scoped()
+        out = kit.call_tool("SCOPED_WRITE", {}, {**TOKEN, "granted_scopes": ["files.read", "files.write"]})
+        assert out.successful and kit.calls == ["SCOPED_WRITE"]
+
+    def test_no_grant_info_runs(self):
+        kit = _Scoped()
+        assert kit.call_tool("SCOPED_WRITE", {}, TOKEN).successful
+
+    @pytest.mark.parametrize("scope", ["", "   "])
+    def test_a_token_whose_provider_omitted_scope_is_not_locked_out(self, scope):
+        # RFC 6749 §5.1: no scope in the response means "what was asked".
+        token = OAuthToken(access_token="tok-secret-123456", scope=scope)
+        for granted in (token.granted_scopes, token.scope):
+            config = {"access_token": token.access_token, "granted_scopes": granted}
+            assert len(_Scoped().available_tools(config)) == 3
+            assert _Scoped().call_tool("SCOPED_WRITE", {}, config).successful
+
+    def test_token_granted_scopes_is_what_to_pass(self):
+        token = OAuthToken(access_token="tok-secret-123456", scope="files.read")
+        config = {"access_token": token.access_token, "granted_scopes": token.granted_scopes}
+        assert [t.slug for t in _Scoped().available_tools(config)] == ["SCOPED_LIST", "SCOPED_PING"]
+        assert _Scoped().call_tool("SCOPED_WRITE", {}, config).error_code == ERROR_INSUFFICIENT_SCOPE
+
+    def test_not_connected_wins_over_scope(self):
+        out = _Scoped().call_tool("SCOPED_WRITE", {}, {"granted_scopes": []})
+        assert out.error_code == ERROR_NOT_CONNECTED
+
+    @pytest.mark.parametrize("code", [ERROR_NOT_CONNECTED, ERROR_INSUFFICIENT_SCOPE])
+    def test_tool_error_accepts_new_codes(self, code):
+        out = _Returns(raise_exc=ToolError("nope", code=code)).call_tool("RET_DO", {}, TOKEN)
+        assert out.error_code == code
+
+
+class TestInsufficientScopeStatus:
+    CHALLENGE = 'Bearer realm="https://accounts.google.com/", error="insufficient_scope", scope="https://www.googleapis.com/auth/drive"'
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            CHALLENGE,
+            'Bearer error="insufficient_scope"',
+            "Bearer error=insufficient_scope",
+            'bearer ERROR = "INSUFFICIENT_SCOPE", scope="x"',
+        ],
+    )
+    def test_rfc6750_challenge_on_403(self, header):
+        assert error_code_for_status(403, www_authenticate=header) == ERROR_INSUFFICIENT_SCOPE
+
+    @pytest.mark.parametrize(
+        ("status", "header", "code"),
+        [
+            (403, None, ERROR_FORBIDDEN),
+            (403, "", ERROR_FORBIDDEN),
+            (403, 'Bearer error="invalid_token"', ERROR_FORBIDDEN),
+            (403, 'Bearer error="insufficient_scope_x"', ERROR_FORBIDDEN),
+            (401, 'Bearer error="insufficient_scope"', ERROR_UNAUTHORIZED),
+            (403, 42, ERROR_FORBIDDEN),
+        ],
+    )
+    def test_everything_else_keeps_its_mapping(self, status, header, code):
+        assert error_code_for_status(status, www_authenticate=header) == code
+
+    def test_http_error_from_run_tool(self):
+        exc = _http_error(403, {"WWW-Authenticate": self.CHALLENGE})
+        out = _Returns(raise_exc=exc).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert out.error_code == ERROR_INSUFFICIENT_SCOPE
+        assert out.error is not None and out.error.startswith("RET_DO failed (HTTP 403 Forbidden)")
+        assert "googleapis" not in out.error  # the challenge is not echoed
+
+    def test_plain_403_from_run_tool_stays_forbidden(self):
+        out = _Returns(raise_exc=_http_error(403)).call_tool("RET_DO", {}, {"access_token": "abcdef123"})
+        assert (out.error_code, out.error) == (ERROR_FORBIDDEN, "RET_DO failed (HTTP 403 Forbidden)")
+
+
+class TestRankAcross:
+    MAIL = (
+        spec("GMAIL_SEND_EMAIL", "Send an email message", read_only=False),
+        spec("GMAIL_LIST_MESSAGES", "List messages in the inbox"),
+    )
+    CAL = (
+        spec("GOOGLECALENDAR_CREATE_EVENT", "Create a calendar event", read_only=False),
+        spec("GOOGLECALENDAR_LIST_EVENTS", "List upcoming events"),
+        spec("GOOGLECALENDAR_FIND_FREE_SLOTS", "Find free time"),
+    )
+
+    def test_results_name_their_connector(self):
+        found = rank_across({"gmail": self.MAIL, "googlecalendar": self.CAL}, "send an email", limit=3)
+        assert found[0] == QualifiedTool("gmail", self.MAIL[0])
+        assert all(isinstance(q, QualifiedTool) for q in found)
+
+    def test_ranks_across_toolkits(self):
+        found = rank_across({"gmail": self.MAIL, "googlecalendar": self.CAL}, "create a calendar event")
+        assert found[0] == QualifiedTool("googlecalendar", self.CAL[0])
+
+    def test_ties_keep_connector_then_catalog_order(self):
+        found = rank_across({"gmail": self.MAIL, "googlecalendar": self.CAL}, "list", limit=None)
+        assert [(q.connector, q.tool.slug) for q in found] == [
+            ("gmail", "GMAIL_LIST_MESSAGES"),
+            ("googlecalendar", "GOOGLECALENDAR_LIST_EVENTS"),
+        ]
+
+    def test_connector_keywords_boost(self):
+        catalogs = {"a": [spec("A_GET", "Get a thing")], "b": [spec("B_GET", "Get a thing")]}
+        found = rank_across(catalogs, "get my invoice", keywords={"b": ["billing", "invoice"]})
+        assert found[0].connector == "b"
+
+    @pytest.mark.parametrize("query", [None, "", "   ", "zebra quantum"])
+    def test_no_match_takes_turns(self, query):
+        found = rank_across({"gmail": self.MAIL, "googlecalendar": self.CAL}, query, limit=4)
+        assert [(q.connector, q.tool.slug) for q in found] == [
+            ("gmail", "GMAIL_SEND_EMAIL"),
+            ("googlecalendar", "GOOGLECALENDAR_CREATE_EVENT"),
+            ("gmail", "GMAIL_LIST_MESSAGES"),
+            ("googlecalendar", "GOOGLECALENDAR_LIST_EVENTS"),
+        ]
+
+    def test_limits(self):
+        catalogs = {"gmail": self.MAIL, "googlecalendar": self.CAL}
+        assert len(rank_across(catalogs, None, limit=None)) == 5
+        assert rank_across(catalogs, "list", limit=0) == []
+        assert rank_across({}, "list") == []
+        assert rank_across({"empty": []}, None) == []
+
+    def test_single_toolkit_matches_rank_tools(self):
+        query = "list my messages"
+        assert [q.tool for q in rank_across({"gmail": self.MAIL}, query)] == rank_tools(self.MAIL, query)
