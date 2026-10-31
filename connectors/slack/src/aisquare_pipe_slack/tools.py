@@ -942,7 +942,17 @@ def _tool(
 ) -> SlackTool:
     """A row. ``read_only`` follows the read tier; ``destructive`` follows
     the destructive tier, or ``overwrites`` for a write that replaces content
-    (an edit) — the owner put edits in the opt-in write tier."""
+    (an edit) — the owner put edits in the opt-in write tier. So the spec's
+    ``risk`` (derived from those flags) is ``read`` for the read tier,
+    ``write`` for send and write, and ``destructive`` for the destructive
+    tier and edits.
+
+    ``required_scopes`` is the scopes of the tool's default identity: the
+    user's, or the bot's for a bot-only tool.
+    :meth:`~aisquare_pipe_slack.toolkit.SlackToolkit.missing_scopes` checks
+    a bot connection against the bot scopes."""
+    user_scopes = None if user is None else tuple(sorted(set(user)))
+    bot_scopes = None if bot is None else tuple(sorted(set(bot)))
     spec = ToolSpec(
         slug,
         description,
@@ -950,6 +960,7 @@ def _tool(
         read_only=tier == TIER_READ,
         destructive=tier == TIER_DESTRUCTIVE or overwrites,
         tags=tuple(tags),
+        required_scopes=user_scopes if user_scopes is not None else bot_scopes or (),
     )
     return SlackTool(
         spec=spec,
@@ -957,8 +968,8 @@ def _tool(
         tier=tier,
         area=area,
         methods=(methods,) if isinstance(methods, str) else methods,
-        user_scopes=None if user is None else tuple(sorted(set(user))),
-        bot_scopes=None if bot is None else tuple(sorted(set(bot))),
+        user_scopes=user_scopes,
+        bot_scopes=bot_scopes,
     )
 
 

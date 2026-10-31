@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "A-Square"}]
 dependencies = [
-    "aisquare-pipe>=0.3.0",
+    "aisquare-pipe>=0.4.0",
     "requests>=2.31",
     # Imported directly: rest.py decides a URL's host with urllib3's parser,
     # the one requests uses (requests also depends on it).
