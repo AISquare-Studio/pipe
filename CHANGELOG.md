@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gmail** (`aisquare-pipe-gmail` 0.1.0, first release): `GmailToolkit`
+  (`gmail`, 13 tools: 7 read, 6 write, 1 destructive) and `GMAIL_OAUTH`.
+  Slugs and argument names follow Composio's Gmail toolkit.
+  - **Tools.** Search and read messages and threads, attachments (returned
+    as a file envelope, like Google Drive downloads), labels and the profile;
+    drafts, sending and threaded replies (`In-Reply-To` / `References`, the
+    last sender by default); label changes (mark read, archive, star) and
+    trash.
+  - **MIME.** Messages are built with the standard library's `email`
+    package (RFC 2047 headers, an HTML body with a text alternative,
+    attachments, header-injection and address checks); large messages go as
+    one multipart upload. Read messages come back with `messageText` (plain
+    text preferred, HTML converted, charsets honoured) and `attachmentList`.
+  - **Least privilege.** Read-only consent by default (`gmail.readonly`);
+    each write tool names the scope it needs (`gmail.compose`, `gmail.send`,
+    `gmail.modify`) in `REQUIRED_SCOPES` and its description.
+- **Google Calendar** (`aisquare-pipe-googlecalendar` 0.1.0, first
+  release): `GoogleCalendarToolkit` (`googlecalendar`, 14 tools: 10 read,
+  4 write, 1 destructive) and `GOOGLECALENDAR_OAUTH`. Slugs and argument
+  names follow Composio's Google Calendar toolkit.
+  - **Tools.** Calendars, events (by range and text, expanded or not),
+    recurring-event instances, events across every calendar, free/busy and
+    free slots, the current time in a zone; create, update (a patch that
+    keeps unmentioned fields), quick-add and delete events.
+  - **Time zones.** Times without an offset are read in the given zone or
+    the calendar's own; query bounds get the zone's offset for that date
+    (daylight saving included); event times stay wall-clock with an IANA
+    zone so recurring events expand correctly.
+  - **Least privilege.** Read-only consent by default (`calendar.readonly`);
+    writes need `calendar.events`.
+- Both Google toolkits tell a 403 for a missing OAuth scope apart from
+  other 403s (`data.insufficient_scope`, `data.required_scopes`) and map it
+  to core's `insufficient_scope` code once core has one (`forbidden` until
+  then). Their OAuth specs omit `include_granted_scopes`, so one Google OAuth
+  client can serve Drive, Gmail and Calendar without one connector's token
+  carrying another's scopes.
 - **Slack** (`aisquare-pipe-slack` 0.1.0, first release): `SlackToolkit`
   (`slack`, 111 tools: 47 read, 6 send, 38 write, 20 destructive),
   `SLACK_OAUTH`, `SlackMessageSink` (`slack-message-sink`) and Events API

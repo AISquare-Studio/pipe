@@ -49,6 +49,8 @@ full = [
     "aisquare-pipe-composio",
     "aisquare-pipe-github",
     "aisquare-pipe-slack",
+    "aisquare-pipe-gmail",
+    "aisquare-pipe-googlecalendar",
 ]
 
 [project.scripts]

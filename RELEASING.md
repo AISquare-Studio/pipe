@@ -17,6 +17,8 @@ This repo is a monorepo of independently published PyPI packages:
 | `aisquare-pipe-github` | `connectors/github` |
 | `aisquare-pipe-graphify` | `connectors/graphify` |
 | `aisquare-pipe-slack` | `connectors/slack` |
+| `aisquare-pipe-gmail` | `connectors/gmail` |
+| `aisquare-pipe-googlecalendar` | `connectors/googlecalendar` |
 
 Publishing is automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
 using **PyPI Trusted Publishing (OIDC)** — no API tokens are stored anywhere.
