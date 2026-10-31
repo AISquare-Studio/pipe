@@ -154,6 +154,16 @@ Risk = Literal["read", "write", "destructive"]
 RISKS: tuple[Risk, ...] = ("read", "write", "destructive")
 
 
+def risk_contradicts_flags(risk: str, *, read_only: bool, destructive: bool) -> bool:
+    """Whether ``risk`` (one of :data:`RISKS`) is lower than the flags say,
+    or not ``read`` on a ``read_only`` tool. A ``destructive`` tool must be
+    ``destructive`` and any other non-read-only tool at least ``write``;
+    raising a risk above the flags is fine. ``ToolSpec`` refuses an explicit
+    risk that contradicts its flags, and ``pipe validate`` checks the same."""
+    floor = "destructive" if destructive else "read" if read_only else "write"
+    return RISKS.index(risk) < RISKS.index(floor) or (read_only and risk != "read")
+
+
 def parse_scopes(value: Any) -> frozenset[str]:
     """A set of OAuth scopes from a stored scope string (space- or
     comma-separated, as providers return it) or a list/tuple/set of strings.
@@ -188,7 +198,10 @@ class ToolSpec:
     (empty: none declared). ``risk`` defaults from the flags: ``destructive``
     when ``destructive``, else ``read`` when ``read_only``, else ``write``.
     A defaulted risk follows the flags through ``dataclasses.replace``; an
-    explicit one is kept.
+    explicit one is kept, and may raise the risk above the flags but never
+    lower it: ``ValueError`` for one below the flags or not ``read`` on a
+    ``read_only`` tool (see :func:`risk_contradicts_flags`), at construction
+    and on every ``dataclasses.replace``.
     """
 
     slug: str
@@ -211,6 +224,11 @@ class ToolSpec:
             object.__setattr__(self, "risk", _DerivedRisk(risk))
         elif self.risk not in RISKS:
             raise ValueError(f"ToolSpec risk {self.risk!r} is not one of: {', '.join(RISKS)}")
+        elif risk_contradicts_flags(self.risk, read_only=self.read_only, destructive=self.destructive):
+            raise ValueError(
+                f"ToolSpec {self.slug}: risk {self.risk!r} contradicts read_only={self.read_only}, "
+                f"destructive={self.destructive}"
+            )
 
     def to_llm_tool(self) -> dict[str, Any]:
         """The ``{name, description, input_schema}`` shape LLM tool-use APIs take."""

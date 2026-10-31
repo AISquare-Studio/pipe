@@ -54,6 +54,12 @@ def _with_tools(*tools: ToolSpec, **attrs) -> type:
     return type("Broken", (Good,), {"tools": lambda self: list(tools), **attrs})
 
 
+def _forced_risk(spec: ToolSpec, risk: str) -> ToolSpec:
+    """``spec`` with ``risk`` set past ``__post_init__``'s check."""
+    object.__setattr__(spec, "risk", risk)
+    return spec
+
+
 @pytest.mark.parametrize(
     ("cls", "check_id"),
     [
@@ -354,16 +360,18 @@ class _CardDials(Good):
             _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("a", "a"))),
             "contract.toolkit.tool-metadata",
         ),
+        # ToolSpec refuses these at construction; validate still catches a
+        # spec whose risk was changed afterwards.
         (
-            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, risk="write")),
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True), "write")),
             "contract.toolkit.tool-metadata",
         ),
         (
-            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False, destructive=True, risk="write")),
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False, destructive=True), "write")),
             "contract.toolkit.tool-metadata",
         ),
         (
-            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False, risk="read")),
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False), "read")),
             "contract.toolkit.tool-metadata",
         ),
     ],

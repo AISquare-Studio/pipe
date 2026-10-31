@@ -118,27 +118,43 @@ def slug_prefix_conflicts(toolkits: Mapping[str, type]) -> list[tuple[str, str]]
 
 
 @functools.cache
-def _installed_toolkits() -> dict[str, type]:
+def _installed_toolkits() -> tuple[dict[str, type], str]:
+    """The installed toolkits minus any whose slug prefixes collide, and a
+    description of the collisions ("" when none). Cached, clash or not, so a
+    clash is logged once and the plugins are imported once."""
     toolkits = {
         name: cls
         for name, cls in discover_toolkits().items()
         if isinstance(cls, type) and issubclass(cls, Toolkit)
     }
     conflicts = slug_prefix_conflicts(toolkits)
+    detail = "; ".join(
+        f"{a} ({toolkits[a].slug_prefix}) and {b} ({toolkits[b].slug_prefix})"
+        for a, b in conflicts
+    )
     if conflicts:
-        detail = "; ".join(
-            f"{a} ({toolkits[a].slug_prefix}) and {b} ({toolkits[b].slug_prefix})"
-            for a, b in conflicts
+        # A bare slug could belong to either toolkit of a pair, so neither is
+        # trusted with it; every other toolkit stays available.
+        clashing = {name for pair in conflicts for name in pair}
+        logger.warning(
+            "Left out toolkits whose slug prefixes collide (`pipe validate` fails on this): %s",
+            detail,
         )
-        raise ToolkitConflictError(f"installed toolkits share a slug prefix: {detail}")
-    return dict(sorted(toolkits.items()))
+        toolkits = {name: cls for name, cls in toolkits.items() if name not in clashing}
+    return dict(sorted(toolkits.items())), detail
 
 
-def installed_toolkits(*, refresh: bool = False) -> dict[str, type[Toolkit]]:
+def installed_toolkits(*, refresh: bool = False, strict: bool = False) -> dict[str, type[Toolkit]]:
     """Every installed toolkit class by name, sorted. Entry points are read
     once per process; ``refresh=True`` reads them again (after installing a
-    plugin). Raises :class:`ToolkitConflictError` when two toolkits'
-    slug prefixes collide (see :func:`slug_prefix_conflicts`).
+    plugin).
+
+    Toolkits whose slug prefixes collide (see :func:`slug_prefix_conflicts`)
+    are left out, with one warning logged: one clashing pair must not hide
+    every other toolkit from :func:`catalogue` and
+    :func:`search_tools_across`. ``strict=True`` raises
+    :class:`ToolkitConflictError` instead. ``pipe validate`` always fails
+    on a collision.
 
     The first discovery imports every plugin module. What those imports do
     is the plugins' own business: urllib3, which the Slack toolkit imports,
@@ -146,7 +162,10 @@ def installed_toolkits(*, refresh: bool = False) -> dict[str, type[Toolkit]]:
     host that must stay offline afterwards calls this once at startup."""
     if refresh:
         _installed_toolkits.cache_clear()
-    return dict(_installed_toolkits())
+    toolkits, conflicts = _installed_toolkits()
+    if strict and conflicts:
+        raise ToolkitConflictError(f"installed toolkits share a slug prefix: {conflicts}")
+    return dict(toolkits)
 
 
 def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
@@ -154,8 +173,9 @@ def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     router shows a model to pick connectors. Offline and cheap: the
     discovery is cached and cards are read from class attributes. The first
     call imports the plugins (see :func:`installed_toolkits`). A toolkit
-    whose card fails is left out (and logged). Each call returns fresh
-    dicts."""
+    whose card fails is left out (and logged), and so are toolkits whose
+    slug prefixes collide (see :func:`installed_toolkits`). Each call
+    returns fresh dicts."""
     cards: dict[str, dict[str, Any]] = {}
     for name, cls in installed_toolkits(refresh=refresh).items():
         try:
@@ -177,7 +197,8 @@ def search_tools_across(
     ``connectors`` picks the toolkits: a mapping of name -> the connection's
     ``config`` (so each lists only its :meth:`Toolkit.available_tools`, e.g.
     filtered by ``granted_scopes``), an iterable of names (no config), or None
-    for every installed toolkit. An unknown name raises
+    for every installed toolkit. An unknown name, or one left out because
+    its slug prefix collides with another toolkit's, raises
     :class:`ToolkitNotFoundError`. Offline, like ``available_tools``, once
     the plugins are imported (see :func:`installed_toolkits`)."""
     installed = installed_toolkits()
@@ -190,8 +211,10 @@ def search_tools_across(
     unknown = sorted(name for name in chosen if name not in installed)
     if unknown:
         available = ", ".join(installed) or "(none)"
+        _, conflicts = _installed_toolkits()
+        left_out = f". Left out, their slug prefixes collide: {conflicts}" if conflicts else ""
         raise ToolkitNotFoundError(
-            f"Toolkit(s) {', '.join(map(repr, unknown))} not found. Available: {available}"
+            f"Toolkit(s) {', '.join(map(repr, unknown))} not found. Available: {available}{left_out}"
         )
     catalogs: dict[str, list[ToolSpec]] = {}
     keywords: dict[str, list[str]] = {}

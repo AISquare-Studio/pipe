@@ -1117,8 +1117,31 @@ class TestToolSpecMetadata:
     def test_replace_keeps_an_explicit_risk(self):
         tool = spec("X_SEND", read_only=False, risk="destructive")
         assert dataclasses.replace(tool, tags=("x",)).risk == "destructive"
-        assert dataclasses.replace(spec("X_A"), risk="write").risk == "write"
-        assert dataclasses.replace(dataclasses.replace(spec("X_A"), risk="write"), read_only=True).risk == "write"
+        assert dataclasses.replace(tool, destructive=True).risk == "destructive"
+        assert dataclasses.replace(spec("X_A", read_only=False), risk="destructive").risk == "destructive"
+
+    @pytest.mark.parametrize(
+        ("read_only", "destructive", "risk"),
+        [
+            (True, False, "write"),  # a read-only tool is "read"
+            (True, False, "destructive"),
+            (False, False, "read"),  # below the flags
+            (False, True, "write"),
+            (False, True, "read"),
+            (True, True, "destructive"),  # read_only and destructive at once
+        ],
+    )
+    def test_an_explicit_risk_contradicting_the_flags_is_refused(self, read_only, destructive, risk):
+        with pytest.raises(ValueError, match=r"X_DO: risk .* contradicts read_only"):
+            spec("X_DO", read_only=read_only, destructive=destructive, risk=risk)
+
+    def test_replace_cannot_leave_an_explicit_risk_below_the_flags(self):
+        # The flags moved, the explicit risk did not: refused, not kept.
+        write = spec("X_SEND", read_only=False, risk="write")
+        with pytest.raises(ValueError, match="contradicts"):
+            dataclasses.replace(write, destructive=True)
+        with pytest.raises(ValueError, match="contradicts"):
+            dataclasses.replace(write, read_only=True)
 
     def test_risk_is_a_plain_string(self):
         tool = spec("X_A")
