@@ -853,7 +853,6 @@ CATALOG: tuple[OneDriveTool, ...] = (
         ),
         _search_items,
         "search", "find", "file", "files", "document", "lookup", "keyword",
-        "pipe:primary",
     ),
     _read(
         "ONE_DRIVE_DOWNLOAD_FILE",

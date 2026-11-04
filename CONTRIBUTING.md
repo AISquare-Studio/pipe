@@ -441,9 +441,9 @@ a tool is the text you give it.
 - **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
   two tools a toolkit should offer first when a query is ambiguous (the main
   search or send tool) with `pipe:primary`; their score is raised by 5%. The
-  native toolkits mark their main read and write tool (Gmail fetch/send,
-  Calendar list/create event, Drive find/upload, OneDrive search/upload,
-  Slack send/search messages). It
+  native toolkits mark their main tools (Gmail fetch/send, Calendar
+  list/create event, Drive find/upload, OneDrive upload, Slack send/search
+  messages); check a toolkit's own ranking tests when you add one. It
   is a ranking marker only: tags in the `pipe:` namespace are never indexed
   as text. Don't use it on most tools (it then means nothing), and don't use
   the word `important` for this: `important` is an ordinary content tag

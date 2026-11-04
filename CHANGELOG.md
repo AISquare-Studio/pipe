@@ -43,12 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1,000 connectors x 50 tools.
 - `tests/evals/`: 150 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
-- The native toolkits' main read and write tools carry `pipe:primary`:
+- The native toolkits' main tools carry `pipe:primary`:
   `GMAIL_FETCH_EMAILS`, `GMAIL_SEND_EMAIL`, `GOOGLECALENDAR_EVENTS_LIST`,
   `GOOGLECALENDAR_CREATE_EVENT`, `GOOGLEDRIVE_FIND_FILE`,
-  `GOOGLEDRIVE_UPLOAD_FILE`, `ONE_DRIVE_SEARCH_ITEMS`,
-  `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE`, `SLACK_SEND_MESSAGE`,
-  `SLACK_SEARCH_MESSAGES`.
+  `GOOGLEDRIVE_UPLOAD_FILE`, `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE`,
+  `SLACK_SEND_MESSAGE`, `SLACK_SEARCH_MESSAGES`.
 
 ### Changed
 
