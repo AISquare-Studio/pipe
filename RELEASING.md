@@ -64,6 +64,29 @@ You can also run it manually: **Actions → publish → Run workflow**
 (`workflow_dispatch`). Either way, every package whose project is new on PyPI
 needs its pending trusted publisher registered first ("One-time setup").
 
+## Toolkits before the `[toolkits]` extra
+
+`aisquare-pipe[toolkits]` names every toolkit package with a floor
+(`aisquare-pipe-github>=0.3.0`, …), and pipe-as-service installs it to get
+every toolkit. `scripts/check_toolkits_extra.py` keeps the list complete in CI,
+so a PR that adds a toolkit package also adds it there.
+
+**Publish order: the toolkit packages first, then the `aisquare-pipe` release
+whose `[toolkits]` names them.** An `aisquare-pipe` on PyPI whose `[toolkits]`
+names a package (or a floor) that isn't there cannot be installed with that
+extra, and every host that relocks against it fails. The publish workflow
+uploads every package in one parallel run, so the order comes from versions:
+
+1. Bump and publish the new or changed toolkit packages. Leave the
+   `aisquare-pipe` version alone: `skip-existing` skips the framework, so the
+   extra change rides along unpublished.
+2. Confirm each one on the simple index (`pip index versions <project>`).
+3. Then bump `aisquare-pipe` and publish it: its `[toolkits]` now resolves.
+
+When one run must carry both (as 0.4.0 does), check every toolkit package is
+on the index (step 3 of the 0.4.0 list below) before anyone relocks against
+the new `aisquare-pipe`; until then its `[toolkits]` cannot resolve.
+
 ## The 0.4.0 release (native connectors)
 
 PyPI has `aisquare-pipe` 0.1.0 and 0.1.1 only (checked 2026-10-31): the

@@ -66,6 +66,14 @@ First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
 
 ### Added
 
+- **`aisquare-pipe[toolkits]`**: every package that registers an
+  `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
+  googledrive, onedrive, slack), each floored at a release that ships its
+  toolkit. `scripts/check_toolkits_extra.py` (CI) fails when a toolkit package
+  is missing from it or an entry has no toolkit;
+  `scripts/dev_install_toolkits.sh` editable-installs the framework and every
+  toolkit into another venv. Publish the toolkits before the `aisquare-pipe`
+  release whose extra names them (RELEASING.md).
 - **Router metadata on every native toolkit** — github, googledrive,
   onedrive, slack, gmail and googlecalendar — so `catalogue()` returns six
   cards and scope filtering works on all of them.
