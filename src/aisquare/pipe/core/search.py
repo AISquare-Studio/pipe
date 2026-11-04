@@ -31,7 +31,9 @@ Searching several connectors at once scores every tool with IDF over the
 union of their catalogues, and a connector the query names as the service
 to use ("... on slack", "... in Google Drive", "in gcal") has its scores
 raised by :data:`NAMED_BOOST` (never a filter); one only mentioned as a
-topic ("the slack migration") is not. Length normalisation pivots on fixed field
+topic ("the slack migration") or a modifier ("slack-style") is not. A
+connector's own name is left out of its tools' fields, so it never orders
+its own tools. Length normalisation pivots on fixed field
 lengths, so the same tool scores the same in any search and scores compare
 across connectors.
 """
@@ -139,6 +141,7 @@ SYNONYMS: tuple[tuple[str, ...], ...] = (
     ("cancel", "delete"),
     ("copy", "duplicate", "clone"),
     ("share", "grant", "invite", "access"),
+    ("permission", "access", "rights"),
     ("invite", "bring"),
     ("star", "favorite", "favourite", "bookmark"),
     ("draft", "compose", "write"),
@@ -221,6 +224,15 @@ _SERVICE_BEFORE = frozenset(
 )
 # Words after a connector's name that make it the service: "slack channel",
 # "github repo", "gmail inbox", "onedrive folder".
+# Words after a connector's name that make it a modifier, not the service:
+# "in slack style", "github-flavored markdown", "slack-like", "gmail-esque".
+_MODIFIER_AFTER = frozenset(
+    {
+        "style", "styled", "styles", "flavor", "flavored", "flavour", "flavoured", "format",
+        "formatted", "formatting", "syntax", "markdown", "like", "esque", "ish", "inspired",
+        "theme", "themed", "tone", "look",
+    }
+)
 _SERVICE_AFTER = frozenset(
     {
         "account", "app", "calendar", "calendars", "channel", "channels", "dm", "dms", "drive",
@@ -280,6 +292,9 @@ _WRITE_VERBS = frozenset(
 # Nouns that are write verbs when they open the query ("email Bob the
 # numbers", "file a bug"), not elsewhere ("the email from Bob").
 _IMPERATIVE_NOUNS = frozenset({"email", "mail", "message", "text", "file", "call", "invite"})
+# A query opening with these asks to see something, whatever verbs follow
+# ("who has edit rights", "what changed in the last commit").
+_QUESTION_WORDS = frozenset({"who", "what", "whats", "which", "when", "where", "how"})
 # Verbs that may read or write ("open a PR" / "open the email"): no intent.
 _AMBIGUOUS_VERBS = frozenset({"open", "close", "do"})
 _READ_VERBS = frozenset(
@@ -353,6 +368,26 @@ def _words(text: str) -> list[str]:
     return words
 
 
+def _tokenize_without(text: str, phrases: frozenset[Phrase]) -> list[str]:
+    """:func:`tokenize` of ``text`` with every occurrence of ``phrases``
+    (lowercase word tuples) taken out first."""
+    words = _words(text)
+    if phrases and words:
+        longest = max(len(p) for p in phrases)
+        kept: list[str] = []
+        i = 0
+        while i < len(words):
+            for n in range(min(longest, len(words) - i), 0, -1):
+                if tuple(words[i : i + n]) in phrases:
+                    i += n
+                    break
+            else:
+                kept.append(words[i])
+                i += 1
+        words = kept
+    return [stem(w) for w in words if len(w) > 1 and w not in STOPWORDS]
+
+
 def tokenize(text: str) -> list[str]:
     """Index terms of ``text`` in order: its words (UPPER_SNAKE, camelCase
     and punctuation split, lowercased) minus :data:`STOPWORDS` and one-letter
@@ -413,9 +448,10 @@ def analyze_query(query: str) -> QueryAnalysis:
     distinct query term with its synonyms, one per multi-word synonym phrase
     in the query ("pull request" -> ``pr``), and ``authenticated`` (weighted
     :data:`FIRST_PERSON_WEIGHT`) for first-person phrasing. Intent is
-    ``"write"`` when the query has a write verb and no read verb, ``"read"``
-    when it has a read verb and no write verb, or no verb at all (a noun
-    phrase such as "my unread emails" asks to see something), else None."""
+    ``"read"`` for a question ("who ...", "what ..."), else ``"write"`` when
+    the query has a write verb and no read verb, ``"read"`` when it has a
+    read verb and no write verb, or no verb at all (a noun phrase such as
+    "my unread emails" asks to see something), else None."""
     raw = _imperative(_rewrite_idioms(_words(query)))
     tokens = [stem(w) for w in raw if len(w) > 1 and w not in STOPWORDS]
     table, longest = _synonym_table()
@@ -436,8 +472,11 @@ def analyze_query(query: str) -> QueryAnalysis:
         concepts.setdefault(source, Concept(source, ((source, 1.0),), FIRST_PERSON_WEIGHT))
     writes = any(w in _WRITE_VERBS for w in raw) or bool(raw and raw[0] in _IMPERATIVE_NOUNS)
     reads = any(w in _READ_VERBS for w in raw)
-    if writes != reads:
-        intent: str | None = "write" if writes else "read"
+    intent: str | None
+    if raw and raw[0] in _QUESTION_WORDS:  # "who has edit rights ...": a question reads
+        intent = "read"
+    elif writes != reads:
+        intent = "write" if writes else "read"
     elif not writes and not any(w in _AMBIGUOUS_VERBS for w in raw):
         intent = "read"
     else:
@@ -449,7 +488,13 @@ _AUTHENTICATED = stem("authenticated")
 
 
 def _rewrite_idioms(words: list[str]) -> list[str]:
-    """``words`` with each :data:`IDIOMS` phrase replaced by its verb."""
+    """``words`` with each :data:`IDIOMS` phrase replaced by its verb, and
+    "let <someone> know" read as "notify <someone>"."""
+    if "let" in words and "know" in words:
+        i = words.index("let")
+        if "know" in words[i + 1 : i + 5]:
+            j = words.index("know", i + 1)
+            words = [*words[:i], "notify", *words[i + 1 : j], *words[j + 1 :]]
     if not any(w in _IDIOM_HEADS for w in words):
         return words
     out: list[str] = []
@@ -731,17 +776,37 @@ class ToolIndex:
         self.fingerprint = _fingerprint(connector, catalogue, card)
         slugs = tuple(str(t.slug) for t in catalogue)
         cut = _prefix_len(connector, slugs)
+        prefix = " ".join(_slug_words(slugs[0])[:cut]) if cut else ""
+        names = [(card or {}).get("name"), (card or {}).get("display_name"), connector, prefix]
+        # How a query may name this connector: its names and slug prefix,
+        # spaced and joined ("google drive", "googledrive", "one drive"), and
+        # its card keywords ("gcal").
+        spellings = [str(v) for v in names if v]
+        spellings += [re.sub(r"[^a-z0-9]", "", v.lower()) for v in spellings]
+        self._names = frozenset(p for p in map(_plain_words, spellings) if p)
+        keywords = _values((card or {}).get("keywords"))
+        self._keywords = frozenset(p for p in map(_plain_words, keywords) if p)
+        # The connector's own name says nothing about which of its tools to
+        # use: it is left out of every tool field (SLACK_CREATE_SLACK_LIST
+        # indexes as "create list", "Search Google Drive for files" as
+        # "search files"; "shared drives" and "primary calendar" keep their
+        # words, being no name).
+        own = self._names
+
+        def terms(text: str) -> list[str]:
+            return _tokenize_without(text, own)
+
         docs = [
             (
-                tokenize(" ".join(_slug_words(slug)[cut:])),
+                terms(" ".join(_slug_words(slug)[cut:])),
                 [
                     term
                     for tag in _tags_of(t)
                     if not tag.startswith(MARKER_PREFIX)
-                    for term in tokenize(tag)
+                    for term in terms(tag)
                 ],
-                tokenize(str(getattr(t, "description", "") or "")),
-                tokenize(_schema_text(getattr(t, "input_schema", None))),
+                terms(str(getattr(t, "description", "") or "")),
+                terms(_schema_text(getattr(t, "input_schema", None))),
             )
             for t, slug in zip(catalogue, slugs)
         ]
@@ -752,22 +817,12 @@ class ToolIndex:
             pivots=[_FIELD_PIVOT[f] for f in _TOOL_FIELDS],
             df_weights=[_FIELD_DF[f] for f in _TOOL_FIELDS],
         )
-        prefix = " ".join(_slug_words(slugs[0])[:cut]) if cut else ""
         # Shared by every tool: the card's category and keywords (low), and
         # the connector's own names, including its slug prefix (higher).
         shared = dict.fromkeys(tokenize(_card_words(card)), FIELD_WEIGHTS["card"])
-        names = [(card or {}).get("name"), (card or {}).get("display_name"), connector, prefix]
         names_text = " ".join(str(v) for v in names if v)
         shared.update(dict.fromkeys(tokenize(names_text), FIELD_WEIGHTS["connector"]))
         self._shared = shared
-        # How a query may name this connector: its names and slug prefix,
-        # spaced and joined ("google drive", "googledrive", "one drive"), and
-        # its card keywords ("gcal").
-        spellings = [str(v) for v in names if v]
-        spellings += [re.sub(r"[^a-z0-9]", "", v.lower()) for v in spellings]
-        self._names = frozenset(p for p in map(_plain_words, spellings) if p)
-        keywords = _values((card or {}).get("keywords"))
-        self._keywords = frozenset(p for p in map(_plain_words, keywords) if p)
         self._slugs = slugs
         self._primary = tuple(PRIMARY_TAG in _tags_of(t) for t in catalogue)
         self._read_only = tuple(_read_only_of(t) for t in catalogue)
@@ -882,13 +937,18 @@ def _cued(query: str, words: Sequence[str], found: list[tuple[Phrase, int]]) -> 
     """Whether any occurrence stands in service position: after "in", "on",
     "to", "via", "my", "search", ... (:data:`_SERVICE_BEFORE`), before
     "channel", "repo", "inbox", "folder", ... (:data:`_SERVICE_AFTER`), or
-    as the query's leading "<name>:"."""
+    as the query's leading "<name>:". A name followed by "style",
+    "flavored", "format", "markdown", "like", ... (:data:`_MODIFIER_AFTER`)
+    modifies something else and is never the service."""
     lead = _plain_words(query.split(":", 1)[0]) if ":" in query else None
     for phrase, i in found:
+        end = i + len(phrase)
+        after = words[end] if end < len(words) else None
+        if after in _MODIFIER_AFTER:
+            continue  # "in slack style", "github-flavored": a topic, not the service
         if i > 0 and words[i - 1] in _SERVICE_BEFORE:
             return True
-        end = i + len(phrase)
-        if end < len(words) and words[end] in _SERVICE_AFTER:
+        if after in _SERVICE_AFTER:
             return True
         if lead == phrase:
             return True

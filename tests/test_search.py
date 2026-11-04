@@ -139,6 +139,14 @@ class TestAnalyzeQuery:
         assert analyze_query("push back the standup").tokens[:1] == ("postpon",)
         assert analyze_query("get the draft").tokens == ("get", "draft")
 
+    def test_let_someone_know(self):
+        assert analyze_query("let the team know it shipped").tokens[:2] == ("notify", "team")
+        assert analyze_query("let the team know it shipped").intent == "write"
+
+    def test_questions_read(self):
+        assert analyze_query("who has edit rights on the plan").intent == "read"
+        assert analyze_query("what changed in the last commit").intent == "read"
+
     def test_opening_noun_verbs(self):
         assert analyze_query("email the team about it").tokens[:2] == ("send", "email")
         assert analyze_query("file a bug about the login").tokens[:2] == ("creat", "bug")
@@ -380,6 +388,10 @@ class TestNamedConnector:
             ("file a bug: slack notifications are delayed", {}),
             ("add slack time to the week", {}),
             ("send it to review", {}),  # "review" is github's and googlecalendar's
+            ("email Bob a recap in slack style", {}),  # a name as a modifier is a topic
+            ("draft it in github-flavored markdown", {}),
+            ("write it with slack-like brevity", {}),
+            ("open an issue in slack format", {}),
             ("schedule a meeting about the github workshop", {}),
         ],
     )
@@ -429,6 +441,25 @@ class TestNamedConnector:
             if h.connector == "slack"
         ]
         assert together == alone
+
+    def test_own_name_is_not_a_signal_among_own_tools(self):
+        tools = [
+            spec("ACME_CREATE_ACME_LIST", "Create an Acme list in Acme.", read_only=False),
+            spec("ACME_LIST_CHANNELS", "List the channels."),
+        ]
+        index = ToolIndex.build("acme", tools, {"name": "acme", "display_name": "Acme"})
+        assert index.df("acm") == 0  # left out of slugs and descriptions
+        assert index.search("what channels are in acme")[0].tool.slug == "ACME_LIST_CHANNELS"
+        assert set(slugs(index.search("acme lists"))) == {t.slug for t in tools}  # "list" still counts
+
+    def test_a_multi_word_name_goes_as_a_phrase(self):
+        tools = [
+            spec("GOOGLEDRIVE_LIST_SHARED_DRIVES", "List shared drives in Google Drive."),
+            spec("GOOGLEDRIVE_FIND_FILE", "Search GoogleDrive for files."),
+        ]
+        index = ToolIndex.build("googledrive", tools, {"name": "googledrive", "display_name": "Google Drive"})
+        assert index.df("googl") == 0 and index.df("googledriv") == 0
+        assert index.df("driv") == 1  # "shared drives" is no name
 
     def test_named_in_reports_any_mention(self):
         slack, github, _, cal = self._indexes()

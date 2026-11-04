@@ -31,10 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Across several connectors, a connector the query names as the service
     to use ("post it in slack", "on one drive", "in gcal", "github repo",
     "slack: ...") has its scores doubled (`NAMED_BOOST`). Boost only; a
-    name used only as a topic ("the slack migration") gets no boost and
-    counts as a weak search term (`TOPIC_WEIGHT`).
+    name used only as a topic ("the slack migration") or as a modifier
+    ("in slack style", "github-flavored markdown") gets no boost and counts
+    as a weak search term (`TOPIC_WEIGHT`). A connector's own name is left
+    out of its tools' fields at index time, so it never ranks one of its
+    tools above another.
   - Idioms ("get rid of", "set up", "push back") and opening noun-verbs
-    ("email the team ...", "file a bug ...") read as the verbs they mean;
+    ("email the team ...", "file a bug ...") read as the verbs they mean,
+    "let <someone> know" as notify, and a question ("who ...", "what ...")
+    as a read;
     calendar vocabulary (postpone/push/shift ~ update, standup/sync/huddle/
     call ~ meeting, bring ~ invite) joins the synonym table. Ranking accepts
     duck-typed specs (`slug`, `description`, `input_schema`; other fields
@@ -47,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
   measures index build, memory and query latency on 10,000 tools and on
   1,000 connectors x 50 tools.
-- `tests/evals/`: 165 labelled tool-search queries over the six native
+- `tests/evals/`: 182 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
 - The native toolkits' main tools carry `pipe:primary`:
   `GMAIL_FETCH_EMAILS`, `GMAIL_SEND_EMAIL`, `GOOGLECALENDAR_EVENTS_LIST`,
@@ -64,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogue (or the connectors taking turns). Results differ: plurals and
   other word forms match (`repository` finds `..._REPOSITORIES_...`),
   synonyms match below exact words, and IDF makes rare words count more.
-  On the eval, recall@1 goes from 0.576 to 0.812 and recall@10 from 0.891
+  On the eval, recall@1 goes from 0.560 to 0.797 and recall@10 from 0.885
   to 1.000.
 - `search_tools_across` no longer rebuilds every catalogue's ranking on
   each call: each toolkit's index is cached and reused until its catalogue

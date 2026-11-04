@@ -734,3 +734,93 @@
   mentions: gmail
   acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
   kinds: [multi, write, incidental]
+
+# ---------- a connector's own name says nothing about which of its tools (positive)
+- query: what channels are on slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_LIST_ALL_CHANNELS, SLACK_LIST_CONVERSATIONS, SLACK_FIND_CHANNELS]
+  kinds: [multi, named]
+- query: what files are in my onedrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_LIST_FOLDER_CHILDREN, ONE_DRIVE_SEARCH_ITEMS, ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [multi, named, first_person]
+- query: upload a file to onedrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_ONEDRIVE_UPLOAD_FILE]
+  kinds: [multi, named, write]
+- query: find my files in google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_FIND_FILE, GOOGLEDRIVE_LIST_FILES]
+  kinds: [multi, named, first_person]
+- query: list my github repositories
+  connector: github
+  across: all
+  acceptable: [GITHUB_LIST_REPOSITORIES_FOR_THE_AUTHENTICATED_USER]
+  kinds: [multi, named, first_person]
+- query: which channels are there in slack
+  connector: slack
+  acceptable: [SLACK_LIST_ALL_CHANNELS, SLACK_LIST_CONVERSATIONS, SLACK_FIND_CHANNELS]
+- query: show the files in my onedrive
+  connector: onedrive
+  acceptable: [ONE_DRIVE_LIST_FOLDER_CHILDREN, ONE_DRIVE_SEARCH_ITEMS, ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [first_person]
+- query: search slack for messages about the launch
+  connector: slack
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+
+# ------------- a connector's name as a style or format modifier is a topic (negative)
+- query: write the release notes email in github-flavored markdown
+  connector: gmail
+  across: all
+  mentions: github
+  acceptable: [GMAIL_CREATE_EMAIL_DRAFT, GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: send the weekly update by email in slack-style bullet points
+  connector: gmail
+  across: all
+  mentions: slack
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: post a gmail-style summary to the team channel
+  connector: slack
+  across: all
+  mentions: gmail
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, incidental]
+- query: create a doc with the notes in github markdown syntax
+  connector: googledrive
+  across: all
+  mentions: github
+  acceptable: [GOOGLEDRIVE_CREATE_FILE_FROM_TEXT]
+  kinds: [multi, write, incidental]
+- query: open an issue with the repro steps in slack format
+  connector: github
+  across: all
+  mentions: slack
+  acceptable: [GITHUB_CREATE_AN_ISSUE]
+  kinds: [multi, write, incidental]
+- query: email the client a recap with slack-esque emoji
+  connector: gmail
+  across: all
+  mentions: slack
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+
+# ------------------------------------------------------- more paraphrases
+- query: let the team know the deploy finished
+  connector: slack
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [write, paraphrase]
+- query: what's on the agenda for tomorrow
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_EVENTS_LIST, GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS, GOOGLECALENDAR_FIND_EVENT]
+  kinds: [paraphrase]
+- query: who has edit rights on the budget sheet
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_PERMISSIONS]
+  kinds: [paraphrase]
+

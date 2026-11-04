@@ -442,10 +442,19 @@ a tool is the text you give it.
   toolkit; so does a card keyword no other searched toolkit lists ("in
   gcal", "on my calendar"), and a name beats a keyword. A name used only as
   a topic ("schedule a meeting about the slack migration", "slack
-  notifications are delayed") gets no boost and counts as a weak search
-  term (`TOPIC_WEIGHT`). Keep brand abbreviations among your `keywords`.
+  notifications are delayed") or as a modifier ("in slack style",
+  "github-flavored markdown", "slack-like") gets no boost and counts as a
+  weak search term (`TOPIC_WEIGHT`). Keep brand abbreviations among your
+  `keywords`.
+- **A toolkit's own name says nothing about which of its tools to use.** It
+  is left out of every tool field at index time, as a phrase
+  (`SLACK_CREATE_SLACK_LIST` indexes as "create list", "Search Google
+  Drive for files" as "search files"; "shared drives" keeps "drive"). So
+  repeating your toolkit's name in slugs and descriptions is harmless, and
+  it never ranks one of your tools above another.
 - **Idioms and opening noun-verbs.** "get rid of" reads as delete, "set
-  up" as create, "push back" as postpone, "look up/for" as search; a query
+  up" as create, "push back" as postpone, "look up/for" as search, "let
+  <someone> know" as notify; a query
   opening with "email", "message" or "text" also means send, and "file a
   bug" means create.
 - **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
@@ -482,7 +491,7 @@ still ranks first. Extend a group when the search eval shows a miss:
 | cancel · delete | spreadsheet · sheet · excel · workbook |
 | copy · duplicate · clone | free · available · availability |
 | share · grant · invite · access | profile · account · whoami |
-| invite · bring | |
+| invite · bring | permission · access · rights |
 | star · favorite · favourite · bookmark | reminder · remind |
 | draft · compose · write | commit · change · diff |
 | react · reaction · emoji | release · version |
