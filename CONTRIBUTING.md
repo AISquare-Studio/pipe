@@ -511,9 +511,10 @@ rename tools in a native toolkit, run it; when you change the analyser or
 the synonym table, it must not get worse. `scripts/bench_search.py` checks
 build time and latency on synthetic catalogues
 (`aisquare.pipe.testing.synthetic.synthetic_catalog`) of 10,000 tools and
-1,000 connectors, and the index cache's hit rate through `search_scored`,
-`search_connectors` and `search_tools_across` with 1,000 and 2,000 toolkits
-installed.
+1,000 connectors, and that the installed toolkits' indexes are reused
+(not rebuilt) through `search_scored`, `search_connectors`,
+`search_tools_across` and `Toolkit.search_tools` with 1,000 and 2,000
+toolkits installed.
 
 ## Live Tests (optional)
 

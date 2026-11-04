@@ -1093,13 +1093,6 @@ def _tool_digest(tool: ToolSpec) -> bytes:
     return hashlib.blake2b(payload.encode(), digest_size=16).digest()
 
 
-def _hash_catalogue(tools: Sequence[ToolSpec]) -> bytes:
-    h = hashlib.blake2b(digest_size=16)
-    for tool in tools:
-        h.update(_tool_digest(tool))
-    return h.digest()
-
-
 def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
     key = tuple(map(id, tools))
     with _lock:
@@ -1107,7 +1100,10 @@ def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
         if hit is not None:
             _digests.move_to_end(key)
             return hit[1]
-    digest = _hash_catalogue(tools)
+    h = hashlib.blake2b(digest_size=16)
+    for tool in tools:
+        h.update(_tool_digest(tool))
+    digest = h.digest()
     with _lock:
         _digests[key] = (tuple(tools), digest)
         while len(_digests) > INDEX_CACHE_SIZE:
@@ -1115,18 +1111,10 @@ def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
     return digest
 
 
-def _fingerprint(
-    connector: str,
-    tools: Sequence[ToolSpec],
-    card: Mapping[str, Any] | None,
-    digest: bytes | None = None,
-) -> str:
-    """The fingerprint of a catalogue and card; ``digest`` is the catalogue's
-    (:func:`_hash_catalogue`) when the caller has it, else it comes from the
-    digest LRU."""
+def _fingerprint(connector: str, tools: Sequence[ToolSpec], card: Mapping[str, Any] | None) -> str:
     h = hashlib.blake2b(digest_size=16)
     h.update(json.dumps([connector, _card_words(card)]).encode())
-    h.update(_catalogue_digest(tools) if digest is None else digest)
+    h.update(_catalogue_digest(tools))
     return h.hexdigest()
 
 
@@ -1163,21 +1151,36 @@ def cached_index(
     return index
 
 
+def _same_spec(known: Any, tool: Any) -> bool:
+    """Whether ``tool`` is the spec ``known`` stands for: the same object (the
+    fast path), an equal one (a ToolSpec, a frozen dataclass, compares every
+    field, the schema included, so a toolkit may build its specs anew on
+    each call), or, for specs that compare only by identity (duck-typed),
+    one with the same indexed content."""
+    if known is tool:
+        return True
+    if known is None or tool is None:
+        return False
+    if type(known).__eq__ is not object.__eq__ or type(tool).__eq__ is not object.__eq__:
+        return bool(known == tool)
+    return _tool_digest(known) == _tool_digest(tool)
+
+
 @dataclass(frozen=True)
 class _Slot:
-    """A toolkit class's cached index, and what it was checked against last:
-    the class's name, version and card words, and the very ToolSpec objects
-    its ``tools()`` returned (held, so their identity stays meaningful)."""
+    """A toolkit class's cached index and the class's name, version and card
+    words it was built for."""
 
     key: tuple[str, str, str]
-    tools: tuple[ToolSpec, ...]
     index: ToolIndex
 
     def holds(self, key: tuple[str, str, str], tools: Sequence[ToolSpec]) -> bool:
+        """Whether the index still describes these specs (:func:`_same_spec`)."""
+        built = self.index.tools
         return (
             key == self.key
-            and len(tools) == len(self.tools)
-            and all(a is b for a, b in zip(tools, self.tools))
+            and len(tools) == len(built)
+            and all(_same_spec(a, b) for a, b in zip(built, tools))
         )
 
 
@@ -1220,8 +1223,10 @@ def toolkit_index(toolkit: Toolkit) -> ToolIndex:
     :func:`cached_index`, so walking every installed toolkit on each search
     keeps hitting however many there are. The slot is reused while the
     class's name, version and card words are the same and ``tools()``
-    returns the same ToolSpec objects, or new ones with the same
-    fingerprint; anything else rebuilds it. It lives as long as the class."""
+    returns the same specs, in order: the same objects, or equal ones (a
+    toolkit may build new ToolSpecs on each call); for specs that compare
+    only by identity, ones with the same indexed content. Anything else
+    rebuilds it. It lives as long as the class."""
     cls = type(toolkit)
     connector = str(getattr(cls, "name", ""))
     tools = tuple(toolkit.tools())
@@ -1229,23 +1234,15 @@ def toolkit_index(toolkit: Toolkit) -> ToolIndex:
     key = (connector, str(getattr(cls, "version", "")), _card_words(card))
     with _lock:
         slot = _toolkit_slots.get(cls)
-        if slot is not None and slot.holds(key, tools):
+    if slot is not None and slot.holds(key, tools):
+        with _lock:
             _counters["hits"] += 1
-            return slot.index
-    if slot is not None and slot.key == key:
-        # New spec objects (a toolkit that builds its ToolSpecs on each
-        # call): the same index if they describe the same catalogue.
-        fingerprint = _fingerprint(connector, tools, card, _hash_catalogue(tools))
-        if fingerprint == slot.index.fingerprint:
-            with _lock:
-                _toolkit_slots[cls] = _Slot(key, tools, slot.index)
-                _counters["hits"] += 1
-            return slot.index
+        return slot.index
     with _lock:
         _counters["misses"] += 1
     index = ToolIndex.build(connector, tools, card)
     with _lock:
-        _toolkit_slots[cls] = _Slot(key, tools, index)
+        _toolkit_slots[cls] = _Slot(key, index)
     return index
 
 
@@ -1254,12 +1251,16 @@ def scoped_index(
 ) -> tuple[ToolIndex, frozenset[str] | None]:
     """The index to search ``available`` (a subset of ``toolkit``'s
     catalogue, such as its :meth:`Toolkit.available_tools`) and the slugs to
-    keep: the whole catalogue's cached index, filtered by slug (None when
-    ``available`` is the whole catalogue). When ``available`` holds ToolSpecs
-    the catalogue does not, an index of ``available`` itself, unfiltered."""
+    keep: the whole catalogue's cached index (:func:`toolkit_index`),
+    filtered by slug (None when ``available`` is the whole catalogue).
+    ``available`` matches the catalogue spec by spec, as the same objects or
+    equal ones (see :func:`toolkit_index`), so a toolkit that builds its
+    specs anew on each call keeps its one index. When ``available`` holds
+    specs the catalogue does not, an index of ``available`` itself (from
+    the LRU of :func:`cached_index`), unfiltered."""
     index = toolkit_index(toolkit)
     by_slug = {tool.slug: tool for tool in index.tools}
-    if all(by_slug.get(tool.slug) is tool for tool in available):
+    if all(_same_spec(by_slug.get(tool.slug), tool) for tool in available):
         if len(available) == len(index.tools):
             return index, None
         return index, frozenset(tool.slug for tool in available)

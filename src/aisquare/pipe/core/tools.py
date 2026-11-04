@@ -678,7 +678,8 @@ class Toolkit(ABC):
         string works too. Absent, None or a blank string means "not known"
         and filters nothing; any other unreadable value grants nothing.
 
-        An override returns a subset of :meth:`tools` (the same ToolSpecs).
+        An override returns a subset of :meth:`tools` (the same ToolSpecs, or
+        equal ones).
         It must not raise for any ``config``, including None, ``{}`` and
         garbage: return ``[]`` when the config can't be read. Like
         :meth:`tools`, it must not touch the network. Listing is advisory:

@@ -41,11 +41,15 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   - `ConnectorIndex.build(cards).search(query, limit)` ranks connector
     cards, for routers that shortlist connectors before tools.
   - `index_for(name)` keeps one index per installed toolkit, rebuilt only
-    when its name, version, card or catalogue changes. These are not in an
-    LRU, so a search over every installed toolkit keeps hitting the cache
-    however many there are (100% on repeated searches at 1,000 and 2,000
-    toolkits in `scripts/bench_search.py`); ad-hoc catalogues (`rank_tools`,
-    `rank_across`) share an LRU of `INDEX_CACHE_SIZE` (512).
+    when its name, version, card or catalogue changes. Specs are matched
+    by content (equal ToolSpecs count as the same), so a toolkit whose
+    `tools()` builds new ToolSpecs on each call keeps its index too. These
+    indexes are not in an LRU: `search_scored`, `search_tools_across` and
+    `Toolkit.search_tools` reuse them however many toolkits are installed
+    (no index rebuilt on repeated searches at 1,000 and 2,000 toolkits in
+    `scripts/bench_search.py`). Ad-hoc catalogues (`rank_tools`,
+    `rank_across`, or an `available_tools()` override listing specs the
+    catalogue doesn't have) share an LRU of `INDEX_CACHE_SIZE` (512).
     `search_scored(query, connectors=None, *, limit=10)` searches several
     toolkits as one ranking, with the forms of `search_tools_across`;
     `search_connectors(query, limit)` ranks the installed cards.
@@ -81,9 +85,11 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   tools_per_connector, *, seed=0)`: deterministic, realistic catalogues
   (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
   measures index build, memory and query latency on 10,000 tools and on
-  1,000 connectors x 50 tools, and the index cache's hit rate and latency
-  through `search_scored`, `search_connectors` and `search_tools_across`
-  with 1,000 and 2,000 toolkits installed.
+  1,000 connectors x 50 tools, and how often the installed toolkits'
+  indexes are reused (index builds counted), the cache's hit rate and
+  latency through `search_scored`, `search_connectors`,
+  `search_tools_across` and `Toolkit.search_tools`, with 1,000 and 2,000
+  toolkits installed whose `tools()` returns the same or new ToolSpecs.
 - `tests/evals/`: 182 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
 - The native toolkits' main tools carry `pipe:primary`:
@@ -132,7 +138,9 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
 - Whatever `installed_toolkits()` leaves out is left out everywhere:
   `get_toolkit(name)` reads the served set, so a left-out name raises
   `ToolkitNotFoundError` saying why (`discover_toolkits()` still reads every
-  entry point); `installed_toolkits(strict=True)` raises
+  entry point). Like `installed_toolkits()` it reads the cached discovery:
+  a toolkit installed after the first one is found after
+  `installed_toolkits(refresh=True)`; `installed_toolkits(strict=True)` raises
   `ToolkitConflictError` for any toolkit left out, not only a slug-prefix
   clash; and `pipe tools` lists left-out toolkits with why and won't open
   them.

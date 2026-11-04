@@ -646,6 +646,95 @@ class TestToolkitIndexCache:
         assert index_for("mail") is not first
 
 
+@pytest.fixture
+def builds(monkeypatch) -> list[str]:
+    """The connector of every ToolIndex.build while the test runs (each
+    index any cache builds)."""
+    built: list[str] = []
+    build = ToolIndex.__dict__["build"]
+
+    def counted(cls, connector, *args, **kwargs):
+        built.append(connector)
+        return build.__func__(cls, connector, *args, **kwargs)
+
+    monkeypatch.setattr(ToolIndex, "build", classmethod(counted))
+    return built
+
+
+def _fresh_kit(name: str, specs: list[ToolSpec], **attrs) -> type:
+    """A toolkit whose tools() builds new, equal ToolSpecs on every call."""
+    kit = _kit(name, [], **attrs)
+    kit.tools = lambda self: [dataclasses.replace(s) for s in specs]  # type: ignore[attr-defined]
+    return kit
+
+
+class TestFreshSpecToolkits:
+    """A toolkit may build new, equal ToolSpecs on each tools() call: every
+    search path still reuses its one index, at any number of toolkits."""
+
+    def test_more_toolkits_than_the_lru_holds(self, installed, monkeypatch, builds):
+        monkeypatch.setattr(search, "INDEX_CACHE_SIZE", 4)
+        kits = [
+            _fresh_kit(f"kit{i}", [spec(f"KIT{i}_LIST_ITEMS", "List items."), spec(f"KIT{i}_SEND_ITEM", "Send an item.", read_only=False)])
+            for i in range(10)
+        ]  # fmt: skip
+        installed(*kits)
+        search_scored("list items", limit=None)
+        assert len(builds) == 10
+        for query in ("list items", "send the item", "zebra"):
+            assert search_scored(query, limit=None) or query == "zebra"
+            assert search_tools_across(query, limit=None)
+            for kit in kits:
+                assert kit().search_tools(query)
+        assert len(builds) == 10  # nothing rebuilt
+        assert cache_info() == {"hits": 90, "misses": 10, "size": 10}  # one slot each, the LRU empty
+
+    def test_hits_equal_what_the_toolkit_lists(self, installed):
+        kit = _fresh_kit("mail", MAIL_TOOLS)
+        installed(kit)
+        first = search_scored("send an email")[0].tool
+        assert search_scored("send an email")[0].tool is first and first == kit().tools()[0]
+
+    def test_a_scoped_connection_filters_the_one_index(self, installed, builds):
+        installed(_fresh_kit("mail", MAIL_TOOLS))
+        for _ in range(3):
+            found = search_scored("email messages", {"mail": {"granted_scopes": ["read"]}}, limit=None)
+            assert slugs(found) == ["MAIL_LIST_MESSAGES"]
+        assert builds == ["mail"]
+
+    def test_any_changed_field_rebuilds(self, installed):
+        """Equal means every field: a spec whose scopes changed rebuilds the
+        index, so a search never hands out the old spec."""
+        scopes = [("read",)]
+        kit = _kit("mail", [])
+        kit.tools = lambda self: [spec("MAIL_LIST_MESSAGES", "List messages.", required_scopes=scopes[0])]  # type: ignore[attr-defined]
+        installed(kit)
+        first = index_for("mail")
+        scopes[0] = ("mail.read",)
+        second = index_for("mail")
+        assert second is not first and second.tools[0].required_scopes == ("mail.read",)
+        assert search_scored("list messages")[0].tool.required_scopes == ("mail.read",)
+
+    def test_duck_typed_specs_without_equality_match_by_content(self, builds):
+        class Spec:  # compares by identity only
+            def __init__(self, slug: str, description: str) -> None:
+                self.slug, self.description, self.input_schema = slug, description, SCHEMA
+
+        class Kit(Toolkit):
+            name = "duck"
+            version = "1.0.0"
+
+            def tools(self):
+                return [Spec("DUCK_LIST_ITEMS", "List items."), Spec("DUCK_DELETE_ITEM", "Delete an item.")]
+
+            def run_tool(self, tool, arguments, config):
+                return ToolResult.ok(None)
+
+        for _ in range(3):
+            assert [t.slug for t in Kit().search_tools("delete the item")][:1] == ["DUCK_DELETE_ITEM"]
+        assert builds == ["duck"]
+
+
 class TestSearchScored:
     def test_across_installed(self, mail_and_cal):
         hits = search_scored("send an email")

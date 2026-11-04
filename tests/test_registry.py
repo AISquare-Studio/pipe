@@ -514,6 +514,23 @@ class TestSearchToolsAcross:
         found = search_tools_across("files", {"scoped": None}, limit=None)
         assert [q.tool.slug for q in found] == ["SCOPED_READ", "SCOPED_WRITE"]
 
+    def test_one_discovery_per_search(self, installed, monkeypatch):
+        """A refresh landing mid-search can't make an installed toolkit
+        unknown: the search reads the discovery once."""
+        self._install(installed)
+        cached = registry_mod._installed_toolkits
+        first = cached()
+        reads = []
+
+        def racing():
+            reads.append(1)
+            return first if len(reads) == 1 else first._replace(toolkits={})
+
+        racing.cache_clear = cached.cache_clear  # type: ignore[attr-defined]
+        monkeypatch.setattr(registry_mod, "_installed_toolkits", racing)
+        assert {q.connector for q in search_tools_across(None, limit=None)} == {"mail", "cal"}
+        assert reads == [1]
+
     def test_unknown_connector(self, installed):
         self._install(installed)
         with pytest.raises(ToolkitNotFoundError, match="'nope'"):

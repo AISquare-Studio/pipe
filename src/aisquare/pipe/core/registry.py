@@ -113,6 +113,8 @@ def get_toolkit(name: str) -> type:
     a toolkit it leaves out (a name hosts can't route, a class name that
     differs from its entry point, a slug-prefix clash) is not found, and the
     error says why. :func:`discover_toolkits` still reads every entry point.
+    The discovery is cached: a toolkit installed after it is found once
+    ``installed_toolkits(refresh=True)`` reads the entry points again.
 
     Raises ToolkitNotFoundError if not found.
     """
@@ -317,11 +319,15 @@ def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     return cards
 
 
-def _require_installed(names: Iterable[str]) -> dict[str, type[Toolkit]]:
+def _require_installed(
+    names: Iterable[str], discovery: _Discovery | None = None
+) -> dict[str, type[Toolkit]]:
     """The installed toolkits; :class:`ToolkitNotFoundError` naming any of
     ``names`` that is not served, and why it was left out (see
-    :func:`_not_found`), both from one discovery. Not a copy: don't change it."""
-    discovery = _installed_toolkits()
+    :func:`_not_found`), both from one discovery (``discovery``, else the
+    cached one). Not a copy: don't change it."""
+    if discovery is None:
+        discovery = _installed_toolkits()
     unknown = sorted({name for name in names if name not in discovery.toolkits})
     if unknown:
         raise _not_found(unknown, discovery)
@@ -334,13 +340,15 @@ def _searchable(
     """For each chosen toolkit: its name, its cached index, the slugs its
     connection may call (None: all) and those tools, in catalogue order. A
     toolkit that fails to list its tools is logged and has none."""
+    # One snapshot: a refresh meanwhile can't make an installed name unknown.
+    discovery = _installed_toolkits()
     if connectors is None:
-        chosen: dict[str, Mapping[str, Any] | None] = dict.fromkeys(_installed_toolkits().toolkits)
+        chosen: dict[str, Mapping[str, Any] | None] = dict.fromkeys(discovery.toolkits)
     elif isinstance(connectors, Mapping):
         chosen = dict(connectors)
     else:
         chosen = dict.fromkeys([connectors] if isinstance(connectors, str) else connectors)
-    installed = _require_installed(chosen)
+    installed = _require_installed(chosen, discovery)
     found: list[tuple[str, ToolIndex, frozenset[str] | None, list[ToolSpec]]] = []
     for name, config in chosen.items():
         try:
