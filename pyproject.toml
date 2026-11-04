@@ -52,6 +52,19 @@ full = [
     "aisquare-pipe-gmail",
     "aisquare-pipe-googlecalendar",
 ]
+# Every package under connectors/ that registers an `aisquare_pipe.toolkits`
+# entry point, each floored at a release that ships its toolkit (a bare name
+# could resolve aisquare-pipe-github 0.1.0, which has none). Hosts install this
+# to get every toolkit. scripts/check_toolkits_extra.py (CI) fails when a
+# toolkit package is missing here or an entry here has no toolkit.
+toolkits = [
+    "aisquare-pipe-github>=0.3.0",
+    "aisquare-pipe-gmail>=0.1.0",
+    "aisquare-pipe-googlecalendar>=0.1.0",
+    "aisquare-pipe-googledrive>=0.3.0",
+    "aisquare-pipe-onedrive>=0.3.0",
+    "aisquare-pipe-slack>=0.1.0",
+]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
