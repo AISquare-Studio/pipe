@@ -356,6 +356,25 @@ class TestMyServiceToolkit(toolkit_compliance_suite(MyServiceToolkit)):
     pass
 ```
 
+Then add the package to the `[toolkits]` extra in the root `pyproject.toml`,
+floored at the first release that ships the toolkit:
+
+```toml
+toolkits = [
+    # ...
+    "aisquare-pipe-mysvc>=0.1.0",
+]
+```
+
+`pip install "aisquare-pipe[toolkits]"` is how a host (pipe-as-service)
+installs every toolkit without naming them, and an installed toolkit is
+served there with no further edits. `scripts/check_toolkits_extra.py` (CI
+runs it) fails when a package registering an `aisquare_pipe.toolkits` entry
+point is missing from the extra, when an entry has no toolkit, or when an
+entry has no `>=` floor or one above the package's version here. To install
+the framework and every toolkit editable into another venv (a host's, say),
+run `scripts/dev_install_toolkits.sh` from that venv; it reads the same list.
+
 The suite (and the contract layer of `pipe validate`) checks, without
 credentials or network: zero-arg instantiation, name + semver version, the
 entry-point name equals `name`, slugs are unique and carry `slug_prefix`,
@@ -453,7 +472,7 @@ twine upload dist/*
 
 ## Which Tier?
 
-All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`.
+All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`. A package that registers a toolkit also goes in `[toolkits]` whatever its tier (see [Building a Toolkit](#building-a-toolkit)); CI enforces that one.
 
 - **Super-popular and broadly useful** → add the package name to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
 - **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via direct install (`pip install aisquare-pipe-{service}`).

@@ -16,6 +16,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Every package that registers an aisquare_pipe.toolkits entry point is
+      # in the root [toolkits] extra, and nothing else is (reads pyproject
+      # files only, so it runs before the install).
+      - name: toolkits extra
+        run: python scripts/check_toolkits_extra.py
+
       - name: Install framework + all connectors
         run: |
           python -m pip install --upgrade pip

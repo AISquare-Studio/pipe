@@ -54,6 +54,15 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
   ```bash
   mypy src
   ```
+- Toolkits extra — every package registering an `aisquare_pipe.toolkits` entry point is in the root
+  `[toolkits]` extra with a `>=` floor, and nothing else is (CI runs it; no install needed):
+  ```bash
+  python scripts/check_toolkits_extra.py
+  ```
+- Editable-install the framework and every toolkit into another venv (e.g. pipe-as-service's), from that venv:
+  ```bash
+  <pipe-checkout>/scripts/dev_install_toolkits.sh
+  ```
 - Inspect CLI:
   ```bash
   pipe --help
@@ -76,6 +85,7 @@ All connectors live in the same `connectors/<name>/` directory; the tier signal 
 - **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`, `googledrive`. Installed via `pip install "aisquare-pipe[popular]"`.
 - **`[full]`** — Everything in `[popular]` plus the long-tail / enterprise / client-specific connectors. Currently adds `salesforce`, `docusign`, `composio`, `github`, `slack`, `gmail`, `googlecalendar`. Installed via `pip install "aisquare-pipe[full]"`.
 - **Direct install** — `pip install aisquare-pipe-<name>` always works for any connector regardless of tier.
+- **`[toolkits]`** — not a tier: every package that registers an `aisquare_pipe.toolkits` entry point, each with a `>=` floor. Hosts (pipe-as-service) install it to get every toolkit. `scripts/check_toolkits_extra.py` fails CI when a toolkit package is missing from it or an entry has no toolkit.
 
 **Where does a new connector belong?**
 - Super-popular and broadly useful (a typical AISquare user is likely to need it) → add to `[popular]` in `pyproject.toml`.
@@ -85,7 +95,7 @@ All connectors live in the same `connectors/<name>/` directory; the tier signal 
 The repo is sized to scale to ~50 connectors in this layout. If the long-tail grows past that, the `[popular]` set may need to spin out into its own repo — but that's a future problem, not a current one.
 
 ## Testing Expectations
-- Run `pipe validate` before pushing any connector change — it is the single gate (contract, hygiene, unit suites) and what CI runs.
+- Run `pipe validate` before pushing any connector change — it is the single gate (contract, hygiene, unit suites) and what CI runs, together with `python scripts/check_toolkits_extra.py`.
 - Any change to pipeline logic, type matching, envelope handling, registry behavior, or merge behavior should include or update tests under `tests/`.
 - Any connector package change should run that connector's test suite and keep compliance tests passing.
 - If a change affects CLI output or connector discovery, verify with the CLI where practical.
