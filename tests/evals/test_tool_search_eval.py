@@ -24,7 +24,7 @@ from aisquare.pipe.core.search import STOPWORDS, ToolIndex, search_indexes, stem
 yaml = pytest.importorskip("yaml")
 
 NATIVE = ("github", "gmail", "googlecalendar", "googledrive", "onedrive", "slack")
-KINDS = {"paraphrase", "first_person", "write", "multi"}
+KINDS = {"paraphrase", "first_person", "write", "multi", "named"}
 CASES: list[dict[str, Any]] = yaml.safe_load(
     (Path(__file__).parent / "tool_search_cases.yaml").read_text()
 )
@@ -167,6 +167,7 @@ def test_case_file_is_well_formed(corpus):
         assert case.get("across") in (None, "all"), case
         assert set(case.get("kinds", [])) <= KINDS, case
         assert ("multi" in case.get("kinds", [])) == bool(case.get("across")), case
+        assert "named" not in case.get("kinds", []) or case.get("across"), case
         slugs = {t.slug for t in tools[case["connector"]]}
         assert case["acceptable"] and set(case["acceptable"]) <= slugs, case
         key = (case["query"].lower(), case.get("across"))
@@ -189,6 +190,7 @@ def test_case_mix():
     assert count["multi"] >= 10, count
     assert count["first_person"] >= 10, count
     assert count["write"] >= 20, count
+    assert count["named"] >= 8, count
     assert {c["connector"] for c in CASES} == set(NATIVE)
 
 
@@ -234,3 +236,13 @@ def test_new_ranker_beats_old(corpus):
     assert m_new["recall@10"] >= 0.90
     for name in m_new:
         assert m_new[name] >= m_old[name], (name, m_old[name], m_new[name])
+    # A connector the query names wins over other connectors' word matches:
+    # its best hit is at rank 1. (Which of its tools that is stays the
+    # ranker's call; the slug-level r@1 of these cases is in the table.)
+    named = [i for i, c in enumerate(CASES) if "named" in c.get("kinds", [])]
+    by_slug = {t.slug: name for name, catalogue in tools.items() for t in catalogue}
+    wrong = [CASES[i]["query"] for i in named if [by_slug[s] for s in new[i][:1]] != [CASES[i]["connector"]]]
+    assert not wrong, f"named connector not at rank 1: {wrong}"
+    for query in ("ping the team on slack that the release is out", "DM Priya the build is green"):
+        i = next(i for i in named if CASES[i]["query"] == query)
+        assert set(CASES[i]["acceptable"]) & set(new[i][:1]), (query, new[i][:3])

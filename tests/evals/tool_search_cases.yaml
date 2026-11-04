@@ -10,6 +10,9 @@
 #   first_person "my ...", "... me", "I ..."
 #   write        the user wants to change something
 #   multi        searched across all six toolkits
+#   named        multi, and the query names the connector that answers it
+#                (name, display name, slug-prefix spelling or a card keyword)
+#                next to a word another connector's tools match
 #
 # Cases are phrased the way people ask, not the way slugs read. Don't tune a
 # case to the ranker; add a synonym or a tag instead, and keep the case.
@@ -526,7 +529,7 @@
   connector: slack
   across: all
   acceptable: [SLACK_SEND_MESSAGE, SLACK_OPEN_DM]
-  kinds: [multi, write]
+  kinds: [multi, write, named]
 - query: who has access to the roadmap doc in google drive
   connector: googledrive
   across: all
@@ -571,9 +574,66 @@
   connector: slack
   across: all
   acceptable: [SLACK_SEND_MESSAGE]
-  kinds: [multi, write]
+  kinds: [multi, write, named]
 - query: add the offsite to my calendar
   connector: googlecalendar
   across: all
   acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
   kinds: [multi, write, first_person]
+
+# ----------------------- across all six, the query names the connector
+- query: post the build status in slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, named]
+- query: find the calendar invite in gmail
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_FETCH_EMAILS, GMAIL_LIST_THREADS]
+  kinds: [multi, named]
+- query: search slack for the issue about the login page
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+  kinds: [multi, named]
+- query: upload the release notes to google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_UPLOAD_FILE]
+  kinds: [multi, write, named]
+- query: share the design file on one drive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_CREATE_LINK]
+  kinds: [multi, write, named]
+- query: find the meeting notes doc in OneDrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_SEARCH_ITEMS]
+  kinds: [multi, named]
+- query: create an event in gcal for the sprint review
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, named]
+- query: who commented on the file in google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_LIST_COMMENTS]
+  kinds: [multi, named]
+- query: reply to the thread in slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, named]
+- query: upload the build log to slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK]
+  kinds: [multi, write, named]
+- query: list the open issues on github about the calendar sync
+  connector: github
+  across: all
+  acceptable: [GITHUB_LIST_REPOSITORY_ISSUES, GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS]
+  kinds: [multi, named]

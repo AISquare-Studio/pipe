@@ -5,6 +5,7 @@ search_tools_across)."""
 from __future__ import annotations
 
 import dataclasses
+import unittest.mock
 from typing import Any, ClassVar
 
 import pytest
@@ -293,6 +294,97 @@ class TestSearchIndexes:
         a = ToolIndex.build("a", [spec("A_LIST_X"), spec("A_LIST_Y")])
         hits = search_indexes([(a, {"A_LIST_Y"})], "list")
         assert slugs(hits) == ["A_LIST_Y"]
+
+
+class TestNamedConnector:
+    """A query that names one of several connectors searched ranks that
+    connector's best hit first; boost only, never a filter."""
+
+    def _indexes(self):
+        slack = ToolIndex.build(
+            "slack",
+            [
+                spec("SLACK_SEND_MESSAGE", "Post a message to a channel.", read_only=False, tags=("post", "dm")),
+                spec("SLACK_LIST_CHANNELS", "List channels."),
+            ],
+            {"name": "slack", "display_name": "Slack", "keywords": ["dm", "channel"]},
+        )
+        github = ToolIndex.build(
+            "github",
+            [
+                spec("GITHUB_LIST_RELEASES", "List releases of a repository, newest first.", tags=("releases",)),
+                spec("GITHUB_CREATE_A_REVIEW", "Review a pull request.", read_only=False, tags=("review",)),
+            ],
+            {"name": "github", "display_name": "GitHub", "keywords": ["release", "review"]},
+        )
+        drive = ToolIndex.build(
+            "onedrive",
+            [spec("ONE_DRIVE_CREATE_LINK", "Create a sharing link for a release file.", read_only=False)],
+            {"name": "onedrive", "display_name": "OneDrive", "keywords": ["file"]},
+        )
+        cal = ToolIndex.build(
+            "googlecalendar",
+            [spec("GOOGLECALENDAR_CREATE_EVENT", "Create an event.", read_only=False)],
+            {"name": "googlecalendar", "display_name": "Google Calendar", "keywords": ["gcal", "review"]},
+        )
+        return slack, github, drive, cal
+
+    def test_named_connector_outranks_other_slug_hits(self):
+        slack, github, _, _ = self._indexes()
+        plain = search_indexes([github, slack], "tell the team the releases are out")
+        assert plain[0].tool.slug == "GITHUB_LIST_RELEASES"  # the word match wins unnamed ...
+        named = search_indexes([github, slack], "tell the team on slack the releases are out")
+        assert named[0].connector == "slack"  # ... and loses once slack is named
+        assert "GITHUB_LIST_RELEASES" in slugs(named)  # boost only, nothing filtered
+
+    @pytest.mark.parametrize(
+        ("query", "connector"),
+        [
+            ("share the release file on one drive", "onedrive"),  # slug-prefix spelling
+            ("share the release file on OneDrive", "onedrive"),  # display name, camelCase
+            ("share the release file in onedrive", "onedrive"),  # name
+            ("add the release review to gcal", "googlecalendar"),  # distinctive keyword
+        ],
+    )
+    def test_spellings(self, query, connector):
+        assert search_indexes(self._indexes(), query)[0].connector == connector
+
+    def test_name_beats_keyword_and_shared_keywords_name_nothing(self):
+        slack, github, drive, cal = self._indexes()
+        assert slack.named_in("dm Ann on slack") == 2 and slack.named_in("dm Ann") == 1
+        assert github.named_in("the review") == 1 and github.named_in("nothing") == 0
+        # "review" is a keyword of github and googlecalendar: it names neither.
+        assert search._naming_levels([(github, None), (cal, None)], ("review",)) == [0, 0]
+        # "release" is github's alone, but onedrive's tools use the word: no name.
+        assert search._naming_levels([(github, None), (drive, None)], ("releas",)) == [0, 0]
+        assert search._naming_levels([(github, None), (slack, None)], ("releas",)) == [1, 0]
+        # A name beats a distinctive keyword.
+        assert search._naming_levels([(github, None), (slack, None)], ("releas", "slack")) == [1, 2]
+
+    def test_no_change_when_nothing_or_everything_is_named_or_one_connector(self):
+        slack, github, _, _ = self._indexes()
+        unboosted = search._boost_named
+        calls = []
+
+        def spy(entries, tokens, ranked):
+            out = unboosted(entries, tokens, ranked)
+            calls.append(out == ranked)
+            return out
+
+        with unittest.mock.patch.object(search, "_boost_named", spy):
+            search_indexes([github, slack], "list everything from today")  # nothing named
+            search_indexes([github, slack], "releases from github to slack")  # both named
+            slack.search("post in slack")  # one connector
+        assert calls == [True, True, True]
+
+    def test_order_within_the_named_connector_is_kept(self):
+        slack, github, _, _ = self._indexes()
+        alone = [h.tool.slug for h in slack.search("post the release to slack channels")]
+        together = [
+            h.tool.slug for h in search_indexes([github, slack], "post the release to slack channels")
+            if h.connector == "slack"
+        ]
+        assert together == alone
 
 
 # --------------------------------------------------------------------------

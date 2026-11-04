@@ -28,7 +28,9 @@ that are not ``read_only``; one with read verbs, or no verb at all, favours
 ``read_only`` ones). Ties keep connector order, then catalogue order.
 
 Searching several connectors at once scores every tool with IDF over the
-union of their catalogues. Length normalisation pivots on fixed field
+union of their catalogues, and a connector the query names ("... on slack",
+"... in Google Drive", "gcal") gets its scores raised until its best hit
+ranks first (:data:`NAMED_BOOST`; never a filter). Length normalisation pivots on fixed field
 lengths, so the same tool scores the same in any search and scores compare
 across connectors.
 """
@@ -180,8 +182,14 @@ PRIMARY_TAG = "pipe:primary"
 PRIMARY_BOOST = 0.05
 #: Tags with this prefix are markers for the ranker, not words to match.
 MARKER_PREFIX = "pipe:"
+#: When several connectors are searched and the query names some of them
+#: (see :meth:`ToolIndex.named_in`), each named connector's scores are
+#: multiplied by at least this, and by enough that its best hit ranks
+#: :data:`NAMED_MARGIN` times above the best hit of any connector not named.
+NAMED_BOOST = 1.5
+NAMED_MARGIN = 1.1
 #: How much a tool whose ``read_only`` flag matches the query's intent is raised.
-INTENT_BOOST = 0.1
+INTENT_BOOST = 0.15
 
 #: BM25F field weights. ``connector`` (its name, display name and slug
 #: prefix) and ``card`` (its category and keywords) are shared by all of a
@@ -348,6 +356,8 @@ class QueryAnalysis:
 
     concepts: tuple[Concept, ...]
     intent: str | None
+    #: The query's terms in order, as :func:`tokenize` gives them.
+    tokens: tuple[str, ...] = ()
 
     @property
     def terms(self) -> frozenset[str]:
@@ -390,7 +400,7 @@ def analyze_query(query: str) -> QueryAnalysis:
         intent = "read"
     else:
         intent = None
-    return QueryAnalysis(tuple(concepts.values()), intent)
+    return QueryAnalysis(tuple(concepts.values()), intent, tuple(tokens))
 
 
 _AUTHENTICATED = stem("authenticated")
@@ -598,6 +608,8 @@ class ToolIndex:
     indexed: equal catalogues and cards give equal fingerprints."""
 
     __slots__ = (
+        "_keywords",
+        "_names",
         "_postings",
         "_primary",
         "_read_only",
@@ -614,6 +626,8 @@ class ToolIndex:
     _read_only: tuple[bool, ...]
     _shared: dict[str, float]
     _slugs: tuple[str, ...]
+    _names: frozenset[Phrase]
+    _keywords: frozenset[Phrase]
     connector: str
     tools: tuple[ToolSpec, ...]
     card: dict[str, Any] | None
@@ -664,6 +678,14 @@ class ToolIndex:
         names_text = " ".join(str(v) for v in names if v)
         shared.update(dict.fromkeys(tokenize(names_text), FIELD_WEIGHTS["connector"]))
         self._shared = shared
+        # How a query may name this connector: its names and slug prefix,
+        # spaced and joined ("google drive", "googledrive", "one drive"), and
+        # its card keywords ("gcal").
+        spellings = [str(v) for v in names if v]
+        spellings += [re.sub(r"[^a-z0-9]", "", v.lower()) for v in spellings]
+        self._names = frozenset(p for p in (tuple(tokenize(v)) for v in spellings) if p)
+        keywords = _values((card or {}).get("keywords"))
+        self._keywords = frozenset(p for p in (tuple(tokenize(k)) for k in keywords) if p)
         self._slugs = slugs
         self._primary = tuple(PRIMARY_TAG in t.tags for t in catalogue)
         self._read_only = tuple(bool(t.read_only) for t in catalogue)
@@ -695,6 +717,16 @@ class ToolIndex:
         is in every tool, and counting it would take the IDF of a toolkit's
         own subject ("calendar" in Google Calendar) to 0."""
         return self._postings.df.get(term, 0.0)
+
+    def named_in(self, query: str) -> int:
+        """How the query names this connector: 2 by name, display name or
+        slug-prefix spelling ("slack", "Google Drive", "one drive",
+        "OneDrive"), 1 by a card keyword only ("gcal"), 0 not at all. Words
+        and phrases match whole, after :func:`tokenize`. Across several
+        connectors a keyword counts only when it is distinctive (see
+        :func:`_naming_levels`)."""
+        tokens = analyze_query(query).tokens if query else ()
+        return _mention(tokens, self._names, self._keywords)
 
     def _boost(self, d: int, intent: str | None) -> float:
         boost = 1.0 + PRIMARY_BOOST if self._primary[d] else 1.0
@@ -729,8 +761,81 @@ def _search(entries: Sequence[Entry], query: str | None, limit: int | None) -> l
             score = (acc.get(d, 0.0) + base) * index._boost(d, analysis.intent)
             if score > 0.0:
                 ranked.append((-score, e, d))
+    ranked = _boost_named(entries, analysis.tokens, ranked)
     best = heapq.nsmallest(limit, ranked) if limit is not None else sorted(ranked)
     return [ScoredTool(entries[e][0].connector, entries[e][0].tools[d], -neg) for neg, e, d in best]
+
+
+def _phrases_in(tokens: Sequence[str], phrases: frozenset[Phrase]) -> list[Phrase]:
+    """The ``phrases`` that occur in ``tokens``, each as a contiguous run."""
+    longest = max((len(p) for p in phrases), default=0)
+    return [
+        phrase
+        for n in range(1, min(longest, len(tokens)) + 1)
+        for i in range(len(tokens) - n + 1)
+        if (phrase := tuple(tokens[i : i + n])) in phrases
+    ]
+
+
+def _mention(tokens: Sequence[str], names: frozenset[Phrase], keywords: frozenset[Phrase]) -> int:
+    """2 when a phrase of ``names`` occurs in ``tokens``, 1 when only one of
+    ``keywords`` does, else 0."""
+    if _phrases_in(tokens, names):
+        return 2
+    return 1 if _phrases_in(tokens, keywords) else 0
+
+
+def _naming_levels(entries: Sequence[Entry], tokens: Sequence[str]) -> list[int]:
+    """Per entry, how the query names its connector among the others: 2 by
+    name, 1 by a *distinctive* card keyword, else 0. A keyword is
+    distinctive when no other connector searched has it as a keyword or has
+    all its words in its tools: "gcal" names Google Calendar, but "review"
+    (GitHub's keyword, also in Google Drive's tools) or "file" names
+    nothing."""
+    levels = []
+    for index, _ in entries:
+        if _phrases_in(tokens, index._names):
+            levels.append(2)
+            continue
+        others = [o for o, _ in entries if o.connector != index.connector]
+        distinctive = any(
+            all(
+                phrase not in other._keywords and not all(other.df(t) > 0 for t in phrase)
+                for other in others
+            )
+            for phrase in _phrases_in(tokens, index._keywords)
+        )
+        levels.append(1 if distinctive else 0)
+    return levels
+
+
+def _boost_named(
+    entries: Sequence[Entry], tokens: Sequence[str], ranked: list[tuple[float, int, int]]
+) -> list[tuple[float, int, int]]:
+    """Raise the connectors the query names (``ranked`` holds ``(-score,
+    entry, doc)``). Only when several connectors are searched and some, not
+    all, are named; only the most explicit level of naming counts (a name
+    beats a keyword: in "calendar invite in gmail", Gmail is named, Google
+    Calendar is not), and a keyword names a connector only when it is
+    distinctive (see :func:`_naming_levels`). Each named connector's scores are multiplied by
+    :data:`NAMED_BOOST`, or more when needed so that its best hit lands
+    :data:`NAMED_MARGIN` times above every other connector's hits. Nothing
+    is filtered out; order within a connector is kept."""
+    if len({index.connector for index, _ in entries}) < 2 or not ranked:
+        return ranked
+    levels = _naming_levels(entries, tokens)
+    top = max(levels)
+    named = {e for e, level in enumerate(levels) if level == top} if top else set()
+    if not named or len(named) == len(entries):
+        return ranked
+    best: dict[int, float] = {}
+    for neg, e, _ in ranked:
+        best[e] = max(best.get(e, 0.0), -neg)
+    others = max((score for e, score in best.items() if e not in named), default=0.0)
+    factor = {
+        e: max(NAMED_BOOST, NAMED_MARGIN * others / best[e]) for e in named if best.get(e)
+    }
+    return [(neg * factor.get(e, 1.0), e, d) for neg, e, d in ranked]
 
 
 def search_indexes(

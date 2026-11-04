@@ -430,9 +430,20 @@ a tool is the text you give it.
   slightly favours tools that are not `read_only`; one with read verbs, or
   no verb at all ("my unread emails"), favours `read_only` tools. Keep
   `read_only` honest.
+- **Named connectors.** When several toolkits are searched and the query
+  names one ("post the build status in slack", "upload it to google
+  drive", "one drive", "OneDrive"), that toolkit's scores are raised until
+  its best tool ranks first; the others stay in the list. A name, display
+  name or slug-prefix spelling names a toolkit; so does a card keyword, but
+  only a distinctive one (`gcal`): a keyword another searched toolkit also
+  lists, or whose words its tools use (`file`, `review`, `send`), names
+  nothing. Keep brand abbreviations among your `keywords`.
 - **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
   two tools a toolkit should offer first when a query is ambiguous (the main
-  search or send tool) with `pipe:primary`; their score is raised by 5%. It
+  search or send tool) with `pipe:primary`; their score is raised by 5%. The
+  native toolkits mark their main read and write tool (Gmail fetch/send,
+  Calendar list/create event, Drive find/upload, OneDrive search/upload,
+  Slack send/search messages). It
   is a ranking marker only: tags in the `pipe:` namespace are never indexed
   as text. Don't use it on most tools (it then means nothing), and don't use
   the word `important` for this: `important` is an ordinary content tag

@@ -1002,7 +1002,10 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         _message_tool("chat.postMessage", _SEND_ARGS, text_arg="fallback_text"),
         user=("chat:write", *LOOKUP),
         bot=("chat:write", "chat:write.public", *LOOKUP),
-        tags=("post", "send", "write", "reply", "thread", "dm", "notify", "message", "chat"),
+        tags=(
+            "post", "send", "write", "reply", "thread", "dm", "notify", "message", "chat",
+            "pipe:primary",
+        ),
     ),
     _tool(
         "SLACK_UPDATES_A_SLACK_MESSAGE", TIER_WRITE, "messages", "chat.update",
@@ -1243,7 +1246,7 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         _search("search.messages", ("messages",)),
         user=("search:read",),
         bot=None,
-        tags=("search", "find", "messages", "query", "lookup", "discussion"),
+        tags=("search", "find", "messages", "query", "lookup", "discussion", "pipe:primary"),
     ),
     _tool(
         "SLACK_SEARCH_FILES", TIER_READ, "search", "search.files",

@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stemming, a synonym table (`SYNONYMS`; a synonym counts less than the
     word itself), `authenticated` for first-person queries, and a small
     read/write intent boost.
+  - Across several connectors, a connector the query names (name, display
+    name, slug-prefix spelling such as "one drive", or a distinctive card
+    keyword such as "gcal") has its scores raised until its best tool ranks
+    first. Boost only; nothing changes when nothing is named or one
+    connector is searched.
   - The primary-tool marker is the tag `pipe:primary` (`PRIMARY_TAG`): a
     5% boost, never indexed as text. A plain `important` tag is ordinary
     content. See CONTRIBUTING.md, "Making tools findable".
@@ -36,8 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
   measures index build, memory and query latency on 10,000 tools and on
   1,000 connectors x 50 tools.
-- `tests/evals/`: 139 labelled tool-search queries over the six native
+- `tests/evals/`: 150 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
+- The native toolkits' main read and write tools carry `pipe:primary`:
+  `GMAIL_FETCH_EMAILS`, `GMAIL_SEND_EMAIL`, `GOOGLECALENDAR_EVENTS_LIST`,
+  `GOOGLECALENDAR_CREATE_EVENT`, `GOOGLEDRIVE_FIND_FILE`,
+  `GOOGLEDRIVE_UPLOAD_FILE`, `ONE_DRIVE_SEARCH_ITEMS`,
+  `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE`, `SLACK_SEND_MESSAGE`,
+  `SLACK_SEARCH_MESSAGES`.
 
 ### Changed
 
@@ -48,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogue (or the connectors taking turns). Results differ: plurals and
   other word forms match (`repository` finds `..._REPOSITORIES_...`),
   synonyms match below exact words, and IDF makes rare words count more.
-  On the eval, recall@1 goes from 0.604 to 0.799 and recall@10 from 0.942
+  On the eval, recall@1 goes from 0.593 to 0.820 and recall@10 from 0.927
   to 1.000.
 - `search_tools_across` no longer rebuilds every catalogue's ranking on
   each call: each toolkit's index is cached and reused until its catalogue
