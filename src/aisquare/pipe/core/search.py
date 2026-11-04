@@ -791,21 +791,26 @@ def _naming_levels(entries: Sequence[Entry], tokens: Sequence[str]) -> list[int]
     distinctive when no other connector searched has it as a keyword or has
     all its words in its tools: "gcal" names Google Calendar, but "review"
     (GitHub's keyword, also in Google Drive's tools) or "file" names
-    nothing."""
+    nothing. Linear in the number of connectors."""
+    indexes = [index for index, _ in entries]
+    matched = [_phrases_in(tokens, index._keywords) for index in indexes]
+    # For each keyword phrase the query holds: the connectors that list it
+    # or whose tools use all its words.
+    claims: dict[Phrase, set[str]] = {}
+    for phrase in {p for found in matched for p in found}:
+        claims[phrase] = {
+            index.connector
+            for index in indexes
+            if phrase in index._keywords or all(index.df(t) > 0 for t in phrase)
+        }
     levels = []
-    for index, _ in entries:
+    for index, found in zip(indexes, matched):
         if _phrases_in(tokens, index._names):
             levels.append(2)
-            continue
-        others = [o for o, _ in entries if o.connector != index.connector]
-        distinctive = any(
-            all(
-                phrase not in other._keywords and not all(other.df(t) > 0 for t in phrase)
-                for other in others
-            )
-            for phrase in _phrases_in(tokens, index._keywords)
-        )
-        levels.append(1 if distinctive else 0)
+        elif any(claims[phrase] <= {index.connector} for phrase in found):
+            levels.append(1)
+        else:
+            levels.append(0)
     return levels
 
 
