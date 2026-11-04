@@ -644,6 +644,38 @@ class TestLegacyHelpers:
         found = rank_across({"mail": MAIL_TOOLS, "cal": CAL_TOOLS}, "create a calendar event")
         assert found[0] == QualifiedTool("cal", CAL_TOOLS[0])
 
+    def test_duck_typed_specs(self):
+        """Hosts may pass their own spec objects: slug, description and
+        input_schema are enough for every legacy wrapper."""
+
+        @dataclasses.dataclass
+        class Spec:  # no tags, read_only, destructive, required_scopes or risk
+            slug: str
+            description: str
+            input_schema: dict
+
+        mail = [Spec("MAIL_SEND_EMAIL", "Send an email.", SCHEMA), Spec("MAIL_LIST_MESSAGES", "List messages.", SCHEMA)]
+        cal = [Spec("CAL_CREATE_EVENT", "Create a calendar event.", {"type": "object", "properties": {"title": {}}})]
+        assert rank_tools(mail, "send an email")[0] is mail[0]
+        assert rank_tools(mail, "zzzz", limit=1) == mail[:1]
+        found = rank_across({"mail": mail, "cal": cal}, "create a calendar event", keywords={"cal": ["calendar"]})
+        assert (found[0].connector, found[0].tool) == ("cal", cal[0])
+        assert [q.tool for q in rank_across({"mail": mail, "cal": cal}, None, limit=2)] == [mail[0], cal[0]]
+        hits = search_indexes([ToolIndex.build("mail", mail), ToolIndex.build("cal", cal)], "list messages in mail")
+        assert hits[0].tool is mail[1]
+
+        class Kit(Toolkit):
+            name = "duck"
+            version = "1.0.0"
+
+            def tools(self):
+                return [Spec("DUCK_LIST_ITEMS", "List items.", SCHEMA), Spec("DUCK_DELETE_ITEM", "Delete an item.", SCHEMA)]
+
+            def run_tool(self, tool, arguments, config):
+                return ToolResult.ok(None)
+
+        assert [t.slug for t in Kit().search_tools("delete the item")][:1] == ["DUCK_DELETE_ITEM"]
+
     def test_toolkit_search_tools(self, mail_and_cal):
         mail, _ = mail_and_cal
         kit = mail()

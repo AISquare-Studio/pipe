@@ -360,7 +360,10 @@ def rank_tools(
     index of ``tools`` (slug words, tags, description and input schema;
     synonyms; see :mod:`aisquare.pipe.core.search`). The index is cached by
     the catalogue's fingerprint. Only matching tools are returned, ties in
-    catalogue order; with no query, or no match, the head of the catalogue."""
+    catalogue order; with no query, or no match, the head of the catalogue.
+    A duck-typed spec needs only ``slug``, ``description`` and
+    ``input_schema``; missing ``tags``, ``read_only`` and ``destructive``
+    read as the ToolSpec defaults (``read_only`` as unknown)."""
     cap = len(tools) if limit is None else max(limit, 0)
     if not query or not query.strip():
         return list(tools[:cap])

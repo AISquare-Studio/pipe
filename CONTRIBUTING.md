@@ -482,6 +482,7 @@ still ranks first. Extend a group when the search eval shows a miss:
 | cancel · delete | spreadsheet · sheet · excel · workbook |
 | copy · duplicate · clone | free · available · availability |
 | share · grant · invite · access | profile · account · whoami |
+| invite · bring | |
 | star · favorite · favourite · bookmark | reminder · remind |
 | draft · compose · write | commit · change · diff |
 | react · reaction · emoji | release · version |

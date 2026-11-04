@@ -36,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Idioms ("get rid of", "set up", "push back") and opening noun-verbs
     ("email the team ...", "file a bug ...") read as the verbs they mean;
     calendar vocabulary (postpone/push/shift ~ update, standup/sync/huddle/
-    call ~ meeting) joins the synonym table.
+    call ~ meeting, bring ~ invite) joins the synonym table. Ranking accepts
+    duck-typed specs (`slug`, `description`, `input_schema`; other fields
+    default as in ToolSpec, `read_only` as unknown).
   - The primary-tool marker is the tag `pipe:primary` (`PRIMARY_TAG`): a
     5% boost, never indexed as text. A plain `important` tag is ordinary
     content. See CONTRIBUTING.md, "Making tools findable".

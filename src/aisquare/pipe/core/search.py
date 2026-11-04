@@ -139,6 +139,7 @@ SYNONYMS: tuple[tuple[str, ...], ...] = (
     ("cancel", "delete"),
     ("copy", "duplicate", "clone"),
     ("share", "grant", "invite", "access"),
+    ("invite", "bring"),
     ("star", "favorite", "favourite", "bookmark"),
     ("draft", "compose", "write"),
     ("react", "reaction", "emoji"),
@@ -704,7 +705,7 @@ class ToolIndex:
 
     _postings: _Postings
     _primary: tuple[bool, ...]
-    _read_only: tuple[bool, ...]
+    _read_only: tuple[bool | None, ...]
     _shared: dict[str, float]
     _slugs: tuple[str, ...]
     _names: frozenset[Phrase]
@@ -728,21 +729,21 @@ class ToolIndex:
         self.tools = catalogue
         self.card = dict(card) if card is not None else None
         self.fingerprint = _fingerprint(connector, catalogue, card)
-        slugs = tuple(t.slug for t in catalogue)
+        slugs = tuple(str(t.slug) for t in catalogue)
         cut = _prefix_len(connector, slugs)
         docs = [
             (
-                tokenize(" ".join(_slug_words(t.slug)[cut:])),
+                tokenize(" ".join(_slug_words(slug)[cut:])),
                 [
                     term
-                    for tag in t.tags
+                    for tag in _tags_of(t)
                     if not tag.startswith(MARKER_PREFIX)
                     for term in tokenize(tag)
                 ],
-                tokenize(t.description),
-                tokenize(_schema_text(t.input_schema)),
+                tokenize(str(getattr(t, "description", "") or "")),
+                tokenize(_schema_text(getattr(t, "input_schema", None))),
             )
-            for t in catalogue
+            for t, slug in zip(catalogue, slugs)
         ]
         self._postings = _Postings(
             docs,
@@ -768,8 +769,8 @@ class ToolIndex:
         keywords = _values((card or {}).get("keywords"))
         self._keywords = frozenset(p for p in map(_plain_words, keywords) if p)
         self._slugs = slugs
-        self._primary = tuple(PRIMARY_TAG in t.tags for t in catalogue)
-        self._read_only = tuple(bool(t.read_only) for t in catalogue)
+        self._primary = tuple(PRIMARY_TAG in _tags_of(t) for t in catalogue)
+        self._read_only = tuple(_read_only_of(t) for t in catalogue)
         return self
 
     def __len__(self) -> int:
@@ -812,7 +813,8 @@ class ToolIndex:
 
     def _boost(self, d: int, intent: str | None) -> float:
         boost = 1.0 + PRIMARY_BOOST if self._primary[d] else 1.0
-        if intent is not None and self._read_only[d] == (intent == "read"):
+        read_only = self._read_only[d]
+        if intent is not None and read_only is not None and read_only == (intent == "read"):
             boost *= 1.0 + INTENT_BOOST
         return boost
 
@@ -986,10 +988,23 @@ _digests: OrderedDict[tuple[int, ...], tuple[tuple[ToolSpec, ...], bytes]] = Ord
 _counters = {"hits": 0, "misses": 0}
 
 
+def _tags_of(tool: Any) -> tuple[str, ...]:
+    """A tool's tags; () for a duck-typed spec without them."""
+    tags = getattr(tool, "tags", ()) or ()
+    return (tags,) if isinstance(tags, str) else tuple(str(tag) for tag in tags)
+
+
+def _read_only_of(tool: Any) -> bool | None:
+    """A tool's ``read_only`` flag; None (unknown: no intent boost) for a
+    duck-typed spec without one."""
+    value = getattr(tool, "read_only", None)
+    return None if value is None else bool(value)
+
+
 def _tool_digest(tool: ToolSpec) -> bytes:
     payload = json.dumps(
-        [tool.slug, tool.description, list(tool.tags), tool.read_only, tool.destructive,
-         tool.input_schema],
+        [str(tool.slug), getattr(tool, "description", ""), list(_tags_of(tool)), _read_only_of(tool),
+         bool(getattr(tool, "destructive", False)), getattr(tool, "input_schema", None)],
         sort_keys=True,
         default=str,
         separators=(",", ":"),
