@@ -11,6 +11,7 @@ from aisquare.pipe import (
     ToolSpec,
     catalogue,
     installed_toolkits,
+    left_out_toolkits,
     search_tools_across,
     slug_prefix_conflicts,
 )
@@ -199,6 +200,104 @@ class TestCatalogue:
             registry_mod, "discover_toolkits", lambda: {"mail": _kit("mail", ["MAIL_SEND"]), "odd": object}
         )
         assert list(catalogue()) == ["mail"]
+
+
+RULE = "^[a-z][a-z0-9_]{0,63}$"
+
+
+class TestLeftOutReasons:
+    """Whatever installed_toolkits leaves out, left_out_toolkits says why, and
+    naming it in a search says why too."""
+
+    @pytest.fixture
+    def entry_points(self, monkeypatch, fresh_cache):
+        def install(found: dict[str, type]) -> None:
+            monkeypatch.setattr(registry_mod, "discover_toolkits", lambda: dict(found))
+
+        return install
+
+    def test_a_class_name_that_differs_from_its_entry_point_is_left_out(self, entry_points, caplog):
+        entry_points(
+            {
+                "ledgermis": _kit("ledger-mis", ["LEDGERMIS_X"], prefix="LEDGERMIS_"),
+                "ledger": _kit("ledger_v2", ["LEDGER_X"], prefix="LEDGER_"),
+                "mail": _kit("mail", ["MAIL_SEND"]),
+            }
+        )
+        with caplog.at_level("WARNING", logger="aisquare.pipe"):
+            assert list(installed_toolkits()) == ["mail"]
+            assert list(catalogue()) == ["mail"]
+            assert list(installed_toolkits()) == ["mail"]
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [
+            (
+                "Left out toolkits whose class name differs from their entry point "
+                "(`pipe validate` fails on this): 'ledger' (class name 'ledger_v2'), "
+                "'ledgermis' (class name 'ledger-mis')"
+            )
+        ]
+
+    def test_every_reason_is_recorded(self, entry_points):
+        entry_points(
+            {
+                "led-ger": _kit("led-ger", ["LED_GER_X"]),
+                "ledgermis": _kit("ledger-mis", ["LEDGERMIS_X"], prefix="LEDGERMIS_"),
+                "one": _kit("one", ["ONE_X"]),
+                "one_drive": _kit("one_drive", ["ONE_DRIVE_X"]),
+                "mail": _kit("mail", ["MAIL_SEND"]),
+            }
+        )
+        assert left_out_toolkits() == {
+            "led-ger": f"name breaks {RULE}",
+            "ledgermis": "name differs from its entry point (class name 'ledger-mis')",
+            "one": "slug prefix ONE_ collides with one_drive (ONE_DRIVE_)",
+            "one_drive": "slug prefix ONE_DRIVE_ collides with one (ONE_)",
+        }
+        assert list(installed_toolkits()) == ["mail"]
+
+    def test_nothing_left_out(self, entry_points):
+        entry_points({"mail": _kit("mail", ["MAIL_SEND"])})
+        assert left_out_toolkits() == {}
+
+    def test_it_follows_the_cache_and_refresh(self, monkeypatch, fresh_cache):
+        found = {"led-ger": _kit("led-ger", ["LED_GER_X"])}
+        monkeypatch.setattr(registry_mod, "discover_toolkits", lambda: dict(found))
+        assert list(left_out_toolkits()) == ["led-ger"]
+        found = {"ledger": _kit("ledger", ["LEDGER_X"])}
+        assert list(left_out_toolkits()) == ["led-ger"]  # cached, like installed_toolkits
+        assert left_out_toolkits(refresh=True) == {}
+        assert list(installed_toolkits()) == ["ledger"]
+
+    def test_the_real_install_leaves_nothing_out(self, fresh_cache):
+        assert left_out_toolkits() == {}
+
+    @pytest.mark.parametrize(
+        "found, name, says",
+        [
+            ({"led-ger": _kit("led-ger", ["LED_GER_X"])}, "led-ger", f"'led-ger' left out: name breaks {RULE}"),
+            (
+                {"ledgermis": _kit("ledger-mis", ["LEDGERMIS_X"], prefix="LEDGERMIS_")},
+                "ledgermis",
+                "'ledgermis' left out: name differs from its entry point (class name 'ledger-mis')",
+            ),
+        ],
+    )
+    def test_naming_a_left_out_toolkit_says_why(self, entry_points, found, name, says):
+        entry_points({**found, "mail": _kit("mail", ["MAIL_SEND"])})
+        with pytest.raises(ToolkitNotFoundError) as caught:
+            search_tools_across("x", [name, "nowhere"])
+        message = str(caught.value)
+        assert message.startswith(f"Toolkit(s) {name!r}, 'nowhere' not found. Available: mail")
+        assert message.endswith(f". {says}") and "collide" not in message
+
+    def test_a_clash_keeps_its_own_wording(self, entry_points):
+        entry_points({"github": _kit("github", ["GITHUB_X"]), "gh2": _kit("gh2", ["GITHUB_Y"], prefix="GITHUB_")})
+        with pytest.raises(ToolkitNotFoundError) as caught:
+            search_tools_across("x", ["github"])
+        assert str(caught.value) == (
+            "Toolkit(s) 'github' not found. Available: (none). "
+            "Left out, their slug prefixes collide: gh2 (GITHUB_) and github (GITHUB_)"
+        )
 
 
 class TestUnroutableNames:
