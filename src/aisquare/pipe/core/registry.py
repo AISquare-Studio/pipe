@@ -337,7 +337,9 @@ def search_tools_across(
     for every installed toolkit. An unknown name, or one left out because
     its slug prefix collides with another toolkit's, raises
     :class:`ToolkitNotFoundError`. With no query, or no match, the
-    connectors take turns. Offline, like ``available_tools``, once the
+    connectors take turns. Each toolkit's index is cached by spec identity,
+    so its specs must be immutable (a spec changed in place keeps a stale
+    index). Offline, like ``available_tools``, once the
     plugins are imported (see :func:`installed_toolkits`)."""
     found = _searchable(connectors)
     cap = sum(len(available) for *_, available in found) if limit is None else max(limit, 0)

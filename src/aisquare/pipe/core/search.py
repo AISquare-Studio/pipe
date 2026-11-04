@@ -1044,6 +1044,11 @@ _indexes: OrderedDict[tuple[str, str, str], ToolIndex] = OrderedDict()
 # Catalogue digests by ToolSpec identity, so a toolkit that hands out the
 # same ToolSpec objects on each call is not re-hashed on each search. An
 # entry holds its ToolSpecs, so their ids cannot be reused while it lives.
+# Specs must be immutable: the digest of a spec object is computed once, so
+# a spec changed in place (a mutable duck-typed spec, or a ToolSpec whose
+# input_schema dict is edited) keeps its old digest and is served the stale
+# index until the entry is evicted (or cache_clear()). Frozen ToolSpecs with
+# untouched schemas cannot hit this; to change a tool, make a new spec.
 _digests: OrderedDict[tuple[int, ...], tuple[tuple[ToolSpec, ...], bytes]] = OrderedDict()
 _counters = {"hits": 0, "misses": 0}
 
@@ -1107,9 +1112,13 @@ def cached_index(
     """The :class:`ToolIndex` of this catalogue from an LRU cache keyed on
     (connector, version, fingerprint), built on a miss. Any change to a
     tool's slug, description, tags, flags or schema, to the order of the
-    tools, or to the card gives a new fingerprint, so a new index. A
-    toolkit's ToolSpecs are frozen; a schema dict mutated in place is not
-    noticed while the same ToolSpec objects are cached."""
+    tools, or to the card gives a new fingerprint, so a new index.
+
+    Specs must be immutable. Fingerprints are cached by spec identity, so a
+    spec changed in place (a mutable duck-typed spec, or a ToolSpec whose
+    ``input_schema`` dict is edited) is not noticed: the same objects keep
+    the old fingerprint and get the stale index. To change a tool, pass a
+    new spec (``dataclasses.replace``), or call :func:`cache_clear`."""
     key = (connector, version, _fingerprint(connector, tools, card))
     with _lock:
         index = _indexes.get(key)

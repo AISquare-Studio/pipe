@@ -363,7 +363,10 @@ def rank_tools(
     catalogue order; with no query, or no match, the head of the catalogue.
     A duck-typed spec needs only ``slug``, ``description`` and
     ``input_schema``; missing ``tags``, ``read_only`` and ``destructive``
-    read as the ToolSpec defaults (``read_only`` as unknown)."""
+    read as the ToolSpec defaults (``read_only`` as unknown).
+    Specs must be immutable: the index is cached by spec identity, so a
+    spec changed in place (a mutable duck-typed one, or an edited
+    ``input_schema`` dict) keeps its stale index; pass new specs instead."""
     cap = len(tools) if limit is None else max(limit, 0)
     if not query or not query.strip():
         return list(tools[:cap])
@@ -386,7 +389,10 @@ def rank_across(
     -> words, e.g. its name, category and keywords) are a low-weight field
     of each of its tools. Ties keep connector order, then catalog order.
     With no query, or no match, the connectors take turns, so each one is
-    represented in the head."""
+    represented in the head. Specs must be immutable: the index is cached
+    by spec identity, so a spec changed in place (a mutable duck-typed one,
+    or an edited ``input_schema`` dict) keeps its stale index; pass new
+    specs instead."""
     cap = sum(len(tools) for tools in catalogs.values()) if limit is None else max(limit, 0)
     words = keywords or {}
     indexes = [
@@ -734,7 +740,9 @@ class Toolkit(ABC):
         :meth:`available_tools` for ``config``, ranked as in
         :func:`rank_tools` by this toolkit's cached search index (with its
         card; see :func:`aisquare.pipe.core.search.index_for`). With no
-        query, or no match, the head of :meth:`available_tools`."""
+        query, or no match, the head of :meth:`available_tools`. The
+        index is cached by spec identity: return immutable specs (frozen
+        ToolSpecs) from :meth:`tools`, never ones changed in place."""
         available = self.available_tools(config)
         cap = len(available) if limit is None else max(limit, 0)
         if not query or not query.strip():
