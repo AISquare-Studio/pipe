@@ -201,6 +201,40 @@ class TestCatalogue:
         assert list(catalogue()) == ["mail"]
 
 
+class TestUnroutableNames:
+    def test_a_hyphenated_toolkit_is_left_out_with_one_warning(self, installed, caplog):
+        # "led-ger" and "led_ger" both default to the LED_GER_ prefix: the bad
+        # name goes first, so it can't take the good one down in a clash.
+        installed(
+            _kit("led-ger", ["LED_GER_X"]),
+            _kit("led_ger", ["LED_GER_Y"]),
+            _kit("mail", ["MAIL_SEND"]),
+        )
+        with caplog.at_level("WARNING", logger="aisquare.pipe"):
+            assert list(installed_toolkits()) == ["led_ger", "mail"]
+            assert list(catalogue()) == ["led_ger", "mail"]
+            assert {q.connector for q in search_tools_across("x", limit=None)} == {"led_ger", "mail"}
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == [
+            (
+                "Left out toolkits whose names break ^[a-z][a-z0-9_]{0,63}$ "
+                "(`pipe validate` fails on this): 'led-ger'"
+            )
+        ]
+
+    def test_naming_a_hyphenated_toolkit_is_not_found(self, installed):
+        installed(_kit("led-ger", ["LED_GER_X"]))
+        with pytest.raises(ToolkitNotFoundError, match="'led-ger' not found"):
+            search_tools_across("x", ["led-ger"])
+
+    def test_raw_discovery_still_sees_it(self, installed):
+        """discover_toolkits is the raw entry-point read (what `pipe validate`
+        reports on); only the served set leaves it out."""
+        found = installed(_kit("led-ger", ["LED_GER_X"]))
+        assert registry_mod.discover_toolkits() == found
+        assert installed_toolkits() == {}
+
+
 class TestSlugPrefixConflicts:
     def test_equal_and_nested_prefixes(self):
         kits = {

@@ -64,6 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each call: each toolkit's index is cached and reused until its catalogue
   changes.
 
+- **Toolkit names must be routable**: `^[a-z][a-z0-9_]{0,63}$`
+  (`TOOLKIT_NAME_RULE`, `valid_toolkit_name()`), so no hyphens and at most
+  64 characters. A toolkit's name is its entry-point name and the connector
+  id hosts route on. pipe-as-service serves only these names (it keeps
+  hyphenated ones for pull/push connectors), so a hyphenated toolkit
+  installed but was never served. `pipe validate` (`contract.toolkit.name`)
+  and `scripts/check_toolkits_extra.py` now fail one, and
+  `installed_toolkits()` (and so `catalogue()`, `search_tools_across()`)
+  leaves it out with one warning. `discover_toolkits()` still reads every
+  entry point. Connector entry-point names are unaffected, and every shipped
+  toolkit already complies.
+
 ## [0.4.0] - 2026-10-31
 
 The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and
