@@ -288,7 +288,8 @@ class TestRankTools:
 
     def test_limit(self):
         assert len(rank_tools(GITHUB_LIKE, "repository", limit=2)) == 2
-        assert len(rank_tools(GITHUB_LIKE, "repository", limit=None)) == 3  # matches only
+        # Matches only. ("repository" now matches all six: "repositories" stems to it.)
+        assert len(rank_tools(GITHUB_LIKE, "user", limit=None)) == 2
         assert len(rank_tools(GITHUB_LIKE, "zzzz", limit=None)) == len(GITHUB_LIKE)
         assert rank_tools(GITHUB_LIKE, "repository", limit=0) == []
 
@@ -1455,6 +1456,8 @@ class TestRankAcross:
         assert [(q.connector, q.tool.slug) for q in found] == [
             ("gmail", "GMAIL_LIST_MESSAGES"),
             ("googlecalendar", "GOOGLECALENDAR_LIST_EVENTS"),
+            # A synonym ("find" ~ "list") matches too, below the exact matches.
+            ("googlecalendar", "GOOGLECALENDAR_FIND_FREE_SLOTS"),
         ]
 
     def test_connector_keywords_boost(self):

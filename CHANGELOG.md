@@ -5,6 +5,55 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Tool and connector search index** (`aisquare.pipe.core.search`): BM25F
+  in pure Python, no new dependency, no network, no model.
+  - `ToolIndex.build(connector, tools, card=None)` indexes one catalogue
+    (slug words, tags, description and input-schema properties, weighted in
+    that order, plus the connector's name, category and keywords); its
+    `.search(query, limit=10, *, allowed=None)` returns `ScoredTool`s
+    (connector, tool, score). `allowed` filters by slug, e.g. what a
+    connection's granted scopes allow, without rebuilding.
+  - `ConnectorIndex.build(cards).search(query, limit)` ranks connector
+    cards, for routers that shortlist connectors before tools.
+  - `index_for(name)` caches an installed toolkit's index per name,
+    version and catalogue fingerprint (LRU-bounded);
+    `search_scored(query, connectors=None, *, limit=10)` searches several
+    toolkits as one ranking, with the forms of `search_tools_across`;
+    `search_connectors(query, limit)` ranks the installed cards.
+  - Query analysis: UPPER_SNAKE/camelCase splitting, stopwords, light
+    stemming, a synonym table (`SYNONYMS`; a synonym counts less than the
+    word itself), `authenticated` for first-person queries, and a small
+    read/write intent boost.
+  - The primary-tool marker is the tag `pipe:primary` (`PRIMARY_TAG`): a
+    5% boost, never indexed as text. A plain `important` tag is ordinary
+    content. See CONTRIBUTING.md, "Making tools findable".
+- `aisquare.pipe.testing.synthetic.synthetic_catalog(n_connectors,
+  tools_per_connector, *, seed=0)`: deterministic, realistic catalogues
+  (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
+  measures index build, memory and query latency on 10,000 tools and on
+  1,000 connectors x 50 tools.
+- `tests/evals/`: 139 labelled tool-search queries over the six native
+  toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
+
+### Changed
+
+- `rank_tools`, `rank_across`, `Toolkit.search_tools` and
+  `search_tools_across` rank with the search index instead of substring
+  counting (+2 slug, +1 description). Signatures, return types and the
+  fallbacks are unchanged: with no query or no match, the head of the
+  catalogue (or the connectors taking turns). Results differ: plurals and
+  other word forms match (`repository` finds `..._REPOSITORIES_...`),
+  synonyms match below exact words, and IDF makes rare words count more.
+  On the eval, recall@1 goes from 0.604 to 0.799 and recall@10 from 0.942
+  to 1.000.
+- `search_tools_across` no longer rebuilds every catalogue's ranking on
+  each call: each toolkit's index is cached and reused until its catalogue
+  changes.
+
 ## [0.4.0] - 2026-10-31
 
 The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and

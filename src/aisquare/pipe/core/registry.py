@@ -10,7 +10,8 @@ from collections.abc import Iterable, Mapping
 from importlib.metadata import entry_points
 from typing import Any
 
-from aisquare.pipe.core.tools import QualifiedTool, Toolkit, ToolSpec, rank_across
+from aisquare.pipe.core.search import ToolIndex, scoped_index, search_indexes
+from aisquare.pipe.core.tools import QualifiedTool, Toolkit, ToolSpec, take_turns
 from aisquare.pipe.errors import (
     ConnectorNotFoundError,
     ConverterError,
@@ -185,30 +186,12 @@ def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     return cards
 
 
-def search_tools_across(
-    query: str | None,
-    connectors: Mapping[str, Mapping[str, Any] | None] | Iterable[str] | None = None,
-    *,
-    limit: int | None = 6,
-) -> list[QualifiedTool]:
-    """The tools most relevant to ``query`` across several toolkits, each
-    named with its connector (see :func:`~aisquare.pipe.core.tools.rank_across`).
-
-    ``connectors`` picks the toolkits: a mapping of name -> the connection's
-    ``config`` (so each lists only its :meth:`Toolkit.available_tools`, e.g.
-    filtered by ``granted_scopes``), an iterable of names (no config), or None
-    for every installed toolkit. An unknown name, or one left out because
-    its slug prefix collides with another toolkit's, raises
-    :class:`ToolkitNotFoundError`. Offline, like ``available_tools``, once
-    the plugins are imported (see :func:`installed_toolkits`)."""
+def _require_installed(names: Iterable[str]) -> dict[str, type[Toolkit]]:
+    """The installed toolkits; :class:`ToolkitNotFoundError` naming any of
+    ``names`` that is not installed (or was left out for a slug-prefix
+    clash)."""
     installed = installed_toolkits()
-    if connectors is None:
-        chosen: dict[str, Mapping[str, Any] | None] = dict.fromkeys(installed)
-    elif isinstance(connectors, Mapping):
-        chosen = dict(connectors)
-    else:
-        chosen = dict.fromkeys([connectors] if isinstance(connectors, str) else connectors)
-    unknown = sorted(name for name in chosen if name not in installed)
+    unknown = sorted({name for name in names if name not in installed})
     if unknown:
         available = ", ".join(installed) or "(none)"
         _, conflicts = _installed_toolkits()
@@ -216,17 +199,57 @@ def search_tools_across(
         raise ToolkitNotFoundError(
             f"Toolkit(s) {', '.join(map(repr, unknown))} not found. Available: {available}{left_out}"
         )
-    catalogs: dict[str, list[ToolSpec]] = {}
-    keywords: dict[str, list[str]] = {}
+    return installed
+
+
+def _searchable(
+    connectors: Mapping[str, Mapping[str, Any] | None] | Iterable[str] | None,
+) -> list[tuple[str, ToolIndex, frozenset[str] | None, list[ToolSpec]]]:
+    """For each chosen toolkit: its name, its cached index, the slugs its
+    connection may call (None: all) and those tools, in catalogue order. A
+    toolkit that fails to list its tools is logged and has none."""
+    if connectors is None:
+        chosen: dict[str, Mapping[str, Any] | None] = dict.fromkeys(installed_toolkits())
+    elif isinstance(connectors, Mapping):
+        chosen = dict(connectors)
+    else:
+        chosen = dict.fromkeys([connectors] if isinstance(connectors, str) else connectors)
+    installed = _require_installed(chosen)
+    found: list[tuple[str, ToolIndex, frozenset[str] | None, list[ToolSpec]]] = []
     for name, config in chosen.items():
-        cls = installed[name]
         try:
-            catalogs[name] = list(cls().available_tools(config))
-            card = cls.card()
-            keywords[name] = [
-                name, str(card["display_name"]), str(card["category"]), *map(str, card["keywords"])
-            ]
+            toolkit = installed[name]()
+            available = list(toolkit.available_tools(config))
+            index, allowed = scoped_index(toolkit, available)
         except Exception as e:  # noqa: BLE001 — one broken plugin must not hide the rest
             logger.warning(f"Failed to list the tools of toolkit {name}: {type(e).__name__}")
-            catalogs[name] = []
-    return rank_across(catalogs, query, limit, keywords=keywords)
+            continue
+        found.append((name, index, allowed, available))
+    return found
+
+
+def search_tools_across(
+    query: str | None,
+    connectors: Mapping[str, Mapping[str, Any] | None] | Iterable[str] | None = None,
+    *,
+    limit: int | None = 6,
+) -> list[QualifiedTool]:
+    """The tools most relevant to ``query`` across several toolkits, each
+    named with its connector, ranked by each toolkit's cached search index
+    (see :mod:`aisquare.pipe.core.search` and
+    :func:`~aisquare.pipe.core.tools.rank_across`).
+
+    ``connectors`` picks the toolkits: a mapping of name -> the connection's
+    ``config`` (so each lists only its :meth:`Toolkit.available_tools`, e.g.
+    filtered by ``granted_scopes``), an iterable of names (no config), or None
+    for every installed toolkit. An unknown name, or one left out because
+    its slug prefix collides with another toolkit's, raises
+    :class:`ToolkitNotFoundError`. With no query, or no match, the
+    connectors take turns. Offline, like ``available_tools``, once the
+    plugins are imported (see :func:`installed_toolkits`)."""
+    found = _searchable(connectors)
+    cap = sum(len(available) for *_, available in found) if limit is None else max(limit, 0)
+    hits = search_indexes([(index, allowed) for _, index, allowed, _ in found], query, cap)
+    if hits:
+        return [QualifiedTool(hit.connector, hit.tool) for hit in hits]
+    return take_turns({name: available for name, _, _, available in found}, cap)

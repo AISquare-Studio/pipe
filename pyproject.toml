@@ -35,7 +35,7 @@ Issues = "https://github.com/AISquare-Studio/pipe/issues"
 Changelog = "https://github.com/AISquare-Studio/pipe/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "pyyaml"]
 popular = [
     "aisquare-pipe-local",
     "aisquare-pipe-dropbox",
