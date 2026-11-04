@@ -431,13 +431,23 @@ a tool is the text you give it.
   no verb at all ("my unread emails"), favours `read_only` tools. Keep
   `read_only` honest.
 - **Named connectors.** When several toolkits are searched and the query
-  names one ("post the build status in slack", "upload it to google
-  drive", "one drive", "OneDrive"), that toolkit's scores are raised until
-  its best tool ranks first; the others stay in the list. A name, display
-  name or slug-prefix spelling names a toolkit; so does a card keyword, but
-  only a distinctive one (`gcal`): a keyword another searched toolkit also
-  lists, or whose words its tools use (`file`, `review`, `send`), names
-  nothing. Keep brand abbreviations among your `keywords`.
+  names one *as the service to use*, that toolkit's scores are doubled
+  (`NAMED_BOOST`); nothing is filtered out. Service position means a cue
+  word next to the name: before it "in", "on", "to", "from", "via",
+  "using", "into", "with", "my", "search", ... ("post it in slack", "my
+  onedrive", "search slack for ..."), after it "channel", "repo",
+  "inbox", "folder", "calendar", "workspace", ... ("the slack channel",
+  "github repo"), or a leading "slack: ...". A name, display name or
+  slug-prefix spelling ("google drive", "one drive", "OneDrive") names a
+  toolkit; so does a card keyword no other searched toolkit lists ("in
+  gcal", "on my calendar"), and a name beats a keyword. A name used only as
+  a topic ("schedule a meeting about the slack migration", "slack
+  notifications are delayed") gets no boost and counts as a weak search
+  term (`TOPIC_WEIGHT`). Keep brand abbreviations among your `keywords`.
+- **Idioms and opening noun-verbs.** "get rid of" reads as delete, "set
+  up" as create, "push back" as postpone, "look up/for" as search; a query
+  opening with "email", "message" or "text" also means send, and "file a
+  bug" means create.
 - **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
   two tools a toolkit should offer first when a query is ambiguous (the main
   search or send tool) with `pipe:primary`; their score is raised by 5%. The
@@ -468,6 +478,7 @@ still ranks first. Extend a group when the search eval shows a miss:
 | download · save · export | user · person · people · member · colleague · teammate · coworker |
 | schedule · book · plan · arrange | thread · conversation · replies |
 | move · relocate · reschedule | comment · note · feedback · remark |
+| reschedule · postpone · push · delay · shift · move · update | meeting · standup · sync · huddle · call · one on one · event |
 | cancel · delete | spreadsheet · sheet · excel · workbook |
 | copy · duplicate · clone | free · available · availability |
 | share · grant · invite · access | profile · account · whoami |

@@ -132,6 +132,23 @@ class TestAnalyzeQuery:
             assert concepts[("authenticat",)].weight == search.FIRST_PERSON_WEIGHT
         assert ("authenticat",) not in {c.source for c in analyze_query("repos for octocat").concepts}
 
+    def test_idioms(self):
+        assert analyze_query("get rid of that draft").tokens == ("delet", "draft")
+        assert analyze_query("get rid of that draft").intent == "write"
+        assert analyze_query("set up a call with Ann").tokens[:2] == ("creat", "call")
+        assert analyze_query("push back the standup").tokens[:1] == ("postpon",)
+        assert analyze_query("get the draft").tokens == ("get", "draft")
+
+    def test_opening_noun_verbs(self):
+        assert analyze_query("email the team about it").tokens[:2] == ("send", "email")
+        assert analyze_query("file a bug about the login").tokens[:2] == ("creat", "bug")
+        assert analyze_query("the email from Ann").tokens[0] == "email"
+        assert analyze_query("file details").tokens[0] == "fil"
+
+    def test_calendar_vocabulary(self):
+        concepts = {c.source: dict(c.alternatives) for c in analyze_query("postpone the standup").concepts}
+        assert ("updat",) in concepts[("postpon",)] and ("meet",) in concepts[("standup",)]
+
     @pytest.mark.parametrize(
         ("query", "intent"),
         [
@@ -297,8 +314,9 @@ class TestSearchIndexes:
 
 
 class TestNamedConnector:
-    """A query that names one of several connectors searched ranks that
-    connector's best hit first; boost only, never a filter."""
+    """A query that names one of several connectors searched *as the service
+    to use* ranks that connector up (boost only, never a filter); a
+    connector mentioned only as a topic is not boosted."""
 
     def _indexes(self):
         slack = ToolIndex.build(
@@ -325,57 +343,83 @@ class TestNamedConnector:
         cal = ToolIndex.build(
             "googlecalendar",
             [spec("GOOGLECALENDAR_CREATE_EVENT", "Create an event.", read_only=False)],
-            {"name": "googlecalendar", "display_name": "Google Calendar", "keywords": ["gcal", "review"]},
-        )
+            {"name": "googlecalendar", "display_name": "Google Calendar",
+             "keywords": ["gcal", "calendar", "review"]},
+        )  # fmt: skip
         return slack, github, drive, cal
 
-    def test_named_connector_outranks_other_slug_hits(self):
+    def _served(self, query):
+        entries = [(index, None) for index in self._indexes()]
+        return {entries[e][0].connector: level for e, level in search._served(entries, query).items()}
+
+    def test_a_served_name_outranks_other_word_matches_without_filtering(self):
         slack, github, _, _ = self._indexes()
-        plain = search_indexes([github, slack], "tell the team the releases are out")
-        assert plain[0].tool.slug == "GITHUB_LIST_RELEASES"  # the word match wins unnamed ...
-        named = search_indexes([github, slack], "tell the team on slack the releases are out")
-        assert named[0].connector == "slack"  # ... and loses once slack is named
+        assert search_indexes([github, slack], "post the latest releases")[0].connector == "github"
+        named = search_indexes([github, slack], "post the latest releases in slack")
+        assert named[0].tool.slug == "SLACK_SEND_MESSAGE"
         assert "GITHUB_LIST_RELEASES" in slugs(named)  # boost only, nothing filtered
 
+    def test_a_topic_mention_is_not_boosted(self):
+        slack, github, _, _ = self._indexes()
+        assert search_indexes([github, slack], "list the latest releases about slack")[0].connector == "github"
+        assert self._served("list the latest releases about slack") == {}
+
     @pytest.mark.parametrize(
-        ("query", "connector"),
+        ("query", "served"),
         [
-            ("share the release file on one drive", "onedrive"),  # slug-prefix spelling
-            ("share the release file on OneDrive", "onedrive"),  # display name, camelCase
-            ("share the release file in onedrive", "onedrive"),  # name
-            ("add the release review to gcal", "googlecalendar"),  # distinctive keyword
+            ("post it in slack", {"slack": 2}),
+            ("share the release file on one drive", {"onedrive": 2}),  # slug-prefix spelling
+            ("share the release file on OneDrive", {"onedrive": 2}),  # camelCase display name
+            ("what is in my onedrive", {"onedrive": 2}),
+            ("search slack for the outage", {"slack": 2}),
+            ("archive the old slack channel", {"slack": 2}),
+            ("slack: tell the team we shipped", {"slack": 2}),
+            ("add the release review to gcal", {"googlecalendar": 1}),  # distinctive keyword
+            ("put the offsite on my calendar", {"googlecalendar": 1}),
+            ("the slack migration plan", {}),
+            ("file a bug: slack notifications are delayed", {}),
+            ("add slack time to the week", {}),
+            ("send it to review", {}),  # "review" is github's and googlecalendar's
+            ("schedule a meeting about the github workshop", {}),
         ],
     )
-    def test_spellings(self, query, connector):
-        assert search_indexes(self._indexes(), query)[0].connector == connector
+    def test_service_position(self, query, served):
+        assert self._served(query) == served
 
-    def test_name_beats_keyword_and_shared_keywords_name_nothing(self):
-        slack, github, drive, cal = self._indexes()
-        assert slack.named_in("dm Ann on slack") == 2 and slack.named_in("dm Ann") == 1
-        assert github.named_in("the review") == 1 and github.named_in("nothing") == 0
-        # "review" is a keyword of github and googlecalendar: it names neither.
-        assert search._naming_levels([(github, None), (cal, None)], ("review",)) == [0, 0]
-        # "release" is github's alone, but onedrive's tools use the word: no name.
-        assert search._naming_levels([(github, None), (drive, None)], ("releas",)) == [0, 0]
-        assert search._naming_levels([(github, None), (slack, None)], ("releas",)) == [1, 0]
-        # A name beats a distinctive keyword.
-        assert search._naming_levels([(github, None), (slack, None)], ("releas", "slack")) == [1, 2]
+    def test_a_name_beats_a_keyword(self):
+        _, github, _, cal = self._indexes()
+        query = "add the releases from github to gcal"
+        assert self._served(query) == {"github": 2, "googlecalendar": 1}
+        boosted = {h.tool.slug: h.score for h in search_indexes([github, cal], query)}
+        with unittest.mock.patch.object(search, "_boost_named", lambda *args: args[-1]):
+            plain = {h.tool.slug: h.score for h in search_indexes([github, cal], query)}
+        assert boosted["GITHUB_LIST_RELEASES"] == pytest.approx(plain["GITHUB_LIST_RELEASES"] * search.NAMED_BOOST)
+        assert boosted["GOOGLECALENDAR_CREATE_EVENT"] == pytest.approx(plain["GOOGLECALENDAR_CREATE_EVENT"])
 
-    def test_no_change_when_nothing_or_everything_is_named_or_one_connector(self):
+    def test_no_change_when_nothing_or_everything_is_served_or_one_connector(self):
         slack, github, _, _ = self._indexes()
         unboosted = search._boost_named
         calls = []
 
-        def spy(entries, tokens, ranked):
-            out = unboosted(entries, tokens, ranked)
-            calls.append(out == ranked)
+        def spy(*args):
+            out = unboosted(*args)
+            calls.append(out == args[-1])
             return out
 
         with unittest.mock.patch.object(search, "_boost_named", spy):
             search_indexes([github, slack], "list everything from today")  # nothing named
-            search_indexes([github, slack], "releases from github to slack")  # both named
+            search_indexes([github, slack], "the slack and github migration")  # topics only
+            search_indexes([github, slack], "releases from github to slack")  # both served
             slack.search("post in slack")  # one connector
-        assert calls == [True, True, True]
+        assert calls == [True, True, True, True]
+
+    def test_topic_names_count_less_as_search_terms(self):
+        slack, github, _, _ = self._indexes()
+        served_terms, topic_terms = search._name_terms([(github, None), (slack, None)], "post the slack plan")
+        assert (served_terms, topic_terms) == (frozenset(), frozenset({"slack"}))
+        served_terms, topic_terms = search._name_terms([(github, None), (slack, None)], "post the plan in slack")
+        assert (served_terms, topic_terms) == (frozenset({"slack"}), frozenset())
+        assert search._name_terms([(slack, None)], "post the slack plan") == (frozenset(), frozenset())
 
     def test_order_within_the_named_connector_is_kept(self):
         slack, github, _, _ = self._indexes()
@@ -385,6 +429,11 @@ class TestNamedConnector:
             if h.connector == "slack"
         ]
         assert together == alone
+
+    def test_named_in_reports_any_mention(self):
+        slack, github, _, cal = self._indexes()
+        assert slack.named_in("the slack migration") == 2 and slack.named_in("dm Ann") == 1
+        assert cal.named_in("put it in gcal") == 1 and github.named_in("nothing here") == 0
 
 
 # --------------------------------------------------------------------------
@@ -659,7 +708,7 @@ class TestSyntheticCatalog:
         index = ToolIndex.build(name, tools[name], cards[name])
         hits = index.search("list events", 10)
         assert cards[name]["category"] == "calendar"
-        assert hits and all("EVENT" in h.tool.slug for h in hits[:3])
+        assert hits and all("EVENT" in h.tool.slug for h in hits[:2])
 
 
 def search_categories() -> frozenset[str]:

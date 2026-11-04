@@ -28,11 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stemming, a synonym table (`SYNONYMS`; a synonym counts less than the
     word itself), `authenticated` for first-person queries, and a small
     read/write intent boost.
-  - Across several connectors, a connector the query names (name, display
-    name, slug-prefix spelling such as "one drive", or a distinctive card
-    keyword such as "gcal") has its scores raised until its best tool ranks
-    first. Boost only; nothing changes when nothing is named or one
-    connector is searched.
+  - Across several connectors, a connector the query names as the service
+    to use ("post it in slack", "on one drive", "in gcal", "github repo",
+    "slack: ...") has its scores doubled (`NAMED_BOOST`). Boost only; a
+    name used only as a topic ("the slack migration") gets no boost and
+    counts as a weak search term (`TOPIC_WEIGHT`).
+  - Idioms ("get rid of", "set up", "push back") and opening noun-verbs
+    ("email the team ...", "file a bug ...") read as the verbs they mean;
+    calendar vocabulary (postpone/push/shift ~ update, standup/sync/huddle/
+    call ~ meeting) joins the synonym table.
   - The primary-tool marker is the tag `pipe:primary` (`PRIMARY_TAG`): a
     5% boost, never indexed as text. A plain `important` tag is ordinary
     content. See CONTRIBUTING.md, "Making tools findable".
@@ -41,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
   measures index build, memory and query latency on 10,000 tools and on
   1,000 connectors x 50 tools.
-- `tests/evals/`: 150 labelled tool-search queries over the six native
+- `tests/evals/`: 165 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
 - The native toolkits' main tools carry `pipe:primary`:
   `GMAIL_FETCH_EMAILS`, `GMAIL_SEND_EMAIL`, `GOOGLECALENDAR_EVENTS_LIST`,
@@ -58,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalogue (or the connectors taking turns). Results differ: plurals and
   other word forms match (`repository` finds `..._REPOSITORIES_...`),
   synonyms match below exact words, and IDF makes rare words count more.
-  On the eval, recall@1 goes from 0.593 to 0.820 and recall@10 from 0.927
+  On the eval, recall@1 goes from 0.576 to 0.812 and recall@10 from 0.891
   to 1.000.
 - `search_tools_across` no longer rebuilds every catalogue's ranking on
   each call: each toolkit's index is cached and reused until its catalogue

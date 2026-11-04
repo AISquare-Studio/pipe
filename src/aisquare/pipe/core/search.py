@@ -28,15 +28,17 @@ that are not ``read_only``; one with read verbs, or no verb at all, favours
 ``read_only`` ones). Ties keep connector order, then catalogue order.
 
 Searching several connectors at once scores every tool with IDF over the
-union of their catalogues, and a connector the query names ("... on slack",
-"... in Google Drive", "gcal") gets its scores raised until its best hit
-ranks first (:data:`NAMED_BOOST`; never a filter). Length normalisation pivots on fixed field
+union of their catalogues, and a connector the query names as the service
+to use ("... on slack", "... in Google Drive", "in gcal") has its scores
+raised by :data:`NAMED_BOOST` (never a filter); one only mentioned as a
+topic ("the slack migration") is not. Length normalisation pivots on fixed field
 lengths, so the same tool scores the same in any search and scores compare
 across connectors.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import heapq
@@ -133,6 +135,7 @@ SYNONYMS: tuple[tuple[str, ...], ...] = (
     ("download", "save", "export"),
     ("schedule", "book", "plan", "arrange"),
     ("move", "relocate", "reschedule"),
+    ("reschedule", "postpone", "push", "delay", "shift", "move", "update"),
     ("cancel", "delete"),
     ("copy", "duplicate", "clone"),
     ("share", "grant", "invite", "access"),
@@ -145,6 +148,7 @@ SYNONYMS: tuple[tuple[str, ...], ...] = (
     ("file", "document", "doc", "attachment"),
     ("email", "mail", "inbox", "message"),
     ("event", "meeting", "calendar", "invite", "appointment"),
+    ("meeting", "standup", "sync", "huddle", "call", "one on one", "event"),
     ("repo", "repository", "project", "codebase"),
     ("issue", "ticket", "bug"),
     ("pr", "pull request", "merge request"),
@@ -168,6 +172,18 @@ SYNONYMS: tuple[tuple[str, ...], ...] = (
     ("contents", "inside", "children"),
 )
 
+#: Multi-word verbs rewritten before analysis, so their parts don't count
+#: on their own ("get rid of" is not a "get").
+IDIOMS: dict[tuple[str, ...], str] = {
+    ("get", "rid", "of"): "delete",
+    ("get", "rid"): "delete",
+    ("set", "up"): "create",
+    ("push", "back"): "postpone",
+    ("look", "up"): "lookup",
+    ("look", "for"): "search",
+    ("call", "off"): "cancel",
+}
+
 #: How much a synonym counts relative to the query word it stands for.
 SYNONYM_WEIGHT = 0.15
 
@@ -182,12 +198,36 @@ PRIMARY_TAG = "pipe:primary"
 PRIMARY_BOOST = 0.05
 #: Tags with this prefix are markers for the ranker, not words to match.
 MARKER_PREFIX = "pipe:"
-#: When several connectors are searched and the query names some of them
-#: (see :meth:`ToolIndex.named_in`), each named connector's scores are
-#: multiplied by at least this, and by enough that its best hit ranks
-#: :data:`NAMED_MARGIN` times above the best hit of any connector not named.
-NAMED_BOOST = 1.5
-NAMED_MARGIN = 1.1
+#: When several connectors are searched and the query names one as the
+#: service to use (see :func:`_served`), that connector's scores are
+#: multiplied by this. A connector only mentioned as a topic ("the slack
+#: migration") gets nothing.
+NAMED_BOOST = 2.0
+#: When several connectors are searched, a connector name used only as a
+#: topic ("the slack migration", "the google drive link") counts this much
+#: as a search term: it says what the thing is about, not which tool to use.
+TOPIC_WEIGHT = 0.2
+#: ... and a name in service position ("in slack") this much (a full term:
+#: it also has to match that connector's tools).
+SERVED_NAME_WEIGHT = 1.0
+# Words before a connector's name that make it the service: "in slack",
+# "to google drive", "via gmail", "my onedrive", "search slack".
+_SERVICE_BEFORE = frozenset(
+    {
+        "across", "ask", "at", "check", "from", "in", "inside", "into", "my", "on", "onto", "open",
+        "our", "over", "search", "through", "to", "use", "using", "via", "with", "within", "your"
+    }
+)
+# Words after a connector's name that make it the service: "slack channel",
+# "github repo", "gmail inbox", "onedrive folder".
+_SERVICE_AFTER = frozenset(
+    {
+        "account", "app", "calendar", "calendars", "channel", "channels", "dm", "dms", "drive",
+        "drives", "folder", "folders", "inbox", "mailbox", "message", "messages", "org",
+        "organization", "repo", "repos", "repositories", "repository", "thread", "threads",
+        "workspace", "workspaces"
+    }
+)
 #: How much a tool whose ``read_only`` flag matches the query's intent is raised.
 INTENT_BOOST = 0.15
 
@@ -225,6 +265,7 @@ IDF_FLOOR = 0.5
 # that make a query read or write.
 _WRITE_VERBS = frozenset(
     {
+        "postpone", "delay", "push", "shift",
         "add", "approve", "archive", "assign", "book", "bookmark", "cancel", "change", "close",
         "comment", "compose", "copy", "create", "delete", "disable", "discard", "dm", "draft",
         "duplicate", "edit", "enable", "erase", "favorite", "give", "grant", "invite", "join",
@@ -374,8 +415,8 @@ def analyze_query(query: str) -> QueryAnalysis:
     ``"write"`` when the query has a write verb and no read verb, ``"read"``
     when it has a read verb and no write verb, or no verb at all (a noun
     phrase such as "my unread emails" asks to see something), else None."""
-    raw = _words(query)
-    tokens = tokenize(query)
+    raw = _imperative(_rewrite_idioms(_words(query)))
+    tokens = [stem(w) for w in raw if len(w) > 1 and w not in STOPWORDS]
     table, longest = _synonym_table()
     concepts: dict[Phrase, Concept] = {}
     for term in dict.fromkeys(tokens):
@@ -404,6 +445,46 @@ def analyze_query(query: str) -> QueryAnalysis:
 
 
 _AUTHENTICATED = stem("authenticated")
+
+
+def _rewrite_idioms(words: list[str]) -> list[str]:
+    """``words`` with each :data:`IDIOMS` phrase replaced by its verb."""
+    if not any(w in _IDIOM_HEADS for w in words):
+        return words
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        for phrase, verb in _IDIOM_ORDER:
+            if tuple(words[i : i + len(phrase)]) == phrase:
+                out.append(verb)
+                i += len(phrase)
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return out
+
+
+# Nouns used as the opening verb: "email the team ..." sends an email,
+# "file a bug ..." creates one.
+_NOUN_VERBS = {"email": "send", "mail": "send", "message": "send", "text": "send"}
+
+
+def _imperative(words: list[str]) -> list[str]:
+    """``words`` with the verb an opening noun-verb stands for put in front
+    ("email the team" -> "send email the team"; "file a bug" -> "create a
+    bug")."""
+    if not words:
+        return words
+    if words[0] in _NOUN_VERBS:
+        return [_NOUN_VERBS[words[0]], *words]
+    if words[0] == "file" and len(words) > 1 and words[1] in ("a", "an"):
+        return ["create", *words[1:]]
+    return words
+
+
+_IDIOM_HEADS = frozenset(phrase[0] for phrase in IDIOMS)
+_IDIOM_ORDER = sorted(IDIOMS.items(), key=lambda item: -len(item[0]))
 
 
 def _schema_text(schema: Any) -> str:
@@ -683,9 +764,9 @@ class ToolIndex:
         # its card keywords ("gcal").
         spellings = [str(v) for v in names if v]
         spellings += [re.sub(r"[^a-z0-9]", "", v.lower()) for v in spellings]
-        self._names = frozenset(p for p in (tuple(tokenize(v)) for v in spellings) if p)
+        self._names = frozenset(p for p in map(_plain_words, spellings) if p)
         keywords = _values((card or {}).get("keywords"))
-        self._keywords = frozenset(p for p in (tuple(tokenize(k)) for k in keywords) if p)
+        self._keywords = frozenset(p for p in map(_plain_words, keywords) if p)
         self._slugs = slugs
         self._primary = tuple(PRIMARY_TAG in t.tags for t in catalogue)
         self._read_only = tuple(bool(t.read_only) for t in catalogue)
@@ -719,14 +800,15 @@ class ToolIndex:
         return self._postings.df.get(term, 0.0)
 
     def named_in(self, query: str) -> int:
-        """How the query names this connector: 2 by name, display name or
-        slug-prefix spelling ("slack", "Google Drive", "one drive",
-        "OneDrive"), 1 by a card keyword only ("gcal"), 0 not at all. Words
-        and phrases match whole, after :func:`tokenize`. Across several
-        connectors a keyword counts only when it is distinctive (see
-        :func:`_naming_levels`)."""
-        tokens = analyze_query(query).tokens if query else ()
-        return _mention(tokens, self._names, self._keywords)
+        """How the query names this connector, wherever the name stands: 2
+        by name, display name or slug-prefix spelling ("slack", "Google
+        Drive", "one drive", "OneDrive"), 1 by a card keyword only ("gcal"),
+        0 not at all. Whole words and phrases, case-insensitive. Whether that
+        earns a boost is :func:`_served`'s call."""
+        words = _words(query) if query else []
+        if _occurrences(words, self._names):
+            return 2
+        return 1 if _occurrences(words, self._keywords) else 0
 
     def _boost(self, d: int, intent: str | None) -> float:
         boost = 1.0 + PRIMARY_BOOST if self._primary[d] else 1.0
@@ -746,12 +828,23 @@ def _search(entries: Sequence[Entry], query: str | None, limit: int | None) -> l
     analysis = analyze_query(query)
     if not analysis.concepts:
         return []
+    concepts = analysis.concepts
+    served_terms, topic_terms = _name_terms(entries, query)
+    if served_terms or topic_terms:
+        concepts = tuple(
+            dataclasses.replace(c, weight=c.weight * SERVED_NAME_WEIGHT)
+            if set(c.source) <= served_terms
+            else dataclasses.replace(c, weight=c.weight * TOPIC_WEIGHT)
+            if set(c.source) <= topic_terms
+            else c
+            for c in concepts
+        )
     total = sum(len(index.tools) for index, _ in entries)
     df = {term: sum(index.df(term) for index, _ in entries) for term in analysis.terms}
-    idfs = [_concept_idf(concept, total, df) for concept in analysis.concepts]
+    idfs = [_concept_idf(concept, total, df) for concept in concepts]
     ranked: list[tuple[float, int, int]] = []
     for e, (index, allowed) in enumerate(entries):
-        acc, base = _score_concepts(index._postings, analysis.concepts, idfs, index._shared)
+        acc, base = _score_concepts(index._postings, concepts, idfs, index._shared)
         keep = None if allowed is None else frozenset(allowed)
         slugs = index._slugs
         candidates: Iterable[int] = range(len(index.tools)) if base > 0.0 else acc
@@ -761,86 +854,108 @@ def _search(entries: Sequence[Entry], query: str | None, limit: int | None) -> l
             score = (acc.get(d, 0.0) + base) * index._boost(d, analysis.intent)
             if score > 0.0:
                 ranked.append((-score, e, d))
-    ranked = _boost_named(entries, analysis.tokens, ranked)
+    ranked = _boost_named(entries, query, ranked)
     best = heapq.nsmallest(limit, ranked) if limit is not None else sorted(ranked)
     return [ScoredTool(entries[e][0].connector, entries[e][0].tools[d], -neg) for neg, e, d in best]
 
 
-def _phrases_in(tokens: Sequence[str], phrases: frozenset[Phrase]) -> list[Phrase]:
-    """The ``phrases`` that occur in ``tokens``, each as a contiguous run."""
+def _plain_words(text: str) -> Phrase:
+    """Lowercase words of ``text``, no splitting of camelCase, no stemming:
+    how connector names and keywords are spelled ("onedrive", "google drive")."""
+    return tuple(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _occurrences(words: Sequence[str], phrases: frozenset[Phrase]) -> list[tuple[Phrase, int]]:
+    """Each ``(phrase, start)`` where one of ``phrases`` occurs in ``words``."""
     longest = max((len(p) for p in phrases), default=0)
     return [
-        phrase
-        for n in range(1, min(longest, len(tokens)) + 1)
-        for i in range(len(tokens) - n + 1)
-        if (phrase := tuple(tokens[i : i + n])) in phrases
+        (phrase, i)
+        for n in range(1, min(longest, len(words)) + 1)
+        for i in range(len(words) - n + 1)
+        if (phrase := tuple(words[i : i + n])) in phrases
     ]
 
 
-def _mention(tokens: Sequence[str], names: frozenset[Phrase], keywords: frozenset[Phrase]) -> int:
-    """2 when a phrase of ``names`` occurs in ``tokens``, 1 when only one of
-    ``keywords`` does, else 0."""
-    if _phrases_in(tokens, names):
-        return 2
-    return 1 if _phrases_in(tokens, keywords) else 0
+def _cued(query: str, words: Sequence[str], found: list[tuple[Phrase, int]]) -> bool:
+    """Whether any occurrence stands in service position: after "in", "on",
+    "to", "via", "my", "search", ... (:data:`_SERVICE_BEFORE`), before
+    "channel", "repo", "inbox", "folder", ... (:data:`_SERVICE_AFTER`), or
+    as the query's leading "<name>:"."""
+    lead = _plain_words(query.split(":", 1)[0]) if ":" in query else None
+    for phrase, i in found:
+        if i > 0 and words[i - 1] in _SERVICE_BEFORE:
+            return True
+        end = i + len(phrase)
+        if end < len(words) and words[end] in _SERVICE_AFTER:
+            return True
+        if lead == phrase:
+            return True
+    return False
 
 
-def _naming_levels(entries: Sequence[Entry], tokens: Sequence[str]) -> list[int]:
-    """Per entry, how the query names its connector among the others: 2 by
-    name, 1 by a *distinctive* card keyword, else 0. A keyword is
-    distinctive when no other connector searched has it as a keyword or has
-    all its words in its tools: "gcal" names Google Calendar, but "review"
-    (GitHub's keyword, also in Google Drive's tools) or "file" names
-    nothing. Linear in the number of connectors."""
+def _served(entries: Sequence[Entry], query: str) -> dict[int, int]:
+    """The entries whose connector the query names *as the service to use*,
+    with how (2 by name, 1 by keyword). A connector is named by its name,
+    display name or slug-prefix spelling, or by a card keyword no other
+    searched connector lists ("gcal", "calendar"; "file" is both drives'),
+    and served when such a mention stands in service position (see
+    :func:`_cued`): "post it in slack", "on my calendar", "github repo",
+    "gmail: ...". A topic mention ("schedule a meeting about the onedrive
+    migration", "slack notifications are delayed") serves nothing. Linear
+    in the number of connectors."""
+    words = _words(query)
     indexes = [index for index, _ in entries]
-    matched = [_phrases_in(tokens, index._keywords) for index in indexes]
-    # For each keyword phrase the query holds: the connectors that list it
-    # or whose tools use all its words.
+    names = [_occurrences(words, index._names) for index in indexes]
+    keywords = [_occurrences(words, index._keywords) for index in indexes]
     claims: dict[Phrase, set[str]] = {}
-    for phrase in {p for found in matched for p in found}:
-        claims[phrase] = {
-            index.connector
-            for index in indexes
-            if phrase in index._keywords or all(index.df(t) > 0 for t in phrase)
-        }
-    levels = []
-    for index, found in zip(indexes, matched):
-        if _phrases_in(tokens, index._names):
-            levels.append(2)
-        elif any(claims[phrase] <= {index.connector} for phrase in found):
-            levels.append(1)
-        else:
-            levels.append(0)
-    return levels
+    for phrase in {p for found in keywords for p, _ in found}:
+        claims[phrase] = {index.connector for index in indexes if phrase in index._keywords}
+    served: dict[int, int] = {}
+    for e, index in enumerate(indexes):
+        mine = [(p, i) for p, i in keywords[e] if claims[p] <= {index.connector}]
+        if _cued(query, words, names[e]):
+            served[e] = 2
+        elif _cued(query, words, mine):
+            served[e] = 1
+    return served
+
+
+def _name_terms(entries: Sequence[Entry], query: str) -> tuple[frozenset[str], frozenset[str]]:
+    """The search terms of the connector names in the query: those in service
+    position, and those used only as a topic. Both empty unless several
+    connectors are searched."""
+    if len({index.connector for index, _ in entries}) < 2:
+        return frozenset(), frozenset()
+    words = _words(query)
+    served: set[str] = set()
+    topic: set[str] = set()
+    for index, _ in entries:
+        found = _occurrences(words, index._names)
+        if found:
+            terms = {stem(w) for phrase, _ in found for w in phrase if w not in STOPWORDS}
+            (served if _cued(query, words, found) else topic).update(terms)
+    return frozenset(served), frozenset(topic - served)
 
 
 def _boost_named(
-    entries: Sequence[Entry], tokens: Sequence[str], ranked: list[tuple[float, int, int]]
+    entries: Sequence[Entry], query: str, ranked: list[tuple[float, int, int]]
 ) -> list[tuple[float, int, int]]:
-    """Raise the connectors the query names (``ranked`` holds ``(-score,
-    entry, doc)``). Only when several connectors are searched and some, not
-    all, are named; only the most explicit level of naming counts (a name
-    beats a keyword: in "calendar invite in gmail", Gmail is named, Google
-    Calendar is not), and a keyword names a connector only when it is
-    distinctive (see :func:`_naming_levels`). Each named connector's scores are multiplied by
-    :data:`NAMED_BOOST`, or more when needed so that its best hit lands
-    :data:`NAMED_MARGIN` times above every other connector's hits. Nothing
-    is filtered out; order within a connector is kept."""
+    """Raise the connectors the query names as the service to use (see
+    :func:`_served`): their scores are multiplied by :data:`NAMED_BOOST`.
+    ``ranked`` holds ``(-score, entry, doc)``. Only when several connectors
+    are searched and some, not all, are served; only the most explicit
+    level counts (a name beats a keyword). Nothing is filtered out and order
+    within a connector is kept."""
     if len({index.connector for index, _ in entries}) < 2 or not ranked:
         return ranked
-    levels = _naming_levels(entries, tokens)
-    top = max(levels)
-    named = {e for e, level in enumerate(levels) if level == top} if top else set()
-    if not named or len(named) == len(entries):
+    served = _served(entries, query)
+    if not served:
         return ranked
-    best: dict[int, float] = {}
-    for neg, e, _ in ranked:
-        best[e] = max(best.get(e, 0.0), -neg)
-    others = max((score for e, score in best.items() if e not in named), default=0.0)
-    factor = {
-        e: max(NAMED_BOOST, NAMED_MARGIN * others / best[e]) for e in named if best.get(e)
-    }
-    return [(neg * factor.get(e, 1.0), e, d) for neg, e, d in ranked]
+    top = max(served.values())
+    named = {e for e, level in served.items() if level == top}
+    if {entries[e][0].connector for e in named} == {index.connector for index, _ in entries}:
+        return ranked
+    return [(neg * NAMED_BOOST if e in named else neg, e, d) for neg, e, d in ranked]
 
 
 def search_indexes(
