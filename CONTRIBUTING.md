@@ -284,10 +284,9 @@ What the base class does for you:
   config), which `contract.toolkit.available-tools` checks. Hosts should list
   and search through it, not through `tools()`.
 - **`search_tools(query, limit=6, *, config=None)`** ranks
-  `available_tools(config)`. If you override it, keep the `*, config=None`
-  parameter. Ranking uses a deterministic keyword score (+2 per query
-  term in the slug, +1 in the description or tags; first-person queries
-  favour `..._AUTHENTICATED_...` tools).
+  `available_tools(config)` with the toolkit's cached BM25F search index
+  (see [Making tools findable](#making-tools-findable)). If you override it,
+  keep the `*, config=None` parameter.
 - **`validate_config(config)`** defaults to "has a non-empty
   `access_token` with no inner whitespace" (or always true for
   `AuthType.NONE`). `run_tool` receives the token with surrounding
@@ -404,6 +403,114 @@ pipe tools mysvc                        # every slug + description
 pipe tools mysvc --search "find a file" # ranked, top 6
 pipe tools mysvc --json                 # full ToolSpecs
 ```
+
+### Making tools findable
+
+Hosts find tools through `aisquare.pipe.core.search`: a BM25F index per
+toolkit (`index_for(name)`, cached per name, version and catalogue
+fingerprint), a `ConnectorIndex` over the cards, and `search_scored` /
+`search_tools_across` across toolkits. No model and no network: what ranks
+a tool is the text you give it.
+
+- **Slug words weigh the most**, then **tags**, then the **description**,
+  then the input schema's property names and descriptions. The toolkit's
+  `slug_prefix` is left out of the slug words; the connector's name,
+  display name, category and keywords count a little for every tool (they
+  matter when several toolkits are searched together).
+- **Tags are your synonyms.** Add the words users say that the slug does
+  not: `("send", "post", "dm", "notify")` on a send-message tool,
+  `("who", "access", "sharing")` on a permissions tool. Lowercase words or
+  short phrases; they are tokenized like any text.
+- **Text is analysed the same way on both sides**: lowercased, UPPER_SNAKE
+  and camelCase split (`OneDrive` also stays `onedrive`), stopwords dropped,
+  light stemming (`repositories` = `repository`, `scheduled` = `schedule`).
+  First-person queries ("my repos", "assigned to me") add the term
+  `authenticated`, so `..._FOR_THE_AUTHENTICATED_USER` tools win them.
+- **Intent.** A query with only write verbs ("delete", "send", "share")
+  slightly favours tools that are not `read_only`; one with read verbs, or
+  no verb at all ("my unread emails"), favours `read_only` tools. Keep
+  `read_only` honest.
+- **Named connectors.** When several toolkits are searched and the query
+  names one *as the service to use*, that toolkit's scores are doubled
+  (`NAMED_BOOST`); nothing is filtered out. Service position means a cue
+  word next to the name: before it "in", "on", "to", "from", "via",
+  "using", "into", "with", "my", "search", ... ("post it in slack", "my
+  onedrive", "search slack for ..."), after it "channel", "repo",
+  "inbox", "folder", "calendar", "workspace", ... ("the slack channel",
+  "github repo"), or a leading "slack: ...". A name, display name or
+  slug-prefix spelling ("google drive", "one drive", "OneDrive") names a
+  toolkit; so does a card keyword no other searched toolkit lists ("in
+  gcal", "on my calendar"), and a name beats a keyword. A name used only as
+  a topic ("schedule a meeting about the slack migration", "slack
+  notifications are delayed") or as a modifier ("in slack style",
+  "github-flavored markdown", "slack-like") gets no boost and counts as a
+  weak search term (`TOPIC_WEIGHT`). Keep brand abbreviations among your
+  `keywords`.
+- **A toolkit's own name says nothing about which of its tools to use.** It
+  is left out of every tool field at index time, as a phrase
+  (`SLACK_CREATE_SLACK_LIST` indexes as "create list", "Search Google
+  Drive for files" as "search files"; "shared drives" keeps "drive"). So
+  repeating your toolkit's name in slugs and descriptions is harmless, and
+  it never ranks one of your tools above another.
+- **Idioms and opening noun-verbs.** "get rid of" reads as delete, "set
+  up" as create, "push back" as postpone, "look up/for" as search, "let
+  <someone> know" as notify; a query
+  opening with "email", "message" or "text" also means send, and "file a
+  bug" means create.
+- **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
+  two tools a toolkit should offer first when a query is ambiguous (the main
+  search or send tool) with `pipe:primary`; their score is raised by 5%. The
+  native toolkits mark their main tools (Gmail fetch/send, Calendar
+  list/create event, Drive find/upload, OneDrive upload, Slack send/search
+  messages); check a toolkit's own ranking tests when you add one. It
+  is a ranking marker only: tags in the `pipe:` namespace are never indexed
+  as text. Don't use it on most tools (it then means nothing), and don't use
+  the word `important` for this: `important` is an ordinary content tag
+  (Gmail's IMPORTANT label) and gets no boost. Hosts read the constant
+  `aisquare.pipe.core.search.PRIMARY_TAG`, never the string.
+
+**Synonym table** (`aisquare.pipe.core.search.SYNONYMS`). A query word
+also matches the other members of its groups, counting
+`SYNONYM_WEIGHT` (0.15) of an exact match, so a tool named for the word
+still ranks first. Extend a group when the search eval shows a miss:
+
+| actions | objects |
+| --- | --- |
+| send · post · message · notify · ping · dm · tell · say | file · document · doc · attachment |
+| list · get · fetch · show · find · read · view · see · display · browse | email · mail · inbox · message |
+| create · add · new · make · open · start | event · meeting · calendar · invite · appointment |
+| delete · remove · trash · archive · erase · discard · bin | repo · repository · project · codebase |
+| update · edit · modify · change · rename · fix · amend | issue · ticket · bug |
+| search · find · query · lookup · locate | pr · pull request · merge request |
+| reply · respond · answer | channel · room |
+| upload · attach · put · store | folder · directory |
+| download · save · export | user · person · people · member · colleague · teammate · coworker |
+| schedule · book · plan · arrange | thread · conversation · replies |
+| move · relocate · reschedule | comment · note · feedback · remark |
+| reschedule · postpone · push · delay · shift · move · update | meeting · standup · sync · huddle · call · one on one · event |
+| cancel · delete | spreadsheet · sheet · excel · workbook |
+| copy · duplicate · clone | free · available · availability |
+| share · grant · invite · access | profile · account · whoami |
+| invite · bring | permission · access · rights |
+| star · favorite · favourite · bookmark | reminder · remind |
+| draft · compose · write | commit · change · diff |
+| react · reaction · emoji | release · version |
+| restore · undelete · recover · untrash | workflow · ci · build · pipeline |
+| mute · snooze · silence · dnd · do not disturb | link · url · permalink |
+| all · every · everything · everyone | unread · missed |
+| recent · latest · today | label · tag · category |
+| | contents · inside · children |
+
+**The search eval.** `tests/evals/tool_search_cases.yaml` holds labelled
+queries over the six native toolkits (`{query, connector, acceptable}`; many
+are paraphrases that share no word with the slug).
+`pytest tests/evals -s` prints recall@1/5/10 and MRR for the index and for
+the 0.4 keyword ranker it replaced, and lists the misses. When you add or
+rename tools in a native toolkit, run it; when you change the analyser or
+the synonym table, it must not get worse. `scripts/bench_search.py` checks
+build time and latency on synthetic catalogues
+(`aisquare.pipe.testing.synthetic.synthetic_catalog`) of 10,000 tools and
+1,000 connectors.
 
 ## Live Tests (optional)
 

@@ -1154,6 +1154,7 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         ),
         _events_list,
         "events", "list", "agenda", "meetings", "upcoming", "calendar", "week", "today",
+        "pipe:primary",
     ),
     _tool(
         "GOOGLECALENDAR_FIND_EVENT",
@@ -1318,6 +1319,7 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         ),
         _create_event,
         "create", "schedule", "add", "book", "new", "event", "meeting", "invite", "appointment",
+        "pipe:primary",
         scopes=_READ_WRITE,
         aliases={"title": "summary", "start_time": "start_datetime", "end_time": "end_datetime", "time_zone": "timezone"},
     ),

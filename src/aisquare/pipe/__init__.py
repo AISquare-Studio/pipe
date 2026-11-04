@@ -41,6 +41,15 @@ from aisquare.pipe.core.registry import (
     search_tools_across,
     slug_prefix_conflicts,
 )
+from aisquare.pipe.core.search import (
+    PRIMARY_TAG,
+    ConnectorIndex,
+    ScoredTool,
+    ToolIndex,
+    index_for,
+    search_connectors,
+    search_scored,
+)
 from aisquare.pipe.core.tools import (
     CARD_FIELDS,
     CATEGORIES,
@@ -162,6 +171,14 @@ __all__ = [
     "catalogue",
     "search_tools_across",
     "slug_prefix_conflicts",
+    # Search
+    "ToolIndex",
+    "ConnectorIndex",
+    "ScoredTool",
+    "PRIMARY_TAG",
+    "index_for",
+    "search_scored",
+    "search_connectors",
     # Errors
     "PipeError",
     "ConnectorNotFoundError",

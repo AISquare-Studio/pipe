@@ -1028,6 +1028,7 @@ CATALOG: tuple[OneDriveTool, ...] = (
         ),
         _upload_file,
         "upload", "save", "write", "create", "file", "put", "store",
+        "pipe:primary",
         destructive=True,
     ),
     _write(

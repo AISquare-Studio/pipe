@@ -953,6 +953,7 @@ CATALOG: tuple[GmailTool, ...] = (
         ),
         _fetch_emails,
         "email", "emails", "mail", "inbox", "messages", "search", "list", "unread", "recent", "fetch", "read",
+        "pipe:primary",
     ),
     _read(
         "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
@@ -1081,6 +1082,7 @@ CATALOG: tuple[GmailTool, ...] = (
         ),
         _send_email,
         "send", "email", "mail", "message", "compose", "write",
+        "pipe:primary",
         scopes=(SEND_SCOPE,),
         aliases=_SEND_ALIASES,
     ),
