@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-04
+
+The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`
+extra are new in it, so a host that needs either (pipe-as-service's
+`/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`; 0.4.0 has neither.
+Toolkit packages in the same run, each now requiring `aisquare-pipe>=0.5.0`
+(their `pipe:primary` tags are a ranking marker only from 0.5.0; 0.4.0's
+ranker would read them as text): `aisquare-pipe-gmail`,
+`-googlecalendar` and `-slack` 0.2.0, `aisquare-pipe-googledrive` and
+`-onedrive` 0.4.0. `aisquare-pipe-github` is unchanged at 0.3.0. Publish
+order: RELEASING.md, "The 0.5.0 release (tool router)".
+
 ### Added
 
+- **`aisquare-pipe[toolkits]`**: every package that registers an
+  `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
+  googledrive, onedrive, slack), each floored at a release that ships its
+  toolkit (and, for the five above, its `pipe:primary` markers).
+  `scripts/check_toolkits_extra.py` (CI) fails when a toolkit package
+  is missing from it or an entry has no toolkit;
+  `scripts/dev_install_toolkits.sh` editable-installs the framework and every
+  toolkit into another venv. Publish the toolkits before the `aisquare-pipe`
+  release whose extra names them (RELEASING.md).
 - **Tool and connector search index** (`aisquare.pipe.core.search`): BM25F
   in pure Python, no new dependency, no network, no model.
   - `ToolIndex.build(connector, tools, card=None)` indexes one catalogue
@@ -59,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GOOGLECALENDAR_CREATE_EVENT`, `GOOGLEDRIVE_FIND_FILE`,
   `GOOGLEDRIVE_UPLOAD_FILE`, `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE`,
   `SLACK_SEND_MESSAGE`, `SLACK_SEARCH_MESSAGES`.
+- **`left_out_toolkits()`**: the installed toolkits `installed_toolkits()`
+  leaves out, name -> why (`name breaks <rule>`, `name differs from its entry
+  point (class name '…')`, `slug prefix … collides with …`), from the same
+  cached discovery. Names and prefixes only, so a host can log it.
+- `ToolkitNotFoundError` for a left-out name says why (`'led-ger' left out:
+  name breaks …`). A clash keeps its existing wording.
 
 ### Changed
 
@@ -91,15 +118,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already failed it): served, it would answer to one name and describe
   itself by another.
 
-### Added
-
-- **`left_out_toolkits()`**: the installed toolkits `installed_toolkits()`
-  leaves out, name -> why (`name breaks <rule>`, `name differs from its entry
-  point (class name '…')`, `slug prefix … collides with …`), from the same
-  cached discovery. Names and prefixes only, so a host can log it.
-- `ToolkitNotFoundError` for a left-out name says why (`'led-ger' left out:
-  name breaks …`). A clash keeps its existing wording.
-
 ## [0.4.0] - 2026-10-31
 
 The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and
@@ -112,14 +130,6 @@ First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
 
 ### Added
 
-- **`aisquare-pipe[toolkits]`**: every package that registers an
-  `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
-  googledrive, onedrive, slack), each floored at a release that ships its
-  toolkit. `scripts/check_toolkits_extra.py` (CI) fails when a toolkit package
-  is missing from it or an entry has no toolkit;
-  `scripts/dev_install_toolkits.sh` editable-installs the framework and every
-  toolkit into another venv. Publish the toolkits before the `aisquare-pipe`
-  release whose extra names them (RELEASING.md).
 - **Router metadata on every native toolkit** — github, googledrive,
   onedrive, slack, gmail and googlecalendar — so `catalogue()` returns six
   cards and scope filtering works on all of them.

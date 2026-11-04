@@ -174,7 +174,7 @@ class GmailToolkit(Toolkit):
     """
 
     name = "gmail"
-    version = "0.1.0"
+    version = "0.2.0"
     display_name = "Gmail"
     description = (
         "Gmail: search and read email, conversations and attachments, labels and the account "

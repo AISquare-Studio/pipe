@@ -117,7 +117,7 @@ class SlackMessageSink(SinkConnector):
     """
 
     name = "slack-message-sink"
-    version = "0.1.0"
+    version = "0.2.0"
     input_types = ["*/*"]  # noqa: RUF012 — framework contract: class-level spec, never mutated
     auth_type = AuthType.OAUTH2
     description = (
