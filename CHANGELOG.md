@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves it out with one warning. `discover_toolkits()` still reads every
   entry point. Connector entry-point names are unaffected, and every shipped
   toolkit already complies.
+- **A toolkit whose class `name` differs from its entry-point name is left
+  out** of `installed_toolkits()` too, with one warning (`pipe validate`
+  already failed it): served, it would answer to one name and describe
+  itself by another.
+
+### Added
+
+- **`left_out_toolkits()`**: the installed toolkits `installed_toolkits()`
+  leaves out, name -> why (`name breaks <rule>`, `name differs from its entry
+  point (class name '…')`, `slug prefix … collides with …`), from the same
+  cached discovery. Names and prefixes only, so a host can log it.
+- `ToolkitNotFoundError` for a left-out name says why (`'led-ger' left out:
+  name breaks …`). A clash keeps its existing wording.
 
 ## [0.4.0] - 2026-10-31
 
