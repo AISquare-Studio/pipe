@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe"
-version = "0.4.0"
+version = "0.5.0"
 description = "Universal anything-to-anything connector framework"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -54,16 +54,18 @@ full = [
 ]
 # Every package under connectors/ that registers an `aisquare_pipe.toolkits`
 # entry point, each floored at a release that ships its toolkit (a bare name
-# could resolve aisquare-pipe-github 0.1.0, which has none). Hosts install this
-# to get every toolkit. scripts/check_toolkits_extra.py (CI) fails when a
-# toolkit package is missing here or an entry here has no toolkit.
+# could resolve aisquare-pipe-github 0.1.0, which has none) and, from 0.5.0,
+# its pipe:primary markers (gmail/googlecalendar/slack 0.2.0,
+# googledrive/onedrive 0.4.0). Hosts install this to get every toolkit.
+# scripts/check_toolkits_extra.py (CI) fails when a toolkit package is missing
+# here or an entry here has no toolkit.
 toolkits = [
     "aisquare-pipe-github>=0.3.0",
-    "aisquare-pipe-gmail>=0.1.0",
-    "aisquare-pipe-googlecalendar>=0.1.0",
-    "aisquare-pipe-googledrive>=0.3.0",
-    "aisquare-pipe-onedrive>=0.3.0",
-    "aisquare-pipe-slack>=0.1.0",
+    "aisquare-pipe-gmail>=0.2.0",
+    "aisquare-pipe-googlecalendar>=0.2.0",
+    "aisquare-pipe-googledrive>=0.4.0",
+    "aisquare-pipe-onedrive>=0.4.0",
+    "aisquare-pipe-slack>=0.2.0",
 ]
 
 [project.scripts]

@@ -180,7 +180,7 @@ class OneDriveToolkit(Toolkit):
     """
 
     name = "onedrive"
-    version = "0.3.0"
+    version = "0.4.0"
     display_name = "OneDrive"
     description = (
         "Microsoft OneDrive files and folders: search, browse, download, upload, create "
