@@ -40,11 +40,24 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
     connection's granted scopes allow, without rebuilding.
   - `ConnectorIndex.build(cards).search(query, limit)` ranks connector
     cards, for routers that shortlist connectors before tools.
-  - `index_for(name)` caches an installed toolkit's index per name,
-    version and catalogue fingerprint (LRU-bounded);
+  - `index_for(name)` keeps one index per installed toolkit, rebuilt only
+    when its name, version, card or catalogue changes. Specs are matched
+    by content (equal ToolSpecs count as the same), so a toolkit whose
+    `tools()` builds new ToolSpecs on each call keeps its index too. These
+    indexes are not in an LRU: `search_scored`, `search_tools_across` and
+    `Toolkit.search_tools` reuse them however many toolkits are installed
+    (no index rebuilt on repeated searches at 1,000 and 2,000 toolkits in
+    `scripts/bench_search.py`). Ad-hoc catalogues (`rank_tools`,
+    `rank_across`, or an `available_tools()` override listing specs the
+    catalogue doesn't have) share an LRU of `INDEX_CACHE_SIZE` (512).
     `search_scored(query, connectors=None, *, limit=10)` searches several
     toolkits as one ranking, with the forms of `search_tools_across`;
     `search_connectors(query, limit)` ranks the installed cards.
+  - `search_indexes(indexes, query, limit=10)`, also
+    `aisquare.pipe.search_indexes`: one ranking across several `ToolIndex`es
+    (IDF over the union of their catalogues), each item an index or
+    `(index, allowed)`. pipe-as-service ranks its own per-toolkit indexes
+    with it.
   - Query analysis: UPPER_SNAKE/camelCase splitting, stopwords, light
     stemming, a synonym table (`SYNONYMS`; a synonym counts less than the
     word itself), `authenticated` for first-person queries, and a small
@@ -72,7 +85,11 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   tools_per_connector, *, seed=0)`: deterministic, realistic catalogues
   (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
   measures index build, memory and query latency on 10,000 tools and on
-  1,000 connectors x 50 tools.
+  1,000 connectors x 50 tools, and how often the installed toolkits'
+  indexes are reused (index builds counted), the cache's hit rate and
+  latency through `search_scored`, `search_connectors`,
+  `search_tools_across` and `Toolkit.search_tools`, with 1,000 and 2,000
+  toolkits installed whose `tools()` returns the same or new ToolSpecs.
 - `tests/evals/`: 182 labelled tool-search queries over the six native
   toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
 - The native toolkits' main tools carry `pipe:primary`:
@@ -99,8 +116,9 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   On the eval, recall@1 goes from 0.560 to 0.797 and recall@10 from 0.885
   to 1.000.
 - `search_tools_across` no longer rebuilds every catalogue's ranking on
-  each call: each toolkit's index is cached and reused until its catalogue
-  changes.
+  each call: each installed toolkit's index is built once and reused until
+  the toolkit's version, card or catalogue changes, however many toolkits
+  are installed.
 
 - **Toolkit names must be routable**: `^[a-z][a-z0-9_]{0,63}$`
   (`TOOLKIT_NAME_RULE`, `valid_toolkit_name()`), so no hyphens and at most
@@ -117,6 +135,22 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   out** of `installed_toolkits()` too, with one warning (`pipe validate`
   already failed it): served, it would answer to one name and describe
   itself by another.
+- Whatever `installed_toolkits()` leaves out is left out everywhere:
+  `get_toolkit(name)` reads the served set, so a left-out name raises
+  `ToolkitNotFoundError` saying why (`discover_toolkits()` still reads every
+  entry point). Like `installed_toolkits()` it reads the cached discovery:
+  a toolkit installed after the first one is found after
+  `installed_toolkits(refresh=True)`; `installed_toolkits(strict=True)` raises
+  `ToolkitConflictError` for any toolkit left out, not only a slug-prefix
+  clash; and `pipe tools` lists left-out toolkits with why and won't open
+  them.
+
+### Removed
+
+- `aisquare.pipe.core.tools.query_terms` and `aisquare.pipe.core.tools.STOPWORDS`,
+  the 0.4 keyword ranker's query analysis, unused since ranking moved to
+  `aisquare.pipe.core.search` (never exported from `aisquare.pipe`). Use
+  `aisquare.pipe.core.search.analyze_query` and its `STOPWORDS`.
 
 ## [0.4.0] - 2026-10-31
 

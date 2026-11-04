@@ -38,6 +38,7 @@ from aisquare.pipe import (
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_FOUND,
     ERROR_UPSTREAM_ERROR,
+    PRIMARY_TAG,
     ToolError,
     ToolResult,
     ToolSpec,
@@ -1004,7 +1005,7 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         bot=("chat:write", "chat:write.public", *LOOKUP),
         tags=(
             "post", "send", "write", "reply", "thread", "dm", "notify", "message", "chat",
-            "pipe:primary",
+            PRIMARY_TAG,
         ),
     ),
     _tool(
@@ -1246,7 +1247,7 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         _search("search.messages", ("messages",)),
         user=("search:read",),
         bot=None,
-        tags=("search", "find", "messages", "query", "lookup", "discussion", "pipe:primary"),
+        tags=("search", "find", "messages", "query", "lookup", "discussion", PRIMARY_TAG),
     ),
     _tool(
         "SLACK_SEARCH_FILES", TIER_READ, "search", "search.files",

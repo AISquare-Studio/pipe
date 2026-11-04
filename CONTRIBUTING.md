@@ -407,10 +407,11 @@ pipe tools mysvc --json                 # full ToolSpecs
 ### Making tools findable
 
 Hosts find tools through `aisquare.pipe.core.search`: a BM25F index per
-toolkit (`index_for(name)`, cached per name, version and catalogue
-fingerprint), a `ConnectorIndex` over the cards, and `search_scored` /
-`search_tools_across` across toolkits. No model and no network: what ranks
-a tool is the text you give it.
+toolkit (`index_for(name)`, kept per toolkit and rebuilt only when its name,
+version, card or catalogue changes), a `ConnectorIndex` over the cards,
+`search_scored` / `search_tools_across` across installed toolkits, and
+`search_indexes` to rank a host's own `ToolIndex`es as one. No model and no
+network: what ranks a tool is the text you give it.
 
 - **Slug words weigh the most**, then **tags**, then the **description**,
   then the input schema's property names and descriptions. The toolkit's
@@ -510,7 +511,10 @@ rename tools in a native toolkit, run it; when you change the analyser or
 the synonym table, it must not get worse. `scripts/bench_search.py` checks
 build time and latency on synthetic catalogues
 (`aisquare.pipe.testing.synthetic.synthetic_catalog`) of 10,000 tools and
-1,000 connectors.
+1,000 connectors, and that the installed toolkits' indexes are reused
+(not rebuilt) through `search_scored`, `search_connectors`,
+`search_tools_across` and `Toolkit.search_tools` with 1,000 and 2,000
+toolkits installed.
 
 ## Live Tests (optional)
 

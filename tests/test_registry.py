@@ -288,8 +288,72 @@ class TestLeftOutReasons:
         assert left_out_toolkits(refresh=True) == {}
         assert list(installed_toolkits()) == ["ledger"]
 
+    def test_refresh_rebuilds_the_record(self, monkeypatch, fresh_cache):
+        """The record comes with the cached discovery (no module global):
+        refresh=True gives the new discovery's record, and each call hands
+        out a copy."""
+        found = {"ledger": _kit("ledger", ["LEDGER_X"])}
+        monkeypatch.setattr(registry_mod, "discover_toolkits", lambda: dict(found))
+        assert left_out_toolkits() == {}
+        found = {**found, "led-ger": _kit("led-ger", ["LED_GER_X"])}
+        assert left_out_toolkits() == {}  # cached
+        assert left_out_toolkits(refresh=True) == {"led-ger": f"name breaks {RULE}"}
+        left_out_toolkits().clear()
+        assert left_out_toolkits() == {"led-ger": f"name breaks {RULE}"}
+        assert registry_mod._installed_toolkits().left_out == {"led-ger": f"name breaks {RULE}"}
+        assert not hasattr(registry_mod, "_LEFT_OUT")
+        found = {"ledger": found["ledger"]}
+        assert list(installed_toolkits(refresh=True)) == ["ledger"]
+        assert left_out_toolkits() == {}
+
     def test_the_real_install_leaves_nothing_out(self, fresh_cache):
         assert left_out_toolkits() == {}
+
+    def test_strict_raises_for_any_left_out_toolkit(self, entry_points):
+        entry_points(
+            {
+                "led-ger": _kit("led-ger", ["LED_GER_X"]),
+                "ledgermis": _kit("ledger-mis", ["LEDGERMIS_X"], prefix="LEDGERMIS_"),
+                "mail": _kit("mail", ["MAIL_SEND"]),
+            }
+        )
+        with pytest.raises(ToolkitConflictError) as caught:
+            installed_toolkits(strict=True)
+        assert str(caught.value) == (
+            f"installed toolkits left out: 'led-ger' (name breaks {RULE}); "
+            "'ledgermis' (name differs from its entry point (class name 'ledger-mis'))"
+        )
+        assert list(installed_toolkits()) == ["mail"]
+
+    def test_strict_names_clashes_then_the_rest(self, entry_points):
+        entry_points(
+            {
+                "github": _kit("github", ["GITHUB_X"]),
+                "gh2": _kit("gh2", ["GITHUB_Y"], prefix="GITHUB_"),
+                "led-ger": _kit("led-ger", ["LED_GER_X"]),
+            }
+        )
+        with pytest.raises(ToolkitConflictError) as caught:
+            installed_toolkits(strict=True)
+        assert str(caught.value) == (
+            "installed toolkits share a slug prefix: gh2 (GITHUB_) and github (GITHUB_). "
+            f"installed toolkits left out: 'led-ger' (name breaks {RULE})"
+        )
+
+    def test_strict_passes_when_nothing_is_left_out(self, entry_points):
+        entry_points({"mail": _kit("mail", ["MAIL_SEND"])})
+        assert list(installed_toolkits(strict=True)) == ["mail"]
+
+    def test_get_toolkit_honours_it(self, entry_points):
+        hyphenated = _kit("led-ger", ["LED_GER_X"])
+        entry_points({"led-ger": hyphenated, "mail": _kit("mail", ["MAIL_SEND"])})
+        with pytest.raises(ToolkitNotFoundError) as caught:
+            get_toolkit("led-ger")
+        assert str(caught.value) == (
+            f"Toolkit 'led-ger' not found. Available: mail. 'led-ger' left out: name breaks {RULE}"
+        )
+        assert registry_mod.discover_toolkits()["led-ger"] is hyphenated  # the raw read still has it
+        assert get_toolkit("mail").name == "mail"
 
     @pytest.mark.parametrize(
         "found, name, says",
@@ -449,6 +513,23 @@ class TestSearchToolsAcross:
         assert [q.tool.slug for q in found] == ["SCOPED_READ"]
         found = search_tools_across("files", {"scoped": None}, limit=None)
         assert [q.tool.slug for q in found] == ["SCOPED_READ", "SCOPED_WRITE"]
+
+    def test_one_discovery_per_search(self, installed, monkeypatch):
+        """A refresh landing mid-search can't make an installed toolkit
+        unknown: the search reads the discovery once."""
+        self._install(installed)
+        cached = registry_mod._installed_toolkits
+        first = cached()
+        reads = []
+
+        def racing():
+            reads.append(1)
+            return first if len(reads) == 1 else first._replace(toolkits={})
+
+        racing.cache_clear = cached.cache_clear  # type: ignore[attr-defined]
+        monkeypatch.setattr(registry_mod, "_installed_toolkits", racing)
+        assert {q.connector for q in search_tools_across(None, limit=None)} == {"mail", "cal"}
+        assert reads == [1]
 
     def test_unknown_connector(self, installed):
         self._install(installed)

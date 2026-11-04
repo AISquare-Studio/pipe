@@ -34,6 +34,7 @@ from typing import Any
 
 from aisquare.pipe import (
     ERROR_INVALID_ARGUMENTS,
+    PRIMARY_TAG,
     DataEnvelope,
     ToolError,
     ToolResult,
@@ -948,7 +949,7 @@ CATALOG: tuple[GoogleDriveTool, ...] = (
         ),
         _find_file,
         "search", "find", "files", "documents", "query", "lookup", "locate",
-        "pipe:primary",
+        PRIMARY_TAG,
     ),
     _read(
         "GOOGLEDRIVE_LIST_FILES",
@@ -1151,7 +1152,7 @@ CATALOG: tuple[GoogleDriveTool, ...] = (
         ),
         _upload_file,
         "upload", "add", "put", "save", "store", "file",
-        "pipe:primary",
+        PRIMARY_TAG,
     ),
     _write(
         "GOOGLEDRIVE_CREATE_FILE_FROM_TEXT",

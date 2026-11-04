@@ -6,20 +6,39 @@ catalogues (aisquare.pipe.testing.synthetic):
       latency p50/p95;
   (b) 1,000 connectors x 50 tools: ConnectorIndex build and query latency,
       building every per-toolkit index, and a hierarchical search (connector
-      shortlist -> those toolkits' indexes) as a router runs it.
+      shortlist -> those toolkits' indexes) as a router runs it;
+  (c) the CACHED path a host takes, at 1,000 and 2,000 installed toolkits:
+      the synthetic toolkits are installed (entry-point discovery replaced
+      for the run) and searched through search_scored (after a
+      search_connectors shortlist, and over all of them),
+      search_tools_across and Toolkit.search_tools (every toolkit in turn),
+      so each toolkit's index comes from the index cache. Twice: toolkits
+      whose tools() returns the same ToolSpec objects each call ("stable"),
+      and toolkits that build new, equal ones each call ("fresh"). One cold
+      search builds every index; the repeated searches after it report the
+      real reuse (1 - indexes built / toolkits searched; every
+      ToolIndex.build is counted), the cache hit rate, the ad-hoc LRU's
+      entries, and latency.
 
 Budgets (the search task's acceptance): 10k build <= 2 s, 10k query p95 <=
-20 ms, ConnectorIndex over 1,000 cards query p95 <= 10 ms. Exit status 1 when
-a budget is missed.
+20 ms, ConnectorIndex over 1,000 cards query p95 <= 10 ms, and in (c), on
+the repeated searches of every size, shape and path, reuse and cache hit
+rate >= 99% with no ad-hoc LRU entries. Exit status 1 when a budget is
+missed.
 
-    python scripts/bench_search.py            # the defaults above
-    python scripts/bench_search.py --json     # machine-readable
+    python scripts/bench_search.py                          # the defaults above
+    python scripts/bench_search.py --json                   # machine-readable
+    python scripts/bench_search.py --cached-sizes 600,1200  # other (c) sizes
+    python scripts/bench_search.py --cached-specs fresh     # one (c) shape
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import dataclasses
 import gc
+import itertools
 import json
 import platform
 import random
@@ -27,13 +46,35 @@ import statistics
 import sys
 import time
 import tracemalloc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
-from aisquare.pipe.core.search import ConnectorIndex, ToolIndex, search_indexes
+from aisquare.pipe.core import registry
+from aisquare.pipe.core.registry import installed_toolkits, search_tools_across
+from aisquare.pipe.core.search import (
+    ConnectorIndex,
+    ToolIndex,
+    cache_clear,
+    cache_info,
+    search_connectors,
+    search_indexes,
+    search_scored,
+)
+from aisquare.pipe.core.tools import Toolkit, ToolResult, ToolSpec
 from aisquare.pipe.testing.synthetic import synthetic_catalog
 
 BUDGET = {"build_10k_s": 2.0, "query_10k_p95_ms": 20.0, "connectors_query_p95_ms": 10.0}
+#: (c): the least reuse and cache hit rate on repeated searches.
+HIT_RATE_FLOOR = 0.99
+#: (c): how the synthetic toolkits' tools() hands out its ToolSpecs.
+SPEC_SHAPES = ("stable", "fresh")
+#: (c): the paths measured, as printed.
+CACHED_PATHS = {
+    "hierarchical": "hierarchical",
+    "search_scored": "search_scored",
+    "search_tools_across": "search_tools_across",
+    "toolkit_search_tools": "Toolkit.search_tools",
+}
 
 # Queries a user or agent would type: exact, paraphrased, first-person,
 # several intents, some with no match at all.
@@ -149,6 +190,136 @@ def bench_many_connectors(
     }
 
 
+def synthetic_toolkits(
+    cards: dict[str, dict[str, Any]], tools: dict[str, list[ToolSpec]], *, fresh: bool = False
+) -> dict[str, type]:
+    """A Toolkit class per synthetic connector, as a plugin would define it:
+    its card from class attributes; tools() returns the same ToolSpec
+    objects on each call, or (``fresh``) new, equal ones."""
+
+    def make(name: str) -> type:
+        card, specs = cards[name], tuple(tools[name])
+
+        def list_tools(self: Toolkit) -> list[ToolSpec]:
+            return [dataclasses.replace(spec) for spec in specs] if fresh else list(specs)
+
+        def run_tool(self: Toolkit, tool: ToolSpec, arguments: dict[str, Any], config: dict[str, Any]) -> ToolResult:
+            return ToolResult.ok(None)
+
+        attrs = {key: card[key] for key in ("display_name", "description", "category")}
+        attrs.update(keywords=tuple(card["keywords"]), examples=tuple(card["examples"]))
+        return type(f"Bench_{name}", (Toolkit,), {"name": name, "version": "1.0.0", "tools": list_tools, "run_tool": run_tool, **attrs})
+
+    return {name: make(name) for name in cards}
+
+
+@contextlib.contextmanager
+def counting_builds() -> Iterator[list[int]]:
+    """Count every ToolIndex.build (each index any cache builds) while open."""
+    count = [0]
+    build = ToolIndex.__dict__["build"]
+
+    def counted_build(cls: type[ToolIndex], *args: Any, **kwargs: Any) -> ToolIndex:
+        count[0] += 1
+        return build.__func__(cls, *args, **kwargs)  # type: ignore[no-any-return]
+
+    setattr(ToolIndex, "build", classmethod(counted_build))  # noqa: B010
+    try:
+        yield count
+    finally:
+        setattr(ToolIndex, "build", build)  # noqa: B010
+
+
+def reused(fn: Callable[[str], int], qs: list[str], warmup: int, builds: list[int]) -> dict[str, Any]:
+    """latencies() of ``fn`` over ``qs`` (``fn`` returns how many toolkits it
+    searched) and what the caches did in the timed calls (the warm-up calls
+    are not counted): indexes built, real reuse (1 - builds / toolkits
+    searched), and the cache's hits and misses."""
+    for q in qs[:warmup]:
+        fn(q)
+    searched = [0]
+
+    def run(q: str) -> None:
+        searched[0] += fn(q)
+
+    before, built = cache_info(), builds[0]
+    lat = latencies(run, qs, warmup=0)
+    after, n_built = cache_info(), builds[0] - built
+    hits, misses = after["hits"] - before["hits"], after["misses"] - before["misses"]
+    return {
+        **lat,
+        "toolkits_searched": searched[0],
+        "builds": n_built,
+        "reuse": 1 - n_built / searched[0] if searched[0] else 0.0,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hits / (hits + misses) if hits + misses else 0.0,
+    }
+
+
+def bench_cached(
+    n_connectors: int, tools_each: int, n_queries: int, shortlist: int, seed: int, *, fresh: bool
+) -> dict[str, Any]:
+    """(c) at one size and spec shape: install ``n_connectors`` synthetic
+    toolkits, search them cold once, then repeatedly through each cached
+    path."""
+    cards, tools = synthetic_catalog(n_connectors, tools_each, seed=seed)
+    toolkits = synthetic_toolkits(cards, tools, fresh=fresh)
+    discover = registry.discover_toolkits
+    registry.discover_toolkits = lambda: dict(toolkits)  # type: ignore[assignment]
+    try:
+        installed = installed_toolkits(refresh=True)
+        assert len(installed) == n_connectors, f"{n_connectors - len(installed)} synthetic toolkits left out"
+        cache_clear()
+        with counting_builds() as builds:
+            qs = queries(n_queries, seed + 2)
+            _, cold_s = timed(lambda: search_scored(qs[0], limit=10))
+            cold_builds = builds[0]
+
+            def hierarchical(q: str) -> int:
+                names = [name for name, _ in search_connectors(q, shortlist)]
+                search_scored(q, names, limit=10)
+                return len(names)
+
+            def scored_all(q: str) -> int:
+                search_scored(q, limit=10)
+                return n_connectors
+
+            def across_all(q: str) -> int:
+                search_tools_across(q, limit=10)
+                return n_connectors
+
+            turn = itertools.cycle(toolkits.values())
+
+            def toolkit_search(q: str) -> int:
+                next(turn)().search_tools(q)
+                return 1
+
+            flat_qs = qs[: max(20, n_queries // 10)]
+            # Every toolkit in turn, twice (warm-up, then timed): the cyclic
+            # pattern an LRU smaller than the install set cannot hold.
+            each_qs = queries(n_connectors, seed + 3)
+            paths = {
+                "hierarchical": reused(hierarchical, qs, 20, builds),
+                "search_scored": reused(scored_all, flat_qs, 2, builds),
+                "search_tools_across": reused(across_all, flat_qs, 2, builds),
+                "toolkit_search_tools": reused(toolkit_search, each_qs, n_connectors, builds),
+            }
+        return {
+            "connectors": n_connectors,
+            "tools_each": tools_each,
+            "specs": "fresh" if fresh else "stable",
+            "cold_search": {"s": cold_s, "builds": cold_builds},
+            **paths,
+            # One slot per toolkit; anything else the cache holds is in the LRU.
+            "lru_entries": cache_info()["size"] - n_connectors,
+        }
+    finally:
+        registry.discover_toolkits = discover  # type: ignore[assignment]
+        installed_toolkits(refresh=True)
+        cache_clear()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tools", type=int, default=10_000, help="tools in the big toolkit")
@@ -157,23 +328,50 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--queries", type=int, default=500)
     parser.add_argument("--shortlist", type=int, default=8, help="connectors searched per query")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cached-sizes", default="1000,2000",
+        help="installed-toolkit counts for (c), comma-separated (empty: skip (c))",
+    )
+    parser.add_argument("--cached-queries", type=int, default=200, help="repeated searches per size in (c)")
+    parser.add_argument(
+        "--cached-specs", default=",".join(SPEC_SHAPES),
+        help="tools() shapes for (c): stable (same ToolSpecs each call), fresh (new, equal ones)",
+    )
     parser.add_argument("--json", action="store_true", help="print JSON only")
     args = parser.parse_args(argv)
 
     big = bench_big_toolkit(args.tools, args.queries, args.seed)
     many = bench_many_connectors(args.connectors, args.tools_each, args.queries, args.shortlist, args.seed)
+    sizes = [int(n) for n in args.cached_sizes.split(",") if n.strip()]
+    shapes = [shape.strip() for shape in args.cached_specs.split(",") if shape.strip()]
+    assert set(shapes) <= set(SPEC_SHAPES), f"--cached-specs takes {', '.join(SPEC_SHAPES)}"
+    cached = [
+        bench_cached(n, args.tools_each, args.cached_queries, args.shortlist, args.seed, fresh=shape == "fresh")
+        for n in sizes
+        for shape in shapes
+    ]
     checks = {
         "build_10k_s": big["build_s"],
         "query_10k_p95_ms": big["query"]["p95_ms"],
         "connectors_query_p95_ms": many["connector_index"]["query"]["p95_ms"],
     }
     ok = {k: checks[k] <= BUDGET[k] for k in BUDGET}
+    floors = {
+        f"cached_{c['connectors']}_{c['specs']}_{path}_{metric}": c[path][metric]
+        for c in cached
+        for path in CACHED_PATHS
+        for metric in ("reuse", "hit_rate")
+    }
+    ok.update({k: rate >= HIT_RATE_FLOOR for k, rate in floors.items()})
+    lru = {f"cached_{c['connectors']}_{c['specs']}_lru_entries": c["lru_entries"] for c in cached}
+    ok.update({k: n == 0 for k, n in lru.items()})
     report = {
         "python": platform.python_version(),
         "machine": f"{platform.system()} {platform.machine()} ({platform.processor() or 'n/a'})",
         "big_toolkit": big,
         "many_connectors": many,
-        "budget": BUDGET,
+        "cached": cached,
+        "budget": {**BUDGET, "cached_reuse_and_hit_rate_min": HIT_RATE_FLOOR, "cached_lru_entries_max": 0},
         "within_budget": ok,
     }
     if args.json:
@@ -199,8 +397,28 @@ def main(argv: list[str] | None = None) -> int:
         ),
         f"    hierarchical     shortlist {hq['shortlist']} -> tools: p50 {hq['p50_ms']:.2f} ms, p95 {hq['p95_ms']:.2f} ms",
         f"    flat (all {many['connectors']:,})  p50 {fq['p50_ms']:.2f} ms, p95 {fq['p95_ms']:.2f} ms (n={fq['n']}; for scale only)",
+    ]
+    for c in cached:
+        lines += [
+            "",
+            f"(c) cached path, {c['connectors']:,} installed toolkits x {c['tools_each']} tools, {c['specs']} specs",
+            f"    cold search      {c['cold_search']['s']:.2f} s, built {c['cold_search']['builds']:,} indexes",
+            *(
+                f"    {label:<20} reuse {r['reuse']:.2%} ({r['builds']:,} builds / {r['toolkits_searched']:,} toolkit "
+                f"searches), hits {r['hit_rate']:.2%}, p50 {r['p50_ms']:.2f} ms, p95 {r['p95_ms']:.2f} ms (n={r['n']})"
+                for path, label in CACHED_PATHS.items()
+                for r in (c[path],)
+            ),
+            f"    ad-hoc LRU           {c['lru_entries']:,} entries",
+        ]
+    lines += [
         "",
         "budget: " + ", ".join(f"{k} {checks[k]:.3f} <= {BUDGET[k]} {'ok' if ok[k] else 'MISSED'}" for k in BUDGET),
+        *(
+            f"        {k} {rate:.2%} >= {HIT_RATE_FLOOR:.0%} {'ok' if ok[k] else 'MISSED'}"
+            for k, rate in floors.items()
+        ),
+        *(f"        {k} {n:,} == 0 {'ok' if ok[k] else 'MISSED'}" for k, n in lru.items()),
     ]
     print("\n".join(lines))
     return 0 if all(ok.values()) else 1
