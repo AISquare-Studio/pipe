@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from aisquare.pipe import TOOLKIT_NAME_RULE
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "check_toolkits_extra.py"
 
@@ -26,14 +28,19 @@ ctx = _load_script()
 
 
 def _connector(
-    root: Path, dirname: str, *, version: str = "0.1.0", toolkit: bool
+    root: Path,
+    dirname: str,
+    *,
+    version: str = "0.1.0",
+    toolkit: bool,
+    toolkit_name: str | None = None,
 ) -> None:
     pkg = root / "connectors" / dirname
     pkg.mkdir(parents=True)
     module = f"aisquare_pipe_{dirname}"
     toolkit_ep = (
         f'[project.entry-points."aisquare_pipe.toolkits"]\n'
-        f'{dirname} = "{module}.toolkit:Toolkit"\n'
+        f'"{toolkit_name or dirname}" = "{module}.toolkit:Toolkit"\n'
         if toolkit
         else ""
     )
@@ -170,3 +177,38 @@ def test_dirs_lists_the_toolkit_packages_for_the_dev_install(tmp_path, capsys):
         str(root / "connectors" / "alpha"),
         str(root / "connectors" / "beta"),
     ]
+
+
+# =============================================================================
+# toolkit names (TOOLKIT_NAME_RULE: what a host can route)
+# =============================================================================
+
+
+def test_the_script_holds_toolkits_to_pipes_name_rule():
+    assert ctx.TOOLKIT_NAME_RULE == TOOLKIT_NAME_RULE
+
+
+@pytest.mark.parametrize("name", ["led-ger", "Ledger", "led.ger", "l" * 65])
+def test_a_toolkit_name_hosts_cannot_route_fails(tmp_path, name):
+    root = _repo(tmp_path, [*GOOD, "aisquare-pipe-ledger>=0.1.0"])
+    _connector(root, "ledger", toolkit=True, toolkit_name=name)
+    [problem] = ctx.check(root)
+    assert f"connectors/ledger: toolkit entry point {name!r} must match" in problem
+    assert TOOLKIT_NAME_RULE in problem and "no hyphens" in problem
+    assert ctx.main(["--root", str(root)]) == 1
+
+
+@pytest.mark.parametrize("name", ["ledger", "led_ger", "l" * 64])
+def test_underscored_and_plain_toolkit_names_pass(tmp_path, name):
+    root = _repo(tmp_path, [*GOOD, "aisquare-pipe-ledger>=0.1.0"])
+    _connector(root, "ledger", toolkit=True, toolkit_name=name)
+    assert ctx.check(root) == []
+
+
+def test_connector_entry_points_may_keep_their_hyphens(tmp_path):
+    """Only the toolkits group is bound: every fixture package registers a
+    hyphenated ``<name>-source`` connector, and the repo passes."""
+    root = _repo(tmp_path, GOOD)
+    text = (root / "connectors" / "alpha" / "pyproject.toml").read_text()
+    assert 'alpha-source = "' in text
+    assert ctx.check(root) == []

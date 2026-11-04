@@ -582,6 +582,22 @@ _NON_SECRET_KEY_KINDS = frozenset(
 )
 
 
+#: What a toolkit's ``name`` must match. The name is also its entry-point
+#: name and the connector id hosts route on: lowercase letters, digits and
+#: underscores, a letter first, at most 64 characters. No hyphens:
+#: pipe-as-service serves toolkits at ``/v1/connectors/{name}/*`` and keeps
+#: hyphenated names for the pull/push connectors (``github-source``) at
+#: ``/v1/connectors/{name}``, so a hyphenated toolkit would install but never
+#: be served. Connector entry-point names are not bound by it.
+TOOLKIT_NAME_RULE = r"^[a-z][a-z0-9_]{0,63}$"
+_TOOLKIT_NAME = re.compile(TOOLKIT_NAME_RULE)
+
+
+def valid_toolkit_name(name: object) -> bool:
+    """Whether ``name`` may name a toolkit (:data:`TOOLKIT_NAME_RULE`)."""
+    return isinstance(name, str) and _TOOLKIT_NAME.fullmatch(name) is not None
+
+
 def default_slug_prefix(name: str) -> str:
     """``github`` -> ``GITHUB_``; ``one-drive`` -> ``ONE_DRIVE_``."""
     return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") + "_"

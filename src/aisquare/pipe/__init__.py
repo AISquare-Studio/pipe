@@ -56,6 +56,7 @@ from aisquare.pipe.core.tools import (
     ERROR_UNKNOWN_TOOL,
     ERROR_UPSTREAM_ERROR,
     RISKS,
+    TOOLKIT_NAME_RULE,
     QualifiedTool,
     Risk,
     Toolkit,
@@ -66,6 +67,7 @@ from aisquare.pipe.core.tools import (
     rank_across,
     rank_tools,
     time_budget,
+    valid_toolkit_name,
     validate_arguments,
 )
 from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
@@ -117,6 +119,8 @@ __all__ = [
     "RISKS",
     "CATEGORIES",
     "CARD_FIELDS",
+    "TOOLKIT_NAME_RULE",
+    "valid_toolkit_name",
     "parse_scopes",
     "rank_tools",
     "rank_across",

@@ -10,7 +10,14 @@ from collections.abc import Iterable, Mapping
 from importlib.metadata import entry_points
 from typing import Any
 
-from aisquare.pipe.core.tools import QualifiedTool, Toolkit, ToolSpec, rank_across
+from aisquare.pipe.core.tools import (
+    TOOLKIT_NAME_RULE,
+    QualifiedTool,
+    Toolkit,
+    ToolSpec,
+    rank_across,
+    valid_toolkit_name,
+)
 from aisquare.pipe.errors import (
     ConnectorNotFoundError,
     ConverterError,
@@ -119,14 +126,26 @@ def slug_prefix_conflicts(toolkits: Mapping[str, type]) -> list[tuple[str, str]]
 
 @functools.cache
 def _installed_toolkits() -> tuple[dict[str, type], str]:
-    """The installed toolkits minus any whose slug prefixes collide, and a
-    description of the collisions ("" when none). Cached, clash or not, so a
-    clash is logged once and the plugins are imported once."""
+    """The installed toolkits minus any whose name hosts cannot route or whose
+    slug prefixes collide, and a description of the collisions ("" when
+    none). Cached, clash or not, so either is logged once and the plugins are
+    imported once."""
     toolkits = {
         name: cls
         for name, cls in discover_toolkits().items()
         if isinstance(cls, type) and issubclass(cls, Toolkit)
     }
+    unroutable = sorted(name for name in toolkits if not valid_toolkit_name(name))
+    if unroutable:
+        # Installed but never servable (pipe-as-service routes only these
+        # names): leave it out everywhere rather than half-appear. Checked
+        # first, so a bad name can't take a good toolkit down in a clash.
+        logger.warning(
+            "Left out toolkits whose names break %s (`pipe validate` fails on this): %s",
+            TOOLKIT_NAME_RULE,
+            ", ".join(map(repr, unroutable)),
+        )
+        toolkits = {name: cls for name, cls in toolkits.items() if name not in unroutable}
     conflicts = slug_prefix_conflicts(toolkits)
     detail = "; ".join(
         f"{a} ({toolkits[a].slug_prefix}) and {b} ({toolkits[b].slug_prefix})"
@@ -149,8 +168,11 @@ def installed_toolkits(*, refresh: bool = False, strict: bool = False) -> dict[s
     once per process; ``refresh=True`` reads them again (after installing a
     plugin).
 
-    Toolkits whose slug prefixes collide (see :func:`slug_prefix_conflicts`)
-    are left out, with one warning logged: one clashing pair must not hide
+    Toolkits whose entry-point name breaks
+    :data:`~aisquare.pipe.core.tools.TOOLKIT_NAME_RULE` (a hyphen, say) are
+    left out, with one warning logged: a host could not serve them. So are
+    toolkits whose slug prefixes collide (see :func:`slug_prefix_conflicts`),
+    with one warning: one clashing pair must not hide
     every other toolkit from :func:`catalogue` and
     :func:`search_tools_across`. ``strict=True`` raises
     :class:`ToolkitConflictError` instead. ``pipe validate`` always fails
