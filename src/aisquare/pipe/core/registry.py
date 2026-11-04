@@ -125,12 +125,24 @@ def slug_prefix_conflicts(toolkits: Mapping[str, type]) -> list[tuple[str, str]]
     ]
 
 
+# Why _installed_toolkits() left each installed toolkit out, name -> reason;
+# rebuilt with every (cached) discovery and read through left_out_toolkits().
+# A record beside the cache rather than a third return value, because the
+# (toolkits, clash detail) pair is unpacked in several places.
+_LEFT_OUT: dict[str, str] = {}
+# Clash reasons start with this; the not-found message already names clashes.
+_CLASH_REASON = "slug prefix "
+
+
 @functools.cache
 def _installed_toolkits() -> tuple[dict[str, type], str]:
-    """The installed toolkits minus any whose name hosts cannot route or whose
-    slug prefixes collide, and a description of the collisions ("" when
-    none). Cached, clash or not, so either is logged once and the plugins are
-    imported once."""
+    """The installed toolkits minus any whose name hosts cannot route, whose
+    class ``name`` differs from its entry-point name, or whose slug prefixes
+    collide, and a description of the collisions ("" when none). Each reason
+    is logged once (the result is cached, and the plugins imported once) and
+    recorded in ``_LEFT_OUT``. The name checks come first, so a bad plugin
+    can't take a good toolkit down with it in a clash."""
+    left_out: dict[str, str] = {}
     toolkits = {
         name: cls
         for name, cls in discover_toolkits().items()
@@ -139,14 +151,34 @@ def _installed_toolkits() -> tuple[dict[str, type], str]:
     unroutable = sorted(name for name in toolkits if not valid_toolkit_name(name))
     if unroutable:
         # Installed but never servable (pipe-as-service routes only these
-        # names): leave it out everywhere rather than half-appear. Checked
-        # first, so a bad name can't take a good toolkit down in a clash.
+        # names): leave it out everywhere rather than half-appear.
         logger.warning(
             "Left out toolkits whose names break %s (`pipe validate` fails on this): %s",
             TOOLKIT_NAME_RULE,
             ", ".join(map(repr, unroutable)),
         )
+        left_out.update(dict.fromkeys(unroutable, f"name breaks {TOOLKIT_NAME_RULE}"))
         toolkits = {name: cls for name, cls in toolkits.items() if name not in unroutable}
+    renamed = {
+        name: getattr(cls, "name", None)
+        for name, cls in sorted(toolkits.items())
+        if getattr(cls, "name", None) != name
+    }
+    if renamed:
+        # Hosts key a toolkit by its entry-point name and its card by `name`:
+        # served, it would answer to one name and describe itself by another.
+        logger.warning(
+            "Left out toolkits whose class name differs from their entry point "
+            "(`pipe validate` fails on this): %s",
+            ", ".join(f"{ep!r} (class name {cls_name!r})" for ep, cls_name in renamed.items()),
+        )
+        left_out.update(
+            {
+                ep: f"name differs from its entry point (class name {cls_name!r})"
+                for ep, cls_name in renamed.items()
+            }
+        )
+        toolkits = {name: cls for name, cls in toolkits.items() if name not in renamed}
     conflicts = slug_prefix_conflicts(toolkits)
     detail = "; ".join(
         f"{a} ({toolkits[a].slug_prefix}) and {b} ({toolkits[b].slug_prefix})"
@@ -160,8 +192,49 @@ def _installed_toolkits() -> tuple[dict[str, type], str]:
             "Left out toolkits whose slug prefixes collide (`pipe validate` fails on this): %s",
             detail,
         )
+        for a, b in conflicts:
+            for one, other in ((a, b), (b, a)):
+                reason = (
+                    f"{_CLASH_REASON}{toolkits[one].slug_prefix} collides with "
+                    f"{other} ({toolkits[other].slug_prefix})"
+                )
+                left_out[one] = f"{left_out[one]}; {reason}" if one in left_out else reason
         toolkits = {name: cls for name, cls in toolkits.items() if name not in clashing}
+    _LEFT_OUT.clear()
+    _LEFT_OUT.update(sorted(left_out.items()))
     return dict(sorted(toolkits.items())), detail
+
+
+def left_out_toolkits(*, refresh: bool = False) -> dict[str, str]:
+    """The installed toolkits :func:`installed_toolkits` leaves out, by name,
+    sorted, each with why: ``name breaks <TOOLKIT_NAME_RULE>``, ``name
+    differs from its entry point (class name '...')`` or ``slug prefix
+    <PREFIX_> collides with <other> (<PREFIX_>)``. Read from the same cached
+    discovery (``refresh=True`` reads the entry points again). Names and
+    prefixes only: a host can log it as is."""
+    if refresh:
+        _installed_toolkits.cache_clear()
+    _installed_toolkits()
+    return dict(_LEFT_OUT)
+
+
+def _not_found(unknown: Iterable[str], installed: Mapping[str, type]) -> ToolkitNotFoundError:
+    """The error for toolkit names that aren't served, saying why any of them
+    was left out (a slug-prefix clash, a name hosts can't route, a name that
+    differs from its entry point)."""
+    names = sorted(unknown)
+    available = ", ".join(installed) or "(none)"
+    _, conflicts = _installed_toolkits()
+    clash = f". Left out, their slug prefixes collide: {conflicts}" if conflicts else ""
+    why = [
+        f"{name!r} left out: {_LEFT_OUT[name]}"
+        for name in names
+        if name in _LEFT_OUT and not _LEFT_OUT[name].startswith(_CLASH_REASON)
+    ]
+    reasons = f". {'; '.join(why)}" if why else ""
+    return ToolkitNotFoundError(
+        f"Toolkit(s) {', '.join(map(repr, names))} not found. Available: {available}{clash}{reasons}"
+    )
 
 
 def installed_toolkits(*, refresh: bool = False, strict: bool = False) -> dict[str, type[Toolkit]]:
@@ -170,9 +243,11 @@ def installed_toolkits(*, refresh: bool = False, strict: bool = False) -> dict[s
     plugin).
 
     Toolkits whose entry-point name breaks
-    :data:`~aisquare.pipe.core.tools.TOOLKIT_NAME_RULE` (a hyphen, say) are
-    left out, with one warning logged: a host could not serve them. So are
-    toolkits whose slug prefixes collide (see :func:`slug_prefix_conflicts`),
+    :data:`~aisquare.pipe.core.tools.TOOLKIT_NAME_RULE` (a hyphen, say), or
+    whose class ``name`` differs from the entry-point name, are left out,
+    with one warning logged each way: a host could not serve them as they
+    are. :func:`left_out_toolkits` says which and why. So are toolkits whose
+    slug prefixes collide (see :func:`slug_prefix_conflicts`),
     with one warning: one clashing pair must not hide
     every other toolkit from :func:`catalogue` and
     :func:`search_tools_across`. ``strict=True`` raises
@@ -210,17 +285,12 @@ def catalogue(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
 
 def _require_installed(names: Iterable[str]) -> dict[str, type[Toolkit]]:
     """The installed toolkits; :class:`ToolkitNotFoundError` naming any of
-    ``names`` that is not installed (or was left out for a slug-prefix
-    clash)."""
+    ``names`` that is not served, and why it was left out (see
+    :func:`_not_found`)."""
     installed = installed_toolkits()
     unknown = sorted({name for name in names if name not in installed})
     if unknown:
-        available = ", ".join(installed) or "(none)"
-        _, conflicts = _installed_toolkits()
-        left_out = f". Left out, their slug prefixes collide: {conflicts}" if conflicts else ""
-        raise ToolkitNotFoundError(
-            f"Toolkit(s) {', '.join(map(repr, unknown))} not found. Available: {available}{left_out}"
-        )
+        raise _not_found(unknown, installed)
     return installed
 
 

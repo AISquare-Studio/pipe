@@ -37,6 +37,7 @@ from aisquare.pipe.core.registry import (
     get_converter,
     get_toolkit,
     installed_toolkits,
+    left_out_toolkits,
     search_tools_across,
     slug_prefix_conflicts,
 )
@@ -166,6 +167,7 @@ __all__ = [
     "get_converter",
     "get_toolkit",
     "installed_toolkits",
+    "left_out_toolkits",
     "catalogue",
     "search_tools_across",
     "slug_prefix_conflicts",
