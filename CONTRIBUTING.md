@@ -468,7 +468,7 @@ twine upload dist/*
 - Package name: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
 - Connector name attribute: `{service}` (e.g., `"s3"`)
 - Entry point name: `{service}` or `{service}-source` / `{service}-sink`
-- Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`)
+- Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`), matching `TOOLKIT_NAME_RULE` `^[a-z][a-z0-9_]{0,63}$`: underscores, never hyphens (`one_drive`, not `one-drive`). It is the connector id hosts route on, and pipe-as-service keeps hyphenated names for pull/push connectors, so `pipe validate` and `scripts/check_toolkits_extra.py` fail a hyphenated toolkit and `installed_toolkits()` leaves it out. Connector entry-point names (`mysvc-source`) are not bound by it.
 
 ## Which Tier?
 

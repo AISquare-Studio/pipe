@@ -12,6 +12,10 @@ old release that predates the package's toolkit (aisquare-pipe-github 0.1.0
 registers none). The floor may not exceed the package's version in this repo,
 or the extra could not be satisfied from it.
 
+Every toolkit entry-point name must match ``TOOLKIT_NAME_RULE`` (no hyphens):
+it is the connector id a host routes on, and pipe-as-service could not serve
+a hyphenated one.
+
 Reads the pyproject files only (no install, no import, stdlib only):
 
     python scripts/check_toolkits_extra.py           # check; exit 1 on a problem
@@ -30,6 +34,9 @@ from pathlib import Path
 
 EXTRA = "toolkits"
 TOOLKIT_GROUP = "aisquare_pipe.toolkits"
+# aisquare.pipe.core.tools.TOOLKIT_NAME_RULE, copied: this script runs before
+# anything is installed. tests/test_check_toolkits_extra.py keeps them equal.
+TOOLKIT_NAME_RULE = r"^[a-z][a-z0-9_]{0,63}$"
 
 # PEP 508 name, optional extras, then the version specifiers (no markers, no URLs).
 _REQUIREMENT = re.compile(
@@ -95,6 +102,13 @@ def check(root: Path) -> list[str]:
 
     packages = {canonical(p.name): p for p in toolkit_packages(root)}
     problems: list[str] = []
+    for package in packages.values():
+        for name in package.toolkits:
+            if re.fullmatch(TOOLKIT_NAME_RULE, name) is None:
+                problems.append(
+                    f"{package.path.relative_to(root)}: toolkit entry point {name!r} must match "
+                    f"{TOOLKIT_NAME_RULE} (no hyphens: hosts route a toolkit by this name)"
+                )
     listed: set[str] = set()
     for entry in extras[EXTRA]:
         match = _REQUIREMENT.match(entry)
