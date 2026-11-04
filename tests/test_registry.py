@@ -237,6 +237,26 @@ class TestLeftOutReasons:
             )
         ]
 
+    def test_the_checks_run_name_rule_then_mismatch_then_clash(self, entry_points):
+        """Pins the order. ledgermis's class name 'ledger-mis' gives the default
+        prefix LEDGER_MIS_, which nests under ledger's LEDGER_: if the mismatch
+        filter ran after the clash check, the pair would clash and take the
+        good ledger down. led-ger's class name differs too, but the name rule
+        comes first, so that is the reason it gets."""
+        entry_points(
+            {
+                "ledger": _kit("ledger", ["LEDGER_X"]),
+                "ledgermis": _kit("ledger-mis", ["LEDGER_MIS_X"]),
+                "led-ger": _kit("led_ger2", ["LED_GER2_X"]),
+            }
+        )
+        assert registry_mod.discover_toolkits()["ledgermis"].slug_prefix == "LEDGER_MIS_"
+        assert list(installed_toolkits()) == ["ledger"]
+        assert left_out_toolkits() == {
+            "led-ger": f"name breaks {RULE}",
+            "ledgermis": "name differs from its entry point (class name 'ledger-mis')",
+        }
+
     def test_every_reason_is_recorded(self, entry_points):
         entry_points(
             {
