@@ -5,6 +5,153 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-04
+
+The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`
+extra are new in it, so a host that needs either (pipe-as-service's
+`/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`; 0.4.0 has neither.
+Toolkit packages in the same run, each now requiring `aisquare-pipe>=0.5.0`
+(their `pipe:primary` tags are a ranking marker only from 0.5.0; 0.4.0's
+ranker would read them as text): `aisquare-pipe-gmail`,
+`-googlecalendar` and `-slack` 0.2.0, `aisquare-pipe-googledrive` and
+`-onedrive` 0.4.0. `aisquare-pipe-github` is unchanged at 0.3.0. Publish
+order: RELEASING.md, "The 0.5.0 release (tool router)".
+
+### Added
+
+- **`aisquare-pipe[toolkits]`**: every package that registers an
+  `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
+  googledrive, onedrive, slack), each floored at a release that ships its
+  toolkit (and, for the five above, its `pipe:primary` markers).
+  `scripts/check_toolkits_extra.py` (CI) fails when a toolkit package
+  is missing from it or an entry has no toolkit;
+  `scripts/dev_install_toolkits.sh` editable-installs the framework and every
+  toolkit into another venv. Publish the toolkits before the `aisquare-pipe`
+  release whose extra names them (RELEASING.md).
+- **Tool and connector search index** (`aisquare.pipe.core.search`): BM25F
+  in pure Python, no new dependency, no network, no model.
+  - `ToolIndex.build(connector, tools, card=None)` indexes one catalogue
+    (slug words, tags, description and input-schema properties, weighted in
+    that order, plus the connector's name, category and keywords); its
+    `.search(query, limit=10, *, allowed=None)` returns `ScoredTool`s
+    (connector, tool, score). `allowed` filters by slug, e.g. what a
+    connection's granted scopes allow, without rebuilding.
+  - `ConnectorIndex.build(cards).search(query, limit)` ranks connector
+    cards, for routers that shortlist connectors before tools.
+  - `index_for(name)` keeps one index per installed toolkit, rebuilt only
+    when its name, version, card or catalogue changes. Specs are matched
+    by content (equal ToolSpecs count as the same), so a toolkit whose
+    `tools()` builds new ToolSpecs on each call keeps its index too. These
+    indexes are not in an LRU: `search_scored`, `search_tools_across` and
+    `Toolkit.search_tools` reuse them however many toolkits are installed
+    (no index rebuilt on repeated searches at 1,000 and 2,000 toolkits in
+    `scripts/bench_search.py`). Ad-hoc catalogues (`rank_tools`,
+    `rank_across`, or an `available_tools()` override listing specs the
+    catalogue doesn't have) share an LRU of `INDEX_CACHE_SIZE` (512).
+    `search_scored(query, connectors=None, *, limit=10)` searches several
+    toolkits as one ranking, with the forms of `search_tools_across`;
+    `search_connectors(query, limit)` ranks the installed cards.
+  - `search_indexes(indexes, query, limit=10)`, also
+    `aisquare.pipe.search_indexes`: one ranking across several `ToolIndex`es
+    (IDF over the union of their catalogues), each item an index or
+    `(index, allowed)`. pipe-as-service ranks its own per-toolkit indexes
+    with it.
+  - Query analysis: UPPER_SNAKE/camelCase splitting, stopwords, light
+    stemming, a synonym table (`SYNONYMS`; a synonym counts less than the
+    word itself), `authenticated` for first-person queries, and a small
+    read/write intent boost.
+  - Across several connectors, a connector the query names as the service
+    to use ("post it in slack", "on one drive", "in gcal", "github repo",
+    "slack: ...") has its scores doubled (`NAMED_BOOST`). Boost only; a
+    name used only as a topic ("the slack migration") or as a modifier
+    ("in slack style", "github-flavored markdown") gets no boost and counts
+    as a weak search term (`TOPIC_WEIGHT`). A connector's own name is left
+    out of its tools' fields at index time, so it never ranks one of its
+    tools above another.
+  - Idioms ("get rid of", "set up", "push back") and opening noun-verbs
+    ("email the team ...", "file a bug ...") read as the verbs they mean,
+    "let <someone> know" as notify, and a question ("who ...", "what ...")
+    as a read;
+    calendar vocabulary (postpone/push/shift ~ update, standup/sync/huddle/
+    call ~ meeting, bring ~ invite) joins the synonym table. Ranking accepts
+    duck-typed specs (`slug`, `description`, `input_schema`; other fields
+    default as in ToolSpec, `read_only` as unknown).
+  - The primary-tool marker is the tag `pipe:primary` (`PRIMARY_TAG`): a
+    5% boost, never indexed as text. A plain `important` tag is ordinary
+    content. See CONTRIBUTING.md, "Making tools findable".
+- `aisquare.pipe.testing.synthetic.synthetic_catalog(n_connectors,
+  tools_per_connector, *, seed=0)`: deterministic, realistic catalogues
+  (with near-duplicate tools) for benchmarks; `scripts/bench_search.py`
+  measures index build, memory and query latency on 10,000 tools and on
+  1,000 connectors x 50 tools, and how often the installed toolkits'
+  indexes are reused (index builds counted), the cache's hit rate and
+  latency through `search_scored`, `search_connectors`,
+  `search_tools_across` and `Toolkit.search_tools`, with 1,000 and 2,000
+  toolkits installed whose `tools()` returns the same or new ToolSpecs.
+- `tests/evals/`: 182 labelled tool-search queries over the six native
+  toolkits, scored for recall@1/5/10 and MRR against the previous ranker.
+- The native toolkits' main tools carry `pipe:primary`:
+  `GMAIL_FETCH_EMAILS`, `GMAIL_SEND_EMAIL`, `GOOGLECALENDAR_EVENTS_LIST`,
+  `GOOGLECALENDAR_CREATE_EVENT`, `GOOGLEDRIVE_FIND_FILE`,
+  `GOOGLEDRIVE_UPLOAD_FILE`, `ONE_DRIVE_ONEDRIVE_UPLOAD_FILE`,
+  `SLACK_SEND_MESSAGE`, `SLACK_SEARCH_MESSAGES`.
+- **`left_out_toolkits()`**: the installed toolkits `installed_toolkits()`
+  leaves out, name -> why (`name breaks <rule>`, `name differs from its entry
+  point (class name '…')`, `slug prefix … collides with …`), from the same
+  cached discovery. Names and prefixes only, so a host can log it.
+- `ToolkitNotFoundError` for a left-out name says why (`'led-ger' left out:
+  name breaks …`). A clash keeps its existing wording.
+
+### Changed
+
+- `rank_tools`, `rank_across`, `Toolkit.search_tools` and
+  `search_tools_across` rank with the search index instead of substring
+  counting (+2 slug, +1 description). Signatures, return types and the
+  fallbacks are unchanged: with no query or no match, the head of the
+  catalogue (or the connectors taking turns). Results differ: plurals and
+  other word forms match (`repository` finds `..._REPOSITORIES_...`),
+  synonyms match below exact words, and IDF makes rare words count more.
+  On the eval, recall@1 goes from 0.560 to 0.797 and recall@10 from 0.885
+  to 1.000.
+- `search_tools_across` no longer rebuilds every catalogue's ranking on
+  each call: each installed toolkit's index is built once and reused until
+  the toolkit's version, card or catalogue changes, however many toolkits
+  are installed.
+
+- **Toolkit names must be routable**: `^[a-z][a-z0-9_]{0,63}$`
+  (`TOOLKIT_NAME_RULE`, `valid_toolkit_name()`), so no hyphens and at most
+  64 characters. A toolkit's name is its entry-point name and the connector
+  id hosts route on. pipe-as-service serves only these names (it keeps
+  hyphenated ones for pull/push connectors), so a hyphenated toolkit
+  installed but was never served. `pipe validate` (`contract.toolkit.name`)
+  and `scripts/check_toolkits_extra.py` now fail one, and
+  `installed_toolkits()` (and so `catalogue()`, `search_tools_across()`)
+  leaves it out with one warning. `discover_toolkits()` still reads every
+  entry point. Connector entry-point names are unaffected, and every shipped
+  toolkit already complies.
+- **A toolkit whose class `name` differs from its entry-point name is left
+  out** of `installed_toolkits()` too, with one warning (`pipe validate`
+  already failed it): served, it would answer to one name and describe
+  itself by another.
+- Whatever `installed_toolkits()` leaves out is left out everywhere:
+  `get_toolkit(name)` reads the served set, so a left-out name raises
+  `ToolkitNotFoundError` saying why (`discover_toolkits()` still reads every
+  entry point). Like `installed_toolkits()` it reads the cached discovery:
+  a toolkit installed after the first one is found after
+  `installed_toolkits(refresh=True)`; `installed_toolkits(strict=True)` raises
+  `ToolkitConflictError` for any toolkit left out, not only a slug-prefix
+  clash; and `pipe tools` lists left-out toolkits with why and won't open
+  them.
+
+### Removed
+
+- `aisquare.pipe.core.tools.query_terms` and `aisquare.pipe.core.tools.STOPWORDS`,
+  the 0.4 keyword ranker's query analysis, unused since ranking moved to
+  `aisquare.pipe.core.search` (never exported from `aisquare.pipe`). Use
+  `aisquare.pipe.core.search.analyze_query` and its `STOPWORDS`.
+
 ## [0.4.0] - 2026-10-31
 
 The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and

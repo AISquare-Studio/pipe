@@ -32,10 +32,12 @@ from aisquare.pipe.core.tools import (
     CATEGORIES,
     ERROR_CODES,
     RISKS,
+    TOOLKIT_NAME_RULE,
     Toolkit,
     ToolResult,
     ToolSpec,
     risk_contradicts_flags,
+    valid_toolkit_name,
 )
 from aisquare.pipe.errors import PipeError
 from aisquare.pipe.testing.fixtures import (
@@ -535,7 +537,6 @@ def _run_contract_checks(cls: type, entry_point_name: str | None) -> list[CheckR
 #: Longest tool description accepted (LLM tool APIs truncate or reject past this).
 MAX_TOOL_DESCRIPTION = 1024
 
-_TOOLKIT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 _SLUG_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 #: A slug no toolkit defines — used to probe unknown-tool handling.
@@ -560,12 +561,19 @@ def _toolkit_catalog(cls: type) -> tuple[list[Any] | None, str | None]:
 def check_toolkit_name(cls: type) -> list[CheckResult]:
     inst = cls()
     name = getattr(inst, "name", None)
-    ok = isinstance(name, str) and bool(_TOOLKIT_NAME_RE.match(name))
+    ok = valid_toolkit_name(name)
     return [
         CheckResult(
             "contract.toolkit.name",
             ok,
-            message="" if ok else f"toolkit name {name!r} must be lowercase [a-z0-9_-] starting with a letter",
+            message=""
+            if ok
+            else (
+                f"toolkit name {name!r} must match {TOOLKIT_NAME_RULE} (lowercase letters, digits "
+                "and underscores, a letter first, at most 64 characters): hosts route a toolkit "
+                "by this name, and pipe-as-service keeps hyphenated names for pull/push "
+                "connectors, so a hyphenated toolkit would install but never be served"
+            ),
         )
     ]
 

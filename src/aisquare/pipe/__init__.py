@@ -36,9 +36,20 @@ from aisquare.pipe.core.registry import (
     get_connector,
     get_converter,
     get_toolkit,
+    index_for,
     installed_toolkits,
+    left_out_toolkits,
+    search_connectors,
+    search_scored,
     search_tools_across,
     slug_prefix_conflicts,
+)
+from aisquare.pipe.core.search import (
+    PRIMARY_TAG,
+    ConnectorIndex,
+    ScoredTool,
+    ToolIndex,
+    search_indexes,
 )
 from aisquare.pipe.core.tools import (
     CARD_FIELDS,
@@ -56,6 +67,7 @@ from aisquare.pipe.core.tools import (
     ERROR_UNKNOWN_TOOL,
     ERROR_UPSTREAM_ERROR,
     RISKS,
+    TOOLKIT_NAME_RULE,
     QualifiedTool,
     Risk,
     Toolkit,
@@ -66,6 +78,7 @@ from aisquare.pipe.core.tools import (
     rank_across,
     rank_tools,
     time_budget,
+    valid_toolkit_name,
     validate_arguments,
 )
 from aisquare.pipe.core.types import MatchLevel, MatchResult, TypeConverter, TypeMatcher
@@ -117,6 +130,8 @@ __all__ = [
     "RISKS",
     "CATEGORIES",
     "CARD_FIELDS",
+    "TOOLKIT_NAME_RULE",
+    "valid_toolkit_name",
     "parse_scopes",
     "rank_tools",
     "rank_across",
@@ -153,9 +168,19 @@ __all__ = [
     "get_converter",
     "get_toolkit",
     "installed_toolkits",
+    "left_out_toolkits",
     "catalogue",
     "search_tools_across",
     "slug_prefix_conflicts",
+    # Search
+    "ToolIndex",
+    "ConnectorIndex",
+    "ScoredTool",
+    "PRIMARY_TAG",
+    "index_for",
+    "search_scored",
+    "search_indexes",
+    "search_connectors",
     # Errors
     "PipeError",
     "ConnectorNotFoundError",

@@ -39,6 +39,7 @@ from aisquare.pipe.core.oauth import (
     refresh_access_token,
     revoke_token,
 )
+from aisquare.pipe.core.search import cached_index, scoped_index, search_indexes
 from aisquare.pipe.errors import OAuthError, ToolError
 
 logger = logging.getLogger("aisquare.pipe")
@@ -319,57 +320,28 @@ class ToolResult:
 
 
 # --------------------------------------------------------------------------
-# Ranking (ported from pipe-as-service's Composio keyword ranking)
+# Ranking: thin wrappers over the BM25F index in aisquare.pipe.core.search
 # --------------------------------------------------------------------------
-
-# Pronouns/articles/fillers dropped from the query so ranking keys on meaningful
-# words. Verbs like "list"/"send"/"create" are kept — they match tool slugs.
-STOPWORDS = frozenset(
-    {
-        "the", "and", "for", "with", "that", "this", "what", "are", "you",
-        "your", "from", "my", "me", "of", "to", "in", "on", "up", "by", "do",
-        "an", "is", "how", "many", "most", "their", "have", "has", "out",
-        "any", "all",
-    }
-)
-
-# First-person phrasing ("my repos", "issues assigned to me") points at a
-# toolkit's authenticated-user variants over the "for a user / for a repo" ones.
-_FIRST_PERSON = frozenset({"my", "me", "mine", "myself", "our", "ours", "i"})
-
-
-def query_terms(text: str) -> set[str]:
-    """Search terms for ``text``: words longer than two characters, minus
-    stopwords, plus their plural-stripped forms, plus ``authenticated`` for
-    first-person queries."""
-    raw = re.split(r"[^a-z0-9]+", text.lower())
-    words = {w for w in raw if len(w) > 2 and w not in STOPWORDS}
-    terms = words | {w.rstrip("s") for w in words}
-    if any(w in _FIRST_PERSON for w in raw):
-        terms.add("authenticated")
-    return terms
-
 
 def rank_tools(
     tools: Sequence[ToolSpec], query: str | None, limit: int | None = 6
 ) -> list[ToolSpec]:
-    """Deterministic keyword ranking: +2 per term found in the slug, +1 per
-    term found in the description or tags. Ties keep catalog order. When no
-    tool matches, the head of the catalog is returned."""
+    """The tools most relevant to ``query``, best first, ranked by a BM25F
+    index of ``tools`` (slug words, tags, description and input schema;
+    synonyms; see :mod:`aisquare.pipe.core.search`). The index is cached by
+    the catalogue's fingerprint. Only matching tools are returned, ties in
+    catalogue order; with no query, or no match, the head of the catalogue.
+    A duck-typed spec needs only ``slug``, ``description`` and
+    ``input_schema``; missing ``tags``, ``read_only`` and ``destructive``
+    read as the ToolSpec defaults (``read_only`` as unknown).
+    Specs must be immutable: the index is cached by spec identity, so a
+    spec changed in place (a mutable duck-typed one, or an edited
+    ``input_schema`` dict) keeps its stale index; pass new specs instead."""
     cap = len(tools) if limit is None else max(limit, 0)
     if not query or not query.strip():
         return list(tools[:cap])
-    terms = query_terms(query)
-    scored = sorted(((_score(t, terms), t) for t in tools), key=lambda pair: pair[0], reverse=True)
-    matched = [t for score, t in scored if score > 0]
-    chosen = matched or [t for _, t in scored]
-    return chosen[:cap]
-
-
-def _score(tool: ToolSpec, terms: set[str]) -> int:
-    slug = tool.slug.lower()
-    text = " ".join((tool.description, *tool.tags)).lower()
-    return sum(2 for t in terms if t in slug) + sum(1 for t in terms if t in text)
+    hits = cached_index("", tools).search(query, cap)
+    return [hit.tool for hit in hits] or list(tools[:cap])
 
 
 def rank_across(
@@ -382,31 +354,35 @@ def rank_across(
     """:func:`rank_tools` over several toolkits at once; each result names
     its connector. ``catalogs`` maps connector name -> its tools.
 
-    A tool scores as in :func:`rank_tools`, plus 1 per query term found in
-    its connector's ``keywords`` (connector name -> words, e.g. its name,
-    category and keywords). Ties keep connector order, then catalog order.
+    The toolkits are ranked as one (IDF over all their tools, so scores
+    compare across connectors). A connector's ``keywords`` (connector name
+    -> words, e.g. its name, category and keywords) are a low-weight field
+    of each of its tools. Ties keep connector order, then catalog order.
     With no query, or no match, the connectors take turns, so each one is
-    represented in the head."""
-    entries = [(name, tool) for name, tools in catalogs.items() for tool in tools]
-    cap = len(entries) if limit is None else max(limit, 0)
-    terms = query_terms(query) if query and query.strip() else set()
-    boost = {
-        name: sum(1 for t in terms if t in " ".join(words).lower())
-        for name, words in (keywords or {}).items()
-    }
-    scored = [
-        (_score(tool, terms) + boost.get(name, 0), QualifiedTool(name, tool))
-        for name, tool in entries
+    represented in the head. Specs must be immutable: the index is cached
+    by spec identity, so a spec changed in place (a mutable duck-typed one,
+    or an edited ``input_schema`` dict) keeps its stale index; pass new
+    specs instead."""
+    cap = sum(len(tools) for tools in catalogs.values()) if limit is None else max(limit, 0)
+    words = keywords or {}
+    indexes = [
+        cached_index(name, tools, {"keywords": list(words[name])} if name in words else None)
+        for name, tools in catalogs.items()
     ]
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    matched = [qualified for score, qualified in scored if score > 0]
-    if matched:
-        return matched[:cap]
+    hits = search_indexes(indexes, query, cap)
+    if hits:
+        return [QualifiedTool(hit.connector, hit.tool) for hit in hits]
+    return take_turns(catalogs, cap)
+
+
+def take_turns(catalogs: Mapping[str, Sequence[ToolSpec]], limit: int) -> list[QualifiedTool]:
+    """The first ``limit`` tools with the connectors taking turns: each
+    one's first tool in connector order, then each one's second, ..."""
     turns: list[QualifiedTool] = []
     columns = [[QualifiedTool(name, tool) for tool in tools] for name, tools in catalogs.items()]
     for row in range(max((len(c) for c in columns), default=0)):
         turns.extend(column[row] for column in columns if row < len(column))
-    return turns[:cap]
+    return turns[:limit]
 
 
 # --------------------------------------------------------------------------
@@ -582,6 +558,22 @@ _NON_SECRET_KEY_KINDS = frozenset(
 )
 
 
+#: What a toolkit's ``name`` must match. The name is also its entry-point
+#: name and the connector id hosts route on: lowercase letters, digits and
+#: underscores, a letter first, at most 64 characters. No hyphens:
+#: pipe-as-service serves toolkits at ``/v1/connectors/{name}/*`` and keeps
+#: hyphenated names for the pull/push connectors (``github-source``) at
+#: ``/v1/connectors/{name}``, so a hyphenated toolkit would install but never
+#: be served. Connector entry-point names are not bound by it.
+TOOLKIT_NAME_RULE = r"^[a-z][a-z0-9_]{0,63}$"
+_TOOLKIT_NAME = re.compile(TOOLKIT_NAME_RULE)
+
+
+def valid_toolkit_name(name: object) -> bool:
+    """Whether ``name`` may name a toolkit (:data:`TOOLKIT_NAME_RULE`)."""
+    return isinstance(name, str) and _TOOLKIT_NAME.fullmatch(name) is not None
+
+
 def default_slug_prefix(name: str) -> str:
     """``github`` -> ``GITHUB_``; ``one-drive`` -> ``ONE_DRIVE_``."""
     return re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_") + "_"
@@ -686,7 +678,8 @@ class Toolkit(ABC):
         string works too. Absent, None or a blank string means "not known"
         and filters nothing; any other unreadable value grants nothing.
 
-        An override returns a subset of :meth:`tools` (the same ToolSpecs).
+        An override returns a subset of :meth:`tools` (the same ToolSpecs, or
+        equal ones).
         It must not raise for any ``config``, including None, ``{}`` and
         garbage: return ``[]`` when the config can't be read. Like
         :meth:`tools`, it must not touch the network. Listing is advisory:
@@ -715,8 +708,19 @@ class Toolkit(ABC):
         self, query: str, limit: int = 6, *, config: Mapping[str, Any] | None = None
     ) -> list[ToolSpec]:
         """Tools most relevant to a natural-language ``query`` among
-        :meth:`available_tools` for ``config`` (see :func:`rank_tools`)."""
-        return rank_tools(self.available_tools(config), query, limit)
+        :meth:`available_tools` for ``config``, ranked as in
+        :func:`rank_tools` by this toolkit's cached search index (with its
+        card; see :func:`aisquare.pipe.core.search.index_for`). With no
+        query, or no match, the head of :meth:`available_tools`. The
+        index is cached by spec identity: return immutable specs (frozen
+        ToolSpecs) from :meth:`tools`, never ones changed in place."""
+        available = self.available_tools(config)
+        cap = len(available) if limit is None else max(limit, 0)
+        if not query or not query.strip():
+            return list(available[:cap])
+        index, allowed = scoped_index(self, available)
+        hits = index.search(query, cap, allowed=allowed)
+        return [hit.tool for hit in hits] or list(available[:cap])
 
     # -- execution -----------------------------------------------------------
 

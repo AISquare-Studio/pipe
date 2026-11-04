@@ -47,6 +47,7 @@ from typing import Any
 
 from aisquare.pipe import (
     ERROR_INVALID_ARGUMENTS,
+    PRIMARY_TAG,
     DataEnvelope,
     ToolError,
     ToolResult,
@@ -953,6 +954,7 @@ CATALOG: tuple[GmailTool, ...] = (
         ),
         _fetch_emails,
         "email", "emails", "mail", "inbox", "messages", "search", "list", "unread", "recent", "fetch", "read",
+        PRIMARY_TAG,
     ),
     _read(
         "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
@@ -1081,6 +1083,7 @@ CATALOG: tuple[GmailTool, ...] = (
         ),
         _send_email,
         "send", "email", "mail", "message", "compose", "write",
+        PRIMARY_TAG,
         scopes=(SEND_SCOPE,),
         aliases=_SEND_ALIASES,
     ),

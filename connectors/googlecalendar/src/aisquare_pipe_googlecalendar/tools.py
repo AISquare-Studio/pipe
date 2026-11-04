@@ -37,7 +37,13 @@ from dataclasses import dataclass, field
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from aisquare.pipe import ERROR_INVALID_ARGUMENTS, ToolError, ToolResult, ToolSpec
+from aisquare.pipe import (
+    ERROR_INVALID_ARGUMENTS,
+    PRIMARY_TAG,
+    ToolError,
+    ToolResult,
+    ToolSpec,
+)
 
 from aisquare_pipe_googlecalendar import times
 from aisquare_pipe_googlecalendar.errors import describe_error, error_code
@@ -1154,6 +1160,7 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         ),
         _events_list,
         "events", "list", "agenda", "meetings", "upcoming", "calendar", "week", "today",
+        PRIMARY_TAG,
     ),
     _tool(
         "GOOGLECALENDAR_FIND_EVENT",
@@ -1318,6 +1325,7 @@ CATALOG: tuple[GoogleCalendarTool, ...] = (
         ),
         _create_event,
         "create", "schedule", "add", "book", "new", "event", "meeting", "invite", "appointment",
+        PRIMARY_TAG,
         scopes=_READ_WRITE,
         aliases={"title": "summary", "start_time": "start_datetime", "end_time": "end_datetime", "time_zone": "timezone"},
     ),

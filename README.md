@@ -15,6 +15,7 @@
 pip install aisquare-pipe                       # framework only
 pip install "aisquare-pipe[popular]"            # framework + the canonical core connectors
 pip install "aisquare-pipe[full]"               # framework + all connectors maintained in this repo
+pip install "aisquare-pipe[toolkits]"           # framework + every agent toolkit (what pipe-as-service installs)
 pip install aisquare-pipe-<service>             # framework + a single connector (e.g. aisquare-pipe-dropbox)
 ```
 

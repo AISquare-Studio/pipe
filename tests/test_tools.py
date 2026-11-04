@@ -42,7 +42,7 @@ from aisquare.pipe import (
     time_budget,
     validate_arguments,
 )
-from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments, query_terms
+from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments
 from aisquare.pipe.errors import ToolError
 from aisquare.pipe.testing.mock_connectors import (
     MOCK_EXPIRED_TOKEN,
@@ -232,19 +232,6 @@ GITHUB_LIKE = [
 ]
 
 
-class TestQueryTerms:
-    def test_drops_stopwords_and_short_words(self):
-        assert query_terms("what are the issues in it") == {"issues", "issue"}
-
-    def test_plural_strip(self):
-        assert {"repos", "repo"} <= query_terms("repos")
-
-    def test_first_person_adds_authenticated(self):
-        assert "authenticated" in query_terms("list my repos")
-        assert "authenticated" in query_terms("issues assigned to me")
-        assert "authenticated" not in query_terms("list repos for octocat")
-
-
 class TestRankTools:
     def test_slug_match_outranks_description_match(self):
         tools = [
@@ -288,7 +275,8 @@ class TestRankTools:
 
     def test_limit(self):
         assert len(rank_tools(GITHUB_LIKE, "repository", limit=2)) == 2
-        assert len(rank_tools(GITHUB_LIKE, "repository", limit=None)) == 3  # matches only
+        # Matches only. ("repository" now matches all six: "repositories" stems to it.)
+        assert len(rank_tools(GITHUB_LIKE, "user", limit=None)) == 2
         assert len(rank_tools(GITHUB_LIKE, "zzzz", limit=None)) == len(GITHUB_LIKE)
         assert rank_tools(GITHUB_LIKE, "repository", limit=0) == []
 
@@ -1455,6 +1443,8 @@ class TestRankAcross:
         assert [(q.connector, q.tool.slug) for q in found] == [
             ("gmail", "GMAIL_LIST_MESSAGES"),
             ("googlecalendar", "GOOGLECALENDAR_LIST_EVENTS"),
+            # A synonym ("find" ~ "list") matches too, below the exact matches.
+            ("googlecalendar", "GOOGLECALENDAR_FIND_FREE_SLOTS"),
         ]
 
     def test_connector_keywords_boost(self):

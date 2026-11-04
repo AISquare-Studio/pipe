@@ -37,6 +37,7 @@ from aisquare.pipe import (
     ERROR_CONFLICT,
     ERROR_INVALID_ARGUMENTS,
     ERROR_UPSTREAM_ERROR,
+    PRIMARY_TAG,
     DataEnvelope,
     ToolError,
     ToolResult,
@@ -1028,6 +1029,7 @@ CATALOG: tuple[OneDriveTool, ...] = (
         ),
         _upload_file,
         "upload", "save", "write", "create", "file", "put", "store",
+        PRIMARY_TAG,
         destructive=True,
     ),
     _write(
