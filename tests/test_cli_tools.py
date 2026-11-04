@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from click.testing import CliRunner
 
 from aisquare.pipe.cli.main import cli
@@ -90,3 +91,40 @@ def test_tool_json_keeps_its_keys_and_adds_scopes_and_risk():
         }
     delete = next(t for t in tools if t["slug"] == "MOCK_DELETE_ITEM")
     assert (delete["risk"], delete["required_scopes"]) == ("destructive", [])
+
+
+class TestLeftOutToolkits:
+    """`pipe tools` shows what hosts serve (installed_toolkits): a toolkit
+    every host leaves out is listed with why and cannot be opened."""
+
+    @pytest.fixture
+    def with_left_out(self, monkeypatch):
+        from aisquare.pipe.core import registry
+
+        class Hyphenated(MockToolkit):
+            name = "mock-two"
+
+        monkeypatch.setattr(registry, "discover_toolkits", lambda: {"mock": MockToolkit, "mock-two": Hyphenated})
+        registry._installed_toolkits.cache_clear()
+        yield
+        registry._installed_toolkits.cache_clear()
+
+    def test_listed_with_why(self, with_left_out):
+        result = invoke()
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert any(line.split()[:1] == ["mock"] for line in lines)
+        assert "mock-two             left out: name breaks ^[a-z][a-z0-9_]{0,63}$" in lines
+
+    def test_listed_with_why_json(self, with_left_out):
+        result = invoke("--json")
+        assert result.exit_code == 0, result.output
+        rows = {row["name"]: row for row in json.loads(result.output)}
+        assert rows["mock-two"] == {"name": "mock-two", "left_out": "name breaks ^[a-z][a-z0-9_]{0,63}$"}
+        assert rows["mock"]["tools"] == len(MOCK_TOOLS)
+
+    def test_cannot_be_opened(self, with_left_out):
+        result = invoke("mock-two")
+        assert result.exit_code == 1
+        assert "Toolkit 'mock-two' not found. Available: mock." in result.output
+        assert "'mock-two' left out: name breaks" in result.output

@@ -323,36 +323,6 @@ class ToolResult:
 # Ranking: thin wrappers over the BM25F index in aisquare.pipe.core.search
 # --------------------------------------------------------------------------
 
-# The 0.4 keyword ranker's query analysis, kept for callers of query_terms.
-# Ranking itself now uses aisquare.pipe.core.search (its own stopwords,
-# stemming and synonyms).
-STOPWORDS = frozenset(
-    {
-        "the", "and", "for", "with", "that", "this", "what", "are", "you",
-        "your", "from", "my", "me", "of", "to", "in", "on", "up", "by", "do",
-        "an", "is", "how", "many", "most", "their", "have", "has", "out",
-        "any", "all",
-    }
-)
-
-# First-person phrasing ("my repos", "issues assigned to me") points at a
-# toolkit's authenticated-user variants over the "for a user / for a repo" ones.
-_FIRST_PERSON = frozenset({"my", "me", "mine", "myself", "our", "ours", "i"})
-
-
-def query_terms(text: str) -> set[str]:
-    """Search terms for ``text`` as the 0.4 keyword ranker saw them: words
-    longer than two characters, minus stopwords, plus their plural-stripped
-    forms, plus ``authenticated`` for first-person queries. Ranking now
-    uses :func:`aisquare.pipe.core.search.analyze_query`."""
-    raw = re.split(r"[^a-z0-9]+", text.lower())
-    words = {w for w in raw if len(w) > 2 and w not in STOPWORDS}
-    terms = words | {w.rstrip("s") for w in words}
-    if any(w in _FIRST_PERSON for w in raw):
-        terms.add("authenticated")
-    return terms
-
-
 def rank_tools(
     tools: Sequence[ToolSpec], query: str | None, limit: int | None = 6
 ) -> list[ToolSpec]:

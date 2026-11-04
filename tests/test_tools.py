@@ -42,7 +42,7 @@ from aisquare.pipe import (
     time_budget,
     validate_arguments,
 )
-from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments, query_terms
+from aisquare.pipe.core.tools import default_slug_prefix, prepare_arguments
 from aisquare.pipe.errors import ToolError
 from aisquare.pipe.testing.mock_connectors import (
     MOCK_EXPIRED_TOKEN,
@@ -230,19 +230,6 @@ GITHUB_LIKE = [
     spec("GITHUB_GET_RAW_REPOSITORY_CONTENT", "Get the raw content of a file in a repository."),
     spec("GITHUB_LIST_PULL_REQUESTS", "List pull requests in a repository.", tags=("pulls",)),
 ]
-
-
-class TestQueryTerms:
-    def test_drops_stopwords_and_short_words(self):
-        assert query_terms("what are the issues in it") == {"issues", "issue"}
-
-    def test_plural_strip(self):
-        assert {"repos", "repo"} <= query_terms("repos")
-
-    def test_first_person_adds_authenticated(self):
-        assert "authenticated" in query_terms("list my repos")
-        assert "authenticated" in query_terms("issues assigned to me")
-        assert "authenticated" not in query_terms("list repos for octocat")
 
 
 class TestRankTools:

@@ -547,7 +547,7 @@ CAL_TOOLS = [
 @pytest.fixture
 def installed(monkeypatch):
     registry_mod._installed_toolkits.cache_clear()
-    monkeypatch.setattr(search, "_connector_index", None)
+    monkeypatch.setattr(registry_mod, "_connector_index", None)
 
     def install(*classes: type) -> None:
         found = {cls.name: cls for cls in classes}
@@ -583,6 +583,67 @@ class TestIndexFor:
     def test_unknown_toolkit(self, mail_and_cal):
         with pytest.raises(ToolkitNotFoundError, match="'nope'"):
             index_for("nope")
+
+
+class TestToolkitIndexCache:
+    """toolkit_index (behind index_for, search_scored, search_tools_across
+    and Toolkit.search_tools) keeps one index per toolkit class, outside the
+    LRU, so walking every installed toolkit hits however many there are."""
+
+    def test_more_toolkits_than_the_lru_holds(self, installed, monkeypatch):
+        monkeypatch.setattr(search, "INDEX_CACHE_SIZE", 4)
+        kits = [_kit(f"kit{i}", [spec(f"KIT{i}_LIST_ITEMS", "List items."), spec(f"KIT{i}_SEND_ITEM", "Send an item.")]) for i in range(10)]
+        installed(*kits)
+        search_scored("list items", limit=None)
+        assert cache_info() == {"hits": 0, "misses": 10, "size": 10}
+        for query in ("list items", "send the item", "zebra"):
+            search_scored(query, limit=None)
+            search_tools_across(query, limit=None)
+        assert cache_info() == {"hits": 60, "misses": 10, "size": 10}
+        cached_index("adhoc", CHAT)  # the LRU of ad-hoc indexes is apart
+        search_scored("list items", limit=None)
+        assert cache_info()["misses"] == 11 and cache_info()["size"] == 11
+
+    def test_new_spec_objects_with_the_same_content_hit(self, installed):
+        kit = _kit("fresh", [])
+        kit.tools = lambda self: [spec("FRESH_LIST_ITEMS", "List items.")]  # type: ignore[attr-defined]
+        installed(kit)
+        first = index_for("fresh")
+        assert index_for("fresh") is first
+        assert cache_info() == {"hits": 1, "misses": 1, "size": 1}
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda kit: setattr(kit, "version", "2.0.0"),
+            lambda kit: setattr(kit, "keywords", ("inbox", "mailbox")),
+            lambda kit: setattr(kit, "tools", lambda self: [*MAIL_TOOLS, spec("MAIL_DELETE", "Delete a message.")]),
+            lambda kit: setattr(kit, "tools", lambda self: [dataclasses.replace(MAIL_TOOLS[0], description="Mail it."), MAIL_TOOLS[1]]),
+        ],
+    )
+    def test_rebuilt_when_the_toolkit_changes(self, mail_and_cal, change):
+        mail, _ = mail_and_cal
+        first = index_for("mail")
+        change(mail)
+        second = index_for("mail")
+        assert second is not first and index_for("mail") is second
+        assert cache_info() == {"hits": 1, "misses": 2, "size": 1}
+
+    def test_one_slot_per_class_dropped_with_it(self):
+        import gc
+
+        kit = _kit("gone", [spec("GONE_LIST_ITEMS", "List items.")])
+        search.toolkit_index(kit())
+        assert cache_info()["size"] == 1
+        del kit
+        gc.collect()
+        assert cache_info()["size"] == 0
+
+    def test_cache_clear_drops_the_slots(self, mail_and_cal):
+        first = index_for("mail")
+        cache_clear()
+        assert cache_info() == {"hits": 0, "misses": 0, "size": 0}
+        assert index_for("mail") is not first
 
 
 class TestSearchScored:
@@ -784,3 +845,70 @@ def registry_prefix(name: str) -> str:
     from aisquare.pipe.core.tools import default_slug_prefix
 
     return default_slug_prefix(name)
+
+
+# --------------------------------------------------------------------------
+# The shared interface (.aisquare/rules/pipe-router.md)
+# --------------------------------------------------------------------------
+
+
+class TestSharedInterface:
+    def test_search_indexes_signature(self):
+        """pipe-as-service calls search_indexes([(index, allowed), ...],
+        query, limit) positionally: these names, kinds and defaults are the
+        contract."""
+        import inspect
+
+        kind = inspect.Parameter.POSITIONAL_OR_KEYWORD
+        params = inspect.signature(search_indexes).parameters.values()
+        assert [(p.name, p.kind, p.default) for p in params] == [
+            ("indexes", kind, inspect.Parameter.empty),
+            ("query", kind, inspect.Parameter.empty),
+            ("limit", kind, 10),
+        ]
+
+    def test_search_indexes_is_exported(self):
+        from aisquare import pipe
+
+        assert pipe.search_indexes is search_indexes
+        assert "search_indexes" in pipe.__all__ and "search_indexes" in search.__all__
+
+    def test_search_indexes_entries_and_results(self):
+        mail, cal = ToolIndex.build("mail", MAIL_TOOLS), ToolIndex.build("cal", CAL_TOOLS)
+        hits = search_indexes([(mail, frozenset({"MAIL_LIST_MESSAGES"})), (cal, None)], "list", None)
+        assert all(isinstance(h, ScoredTool) for h in hits)
+        assert {(h.connector, h.tool.slug) for h in hits} == {
+            ("mail", "MAIL_LIST_MESSAGES"), ("cal", "CAL_LIST_EVENTS"),
+        }  # fmt: skip
+        assert search_indexes([mail, cal], "list", 1) == hits[:1]
+        assert search_indexes([mail, cal], "") == [] and search_indexes([mail, cal], None) == []
+
+    def test_installed_toolkit_searches_live_in_registry(self):
+        """index_for, search_scored and search_connectors are defined in
+        registry and re-exported by search under the same names."""
+        from aisquare import pipe
+
+        for name in ("index_for", "search_scored", "search_connectors"):
+            assert getattr(search, name) is getattr(registry_mod, name) is getattr(pipe, name)
+            assert name in search.__all__ and name in dir(search)
+        with pytest.raises(AttributeError):
+            search.not_a_name  # noqa: B018
+
+    def test_search_never_imports_registry_while_loading(self):
+        """registry imports search; search names registry only for type
+        checking and in its lazy re-export, so neither module needs the
+        other half-loaded."""
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(search))
+        for node in tree.body:
+            if isinstance(node, ast.If) and "TYPE_CHECKING" in ast.unparse(node.test):
+                continue
+            if isinstance(node, ast.FunctionDef) and node.name == "__getattr__":
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.ImportFrom):
+                    assert "registry" not in (inner.module or "") and all(a.name != "registry" for a in inner.names)
+                elif isinstance(inner, ast.Import):
+                    assert all("registry" not in a.name for a in inner.names)

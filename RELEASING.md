@@ -120,8 +120,10 @@ and `[toolkits]` floors each at its new version:
    `v0.5.0`, or Run workflow on `main`). One run carries the framework and
    the five toolkits.
 3. **After the run, before relocking pipe-as-service**, confirm the six
-   bold uploads above on the simple index (`pip index versions <project>`).
-   Until all six are there, `aisquare-pipe[toolkits]` 0.5.0 cannot resolve,
+   bold uploads above on the simple index (`pip index versions <project>`),
+   seven if 0.4.0 never ran: then `aisquare-pipe-github` 0.3.0 is new on
+   PyPI too, and `[toolkits]` floors it.
+   Until all of them are there, `aisquare-pipe[toolkits]` 0.5.0 cannot resolve,
    and a toolkit at its new version cannot install without
    `aisquare-pipe` 0.5.0. A missing one: fix its publisher and rerun
    (`skip-existing` uploads only what is missing).

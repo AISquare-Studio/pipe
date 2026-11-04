@@ -36,8 +36,11 @@ from aisquare.pipe.core.registry import (
     get_connector,
     get_converter,
     get_toolkit,
+    index_for,
     installed_toolkits,
     left_out_toolkits,
+    search_connectors,
+    search_scored,
     search_tools_across,
     slug_prefix_conflicts,
 )
@@ -46,9 +49,7 @@ from aisquare.pipe.core.search import (
     ConnectorIndex,
     ScoredTool,
     ToolIndex,
-    index_for,
-    search_connectors,
-    search_scored,
+    search_indexes,
 )
 from aisquare.pipe.core.tools import (
     CARD_FIELDS,
@@ -178,6 +179,7 @@ __all__ = [
     "PRIMARY_TAG",
     "index_for",
     "search_scored",
+    "search_indexes",
     "search_connectors",
     # Errors
     "PipeError",

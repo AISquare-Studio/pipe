@@ -3,10 +3,13 @@
 A :class:`ToolIndex` indexes one connector's catalogue once; a search reads
 only the postings of the query's terms, so its cost follows the query, not
 the catalogue. A :class:`ConnectorIndex` does the same over connector cards,
-for a router that picks connectors before tools. :func:`index_for` caches a
-toolkit's index per (name, version, catalogue fingerprint), and
-:func:`search_scored` / :func:`search_connectors` search the installed
-toolkits. Pure Python, no dependencies, no network, no model.
+for a router that picks connectors before tools. :func:`search_indexes`
+ranks several ToolIndexes as one. :func:`toolkit_index` keeps one index per
+toolkit class (rebuilt when its name, version, card or catalogue changes),
+and :func:`cached_index` an LRU of ad-hoc ones. :func:`index_for`,
+:func:`search_scored` and :func:`search_connectors` search the installed
+toolkits; they live in :mod:`aisquare.pipe.core.registry` and are
+re-exported here. Pure Python, no dependencies, no network, no model.
 
 **Analysis.** :func:`tokenize` lowercases; splits UPPER_SNAKE slugs,
 camelCase and punctuation into words; drops :data:`STOPWORDS`; and stems
@@ -49,6 +52,7 @@ import logging
 import math
 import re
 import threading
+import weakref
 from array import array
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
@@ -56,6 +60,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from aisquare.pipe.core.registry import index_for, search_connectors, search_scored
     from aisquare.pipe.core.tools import Toolkit, ToolSpec
 
 logger = logging.getLogger("aisquare.pipe")
@@ -222,8 +227,6 @@ _SERVICE_BEFORE = frozenset(
         "our", "over", "search", "through", "to", "use", "using", "via", "with", "within", "your"
     }
 )
-# Words after a connector's name that make it the service: "slack channel",
-# "github repo", "gmail inbox", "onedrive folder".
 # Words after a connector's name that make it a modifier, not the service:
 # "in slack style", "github-flavored markdown", "slack-like", "gmail-esque".
 _MODIFIER_AFTER = frozenset(
@@ -233,6 +236,8 @@ _MODIFIER_AFTER = frozenset(
         "theme", "themed", "tone", "look",
     }
 )
+# Words after a connector's name that make it the service: "slack channel",
+# "github repo", "gmail inbox", "onedrive folder".
 _SERVICE_AFTER = frozenset(
     {
         "account", "app", "calendar", "calendars", "channel", "channels", "dm", "dms", "drive",
@@ -1023,10 +1028,18 @@ def _boost_named(
 def search_indexes(
     indexes: Iterable[ToolIndex | Entry], query: str | None, limit: int | None = 10
 ) -> list[ScoredTool]:
-    """Search several :class:`ToolIndex` es as one ranking (IDF over the
-    union of their catalogues; ties keep index order, then catalogue order).
-    Each item is an index, or ``(index, allowed)`` to filter that one by
-    slug. Only matches are returned."""
+    """Search several :class:`ToolIndex` es as ONE ranking, best first: IDF
+    over the union of their catalogues, so scores compare across connectors,
+    and a connector the query names as the service to use is boosted (see
+    :data:`NAMED_BOOST`). Ties keep index order, then catalogue order.
+
+    Each item of ``indexes`` is an index, or ``(index, allowed)`` where
+    ``allowed`` (a set of slugs, None: all) filters that index alone, as
+    :meth:`ToolIndex.search` does. At most ``limit`` hits (None: every
+    match); only matches are returned, so an empty or unmatched query gives
+    ``[]``. Part of the shared interface (exported as
+    ``aisquare.pipe.search_indexes``): pipe-as-service ranks its own
+    per-toolkit indexes with it."""
     entries = [item if isinstance(item, tuple) else (item, None) for item in indexes]
     return _search(entries, query, limit)
 
@@ -1035,8 +1048,11 @@ def search_indexes(
 # Fingerprints and the index cache
 # --------------------------------------------------------------------------
 
-#: Most indexes (and catalogue digests) kept by the LRU cache behind
-#: :func:`cached_index`, :func:`index_for` and the ranking helpers.
+#: Most ad-hoc indexes (and catalogue digests) kept by the LRU cache behind
+#: :func:`cached_index` and the ranking helpers (:func:`rank_tools`,
+#: :func:`rank_across`). A toolkit's own catalogue is not in it: see
+#: :func:`toolkit_index`, which keeps one index per toolkit class at any
+#: number of toolkits.
 INDEX_CACHE_SIZE = 512
 
 _lock = threading.Lock()
@@ -1077,6 +1093,13 @@ def _tool_digest(tool: ToolSpec) -> bytes:
     return hashlib.blake2b(payload.encode(), digest_size=16).digest()
 
 
+def _hash_catalogue(tools: Sequence[ToolSpec]) -> bytes:
+    h = hashlib.blake2b(digest_size=16)
+    for tool in tools:
+        h.update(_tool_digest(tool))
+    return h.digest()
+
+
 def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
     key = tuple(map(id, tools))
     with _lock:
@@ -1084,10 +1107,7 @@ def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
         if hit is not None:
             _digests.move_to_end(key)
             return hit[1]
-    h = hashlib.blake2b(digest_size=16)
-    for tool in tools:
-        h.update(_tool_digest(tool))
-    digest = h.digest()
+    digest = _hash_catalogue(tools)
     with _lock:
         _digests[key] = (tuple(tools), digest)
         while len(_digests) > INDEX_CACHE_SIZE:
@@ -1095,10 +1115,18 @@ def _catalogue_digest(tools: Sequence[ToolSpec]) -> bytes:
     return digest
 
 
-def _fingerprint(connector: str, tools: Sequence[ToolSpec], card: Mapping[str, Any] | None) -> str:
+def _fingerprint(
+    connector: str,
+    tools: Sequence[ToolSpec],
+    card: Mapping[str, Any] | None,
+    digest: bytes | None = None,
+) -> str:
+    """The fingerprint of a catalogue and card; ``digest`` is the catalogue's
+    (:func:`_hash_catalogue`) when the caller has it, else it comes from the
+    digest LRU."""
     h = hashlib.blake2b(digest_size=16)
     h.update(json.dumps([connector, _card_words(card)]).encode())
-    h.update(_catalogue_digest(tools))
+    h.update(_catalogue_digest(tools) if digest is None else digest)
     return h.hexdigest()
 
 
@@ -1135,10 +1163,37 @@ def cached_index(
     return index
 
 
+@dataclass(frozen=True)
+class _Slot:
+    """A toolkit class's cached index, and what it was checked against last:
+    the class's name, version and card words, and the very ToolSpec objects
+    its ``tools()`` returned (held, so their identity stays meaningful)."""
+
+    key: tuple[str, str, str]
+    tools: tuple[ToolSpec, ...]
+    index: ToolIndex
+
+    def holds(self, key: tuple[str, str, str], tools: Sequence[ToolSpec]) -> bool:
+        return (
+            key == self.key
+            and len(tools) == len(self.tools)
+            and all(a is b for a, b in zip(tools, self.tools))
+        )
+
+
+# One index per Toolkit class (see toolkit_index), outside the LRU, so a
+# search that walks every installed toolkit hits at any number of them. Weak
+# keys: a slot lives as long as its class does, so the slots are bounded by
+# the toolkit classes loaded (for a host: what is installed).
+_toolkit_slots: weakref.WeakKeyDictionary[type, _Slot] = weakref.WeakKeyDictionary()
+
+
 def cache_info() -> dict[str, int]:
-    """Index cache counters: ``hits``, ``misses`` and ``size``."""
+    """Index cache counters: ``hits`` and ``misses`` (every lookup through
+    :func:`cached_index` or :func:`toolkit_index`) and ``size`` (the
+    indexes held: the LRU's plus one per toolkit class)."""
     with _lock:
-        return {**_counters, "size": len(_indexes)}
+        return {**_counters, "size": len(_indexes) + len(_toolkit_slots)}
 
 
 def cache_clear() -> None:
@@ -1146,6 +1201,7 @@ def cache_clear() -> None:
     with _lock:
         _indexes.clear()
         _digests.clear()
+        _toolkit_slots.clear()
         _counters.update(hits=0, misses=0)
 
 
@@ -1160,14 +1216,37 @@ def _card_of(cls: type[Toolkit]) -> dict[str, Any] | None:
 
 def toolkit_index(toolkit: Toolkit) -> ToolIndex:
     """The cached index of ``toolkit``'s whole catalogue (:meth:`Toolkit.tools`)
-    with its card, keyed on the toolkit's name and version."""
+    with its card. Each toolkit class has one slot, outside the LRU of
+    :func:`cached_index`, so walking every installed toolkit on each search
+    keeps hitting however many there are. The slot is reused while the
+    class's name, version and card words are the same and ``tools()``
+    returns the same ToolSpec objects, or new ones with the same
+    fingerprint; anything else rebuilds it. It lives as long as the class."""
     cls = type(toolkit)
-    return cached_index(
-        str(getattr(cls, "name", "")),
-        toolkit.tools(),
-        _card_of(cls),
-        version=str(getattr(cls, "version", "")),
-    )
+    connector = str(getattr(cls, "name", ""))
+    tools = tuple(toolkit.tools())
+    card = _card_of(cls)
+    key = (connector, str(getattr(cls, "version", "")), _card_words(card))
+    with _lock:
+        slot = _toolkit_slots.get(cls)
+        if slot is not None and slot.holds(key, tools):
+            _counters["hits"] += 1
+            return slot.index
+    if slot is not None and slot.key == key:
+        # New spec objects (a toolkit that builds its ToolSpecs on each
+        # call): the same index if they describe the same catalogue.
+        fingerprint = _fingerprint(connector, tools, card, _hash_catalogue(tools))
+        if fingerprint == slot.index.fingerprint:
+            with _lock:
+                _toolkit_slots[cls] = _Slot(key, tools, slot.index)
+                _counters["hits"] += 1
+            return slot.index
+    with _lock:
+        _counters["misses"] += 1
+    index = ToolIndex.build(connector, tools, card)
+    with _lock:
+        _toolkit_slots[cls] = _Slot(key, tools, index)
+    return index
 
 
 def scoped_index(
@@ -1192,36 +1271,6 @@ def scoped_index(
         version=str(getattr(cls, "version", "")),
     )
     return scoped, None
-
-
-def index_for(toolkit_name: str) -> ToolIndex:
-    """The index of an installed toolkit's whole catalogue, cached per
-    (name, version, catalogue fingerprint), so it is built once and rebuilt
-    only when the catalogue changes. Raises
-    :class:`~aisquare.pipe.errors.ToolkitNotFoundError` for a toolkit that is
-    not installed (see :func:`~aisquare.pipe.core.registry.installed_toolkits`)."""
-    from aisquare.pipe.core.registry import _require_installed
-
-    return toolkit_index(_require_installed([toolkit_name])[toolkit_name]())
-
-
-def search_scored(
-    query: str | None,
-    connectors: Mapping[str, Mapping[str, Any] | None] | Iterable[str] | None = None,
-    *,
-    limit: int | None = 10,
-) -> list[ScoredTool]:
-    """The installed tools matching ``query`` across ``connectors``, best
-    first, with scores. ``connectors`` takes the forms of
-    :func:`~aisquare.pipe.core.registry.search_tools_across`: a mapping of
-    name -> the connection's ``config`` (each toolkit then offers only its
-    :meth:`Toolkit.available_tools` for it), an iterable of names, or None
-    for every installed toolkit; an unknown name raises
-    :class:`~aisquare.pipe.errors.ToolkitNotFoundError`. Only matches are
-    returned: unlike ``search_tools_across`` there is no fallback."""
-    from aisquare.pipe.core.registry import _searchable
-
-    return _search([(index, allowed) for _, index, allowed, _ in _searchable(connectors)], query, limit)
 
 
 # --------------------------------------------------------------------------
@@ -1305,22 +1354,26 @@ class ConnectorIndex:
         return [(self.names[d], -neg) for neg, d in best]
 
 
-_connector_index: tuple[str, ConnectorIndex] | None = None
+# --------------------------------------------------------------------------
+# Installed toolkits
+# --------------------------------------------------------------------------
+
+# index_for, search_scored and search_connectors search the installed
+# toolkits, so they live in aisquare.pipe.core.registry, which imports this
+# module; this module never imports registry while loading. They are part of
+# this module's interface, so they are re-exported here on first use.
+_REGISTRY_NAMES = frozenset({"index_for", "search_connectors", "search_scored"})
 
 
-def search_connectors(query: str | None, limit: int | None = 10) -> list[tuple[str, float]]:
-    """:meth:`ConnectorIndex.search` over the installed toolkits' cards
-    (:func:`~aisquare.pipe.core.registry.catalogue`); the index is rebuilt
-    only when the cards change."""
-    global _connector_index
-    from aisquare.pipe.core.registry import catalogue
+def __getattr__(name: str) -> Any:
+    if name in _REGISTRY_NAMES:
+        from aisquare.pipe.core import registry
 
-    cards = catalogue()
-    key = hashlib.blake2b(
-        json.dumps(cards, sort_keys=True, default=str).encode(), digest_size=16
-    ).hexdigest()
-    current = _connector_index
-    if current is None or current[0] != key:
-        current = (key, ConnectorIndex.build(cards))
-        _connector_index = current
-    return current[1].search(query, limit)
+        value = getattr(registry, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *_REGISTRY_NAMES})
