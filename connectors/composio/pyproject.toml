@@ -13,7 +13,7 @@ authors = [{name = "AISquare Studio"}]
 dependencies = [
     "aisquare-pipe>=0.1.0",
     "composio>=0.13.1,<2.0",
-    "composio-client>=1.39,<2.0",
+    "composio-client>=1.39,<3.0",
 ]
 
 [project.optional-dependencies]
