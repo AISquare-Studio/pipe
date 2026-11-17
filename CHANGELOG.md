@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Glean connector** (`connectors/glean`, module `aisquare_pipe_glean`, extra
+  `aisquare-pipe[glean]`, in `[full]` and `[toolkits]`). It is read-only over
+  Glean's Client API.
+  - **Toolkit `glean`**: `GLEAN_SEARCH` (`pipe:primary`) and `GLEAN_GET_DOCUMENT`.
+  - **Source `glean-source`**: a saved query or document ids, read as
+    `text/plain` envelopes. Each carries the document's `update_time` as its
+    version marker.
+  - **Auth**: a Glean-issued token, held in a per-tenant credential blob
+    `{host, token, token_kind: user|global, act_as?, allowed_hosts?}`. No
+    OAuthSpec, so a host classifies it as first party.
+    - A global token always sends `X-Glean-ActAs`; a user token never does.
+    - `host` must match `<instance>-be.glean.com` or the blob's own
+      `allowed_hosts`. Redirects are not followed.
+    - Neither tool arguments nor pull params can set any credential key.
+    - Without a usable blob it fails closed (`not_connected` /
+      `GleanNotConfigured`) before any request.
+  - The extra is empty: HTTP goes through `requests`, which core already
+    requires.
+
 ## [0.5.0] - 2026-11-04
 
 The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`
