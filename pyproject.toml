@@ -51,6 +51,7 @@ full = [
     "aisquare-pipe-slack",
     "aisquare-pipe-gmail",
     "aisquare-pipe-googlecalendar",
+    "aisquare-pipe-aws",
 ]
 # Every package under connectors/ that registers an `aisquare_pipe.toolkits`
 # entry point, each floored at a release that ships its toolkit (a bare name
@@ -66,6 +67,7 @@ toolkits = [
     "aisquare-pipe-googledrive>=0.4.0",
     "aisquare-pipe-onedrive>=0.4.0",
     "aisquare-pipe-slack>=0.2.0",
+    "aisquare-pipe-aws>=0.1.0",
 ]
 
 [project.scripts]

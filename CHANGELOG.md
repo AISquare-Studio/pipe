@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`aisquare-pipe-aws` 0.1.0** (`connectors/aws`): read-only access to a
+  customer's AWS account through one cross-account IAM role.
+  - `aisquare_pipe_aws.credentials`: the shared credential. STS `AssumeRole`
+    runs with the server-issued `ExternalId`, and reads use the role's
+    refreshable temporary credentials. A role in the service's own account is
+    refused. No customer client is built from ambient, default or empty
+    credentials. The blob is
+    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`.
+  - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
+    AgentCore policy, in every configured region (`ListPolicyEngines` →
+    `ListPolicies`, every page; `GetPolicy` only for a policy listed without
+    its definition). Each envelope carries the definition text, with the
+    name, ids, ARN, status, enforcement mode and timestamps as metadata, and
+    `version` = `updatedAt`.
+  - `s3-source`: one envelope per object under the configured bucket and
+    prefix (`ListObjectsV2`, every page; `GetObject`). Its `version` is the
+    `VersionId`, else the `ETag`.
+  - Toolkits `bedrock_agentcore` (`LIST_POLICY_ENGINES`, `LIST_POLICIES`,
+    `GET_POLICY`) and `s3` (`LIST_OBJECTS`, `GET_OBJECT`, `HEAD_OBJECT`). All
+    their tools are read-only, with strict schemas.
+  - Pull params and tool arguments only narrow what the blob allows (a
+    prefix inside the configured one, one engine, a time filter). Neither
+    can name an account, role, region, bucket or credential.
+  - Needs `boto3`/`botocore` >= 1.43.32. The AgentCore Policy GA model
+    arrived in 1.42.60, but a policy's `enforcementMode` only in 1.43.32.
+  - Listed in `[full]` and `[toolkits]` for now. Under D8 it becomes the extra
+    `aisquare-pipe[aws]`, with no PyPI project of its own.
+
 ## [0.5.0] - 2026-11-04
 
 The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`

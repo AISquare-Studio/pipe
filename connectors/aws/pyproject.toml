@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+# Interim per-package layout, as every connector in this tree today. Under D8
+# (revised 2026-11-17, task #27) this package moves into the one aisquare-pipe
+# distribution as the extra aisquare-pipe[aws]; it gets no PyPI project and no
+# publish matrix entry of its own.
+[project]
+name = "aisquare-pipe-aws"
+version = "0.1.0"
+description = "Read-only Amazon Bedrock AgentCore policies and S3 objects in a customer's AWS account (cross-account IAM role), for aisquare.pipe"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [{name = "AISquare Studio"}]
+dependencies = [
+    "aisquare-pipe>=0.5.0",
+    # AgentCore Policy (bedrock-agentcore-control ListPolicyEngines /
+    # ListPolicies / GetPolicy) is in the model from 1.42.60 (GA), but a
+    # policy's enforcementMode only from 1.43.32: botocore drops response
+    # members its model lacks, so an older one silently loses that field.
+    "boto3>=1.43.32,<2",
+    "botocore>=1.43.32,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "moto[s3,sts]>=5.0,<6"]
+
+[project.entry-points."aisquare_pipe.connectors"]
+bedrock-agentcore-policies-source = "aisquare_pipe_aws.connector:BedrockAgentCorePoliciesSource"
+s3-source = "aisquare_pipe_aws.connector:S3Source"
+
+[project.entry-points."aisquare_pipe.toolkits"]
+bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
+s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aisquare_pipe_aws"]
+known-third-party = ["aisquare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
+
+[tool.mypy]
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+# boto3/botocore ship no type information; their stubs would be a new dependency.
+module = ["boto3", "boto3.*", "botocore", "botocore.*", "moto", "moto.*"]
+ignore_missing_imports = true

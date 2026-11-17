@@ -45,6 +45,7 @@ Each connector is its own independently published pip package under `connectors/
 | Slack | `aisquare-pipe-slack` |   | ✓ |
 | Gmail | `aisquare-pipe-gmail` |   | ✓ |
 | Google Calendar | `aisquare-pipe-googlecalendar` |   | ✓ |
+| AWS: Bedrock AgentCore policies, S3 (cross-account role) | `aisquare-pipe-aws` |   | ✓ |
 
 Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
