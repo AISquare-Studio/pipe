@@ -1,28 +1,7 @@
-[build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "aisquare-pipe-n8n"
-version = "0.2.1"
-description = "n8n source connector for aisquare.pipe"
-readme = "README.md"
-requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
-authors = [{name = "AISquare Studio"}]
-dependencies = [
-    "aisquare-pipe>=0.1.0",
-    "requests>=2.31",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
-
-[project.entry-points."aisquare_pipe.connectors"]
-n8n-source = "aisquare_pipe_n8n.connector:N8nSource"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# Tool settings only (pytest, ruff) for running this connector's suite from
+# its own directory. This connector isn't a separate package: it ships inside
+# the `aisquare-pipe` distribution, packaged by the root pyproject.toml (its
+# entry points, and its third-party deps as the `[n8n]` extra).
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

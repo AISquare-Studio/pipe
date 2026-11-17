@@ -1,29 +1,7 @@
-[build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "aisquare-pipe-dropbox"
-version = "0.1.0"
-description = "Dropbox connector for aisquare.pipe"
-readme = "README.md"
-requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
-authors = [{name = "AISquare Studio"}]
-dependencies = [
-    "aisquare-pipe>=0.1.0",
-    "dropbox>=12.0",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
-
-[project.entry-points."aisquare_pipe.connectors"]
-dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
-dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# Tool settings only (pytest, ruff) for running this connector's suite from
+# its own directory. This connector isn't a separate package: it ships inside
+# the `aisquare-pipe` distribution, packaged by the root pyproject.toml (its
+# entry points, and its third-party deps as the `[dropbox]` extra).
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
