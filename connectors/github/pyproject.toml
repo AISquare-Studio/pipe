@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "aisquare-pipe-github"
 version = "0.2.0"
 description = "GitHub toolkit (repos, code, issues, pull requests) and single-repo checkout source for aisquare.pipe"
+readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "A-Square"}]

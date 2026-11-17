@@ -62,6 +62,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Packaging.** It requires `aisquare-pipe>=0.3.0`, `requests` and
     `urllib3`. It ships an app manifest template and joins `[full]`.
 
+### Fixed
+
+- **Publishing** (`publish.yml`, new `scripts/release_packages.py`). A
+  publish run can no longer pass without uploading. Before this, a version
+  already on PyPI was skipped silently (`skip-existing`), and a new PyPI
+  project failed until its pending publisher was registered.
+  - The matrix is every `pyproject.toml` at the root and under
+    `connectors/*/`. A new connector can't be left out.
+  - A version already on PyPI is skipped by an explicit lookup and listed in
+    the run summary. The upload runs without `skip-existing`, and a `verify`
+    job checks each uploaded file's sha256 on PyPI.
+  - A release tag must be `v<aisquare-pipe version>`.
+  - Connectors upload before `aisquare-pipe`, and only if every one of them
+    succeeded.
+  - Every PR (and Run workflow, which defaults to dry run) builds each
+    package and runs `twine check --strict`, uploading nothing.
+- `aisquare-pipe-gateway`, `-github`, `-graphify` and `-n8n` declare their
+  README as `readme`, so their PyPI pages have a description.
+  `twine check --strict` failed on all four.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added
