@@ -64,6 +64,72 @@ You can also run it manually: **Actions → publish → Run workflow**
 (`workflow_dispatch`). Either way, every package whose project is new on PyPI
 needs its pending trusted publisher registered first ("One-time setup").
 
+## Toolkits before the `[toolkits]` extra
+
+`aisquare-pipe[toolkits]` names every toolkit package with a floor
+(`aisquare-pipe-github>=0.3.0`, …), and pipe-as-service installs it to get
+every toolkit. `scripts/check_toolkits_extra.py` keeps the list complete in CI,
+so a PR that adds a toolkit package also adds it there.
+
+**Publish order: the toolkit packages first, then the `aisquare-pipe` release
+whose `[toolkits]` names them.** An `aisquare-pipe` on PyPI whose `[toolkits]`
+names a package (or a floor) that isn't there cannot be installed with that
+extra, and every host that relocks against it fails. The publish workflow
+uploads every package in one parallel run, so the order comes from versions:
+
+1. Bump and publish the new or changed toolkit packages. Leave the
+   `aisquare-pipe` version alone: `skip-existing` skips the framework, so the
+   extra change rides along unpublished.
+2. Confirm each one on the simple index (`pip index versions <project>`).
+3. Then bump `aisquare-pipe` and publish it: its `[toolkits]` now resolves.
+
+When one run must carry both (as 0.5.0 does, the first release with the
+extra), check every toolkit package is on the index (step 3 of the 0.5.0 list
+below) before anyone relocks against the new `aisquare-pipe`; until then its
+`[toolkits]` cannot resolve.
+
+## The 0.5.0 release (tool router)
+
+`aisquare-pipe` 0.5.0 is the first release with `aisquare.pipe.core.search`
+(the BM25F tool index) and the `[toolkits]` extra. pipe-as-service's tool
+router (`/v1/pipe/*`, tool retrieval) requires `aisquare-pipe>=0.5.0`: on 0.4.0
+it would install and serve search with no lexical layer. 0.4.0 publishes
+first, from `release/native-connectors` (pipe#50), and has neither.
+
+Five toolkit packages change with it. Their main tools carry the
+`pipe:primary` marker, which only 0.5.0 reads as a ranking marker (0.4.0's
+ranker would match it as text), so each now requires `aisquare-pipe>=0.5.0`,
+and `[toolkits]` floors each at its new version:
+
+| Project | 0.4.0 run | 0.5.0 run |
+|---|---|---|
+| `aisquare-pipe` | 0.4.0 | **0.5.0** |
+| `aisquare-pipe-gmail` | 0.1.0 | **0.2.0** |
+| `aisquare-pipe-googlecalendar` | 0.1.0 | **0.2.0** |
+| `aisquare-pipe-googledrive` | 0.3.0 | **0.4.0** |
+| `aisquare-pipe-onedrive` | 0.3.0 | **0.4.0** |
+| `aisquare-pipe-slack` | 0.1.0 | **0.2.0** |
+| `aisquare-pipe-github` | 0.3.0 | 0.3.0 (unchanged, skipped) |
+
+1. **0.4.0 first**: "The 0.4.0 release" below, through its step 3. This
+   run then creates no new PyPI project, so it needs no new publisher.
+   If 0.4.0 was never run, do its step 1 (the four pending publishers)
+   before this one; this run then also uploads `aisquare-pipe-github`
+   0.3.0 and `aisquare-pipe-graphify` 0.2.1.
+2. Publish once the router branch has merged to `main` (a GitHub Release
+   `v0.5.0`, or Run workflow on `main`). One run carries the framework and
+   the five toolkits.
+3. **After the run, before relocking pipe-as-service**, confirm the six
+   bold uploads above on the simple index (`pip index versions <project>`),
+   seven if 0.4.0 never ran: then `aisquare-pipe-github` 0.3.0 is new on
+   PyPI too, and `[toolkits]` floors it.
+   Until all of them are there, `aisquare-pipe[toolkits]` 0.5.0 cannot resolve,
+   and a toolkit at its new version cannot install without
+   `aisquare-pipe` 0.5.0. A missing one: fix its publisher and rerun
+   (`skip-existing` uploads only what is missing).
+4. Then relock pipe-as-service (its DEPLOYMENT.md, "Release order"). Its
+   image is built from that lock, so it is never built before step 3.
+
 ## The 0.4.0 release (native connectors)
 
 PyPI has `aisquare-pipe` 0.1.0 and 0.1.1 only (checked 2026-10-31): the

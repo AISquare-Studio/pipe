@@ -166,7 +166,7 @@ class GoogleDriveToolkit(Toolkit):
     """
 
     name = "googledrive"
-    version = "0.3.0"
+    version = "0.4.0"
     display_name = "Google Drive"
     description = (
         "Google Drive: search, read and download files (Google Docs, Sheets and Slides "

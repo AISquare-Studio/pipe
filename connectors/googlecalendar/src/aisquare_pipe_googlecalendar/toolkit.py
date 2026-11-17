@@ -88,7 +88,7 @@ class GoogleCalendarToolkit(Toolkit):
     """
 
     name = "googlecalendar"
-    version = "0.1.0"
+    version = "0.2.0"
     display_name = "Google Calendar"
     description = (
         "Google Calendar: list calendars and events (recurring ones expanded), find events, "

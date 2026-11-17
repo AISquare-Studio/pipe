@@ -1,0 +1,826 @@
+# Labelled tool-search cases over the six native toolkits, for
+# tests/evals/test_tool_search_eval.py.
+#
+# Each case: the query a user (or an agent on their behalf) would type, the
+# connector whose tools answer it, and every slug that is an acceptable
+# answer. `across: all` searches the six toolkits together (multi-connector);
+# otherwise only `connector` is searched. `kinds` tags the case:
+#   paraphrase   no query word shares a stem with any acceptable slug
+#                (checked by the test)
+#   first_person "my ...", "... me", "I ..."
+#   write        the user wants to change something
+#   multi        searched across all six toolkits
+#   named        multi, and the query names the connector that answers it
+#                (name, display name, slug-prefix spelling or a card keyword)
+#                next to a word another connector's tools match
+#   incidental   multi, and the query mentions another connector only as a
+#                topic (`mentions`): that connector must not be pushed to
+#                rank 1, and the answer must rank no worse than with no
+#                named-connector boost at all
+#
+# Cases are phrased the way people ask, not the way slugs read. Don't tune a
+# case to the ranker; add a synonym or a tag instead, and keep the case.
+
+# --------------------------------------------------------------------- github
+- query: list my repositories
+  connector: github
+  acceptable: [GITHUB_LIST_REPOSITORIES_FOR_THE_AUTHENTICATED_USER]
+  kinds: [first_person]
+- query: which organizations do I belong to
+  connector: github
+  acceptable: [GITHUB_LIST_ORGANIZATIONS_FOR_THE_AUTHENTICATED_USER]
+  kinds: [first_person]
+- query: who am I logged in as
+  connector: github
+  acceptable: [GITHUB_GET_THE_AUTHENTICATED_USER]
+  kinds: [first_person, paraphrase]
+- query: find repositories about vector databases written in rust
+  connector: github
+  acceptable: [GITHUB_SEARCH_REPOSITORIES]
+- query: what branches does the api repo have
+  connector: github
+  acceptable: [GITHUB_LIST_BRANCHES]
+- query: show recent commit history on main
+  connector: github
+  acceptable: [GITHUB_LIST_COMMITS]
+- query: what changed in the last commit
+  connector: github
+  acceptable: [GITHUB_GET_A_COMMIT, GITHUB_LIST_COMMITS]
+- query: read the README of the repo
+  connector: github
+  acceptable: [GITHUB_GET_REPOSITORY_CONTENT, GITHUB_GET_RAW_REPOSITORY_CONTENT]
+  kinds: [paraphrase]
+- query: grep the codebase for TODO comments
+  connector: github
+  acceptable: [GITHUB_SEARCH_CODE]
+  kinds: [paraphrase]
+- query: open bugs in the payments repo
+  connector: github
+  acceptable: [GITHUB_LIST_REPOSITORY_ISSUES, GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS]
+  kinds: [paraphrase]
+- query: tickets assigned to me
+  connector: github
+  acceptable: [GITHUB_LIST_ISSUES_ASSIGNED_TO_THE_AUTHENTICATED_USER]
+  kinds: [first_person]
+- query: show the discussion on issue 42
+  connector: github
+  acceptable: [GITHUB_LIST_ISSUE_COMMENTS]
+- query: details of issue 1234 in acme/api
+  connector: github
+  acceptable: [GITHUB_GET_AN_ISSUE]
+- query: PRs waiting for my review
+  connector: github
+  acceptable: [GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS, GITHUB_LIST_PULL_REQUESTS]
+  kinds: [first_person, paraphrase]
+- query: which files does PR 17 touch
+  connector: github
+  acceptable: [GITHUB_LIST_PULL_REQUESTS_FILES]
+- query: latest release notes
+  connector: github
+  acceptable: [GITHUB_LIST_RELEASES]
+- query: did the CI build pass on main
+  connector: github
+  acceptable: [GITHUB_LIST_WORKFLOW_RUNS_FOR_A_REPOSITORY]
+  kinds: [paraphrase]
+- query: top contributors to the repo
+  connector: github
+  acceptable: [GITHUB_LIST_REPOSITORY_CONTRIBUTORS]
+- query: catch me up on mentions and review requests
+  connector: github
+  acceptable: [GITHUB_LIST_NOTIFICATIONS_FOR_THE_AUTHENTICATED_USER]
+  kinds: [first_person, paraphrase]
+- query: file a bug about the login page
+  connector: github
+  acceptable: [GITHUB_CREATE_AN_ISSUE]
+  kinds: [write, paraphrase]
+- query: close issue 12 as completed
+  connector: github
+  acceptable: [GITHUB_UPDATE_AN_ISSUE]
+  kinds: [write]
+- query: leave a comment on issue 7 saying it's fixed
+  connector: github
+  acceptable: [GITHUB_CREATE_AN_ISSUE_COMMENT]
+  kinds: [write]
+- query: approve pull request 99
+  connector: github
+  acceptable: [GITHUB_CREATE_A_REVIEW_FOR_A_PULL_REQUEST]
+  kinds: [write]
+- query: open a PR from feature-x into main
+  connector: github
+  acceptable: [GITHUB_CREATE_A_PULL_REQUEST]
+  kinds: [write, paraphrase]
+- query: cut a new branch off main called hotfix
+  connector: github
+  acceptable: [GITHUB_CREATE_A_REFERENCE]
+  kinds: [write, paraphrase]
+- query: commit an updated config.yaml to the repo
+  connector: github
+  acceptable: [GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS]
+  kinds: [write]
+- query: favorite the octocat/hello-world project
+  connector: github
+  acceptable: [GITHUB_STAR_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER]
+  kinds: [write, paraphrase]
+
+# ---------------------------------------------------------------------- gmail
+- query: my unread emails from today
+  connector: gmail
+  acceptable: [GMAIL_FETCH_EMAILS]
+  kinds: [first_person]
+- query: check my inbox
+  connector: gmail
+  acceptable: [GMAIL_FETCH_EMAILS, GMAIL_LIST_THREADS]
+  kinds: [first_person, paraphrase]
+- query: open the email with id 18c9f
+  connector: gmail
+  acceptable: [GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID]
+- query: show the whole conversation with Ann
+  connector: gmail
+  acceptable: [GMAIL_FETCH_MESSAGE_BY_THREAD_ID]
+  kinds: [paraphrase]
+- query: get the PDF attached to the invoice email
+  connector: gmail
+  acceptable: [GMAIL_GET_ATTACHMENT]
+- query: what labels do I have
+  connector: gmail
+  acceptable: [GMAIL_LIST_LABELS]
+  kinds: [first_person]
+- query: which address is this mailbox
+  connector: gmail
+  acceptable: [GMAIL_GET_PROFILE]
+  kinds: [paraphrase]
+- query: write a draft reply to the vendor
+  connector: gmail
+  acceptable: [GMAIL_CREATE_EMAIL_DRAFT]
+  kinds: [write]
+- query: email Bob the quarterly numbers
+  connector: gmail
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [write]
+- query: shoot a note to finance about the late invoice
+  connector: gmail
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [write, paraphrase]
+- query: respond to the last message in that thread
+  connector: gmail
+  acceptable: [GMAIL_REPLY_TO_THREAD]
+  kinds: [write]
+- query: mark the newsletter as read
+  connector: gmail
+  acceptable: [GMAIL_ADD_LABEL_TO_EMAIL, GMAIL_MODIFY_THREAD_LABELS]
+  kinds: [write, paraphrase]
+- query: archive the whole conversation
+  connector: gmail
+  acceptable: [GMAIL_MODIFY_THREAD_LABELS, GMAIL_ADD_LABEL_TO_EMAIL]
+  kinds: [write, paraphrase]
+- query: bin that spam message
+  connector: gmail
+  acceptable: [GMAIL_MOVE_TO_TRASH]
+  kinds: [write, paraphrase]
+- query: delete the email from the recruiter
+  connector: gmail
+  acceptable: [GMAIL_MOVE_TO_TRASH]
+  kinds: [write, paraphrase]
+- query: list my conversations
+  connector: gmail
+  acceptable: [GMAIL_LIST_THREADS]
+  kinds: [first_person]
+
+# ------------------------------------------------------------- googlecalendar
+- query: what's on my calendar Friday
+  connector: googlecalendar
+  acceptable:
+    [GOOGLECALENDAR_EVENTS_LIST, GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS, GOOGLECALENDAR_FIND_EVENT]
+  kinds: [first_person]
+- query: when am I free tomorrow afternoon
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_FIND_FREE_SLOTS, GOOGLECALENDAR_FREE_BUSY_QUERY]
+  kinds: [first_person]
+- query: is Ann available Tuesday at 3
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_FREE_BUSY_QUERY, GOOGLECALENDAR_FIND_FREE_SLOTS]
+  kinds: [paraphrase]
+- query: schedule a 30 minute call with Ann on Tuesday
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [write, paraphrase]
+- query: move my 3pm meeting to 4
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_UPDATE_EVENT]
+  kinds: [write, first_person, paraphrase]
+- query: cancel the standup tomorrow
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_DELETE_EVENT]
+  kinds: [write, paraphrase]
+- query: what time is it in Tokyo
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_GET_CURRENT_DATE_TIME]
+- query: which calendars do I have
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_LIST_CALENDARS]
+  kinds: [first_person]
+- query: what timezone is my primary calendar in
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_GET_CALENDAR]
+  kinds: [first_person]
+- query: details of the board meeting event
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_EVENTS_GET, GOOGLECALENDAR_FIND_EVENT]
+- query: all occurrences of the weekly sync
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_EVENTS_INSTANCES]
+  kinds: [paraphrase]
+- query: add lunch with Sam tomorrow at noon
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_QUICK_ADD, GOOGLECALENDAR_CREATE_EVENT]
+  kinds: [write]
+- query: find the dentist appointment
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_FIND_EVENT]
+- query: everything on all my calendars next week
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS]
+  kinds: [first_person]
+- query: book a room for the offsite on Monday
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT]
+  kinds: [write, paraphrase]
+
+# ---------------------------------------------------------------- googledrive
+- query: find the Q3 budget spreadsheet
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_FIND_FILE]
+- query: what's inside the Marketing folder
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_FILES, GOOGLEDRIVE_FIND_FOLDER]
+- query: download the contract pdf
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_DOWNLOAD_FILE, GOOGLEDRIVE_EXPORT_GOOGLE_WORKSPACE_FILE]
+- query: export the roadmap doc as markdown
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_EXPORT_GOOGLE_WORKSPACE_FILE]
+- query: how much storage space am I using
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_GET_ABOUT]
+  kinds: [first_person, paraphrase]
+- query: who has access to the roadmap doc
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_PERMISSIONS]
+  kinds: [paraphrase]
+- query: feedback left on the proposal
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_COMMENTS]
+  kinds: [paraphrase]
+- query: make a new folder called Invoices 2026
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_CREATE_FOLDER]
+  kinds: [write]
+- query: put this report into drive
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_UPLOAD_FILE]
+  kinds: [write, paraphrase]
+- query: write meeting notes into a new google doc
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_CREATE_FILE_FROM_TEXT]
+  kinds: [write, paraphrase]
+- query: overwrite notes.txt with this content
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_EDIT_FILE]
+  kinds: [write, paraphrase]
+- query: duplicate the template deck
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_COPY_FILE]
+  kinds: [write, paraphrase]
+- query: relocate the report to the Archive folder
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_MOVE_FILE]
+  kinds: [write, paraphrase]
+- query: rename the budget sheet to FY26 budget
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_UPDATE_FILE_PUT]
+  kinds: [write, paraphrase]
+- query: trash the old draft
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_TRASH_FILE, GOOGLEDRIVE_DELETE_FILE]
+  kinds: [write]
+- query: recover the file I deleted yesterday
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_UNTRASH_FILE]
+  kinds: [write, first_person]
+- query: give Priya edit access to the plan
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_ADD_FILE_SHARING_PREFERENCE, GOOGLEDRIVE_CREATE_PERMISSION]
+  kinds: [write, paraphrase]
+- query: list our shared drives
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_SHARED_DRIVES]
+  kinds: [first_person]
+- query: when was the roadmap last modified and who owns it
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_GET_FILE_METADATA]
+  kinds: [paraphrase]
+
+# ------------------------------------------------------------------- onedrive
+- query: my recent Excel files
+  connector: onedrive
+  acceptable: [ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [first_person]
+- query: find the signed contract PDF in OneDrive
+  connector: onedrive
+  acceptable: [ONE_DRIVE_SEARCH_ITEMS]
+  kinds: [paraphrase]
+- query: files people shared with me
+  connector: onedrive
+  acceptable: [ONE_DRIVE_GET_SHARED_ITEMS]
+  kinds: [first_person]
+- query: what's in the Documents/Plans folder
+  connector: onedrive
+  acceptable: [ONE_DRIVE_LIST_FOLDER_CHILDREN, ONE_DRIVE_GET_ITEM_BY_PATH]
+- query: how much OneDrive space is left
+  connector: onedrive
+  acceptable: [ONE_DRIVE_GET_DRIVE]
+  kinds: [paraphrase]
+- query: download q3.pdf
+  connector: onedrive
+  acceptable: [ONE_DRIVE_DOWNLOAD_FILE]
+- query: save these notes as notes.txt
+  connector: onedrive
+  acceptable: [ONE_DRIVE_ONEDRIVE_UPLOAD_FILE]
+  kinds: [write, paraphrase]
+- query: make a Projects folder
+  connector: onedrive
+  acceptable: [ONE_DRIVE_ONEDRIVE_CREATE_FOLDER]
+  kinds: [write]
+- query: share the budget workbook with a view-only link
+  connector: onedrive
+  acceptable: [ONE_DRIVE_CREATE_LINK]
+  kinds: [write]
+- query: who can open the board deck
+  connector: onedrive
+  acceptable: [ONE_DRIVE_GET_ITEM_PERMISSIONS]
+  kinds: [paraphrase]
+- query: remove the old backup folder
+  connector: onedrive
+  acceptable: [ONE_DRIVE_DELETE_ITEM]
+  kinds: [write, paraphrase]
+- query: rename report.docx to final.docx
+  connector: onedrive
+  acceptable: [ONE_DRIVE_UPDATE_DRIVE_ITEM_METADATA, ONE_DRIVE_MOVE_ITEM]
+  kinds: [write, paraphrase]
+- query: make a copy of the template
+  connector: onedrive
+  acceptable: [ONE_DRIVE_COPY_ITEM]
+  kinds: [write]
+- query: size and modified date of the item with id 01ABC
+  connector: onedrive
+  acceptable: [ONE_DRIVE_GET_ITEM]
+
+# ---------------------------------------------------------------------- slack
+- query: ping the team that the build is green
+  connector: slack
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [write, paraphrase]
+- query: DM Priya that the deploy is done
+  connector: slack
+  acceptable: [SLACK_SEND_MESSAGE, SLACK_OPEN_DM]
+  kinds: [write]
+- query: "what did the team say in #launch today"
+  connector: slack
+  acceptable: [SLACK_FETCH_CONVERSATION_HISTORY]
+  kinds: [paraphrase]
+- query: search Slack for the outage postmortem
+  connector: slack
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+- query: summarize the thread I was mentioned in
+  connector: slack
+  acceptable: [SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION]
+  kinds: [first_person]
+- query: react with a thumbs up to that message
+  connector: slack
+  acceptable: [SLACK_ADD_REACTION_TO_AN_ITEM]
+  kinds: [write]
+- query: pin the announcement
+  connector: slack
+  acceptable: [SLACK_PIN_ITEM]
+  kinds: [write]
+- query: "who is in the #design channel"
+  connector: slack
+  acceptable: [SLACK_RETRIEVE_CONVERSATION_MEMBERS_LIST]
+  kinds: [paraphrase]
+- query: find the channel about the mobile app
+  connector: slack
+  acceptable: [SLACK_FIND_CHANNELS]
+- query: look up Ann's email address
+  connector: slack
+  acceptable: [SLACK_FIND_USER_BY_EMAIL_ADDRESS, SLACK_FIND_USERS]
+- query: is Raj online right now
+  connector: slack
+  acceptable: [SLACK_GET_USER_PRESENCE]
+  kinds: [paraphrase]
+- query: remind me to review the deck at 4pm
+  connector: slack
+  acceptable: [SLACK_CREATE_A_REMINDER]
+  kinds: [write, first_person]
+- query: turn on do not disturb for an hour
+  connector: slack
+  acceptable: [SLACK_SET_DND_DURATION]
+  kinds: [write, paraphrase]
+- query: set my status to in a meeting
+  connector: slack
+  acceptable: [SLACK_SET_USER_PROFILE]
+  kinds: [write, first_person]
+- query: post a message at 9am tomorrow instead of now
+  connector: slack
+  acceptable: [SLACK_SCHEDULE_MESSAGE]
+  kinds: [write]
+- query: "send this text as a snippet file to #eng"
+  connector: slack
+  acceptable: [SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK]
+  kinds: [write]
+- query: messages I missed in my DMs
+  connector: slack
+  acceptable: [SLACK_LIST_UNREAD_CHANNEL_MESSAGES, SLACK_GET_UNREAD_MESSAGES_FROM_USER]
+  kinds: [first_person]
+- query: create a private channel for the incident
+  connector: slack
+  acceptable: [SLACK_CREATE_CHANNEL]
+  kinds: [write]
+- query: "add Maya and Leo to #project-x"
+  connector: slack
+  acceptable: [SLACK_INVITE_USERS_TO_A_SLACK_CHANNEL]
+  kinds: [write, paraphrase]
+- query: "change the topic of #general to the launch date"
+  connector: slack
+  acceptable: [SLACK_SET_THE_TOPIC_OF_A_CONVERSATION]
+  kinds: [write]
+- query: get a link to that message so I can cite it
+  connector: slack
+  acceptable: [SLACK_RETRIEVE_MESSAGE_PERMALINK_URL]
+- query: who reacted to my announcement
+  connector: slack
+  acceptable: [SLACK_FETCH_ITEM_REACTIONS]
+  kinds: [first_person]
+- query: read the release plan canvas
+  connector: slack
+  acceptable: [SLACK_GET_CANVAS_CONTENT]
+- query: what user groups exist in the workspace
+  connector: slack
+  acceptable: [SLACK_LIST_USER_GROUPS]
+- query: edit the message I just posted
+  connector: slack
+  acceptable: [SLACK_UPDATES_A_SLACK_MESSAGE]
+  kinds: [write, first_person]
+- query: delete my last message
+  connector: slack
+  acceptable: [SLACK_DELETES_A_MESSAGE_FROM_A_CHAT]
+  kinds: [write, first_person]
+- query: archive the old q1-campaign channel
+  connector: slack
+  acceptable: [SLACK_ARCHIVE_CONVERSATION]
+  kinds: [write]
+- query: everyone in the workspace
+  connector: slack
+  acceptable: [SLACK_LIST_ALL_USERS]
+  kinds: [paraphrase]
+
+# ------------------------------------------- across all six (multi-connector)
+- query: send an email to the vendor
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write]
+- query: "post in the #launch channel"
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write]
+- query: schedule a meeting with Ann next Tuesday
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT]
+  kinds: [multi, write, paraphrase]
+- query: find the Q3 budget spreadsheet in Google Drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_FIND_FILE]
+  kinds: [multi]
+- query: my open pull requests
+  connector: github
+  across: all
+  acceptable: [GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS, GITHUB_LIST_PULL_REQUESTS]
+  kinds: [multi, first_person]
+- query: unread emails from Acme
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_FETCH_EMAILS]
+  kinds: [multi]
+- query: upload the report to OneDrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_ONEDRIVE_UPLOAD_FILE]
+  kinds: [multi, write]
+- query: when am I free on Thursday
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_FIND_FREE_SLOTS, GOOGLECALENDAR_FREE_BUSY_QUERY]
+  kinds: [multi, first_person]
+- query: open an issue about the login bug
+  connector: github
+  across: all
+  acceptable: [GITHUB_CREATE_AN_ISSUE]
+  kinds: [multi, write]
+- query: DM Priya the build is green
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE, SLACK_OPEN_DM]
+  kinds: [multi, write, named]
+- query: who has access to the roadmap doc in google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_LIST_PERMISSIONS]
+  kinds: [multi]
+- query: my recent Excel files
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [multi, first_person]
+- query: reply to Ann's last email
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_REPLY_TO_THREAD]
+  kinds: [multi, write]
+- query: cancel tomorrow's standup meeting
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_DELETE_EVENT]
+  kinds: [multi, write, paraphrase]
+- query: search slack messages for the outage postmortem
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+  kinds: [multi]
+- query: did CI pass on the main branch
+  connector: github
+  across: all
+  acceptable: [GITHUB_LIST_WORKFLOW_RUNS_FOR_A_REPOSITORY]
+  kinds: [multi, paraphrase]
+- query: download the attachment from the invoice email
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_GET_ATTACHMENT]
+  kinds: [multi]
+- query: share the budget workbook with a view-only link
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_CREATE_LINK]
+  kinds: [multi, write]
+- query: ping the team on slack that the release is out
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, named]
+- query: add the offsite to my calendar
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, first_person]
+
+# ----------------------- across all six, the query names the connector
+- query: post the build status in slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, named]
+- query: find the calendar invite in gmail
+  connector: gmail
+  across: all
+  acceptable: [GMAIL_FETCH_EMAILS, GMAIL_LIST_THREADS]
+  kinds: [multi, named]
+- query: search slack for the issue about the login page
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+  kinds: [multi, named]
+- query: upload the release notes to google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_UPLOAD_FILE]
+  kinds: [multi, write, named]
+- query: share the design file on one drive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_CREATE_LINK]
+  kinds: [multi, write, named]
+- query: find the meeting notes doc in OneDrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_SEARCH_ITEMS]
+  kinds: [multi, named]
+- query: create an event in gcal for the sprint review
+  connector: googlecalendar
+  across: all
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, named]
+- query: who commented on the file in google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_LIST_COMMENTS]
+  kinds: [multi, named]
+- query: reply to the thread in slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, named]
+- query: upload the build log to slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_UPLOAD_OR_CREATE_A_FILE_IN_SLACK]
+  kinds: [multi, write, named]
+- query: list the open issues on github about the calendar sync
+  connector: github
+  across: all
+  acceptable: [GITHUB_LIST_REPOSITORY_ISSUES, GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS]
+  kinds: [multi, named]
+
+# ------------- across all six, another connector is only the topic (negative)
+# The first six are the tester's repros (seq 10560); the rest are new.
+- query: create a calendar event for the github workshop
+  connector: googlecalendar
+  across: all
+  mentions: github
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, incidental]
+- query: schedule a meeting to discuss the onedrive migration
+  connector: googlecalendar
+  across: all
+  mentions: onedrive
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, incidental]
+- query: "file a bug: slack notifications are delayed"
+  connector: github
+  across: all
+  mentions: slack
+  acceptable: [GITHUB_CREATE_AN_ISSUE]
+  kinds: [multi, write, incidental]
+- query: send github-style markdown in my email
+  connector: gmail
+  across: all
+  mentions: github
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: add slack time in the schedule
+  connector: googlecalendar
+  across: all
+  mentions: slack
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, incidental]
+- query: reply to the email about the slack migration
+  connector: gmail
+  across: all
+  mentions: slack
+  acceptable: [GMAIL_REPLY_TO_THREAD]
+  kinds: [multi, write, incidental]
+- query: email the team about the github outage
+  connector: gmail
+  across: all
+  mentions: github
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: put the slack rollout kickoff on my calendar
+  connector: googlecalendar
+  across: all
+  mentions: slack
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, first_person, incidental]
+- query: find the email with the google drive link
+  connector: gmail
+  across: all
+  mentions: googledrive
+  acceptable: [GMAIL_FETCH_EMAILS, GMAIL_LIST_THREADS]
+  kinds: [multi, incidental]
+- query: search my inbox for the onedrive invite
+  connector: gmail
+  across: all
+  mentions: onedrive
+  acceptable: [GMAIL_FETCH_EMAILS, GMAIL_LIST_THREADS]
+  kinds: [multi, first_person, incidental]
+- query: schedule a call about the gmail filters
+  connector: googlecalendar
+  across: all
+  mentions: gmail
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, incidental]
+- query: draft an email summarizing the onedrive cleanup
+  connector: gmail
+  across: all
+  mentions: onedrive
+  acceptable: [GMAIL_CREATE_EMAIL_DRAFT]
+  kinds: [multi, write, incidental]
+- query: list the issues labeled slack-integration
+  connector: github
+  across: all
+  mentions: slack
+  acceptable: [GITHUB_LIST_REPOSITORY_ISSUES, GITHUB_SEARCH_ISSUES_AND_PULL_REQUESTS]
+  kinds: [multi, incidental]
+- query: "post in #eng that the github migration is done"
+  connector: slack
+  across: all
+  mentions: github
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, incidental]
+- query: create a calendar event for the gmail cleanup review
+  connector: googlecalendar
+  across: all
+  mentions: gmail
+  acceptable: [GOOGLECALENDAR_CREATE_EVENT, GOOGLECALENDAR_QUICK_ADD]
+  kinds: [multi, write, incidental]
+
+# ---------- a connector's own name says nothing about which of its tools (positive)
+- query: what channels are on slack
+  connector: slack
+  across: all
+  acceptable: [SLACK_LIST_ALL_CHANNELS, SLACK_LIST_CONVERSATIONS, SLACK_FIND_CHANNELS]
+  kinds: [multi, named]
+- query: what files are in my onedrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_LIST_FOLDER_CHILDREN, ONE_DRIVE_SEARCH_ITEMS, ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [multi, named, first_person]
+- query: upload a file to onedrive
+  connector: onedrive
+  across: all
+  acceptable: [ONE_DRIVE_ONEDRIVE_UPLOAD_FILE]
+  kinds: [multi, named, write]
+- query: find my files in google drive
+  connector: googledrive
+  across: all
+  acceptable: [GOOGLEDRIVE_FIND_FILE, GOOGLEDRIVE_LIST_FILES]
+  kinds: [multi, named, first_person]
+- query: list my github repositories
+  connector: github
+  across: all
+  acceptable: [GITHUB_LIST_REPOSITORIES_FOR_THE_AUTHENTICATED_USER]
+  kinds: [multi, named, first_person]
+- query: which channels are there in slack
+  connector: slack
+  acceptable: [SLACK_LIST_ALL_CHANNELS, SLACK_LIST_CONVERSATIONS, SLACK_FIND_CHANNELS]
+- query: show the files in my onedrive
+  connector: onedrive
+  acceptable: [ONE_DRIVE_LIST_FOLDER_CHILDREN, ONE_DRIVE_SEARCH_ITEMS, ONE_DRIVE_GET_RECENT_ITEMS]
+  kinds: [first_person]
+- query: search slack for messages about the launch
+  connector: slack
+  acceptable: [SLACK_SEARCH_MESSAGES, SLACK_SEARCH_ALL]
+
+# ------------- a connector's name as a style or format modifier is a topic (negative)
+- query: write the release notes email in github-flavored markdown
+  connector: gmail
+  across: all
+  mentions: github
+  acceptable: [GMAIL_CREATE_EMAIL_DRAFT, GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: send the weekly update by email in slack-style bullet points
+  connector: gmail
+  across: all
+  mentions: slack
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+- query: post a gmail-style summary to the team channel
+  connector: slack
+  across: all
+  mentions: gmail
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [multi, write, incidental]
+- query: create a doc with the notes in github markdown syntax
+  connector: googledrive
+  across: all
+  mentions: github
+  acceptable: [GOOGLEDRIVE_CREATE_FILE_FROM_TEXT]
+  kinds: [multi, write, incidental]
+- query: open an issue with the repro steps in slack format
+  connector: github
+  across: all
+  mentions: slack
+  acceptable: [GITHUB_CREATE_AN_ISSUE]
+  kinds: [multi, write, incidental]
+- query: email the client a recap with slack-esque emoji
+  connector: gmail
+  across: all
+  mentions: slack
+  acceptable: [GMAIL_SEND_EMAIL]
+  kinds: [multi, write, incidental]
+
+# ------------------------------------------------------- more paraphrases
+- query: let the team know the deploy finished
+  connector: slack
+  acceptable: [SLACK_SEND_MESSAGE]
+  kinds: [write, paraphrase]
+- query: what's on the agenda for tomorrow
+  connector: googlecalendar
+  acceptable: [GOOGLECALENDAR_EVENTS_LIST, GOOGLECALENDAR_EVENTS_LIST_ALL_CALENDARS, GOOGLECALENDAR_FIND_EVENT]
+  kinds: [paraphrase]
+- query: who has edit rights on the budget sheet
+  connector: googledrive
+  acceptable: [GOOGLEDRIVE_LIST_PERMISSIONS]
+  kinds: [paraphrase]
+

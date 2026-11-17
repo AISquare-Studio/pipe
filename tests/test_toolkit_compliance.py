@@ -106,6 +106,23 @@ def test_broken_declarations_fail(cls, check_id):
     assert check_id in failed_ids(cls)
 
 
+@pytest.mark.parametrize("name", ["led-ger", "Ledger", "1ledger", "_ledger", "led ger", "l" * 65])
+def test_a_toolkit_name_hosts_cannot_route_fails(name):
+    """Toolkit name = entry-point name = the id a host routes on; a hyphen
+    would install but never be served by pipe-as-service."""
+    cls = type("Broken", (Good,), {"name": name})
+    [check] = [c for c in run_toolkit_contract_checks(cls, name) if c.id == "contract.toolkit.name"]
+    assert not check.passed
+    assert "^[a-z][a-z0-9_]{0,63}$" in check.message
+    assert "hyphenated" in check.message
+
+
+@pytest.mark.parametrize("name", ["ledger", "led_ger", "drive2", "l" * 64])
+def test_underscored_and_plain_toolkit_names_pass(name):
+    cls = type("Fine", (Good,), {"name": name})
+    assert "contract.toolkit.name" not in failed_ids(cls, name)
+
+
 def test_tools_raising_fails():
     def tools(self):
         raise RuntimeError("no catalog")

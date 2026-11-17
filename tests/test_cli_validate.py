@@ -317,6 +317,40 @@ class _OtherKit(Toolkit):
         return ToolResult.ok("pong")
 
 
+class _HyphenKit(_OtherKit):
+    name = "led-ger"
+    slug_prefix = "LEDGER_"
+
+    def tools(self) -> list[ToolSpec]:
+        return [ToolSpec("LEDGER_PING", "Ping.", {"type": "object", "properties": {}}, read_only=True)]
+
+
+class _UnderscoreKit(_HyphenKit):
+    name = "led_ger"
+
+
+class TestToolkitNames:
+    def test_a_hyphenated_toolkit_fails_validate(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod, "discover_toolkit_entry_points", lambda: [_toolkit_ep("led-ger", _HyphenKit)]
+        )
+        result = CliRunner().invoke(cli, ["validate", "--skip-tests"])
+        assert result.exit_code == 1
+        assert "contract.toolkit.name@led-ger" in result.output
+        assert "^[a-z][a-z0-9_]{0,63}$" in result.output
+
+    def test_an_underscored_toolkit_passes_and_connectors_keep_hyphens(self, fake_repo, monkeypatch):
+        monkeypatch.setattr(
+            validate_mod, "discover_toolkit_entry_points", lambda: [_toolkit_ep("led_ger", _UnderscoreKit)]
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json", "--skip-tests"])
+        assert result.exit_code == 0, result.output
+        good = next(c for c in json.loads(result.output)["connectors"] if c["name"] == "good")
+        ids = {c["id"]: c["passed"] for c in good["layers"]["contract"]["checks"]}
+        assert ids["contract.toolkit.name@led_ger"] is True
+        assert ids["contract.name@good-source"] is True  # the connector's hyphen is fine
+
+
 class TestSlugPrefixUniqueness:
     def test_colliding_toolkits_fail_validate(self, fake_repo, monkeypatch):
         monkeypatch.setattr(

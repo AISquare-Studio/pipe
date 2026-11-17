@@ -397,7 +397,7 @@ class SlackToolkit(Toolkit):
     """
 
     name = "slack"
-    version = "0.1.0"
+    version = "0.2.0"
     display_name = "Slack"
     description = (
         "Slack messages, channel history and threads, search, channels and DMs, reactions, "

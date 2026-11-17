@@ -35,7 +35,9 @@ class ToolkitNotFoundError(PipeError):
 
 class ToolkitConflictError(PipeError):
     """Raised when installed toolkits cannot be told apart by slug: two share
-    a ``slug_prefix``, or one's prefix starts another's."""
+    a ``slug_prefix``, or one's prefix starts another's. ``installed_toolkits(
+    strict=True)`` also raises it for a toolkit left out for its name (one
+    hosts can't route, or a class name that differs from its entry point)."""
 
 
 class ToolError(PipeError):
