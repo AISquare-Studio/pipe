@@ -173,7 +173,7 @@ class GoogleDriveSource(_Connector, SourceConnector):
     """
 
     name = "googledrive-source"
-    version = "0.2.0"
+    version = "0.3.0"
     output_types = ["*/*"]  # noqa: RUF012 — framework contract: class-level spec, never mutated
     auth_type = AuthType.OAUTH2
     description = "Pull files from Google Drive (Google Docs, Sheets and Slides exported)"
@@ -385,7 +385,7 @@ class GoogleDriveSink(_Connector, SinkConnector):
     """
 
     name = "googledrive-sink"
-    version = "0.2.0"
+    version = "0.3.0"
     input_types = ["*/*"]  # noqa: RUF012 — framework contract: class-level spec, never mutated
     auth_type = AuthType.OAUTH2
     description = "Push files to Google Drive"

@@ -65,6 +65,41 @@ FAILURES = [
         "forbidden",
         None,
     ),
+    # A missing OAuth scope is insufficient_scope (a reconnect), as in Gmail and
+    # Calendar: by reason, ErrorInfo, WWW-Authenticate challenge or message.
+    (
+        "403 insufficientPermissions",
+        GET,
+        [drive_error(403, "Request had insufficient authentication scopes.", "insufficientPermissions")],
+        "insufficient_scope",
+        None,
+    ),
+    (
+        "403 ACCESS_TOKEN_SCOPE_INSUFFICIENT ErrorInfo",
+        POST,
+        [
+            response(
+                403,
+                {
+                    "error": {
+                        "code": 403,
+                        "message": "Permission denied.",
+                        "status": "PERMISSION_DENIED",
+                        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "ACCESS_TOKEN_SCOPE_INSUFFICIENT"}],
+                    }
+                },
+            )
+        ],
+        "insufficient_scope",
+        None,
+    ),
+    (
+        "403 WWW-Authenticate insufficient_scope",
+        GET,
+        [response(403, content=b"", headers={"WWW-Authenticate": 'Bearer realm="https://accounts.google.com/", error="insufficient_scope"'})],
+        "insufficient_scope",
+        None,
+    ),
     ("403 dailyLimitExceeded", GET, [drive_error(403, "Daily Limit Exceeded", "dailyLimitExceeded")], "forbidden", None),
     (
         "403 storageQuotaExceeded",
@@ -103,6 +138,27 @@ def test_error_code_per_failure_class(call, answers, code, retry_after):
     assert result.retry_after == retry_after
     assert TOKEN not in result.error
     assert result.to_dict()["error_code"] == code
+
+
+def test_a_missing_scope_names_the_tools_scopes_and_says_reconnect():
+    h = harness(drive_error(403, "Request had insufficient authentication scopes.", "insufficientPermissions"))
+    result = h.call(*POST)
+    assert result.error_code == "insufficient_scope"
+    assert result.data == {
+        "status": 403,
+        "reason": "insufficientPermissions",
+        "insufficient_scope": True,
+        "required_scopes": ["https://www.googleapis.com/auth/drive"],
+    }
+    assert "not granted" in result.error and "reconnect Google Drive" in result.error
+    assert len(h.session.calls) == 1  # a scope 403 is final, never retried
+
+
+def test_a_file_permission_403_stays_forbidden_without_scope_data():
+    h = harness(drive_error(403, "The user does not have sufficient permissions for this file.", "insufficientFilePermissions"))
+    result = h.call(*GET)
+    assert result.error_code == "forbidden"
+    assert result.data == {"status": 403, "reason": "insufficientFilePermissions"}
 
 
 ARGUMENT_ERRORS = [
@@ -189,10 +245,10 @@ def test_argument_errors_are_invalid_arguments(slug, args, answers):
     assert len(h.session.calls) == len(answers)
 
 
-def test_missing_credentials_are_unauthorized():
+def test_missing_credentials_are_not_connected():
     h = harness()
     result = h.call("GOOGLEDRIVE_GET_ABOUT", {}, config={})
-    assert result.error_code == "unauthorized"
+    assert result.error_code == "not_connected"
     assert h.session.calls == []
 
 
@@ -205,7 +261,9 @@ def test_unknown_slug():
     [
         (GoogleDriveAPIError(429, "x", retry_after=1), "rate_limited"),
         (GoogleDriveAPIError(403, "x", reason="userRateLimitExceeded", retry_after=1), "rate_limited"),
-        (GoogleDriveAPIError(403, "x", reason="insufficientPermissions"), "forbidden"),
+        (GoogleDriveAPIError(403, "x", reason="insufficientPermissions", insufficient_scope=True), "insufficient_scope"),
+        (GoogleDriveAPIError(403, "x", reason="insufficientFilePermissions"), "forbidden"),
+        (GoogleDriveAPIError(401, "x", insufficient_scope=True), "unauthorized"),
         (GoogleDriveAPIError(0, "x", timed_out=True), "timeout"),
         (GoogleDriveAPIError(0, "x"), "upstream_error"),
         (GoogleDriveAPIError(410, "Gone"), "not_found"),

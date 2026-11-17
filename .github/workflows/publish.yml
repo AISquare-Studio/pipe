@@ -41,6 +41,8 @@ jobs:
           - connectors/github
           - connectors/graphify
           - connectors/slack
+          - connectors/gmail
+          - connectors/googlecalendar
     steps:
       - uses: actions/checkout@v7
 

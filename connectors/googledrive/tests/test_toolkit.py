@@ -66,7 +66,7 @@ class TestCatalog:
 
     def test_identity(self):
         toolkit = GoogleDriveToolkit()
-        assert (toolkit.name, toolkit.slug_prefix, toolkit.version) == ("googledrive", "GOOGLEDRIVE_", "0.2.0")
+        assert (toolkit.name, toolkit.slug_prefix, toolkit.version) == ("googledrive", "GOOGLEDRIVE_", "0.3.0")
         assert toolkit.auth_type is AuthType.OAUTH2
 
     def test_composio_slugs_exactly(self):
@@ -110,7 +110,7 @@ class TestCatalog:
     def test_no_credentials_means_no_request(self):
         h = harness()
         result = h.call("GOOGLEDRIVE_FIND_FILE", {"q": "x"}, config={"access_token": " "})
-        assert result.error_code == "unauthorized"
+        assert result.error_code == "not_connected"
         assert h.session.calls == []
 
 
@@ -350,7 +350,7 @@ class TestWrites:
         assert h.session.last.json["parents"] == ["rep1234567"]
 
     def test_create_folder_parent_lookup_failure_other_than_404_is_reported(self):
-        h = harness(drive_error(403, "Forbidden", "insufficientPermissions"))
+        h = harness(drive_error(403, "Forbidden", "insufficientFilePermissions"))
         result = h.call("GOOGLEDRIVE_CREATE_FOLDER", {"name": "Q3", "parent_id": "par1234567"})
         assert result.error_code == "forbidden"
 

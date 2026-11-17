@@ -17,6 +17,7 @@ from email.message import Message
 import pytest
 
 from aisquare.pipe import (
+    OAuthAccount,
     OAuthError,
     OAuthSpec,
     OAuthToken,
@@ -28,7 +29,7 @@ from aisquare.pipe import (
     refresh_access_token,
     revoke_token,
 )
-from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS
+from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, account_from_id_token
 from aisquare.pipe.testing.mock_connectors import MOCK_OAUTH, MockToolkit
 
 SPEC = OAuthSpec(
@@ -612,3 +613,180 @@ class TestToolkitDelegation:
     def test_revoke_via_toolkit(self, http):
         http(FakeResponse(200, b""))
         assert MockToolkit().revoke_token(client_id="c", client_secret="s", token="t") is True
+
+
+# --------------------------------------------------------------------------
+# Granted scopes and account identity
+# --------------------------------------------------------------------------
+
+
+def _id_token(claims: dict, *, header: dict | None = None) -> str:
+    """An unsigned JWT carrying ``claims`` (the signature is not read)."""
+
+    def part(data: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(data).encode()).rstrip(b"=").decode()
+
+    return f"{part(header or {'alg': 'RS256'})}.{part(claims)}.c2lnbmF0dXJl"
+
+
+GOOGLE_CLAIMS = {
+    "iss": "https://accounts.google.com",
+    "aud": "cid",
+    "sub": "1234567890",
+    "email": "sam@example.com",
+    "name": "Sam Doe",
+    "hd": "example.com",
+}
+MICROSOFT_CLAIMS = {
+    "aud": "cid",
+    "sub": "pairwise-sub",
+    "oid": "00000000-0000-0000-0000-00000000beef",
+    "tid": "11111111-1111-1111-1111-111111111111",
+    "preferred_username": "sam@contoso.example",
+    "name": "Sam",
+}
+
+
+class TestGrantedScopes:
+    @pytest.mark.parametrize(
+        ("scope", "granted"),
+        [
+            ("read write", ("read", "write")),
+            ("repo,read:user", ("repo", "read:user")),  # GitHub and Slack use commas
+            ("  a  b\tc ", ("a", "b", "c")),
+            ("a a b", ("a", "b")),
+            ("https://www.googleapis.com/auth/drive openid", ("https://www.googleapis.com/auth/drive", "openid")),
+        ],
+    )
+    def test_parsed_from_scope(self, scope, granted):
+        assert OAuthToken(access_token="t", scope=scope).granted_scopes == granted
+
+    @pytest.mark.parametrize("scope", ["", "   "])
+    def test_none_when_the_provider_did_not_say(self, scope):
+        assert OAuthToken(access_token="t", scope=scope).granted_scopes is None
+
+    def test_exchange_reports_what_was_granted(self, http):
+        # The user unticked "write" on the consent screen.
+        http(FakeResponse(200, {"access_token": "access-new-456", "scope": "read"}))
+        token = exchange_code(SPEC, client_id="cid", client_secret="s", code="c", redirect_uri="https://app/cb")
+        assert token.granted_scopes == ("read",)
+
+    def test_form_encoded_github_scopes(self, http):
+        http(FakeResponse(200, "access_token=gho_x&scope=repo%2Cread%3Auser&token_type=bearer", "application/x-www-form-urlencoded"))
+        token = exchange_code(GITHUB_LIKE, client_id="cid", client_secret="s", code="c", redirect_uri="https://app/cb")
+        assert token.granted_scopes == ("repo", "read:user")
+
+    def test_refresh_without_scope_keeps_the_previous_grant(self, http):
+        http(FakeResponse(200, {"access_token": "access-new-456"}))
+        token = refresh_access_token(
+            SPEC, client_id="cid", client_secret="s", refresh_token="r", previous_scope="read"
+        )
+        assert token.granted_scopes == ("read",)
+
+
+class TestAccount:
+    def test_google_id_token(self):
+        account = account_from_id_token(_id_token(GOOGLE_CLAIMS), client_id="cid")
+        assert account == OAuthAccount(
+            id="1234567890", email="sam@example.com", name="Sam Doe", tenant="example.com"
+        )
+
+    def test_microsoft_id_token_prefers_oid_and_tid(self):
+        account = account_from_id_token(_id_token(MICROSOFT_CLAIMS), client_id="cid")
+        assert account == OAuthAccount(
+            id="00000000-0000-0000-0000-00000000beef",
+            email="sam@contoso.example",
+            name="Sam",
+            tenant="11111111-1111-1111-1111-111111111111",
+        )
+
+    def test_username_without_at_is_not_an_email(self):
+        claims = {**MICROSOFT_CLAIMS, "preferred_username": "sam"}
+        assert account_from_id_token(_id_token(claims)).email is None  # type: ignore[union-attr]
+
+    @pytest.mark.parametrize("aud", ["other-client", ["other-client"], None])
+    def test_token_for_another_client_is_ignored(self, aud):
+        claims = {**GOOGLE_CLAIMS, "aud": aud}
+        assert account_from_id_token(_id_token(claims), client_id="cid") is None
+
+    def test_audience_list_naming_the_client(self):
+        claims = {**GOOGLE_CLAIMS, "aud": ["other", "cid"]}
+        assert account_from_id_token(_id_token(claims), client_id="cid") is not None
+
+    @pytest.mark.parametrize(
+        "id_token",
+        [
+            None,
+            42,
+            "",
+            "not-a-jwt",
+            "a.b",
+            "a.%%%.c",
+            "a." + base64.urlsafe_b64encode(b"not json").decode() + ".c",
+            "a." + base64.urlsafe_b64encode(b"[1, 2]").decode() + ".c",
+            "a." + base64.urlsafe_b64encode(b"[" * 5000 + b"]" * 5000).decode() + ".c",
+            "a." + base64.urlsafe_b64encode(b"\xff\xfe").decode() + ".c",
+            "x" * (16 * 1024 + 1),
+            _id_token({"email": "no-subject@example.com"}),
+            _id_token({"sub": "   "}),
+        ],
+    )
+    def test_unreadable_id_tokens_give_no_account(self, id_token):
+        assert account_from_id_token(id_token) is None
+
+    def test_long_claims_are_capped(self):
+        account = account_from_id_token(_id_token({"sub": "s", "name": "n" * 5000}))
+        assert account is not None and len(account.name or "") == 320
+
+    def test_exchange_fills_account(self, http):
+        http(
+            FakeResponse(
+                200,
+                {
+                    "access_token": "access-new-456",
+                    "scope": "openid email",
+                    "id_token": _id_token(GOOGLE_CLAIMS),
+                },
+            )
+        )
+        token = exchange_code(SPEC, client_id="cid", client_secret="s", code="c", redirect_uri="https://app/cb")
+        assert token.account is not None and token.account.email == "sam@example.com"
+
+    def test_exchange_drops_an_id_token_for_another_client(self, http):
+        http(FakeResponse(200, {"access_token": "a", "id_token": _id_token(GOOGLE_CLAIMS)}))
+        token = exchange_code(SPEC, client_id="someone-else", client_secret="s", code="c", redirect_uri="https://app/cb")
+        assert token.account is None
+
+    def test_no_id_token_means_no_account_and_the_old_storage_shape(self, http):
+        http(FakeResponse(200, {"access_token": "a", "scope": "read"}))
+        token = exchange_code(SPEC, client_id="cid", client_secret="s", code="c", redirect_uri="https://app/cb")
+        assert token.account is None
+        assert set(token.to_dict()) == {"access_token", "refresh_token", "expires_at", "scope", "token_type"}
+
+    def test_storage_round_trip(self):
+        account = OAuthAccount(id="u1", email="sam@example.com", name=None, tenant="t1")
+        token = OAuthToken(access_token="a", scope="read", account=account)
+        stored = token.to_dict()
+        assert stored["account"] == {"id": "u1", "email": "sam@example.com", "name": None, "tenant": "t1"}
+        assert OAuthToken.from_dict(json.loads(json.dumps(stored))) == token
+
+    @pytest.mark.parametrize("account", [None, {}, {"id": ""}, "u1", []])
+    def test_from_dict_ignores_an_unusable_account(self, account):
+        assert OAuthToken.from_dict({"access_token": "a", "account": account}).account is None
+
+    def test_account_stays_out_of_repr(self):
+        token = OAuthToken(access_token="a", account=OAuthAccount(id="u1", email="sam@example.com"))
+        assert "sam@example.com" not in repr(token)
+
+    def test_toolkit_exchange_carries_both(self, http):
+        http(
+            FakeResponse(
+                200,
+                {"access_token": "access-new-456", "scope": "items.read", "id_token": _id_token({**GOOGLE_CLAIMS, "aud": "cid"})},
+            )
+        )
+        token = MockToolkit().exchange_code(
+            client_id="cid", client_secret="s", code="c", redirect_uri="https://app/cb", code_verifier="v"
+        )
+        assert token.granted_scopes == ("items.read",)
+        assert token.account is not None and token.account.id == "1234567890"

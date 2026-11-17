@@ -118,7 +118,7 @@ def tools_cmd(toolkit: str | None, query: str | None, limit: int | None, as_json
         specs = catalog if limit is None else catalog[:limit]
 
     if as_json:
-        click.echo(json.dumps([spec.to_dict() for spec in specs], indent=2))
+        click.echo(json.dumps([spec.to_dict(metadata=True) for spec in specs], indent=2))
         return
     if not specs:
         click.echo("No tools found.")
@@ -144,6 +144,7 @@ def _list_toolkits(as_json: bool) -> None:
                     "tools": len(inst.tools()),
                     "oauth": inst.oauth.provider if inst.oauth else None,
                     "description": inst.description,
+                    **{k: v for k, v in inst.card().items() if k not in ("name", "description")},
                 }
             )
         except Exception as e:  # noqa: BLE001 — one broken toolkit must not hide the rest

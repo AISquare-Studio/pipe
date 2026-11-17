@@ -12,6 +12,7 @@ from aisquare.pipe.testing.validation import (
 )
 
 _DISCOVERED = discover_toolkit_entry_points()
+_INSTALLED = {dc.ep_name: dc.cls for dc in _DISCOVERED if dc.cls is not None}
 
 
 def test_mock_toolkit_is_registered():
@@ -24,7 +25,14 @@ def test_contract(dc):
         pytest.fail(f"entry point {dc.ep_name} failed to load: {dc.load_error}")
     failures = [
         r
-        for r in run_toolkit_contract_checks(dc.cls, dc.ep_name)
+        for r in run_toolkit_contract_checks(dc.cls, dc.ep_name, installed=_INSTALLED)
         if not r.passed and r.severity is Severity.ERROR
     ]
     assert not failures, "; ".join(f"[{r.id}] {r.message}" for r in failures)
+
+
+@pytest.mark.parametrize("dc", _DISCOVERED, ids=lambda dc: dc.ep_name)
+def test_card_and_slug_prefix(dc):
+    ids = {r.id: r for r in run_toolkit_contract_checks(dc.cls, dc.ep_name, installed=_INSTALLED)}
+    assert ids["contract.toolkit.card"].passed, ids["contract.toolkit.card"].message
+    assert ids["contract.toolkit.slug-prefix-unique"].passed, ids["contract.toolkit.slug-prefix-unique"].message

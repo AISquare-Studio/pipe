@@ -37,7 +37,12 @@ from aisquare_pipe_onedrive.rest import (
     OneDriveAPIError,
     OneDriveRestClient,
 )
-from aisquare_pipe_onedrive.tools import HANDLERS, TOOL_SPECS
+from aisquare_pipe_onedrive.tools import (
+    COVERING_SCOPES,
+    HANDLERS,
+    TOOL_SPECS,
+    graph_scope,
+)
 
 #: Placeholder for the Entra ID tenant in :data:`MICROSOFT_OAUTH`'s URLs.
 TENANT_PLACEHOLDER = "{tenant}"
@@ -175,7 +180,7 @@ class OneDriveToolkit(Toolkit):
     """
 
     name = "onedrive"
-    version = "0.2.0"
+    version = "0.3.0"
     display_name = "OneDrive"
     description = (
         "Microsoft OneDrive files and folders: search, browse, download, upload, create "
@@ -186,6 +191,16 @@ class OneDriveToolkit(Toolkit):
     slug_prefix = "ONE_DRIVE_"
     oauth = MICROSOFT_OAUTH
     docs_url = "https://learn.microsoft.com/en-us/graph/api/resources/onedrive"
+    category = "files"
+    keywords = (
+        "onedrive", "microsoft", "office 365", "file", "folder", "word", "excel", "workbook",
+        "powerpoint", "pdf", "upload", "share link", "shared with me", "recent files",
+    )
+    examples = (
+        "my recent Excel files",
+        "find the signed contract PDF in OneDrive",
+        "share the budget workbook with a view-only link",
+    )
 
     def __init__(
         self,
@@ -288,6 +303,16 @@ class OneDriveToolkit(Toolkit):
             scopes=scopes,
             previous_scope=previous_scope,
         )
+
+    def scope_granted(self, scope: str, granted: frozenset[str]) -> bool:
+        """Whether ``granted`` covers ``scope``. Graph permissions compare by
+        short name, case-insensitively (a token response may carry
+        ``https://graph.microsoft.com/files.readwrite.all``), and the broader
+        file permissions cover the narrower ones (``Files.ReadWrite.All``
+        covers ``Files.Read.All``)."""
+        wanted = graph_scope(scope)
+        held = {graph_scope(s) for s in granted}
+        return wanted in held or not COVERING_SCOPES.get(wanted, frozenset()).isdisjoint(held)
 
     def revoke_token(
         self,

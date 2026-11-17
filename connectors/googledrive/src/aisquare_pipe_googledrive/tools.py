@@ -63,6 +63,22 @@ from aisquare_pipe_googledrive.rest import (
 
 Handler = Callable[[GoogleDriveRestClient, dict[str, Any]], ToolResult]
 
+_SCOPE_BASE = "https://www.googleapis.com/auth/"
+#: Full Drive access: every write tool needs it (and it covers every read).
+#: Google classes it as *restricted*: production apps need OAuth
+#: verification plus a security assessment (see the README for the narrower
+#: alternatives).
+DRIVE_SCOPE = _SCOPE_BASE + "drive"
+#: Read every file and its metadata: what the read tools need.
+DRIVE_READONLY_SCOPE = _SCOPE_BASE + "drive.readonly"
+#: Google's Drive scope hierarchy: the broader scopes that cover each one.
+COVERING_SCOPES: dict[str, frozenset[str]] = {
+    DRIVE_READONLY_SCOPE: frozenset({DRIVE_SCOPE}),
+    _SCOPE_BASE + "drive.metadata.readonly": frozenset({DRIVE_SCOPE, DRIVE_READONLY_SCOPE, _SCOPE_BASE + "drive.metadata"}),
+    _SCOPE_BASE + "drive.metadata": frozenset({DRIVE_SCOPE}),
+    _SCOPE_BASE + "drive.file": frozenset({DRIVE_SCOPE}),
+}
+
 #: UTF-8 downloads up to this size also come back as text in ``data["content"]``.
 INLINE_TEXT_MAX = 100_000
 #: Largest file a download tool loads into memory.
@@ -861,7 +877,8 @@ def _read(
     *tags: str,
     aliases: Mapping[str, str] | None = None,
 ) -> GoogleDriveTool:
-    return GoogleDriveTool(ToolSpec(slug, description, schema, read_only=True, tags=tags), handler, aliases or {})
+    spec = ToolSpec(slug, description, schema, read_only=True, tags=tags, required_scopes=(DRIVE_READONLY_SCOPE,))
+    return GoogleDriveTool(spec, handler, aliases or {})
 
 
 def _write(
@@ -874,7 +891,15 @@ def _write(
     aliases: Mapping[str, str] | None = None,
 ) -> GoogleDriveTool:
     return GoogleDriveTool(
-        ToolSpec(slug, description, schema, read_only=False, destructive=destructive, tags=tags),
+        ToolSpec(
+            slug,
+            description,
+            schema,
+            read_only=False,
+            destructive=destructive,
+            tags=tags,
+            required_scopes=(DRIVE_SCOPE,),
+        ),
         handler,
         aliases or {},
     )

@@ -3,6 +3,7 @@ checks (testing/validation.py) against deliberately broken toolkits."""
 
 from __future__ import annotations
 
+import os
 import socket
 import unittest
 
@@ -51,6 +52,12 @@ def test_good_toolkit_passes():
 
 def _with_tools(*tools: ToolSpec, **attrs) -> type:
     return type("Broken", (Good,), {"tools": lambda self: list(tools), **attrs})
+
+
+def _forced_risk(spec: ToolSpec, risk: str) -> ToolSpec:
+    """``spec`` with ``risk`` set past ``__post_init__``'s check."""
+    object.__setattr__(spec, "risk", risk)
+    return spec
 
 
 @pytest.mark.parametrize(
@@ -249,3 +256,195 @@ def test_generated_suite_fails_on_broken_toolkit():
     failed = {test.id().rsplit(".", 1)[-1] for test, _ in result.failures}
     assert failed == {"test_tool_catalog"}
     assert suite_cls.__name__ == "BrokenCompliance"
+
+
+# --------------------------------------------------------------------------
+# Router metadata: card, category, card text, tool scopes/risk, slug prefixes
+# --------------------------------------------------------------------------
+
+
+class Described(Good):
+    category = "files"
+    keywords = ("files", "folders")
+    examples = ("find my report", "share the budget folder")
+
+    def tools(self) -> list[ToolSpec]:
+        return [
+            ToolSpec("GOOD_GET", "Get a thing.", SCHEMA, read_only=True, required_scopes=("files.read",)),
+            ToolSpec(
+                "GOOD_PUT",
+                "Put a thing.",
+                SCHEMA,
+                read_only=False,
+                risk="destructive",
+                required_scopes=("https://www.googleapis.com/auth/drive", "read:org", "Files.ReadWrite.All"),
+            ),
+        ]
+
+
+def test_a_toolkit_setting_no_new_fields_passes():
+    # Good sets none of category/keywords/examples/required_scopes/risk.
+    assert failed_ids(Good, "good") == set()
+    assert Good.card()["category"] == "other"
+
+
+def test_a_described_toolkit_passes():
+    assert failed_ids(Described, "good") == set()
+
+
+class _BadCard(Good):
+    @classmethod
+    def card(cls):
+        return {"name": "good"}
+
+
+class _CardRaises(Good):
+    @classmethod
+    def card(cls):
+        raise RuntimeError("boom")
+
+
+class _CardNotJSON(Good):
+    @classmethod
+    def card(cls):
+        return {**super().card(), "keywords": [object()]}
+
+
+class _CardWrongName(Good):
+    @classmethod
+    def card(cls):
+        return {**super().card(), "name": "other"}
+
+
+class _CardDials(Good):
+    @classmethod
+    def card(cls):
+        socket.create_connection(("example.com", 443))
+        return super().card()
+
+
+@pytest.mark.parametrize(
+    ("cls", "check_id"),
+    [
+        (_BadCard, "contract.toolkit.card"),
+        (_CardRaises, "contract.toolkit.card"),
+        (_CardNotJSON, "contract.toolkit.card"),
+        (_CardWrongName, "contract.toolkit.card"),
+        (_CardDials, "contract.toolkit.card"),
+        (type("Cat", (Good,), {"category": "music"}), "contract.toolkit.category"),
+        (type("Cat", (Good,), {"category": None}), "contract.toolkit.category"),
+        (type("Kw", (Good,), {"keywords": "files"}), "contract.toolkit.card-text"),
+        (type("Kw", (Good,), {"keywords": ("files", "")}), "contract.toolkit.card-text"),
+        (type("Kw", (Good,), {"keywords": ("x" * 41,)}), "contract.toolkit.card-text"),
+        (type("Ex", (Good,), {"examples": ("only one",)}), "contract.toolkit.card-text"),
+        (type("Ex", (Good,), {"examples": ("a", "b", "c", "d", "e")}), "contract.toolkit.card-text"),
+        (type("Ex", (Good,), {"examples": ("fine", "x" * 121)}), "contract.toolkit.card-text"),
+        (type("Ex", (Good,), {"examples": "find my report"}), "contract.toolkit.card-text"),
+        (
+            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("files read",))),
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("a,b",))),
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("",))),
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=(3,))),  # type: ignore[arg-type]
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("a", "a"))),
+            "contract.toolkit.tool-metadata",
+        ),
+        # ToolSpec refuses these at construction; validate still catches a
+        # spec whose risk was changed afterwards.
+        (
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True), "write")),
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False, destructive=True), "write")),
+            "contract.toolkit.tool-metadata",
+        ),
+        (
+            _with_tools(_forced_risk(ToolSpec("GOOD_GET", "x", SCHEMA, read_only=False), "read")),
+            "contract.toolkit.tool-metadata",
+        ),
+    ],
+)
+def test_broken_router_metadata_fails(cls, check_id):
+    assert check_id in failed_ids(cls)
+
+
+def test_raising_the_risk_above_the_flags_passes():
+    kit = _with_tools(ToolSpec("GOOD_SEND", "x", SCHEMA, read_only=False, risk="destructive"))
+    assert "contract.toolkit.tool-metadata" not in failed_ids(kit)
+
+
+def test_scopes_the_default_consent_does_not_request_warn():
+    spec = OAuthSpec(
+        provider="good", authorize_url="https://a.example", token_url="https://t.example", default_scopes=("files.read",)
+    )
+    kit = _with_tools(
+        ToolSpec("GOOD_GET", "x", SCHEMA, read_only=True, required_scopes=("files.read",)),
+        ToolSpec("GOOD_PUT", "x", SCHEMA, read_only=False, required_scopes=("files.write",)),
+        oauth=spec,
+    )
+    (result,) = [r for r in run_toolkit_contract_checks(kit) if r.id == "contract.toolkit.scopes-requested"]
+    assert (result.passed, result.severity) == (False, Severity.WARNING)
+    assert "files.write" in result.message
+    assert "contract.toolkit.scopes-requested" not in failed_ids(kit)  # a warning only
+
+    implying = type("Implying", (kit,), {"scope_granted": lambda self, s, granted: s.startswith("files.")})
+    (result,) = [r for r in run_toolkit_contract_checks(implying) if r.id == "contract.toolkit.scopes-requested"]
+    assert result.passed
+
+
+def _prefixed(kit_name: str, prefix: str) -> type:
+    slug = f"{prefix}GET"
+    return type(
+        f"Kit_{kit_name}",
+        (Good,),
+        {
+            "name": kit_name,
+            "slug_prefix": prefix,
+            "tools": lambda self: [ToolSpec(slug, "Get.", SCHEMA, read_only=True)],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("others", "clash"),
+    [
+        ({"other": ("other", "OTHER_")}, False),
+        ({"twin": ("twin", "GOOD_")}, True),
+        ({"short": ("short", "GO_")}, False),
+        ({"goods": ("goods", "GOODS_")}, False),  # neither starts the other
+        ({"inner": ("inner", "GOOD_X_")}, True),
+    ],
+)
+def test_slug_prefix_must_be_unique_across_installed(others, clash):
+    installed = {name: _prefixed(n, p) for name, (n, p) in others.items()}
+    installed["good"] = Good
+    results = run_toolkit_contract_checks(Good, "good", installed=installed)
+    (result,) = [r for r in results if r.id == "contract.toolkit.slug-prefix-unique"]
+    assert result.passed is not clash
+    if clash:
+        assert "GOOD_" in result.message
+
+
+def test_slug_prefix_check_needs_the_installed_set():
+    ids = {r.id for r in run_toolkit_contract_checks(Good, "good")}
+    assert "contract.toolkit.slug-prefix-unique" not in ids
+
+
+def test_generated_suite_runs_the_router_checks():
+    suite = toolkit_compliance_suite(type("Cat", (Good,), {"category": "music"}))
+    result = unittest.TextTestRunner(stream=open(os.devnull, "w")).run(  # noqa: SIM115
+        unittest.defaultTestLoader.loadTestsFromTestCase(suite)
+    )
+    assert [test.id().rsplit(".", 1)[-1] for test, _ in result.failures] == ["test_category"]

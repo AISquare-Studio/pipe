@@ -38,7 +38,7 @@ class OneDriveSource(SourceConnector):
     """Pull files from OneDrive via Microsoft Graph API."""
 
     name = "onedrive-source"
-    version = "0.2.0"
+    version = "0.3.0"
     output_types = ["*/*"]
     auth_type = AuthType.OAUTH2
     description = "Pull files from Microsoft OneDrive"
@@ -176,7 +176,7 @@ class OneDriveSink(SinkConnector):
     """Push files to OneDrive via Microsoft Graph API."""
 
     name = "onedrive-sink"
-    version = "0.2.0"
+    version = "0.3.0"
     input_types = ["*/*"]
     auth_type = AuthType.OAUTH2
     description = "Push files to Microsoft OneDrive"

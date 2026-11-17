@@ -33,6 +33,11 @@ class ToolkitNotFoundError(PipeError):
     """Raised when a requested toolkit is not found in the registry."""
 
 
+class ToolkitConflictError(PipeError):
+    """Raised when installed toolkits cannot be told apart by slug: two share
+    a ``slug_prefix``, or one's prefix starts another's."""
+
+
 class ToolError(PipeError):
     """Raised inside a toolkit's ``run_tool`` for an expected tool failure.
 

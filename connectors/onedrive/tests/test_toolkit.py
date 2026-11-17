@@ -61,7 +61,7 @@ class TestCatalog:
 
     def test_identity(self):
         toolkit = OneDriveToolkit()
-        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("onedrive", "0.2.0", "ONE_DRIVE_")
+        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("onedrive", "0.3.0", "ONE_DRIVE_")
         assert toolkit.auth_type is AuthType.OAUTH2
         assert toolkit.oauth is MICROSOFT_OAUTH
 

@@ -31,6 +31,7 @@ import hashlib
 import http.client
 import json
 import logging
+import re
 import secrets
 import time
 import urllib.error
@@ -101,14 +102,46 @@ class OAuthSpec:
         object.__setattr__(self, "default_scopes", tuple(self.default_scopes))
 
 
+@dataclass(frozen=True)
+class OAuthAccount:
+    """Who connected, as the token response says (an OpenID Connect
+    ``id_token``). ``id`` is the provider's stable user id (Microsoft's
+    ``oid``, else the ``sub`` claim); ``tenant`` is the organisation
+    (Microsoft's ``tid``, Google Workspace's ``hd`` domain) when there is one.
+
+    The claims are read, not verified: the ``id_token`` came straight from
+    the token endpoint over TLS (OpenID Connect Core §3.1.3.7), and one whose
+    ``aud`` names another client is ignored. Use it to label a connection,
+    not to authenticate a user.
+    """
+
+    id: str
+    email: str | None = None
+    name: str | None = None
+    tenant: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "email": self.email, "name": self.name, "tenant": self.tenant}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> OAuthAccount:
+        return cls(
+            id=str(data["id"]),
+            email=_claim(data, "email"),
+            name=_claim(data, "name"),
+            tenant=_claim(data, "tenant"),
+        )
+
+
 @dataclass
 class OAuthToken:
     """A token set from a provider's token endpoint.
 
     ``expires_at`` is epoch seconds (``None`` = the provider did not say /
-    the token does not expire). Secrets are excluded from ``repr`` so a
-    stray log line cannot leak them; ``to_dict`` does include them — it is
-    the storage format.
+    the token does not expire). ``account`` is who connected, when the
+    response carried an ``id_token`` (see :class:`OAuthAccount`). Secrets
+    and the account are excluded from ``repr`` so a stray log line cannot
+    leak them; ``to_dict`` does include them — it is the storage format.
     """
 
     access_token: str = field(repr=False)
@@ -116,6 +149,17 @@ class OAuthToken:
     expires_at: int | None = None
     scope: str = ""
     token_type: str = "Bearer"
+    account: OAuthAccount | None = field(default=None, repr=False)
+
+    @property
+    def granted_scopes(self) -> tuple[str, ...] | None:
+        """The scopes the token holds, parsed from ``scope`` (providers
+        separate them with spaces or commas), or None when the provider did
+        not say. RFC 6749 §5.1 lets a provider omit ``scope`` when it granted
+        exactly what was asked, so None means "the requested scopes"."""
+        if not self.scope.strip():
+            return None
+        return tuple(dict.fromkeys(s for s in re.split(r"[\s,]+", self.scope) if s))
 
     def expired(self, skew: int = 60, *, now: float | None = None) -> bool:
         """True when the token expires within ``skew`` seconds (or already has)."""
@@ -125,23 +169,34 @@ class OAuthToken:
         return current + skew >= self.expires_at
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        """The storage format. ``account`` is included only when known, so a
+        token without one keeps the 0.3 shape."""
+        data: dict[str, Any] = {
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
             "expires_at": self.expires_at,
             "scope": self.scope,
             "token_type": self.token_type,
         }
+        if self.account is not None:
+            data["account"] = self.account.to_dict()
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> OAuthToken:
         expires_at = data.get("expires_at")
+        account = data.get("account")
         return cls(
             access_token=str(data["access_token"]),
             refresh_token=data.get("refresh_token") or None,
             expires_at=int(expires_at) if expires_at is not None else None,
             scope=str(data.get("scope") or ""),
             token_type=str(data.get("token_type") or "Bearer"),
+            account=(
+                OAuthAccount.from_dict(account)
+                if isinstance(account, Mapping) and account.get("id")
+                else None
+            ),
         )
 
     @classmethod
@@ -151,8 +206,11 @@ class OAuthToken:
         *,
         provider: str | None = None,
         now: float | None = None,
+        client_id: str | None = None,
     ) -> OAuthToken:
-        """Build a token from a token-endpoint response body.
+        """Build a token from a token-endpoint response body. An
+        ``id_token`` in it fills ``account`` (see :func:`account_from_id_token`;
+        pass ``client_id`` to drop one issued to another client).
 
         Raises :class:`OAuthError` when the body carries no access token.
         """
@@ -181,7 +239,56 @@ class OAuthToken:
             expires_at=expires_at,
             scope=str(scope),
             token_type=str(payload.get("token_type") or "Bearer"),
+            account=account_from_id_token(payload.get("id_token"), client_id=client_id),
         )
+
+
+#: Longest ``id_token`` decoded; anything larger is ignored.
+_MAX_ID_TOKEN = 16 * 1024
+#: Longest claim value kept in an :class:`OAuthAccount`.
+_MAX_CLAIM = 320
+
+
+def _claim(claims: Mapping[str, Any], key: str) -> str | None:
+    value = claims.get(key)
+    return value[:_MAX_CLAIM] if isinstance(value, str) and value.strip() else None
+
+
+def account_from_id_token(id_token: Any, *, client_id: str | None = None) -> OAuthAccount | None:
+    """The :class:`OAuthAccount` in an OpenID Connect ``id_token`` (a JWT),
+    or None when there is none, it cannot be read, or — with ``client_id`` —
+    its ``aud`` does not name that client. The signature is not checked
+    (see :class:`OAuthAccount`); never raises."""
+    if not isinstance(id_token, str) or len(id_token) > _MAX_ID_TOKEN:
+        return None
+    parts = id_token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        body = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+    except (ValueError, RecursionError):  # bad base64/JSON, or absurd nesting
+        return None
+    if not isinstance(claims, dict):
+        return None
+    if client_id is not None:
+        audience = claims.get("aud")
+        audiences = audience if isinstance(audience, list) else [audience]
+        if client_id not in audiences:
+            return None
+    user_id = _claim(claims, "oid") or _claim(claims, "sub")
+    if user_id is None:
+        return None
+    email = _claim(claims, "email")
+    if email is None:  # Microsoft work accounts often carry the address here
+        username = _claim(claims, "preferred_username")
+        email = username if username and "@" in username else None
+    return OAuthAccount(
+        id=user_id,
+        email=email,
+        name=_claim(claims, "name"),
+        tenant=_claim(claims, "tid") or _claim(claims, "hd"),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -268,7 +375,11 @@ def exchange_code(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> OAuthToken:
     """Trade an authorization code for a token set. A PKCE spec requires
-    the ``code_verifier`` whose challenge went into the authorize URL."""
+    the ``code_verifier`` whose challenge went into the authorize URL.
+
+    The token's ``granted_scopes`` are what the provider says it granted
+    (the user may have unticked some), and its ``account`` is who connected
+    when the response carries an OpenID Connect ``id_token``."""
     if spec.pkce and not code_verifier:
         raise OAuthError(
             f"{spec.provider}: PKCE is required — pass the code_verifier from make_pkce_pair()",
@@ -283,7 +394,7 @@ def exchange_code(
     if code_verifier:
         form["code_verifier"] = code_verifier
     payload = _token_request(spec, form, client_id, client_secret, "exchange", timeout)
-    return OAuthToken.from_response(payload, provider=spec.provider)
+    return OAuthToken.from_response(payload, provider=spec.provider, client_id=client_id)
 
 
 def refresh_access_token(
@@ -304,7 +415,7 @@ def refresh_access_token(
     if scopes:
         form["scope"] = spec.scope_separator.join(scopes)
     payload = _token_request(spec, form, client_id, client_secret, "refresh", timeout)
-    token = OAuthToken.from_response(payload, provider=spec.provider)
+    token = OAuthToken.from_response(payload, provider=spec.provider, client_id=client_id)
     if token.refresh_token is None:
         token.refresh_token = refresh_token
     if not token.scope:

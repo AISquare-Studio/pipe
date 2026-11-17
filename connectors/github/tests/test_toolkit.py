@@ -63,7 +63,7 @@ class TestCatalog:
 
     def test_identity(self):
         toolkit = GitHubToolkit()
-        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("github", "0.2.0", "GITHUB_")
+        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("github", "0.3.0", "GITHUB_")
         assert toolkit.auth_type is AuthType.OAUTH2
         assert toolkit.oauth is GITHUB_OAUTH
 
