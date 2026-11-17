@@ -11,7 +11,7 @@ license = {text = "Apache-2.0"}
 authors = [{name = "A-Square"}]
 dependencies = [
     "aisquare-pipe>=0.3.0",
-    "requests>=2.31",
+    "requests>=2.34.2",
 ]
 
 [project.optional-dependencies]
