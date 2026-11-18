@@ -253,20 +253,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     something other than a dict. A `TypeError` or `AttributeError` raised
     inside an SDK call keeps its type, and malformed API data is no SDK error.
   - A malformed trigger-log entry (the entry, or its `meta`, not an object) no
-    longer stops the triggers source. It is skipped with one WARNING, and its
-    id and time are recorded in the cursor, so one bad event can't crash-loop
-    the poller. A timestamp that isn't a finite number reads as no time.
-  - The triggers source stops on the two errors no retry can fix, a
-    `ComposioSDKShapeError` and a `ConfigValidationError` (Composio refused the
-    API key: HTTP 401/403). It logs one ERROR line, with no traceback of its
-    own (the caller logs the raised error once), and raises. Before, a 401 was
-    logged and re-polled every cycle. Other failures still retry next cycle.
+    longer stops the triggers source. It is skipped with a WARNING and its
+    time moves the watermark, so one bad event can't crash-loop the poller.
+    Its id is recorded in the cursor: later cycles, and later pulls on the
+    same `cursor_path`, step past it silently. So do later pulls of a host
+    that writes the position the last pull saved into each pull's cursor
+    (pipe-as-service's poller: one `pull(max_polls=1)` per poll, on a temp
+    file holding its stored position). A pull on an empty cursor warns again
+    on every pull while the entry is in its window, and an entry with no id
+    warns on every cycle (it can't be recorded). A readable
+    entry with no id is now skipped with that warning too (it was dropped
+    without one), and its time moves the watermark (it didn't). A timestamp
+    that isn't a finite number reads as no time.
+  - An event time more than 5 minutes (`MAX_EVENT_CLOCK_SKEW_MS`) past this
+    host's clock no longer moves the watermark, and a stored watermark (or
+    pending window maximum) past it is reset to now with one WARNING. Before,
+    one such time, from malformed data or a valid entry alike, became the
+    watermark, and every later poll sent `from=<that time>` and silently saw
+    nothing. (Not clamped to now + 5 minutes: that would skip the next five
+    minutes' real events.)
+  - A `pull` of the triggers source ends on the two errors no retry can fix,
+    a `ComposioSDKShapeError` and a `ConfigValidationError` (Composio refused
+    the API key: HTTP 401/403). It logs one ERROR line ("trigger pull
+    stopped"), with no traceback of its own (the caller logs the raised
+    error), and raises. Before, a 401 was logged and re-polled every cycle.
+    Other failures still retry next cycle. This is per pull: a host that
+    pulls again gets the same error and line again, so it must stop or back
+    off itself (pipe-as-service backs the subscription off).
   - composio-client 2.x gives a POST no SDK retries (1.x retried a 429, 5xx or
     connection error twice on any method). The trigger-log read is a POST that
     only reads, so on 2.x it passes `request_options={"max_retries": 2}`: a 503
     is tried 3 times and a 429 15 times (with our own 429 backoff), as on 1.x.
     `tools.execute` is unaffected: composio sends it without SDK retries on
-    both lines (0.22.0 and 0.33.0). `authorize_toolkit` and
+    both lines (0.18.1, 0.22.0 and 0.33.0). `authorize_toolkit` and
     `initiate_connection` have no retry of their own, so on 2.x a 429 or 5xx
     fails them at once, where 1.x retried twice. They create a connection
     request, so that is left as is.
@@ -275,9 +294,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     SDK methods (all 13 this connector calls) make a call that doesn't bind to
     the installed SDK fail, and a faked `httpx` transport runs the SDK's own
     request, retry and parsing code. validate.yml's new `composio-sdk` job runs
-    the connector's suite on composio 0.22.0 + client 1.43.0 and on the newest
-    pair the extra resolves (0.33.0 + 2.1.33 today), on every PR and on
-    `workflow_dispatch`.
+    the connector's suite on composio 0.18.1 + client 1.43.0 (the pair
+    pipe-as-service's requirements.lock pins, so what production runs) and on
+    the newest pair the extra resolves (0.33.0 + 2.1.33 today), on every PR,
+    every push to `main` and on `workflow_dispatch`.
+  - `list_trigger_events` reads the SDK method's signature once (it read it
+    twice: once for `request_options`, once to bind the call).
+- **Composio triggers: no event delivered twice by the seen-id ring, and the
+  trigger cursor is a public host contract** (pipe-as-service review seq 14039).
+  - `TriggerCursor`, `save_trigger_cursor`, `load_trigger_cursor`,
+    `SEEN_IDS_MAX`, `MAX_EVENT_CLOCK_SKEW_MS`, `MAX_TRIGGER_PAGES_PER_POLL`
+    and `is_transient_error` are exported from `aisquare_pipe_composio`
+    (`__all__`, listed in `TRIGGER_CURSOR_API`). pipe-as-service's poller keeps
+    the position in its own store and round-trips it through these.
+    `connectors/composio/tests/test_trigger_cursor_contract.py` pins the
+    names, the four fields, a lossless save/load of every field, the newest
+    ids kept, and the first-run rule (`last_ts_ms == 0` and no `seen_ids`
+    start at `since`). Adding a field is a contract change: the host copies
+    every field.
+  - The ring (`SEEN_IDS_MAX`) is 2000 ids, was 500: two whole pulls (10
+    pages of 100). With 500, a window read again (a rescan, the inclusive
+    `from`) redelivered whatever had been pushed out of the ring.
+  - A page that fails to read for a reason a retry can fix (HTTP 429/5xx,
+    or no answer) no longer drops the saved page cursor. The cycle saves the
+    page it stopped on and the ids it read before it, and the next cycle
+    resumes on that page. Before, it rescanned the whole window from the held
+    watermark, and a window longer than the ring was delivered twice (1500
+    entries, a 500 on page 11: 500 ids twice). Any other failure (a 4xx such
+    as an expired cursor, or a non-Composio error) still drops the cursor.
+  - An entry read again moves its id to the ring's newest end. An entry dated
+    past the clock-skew ceiling is read on every poll (it never moves the
+    watermark); its id used to be pushed out by newer reads, and the entry
+    was then delivered again.
+  - `PullParams` `on_cycle_error`: called with a failed cycle's exception,
+    after its progress is saved. A host running one cycle per pull learns
+    the read failed, which the pull doesn't raise.
 
 ### Changed
 
