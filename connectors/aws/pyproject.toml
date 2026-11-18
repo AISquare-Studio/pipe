@@ -1,0 +1,24 @@
+# Tool settings only (pytest, ruff, mypy) for running this connector's suite
+# from its own directory. This connector isn't a separate package: it ships
+# inside the `aisquare-pipe` distribution, packaged by the root pyproject.toml
+# (its entry points, its third-party deps as the `[aws]` extra, and its test
+# fake moto in `[dev]`).
+
+[tool.ruff.lint.isort]
+# Same import grouping whatever directory ruff runs from (the repo root sees
+# src/aisquare as first-party otherwise).
+known-first-party = ["aisquare_pipe_aws"]
+known-third-party = ["aisquare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: hits real APIs using env credentials; deselected by default"]
+addopts = "-m 'not live'"
+
+[tool.mypy]
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+# boto3/botocore ship no type information; their stubs would be a new dependency.
+module = ["boto3", "boto3.*", "botocore", "botocore.*", "moto", "moto.*"]
+ignore_missing_imports = true
