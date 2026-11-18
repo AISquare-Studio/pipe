@@ -65,19 +65,29 @@ class GcsAPIError(Exception):
     """A failed GCS call. ``status`` is the HTTP status (None when nothing came
     back); ``retry_after`` is set for a 429/503 that said when to retry;
     ``timed_out`` for a timeout; ``key_refused`` when Google's token endpoint
-    refused the service account key itself."""
+    refused the service account key itself.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, Cloud Storage's own error text when it gave one (redacted
+    and bounded). That text names objects, so only the toolkit, which
+    answers the caller, shows it; the source's errors carry ``summary``
+    alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
         key_refused: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.retry_after = retry_after
         self.timed_out = timed_out
@@ -305,7 +315,8 @@ class GcsClient:
             detail = self._detail(resp)
             resp.close()
             raise GcsAPIError(
-                f"Cloud Storage failed ({status})" + detail,
+                f"Cloud Storage failed ({status})",
+                detail=detail,
                 status=status,
                 retry_after=retry_after_seconds(resp.headers.get("Retry-After"))
                 if status in (429, 503)
@@ -343,8 +354,7 @@ class GcsClient:
                 text = error
         for token in self._sent_tokens:
             text = text.replace(token, "[redacted]")
-        text = " ".join(text.split())[:_MAX_DETAIL]
-        return f": {text}" if text else ""
+        return " ".join(text.split())[:_MAX_DETAIL]
 
 
 def object_record(item: Any) -> dict[str, Any]:

@@ -59,7 +59,13 @@ from aisquare_pipe_gcs.credentials import (
     GcsNotConfigured,
     load_credentials,
 )
-from aisquare_pipe_gcs.toolkit import DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES, file_envelope
+from aisquare_pipe_gcs.toolkit import (
+    DEFAULT_MAX_BYTES,
+    MAX_OBJECT_BYTES,
+    GcsRequestError,
+    file_envelope,
+    source_error,
+)
 
 logger = logging.getLogger("aisquare.pipe.gcs")
 
@@ -112,7 +118,7 @@ def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw = params.params if isinstance(params, PullParams) else params
     if not isinstance(raw, dict):
-        raise TypeError("pull params must be a mapping")
+        raise ValueError("pull params must be a mapping")  # noqa: TRY004 — a host answers TypeError 500
     server = sorted(SERVER_KEYS.intersection(raw))
     if server:
         raise ValueError(
@@ -251,10 +257,29 @@ class GcsSource(SourceConnector):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
-        """Yield one envelope per object. Raises :class:`GcsNotConfigured`
-        without a usable credential (before any request), ``ValueError`` for
-        bad params, and :class:`GcsAPIError` when Cloud Storage fails."""
+        """Yield one envelope per object.
+
+        Raises, as pipe-as-service answers them:
+
+        * 422, a ``ValueError``: :class:`GcsNotConfigured` without a usable
+          credential (before any request); bad params;
+          :class:`GcsPullTruncated`; and what Cloud Storage refused that the
+          caller can fix, a named object that does not exist
+          (:class:`~aisquare_pipe_gcs.toolkit.GcsRequestError`);
+        * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
+          Cloud Storage failure (a refused key or permission, throttling, a
+          timeout, a 5xx), with ``retry_after`` when it gave one.
+
+        Neither carries Cloud Storage's own error text."""
         creds = load_credentials(config)
+        try:
+            yield from self._pull(creds, params)
+        except GcsAPIError as e:
+            raise source_error(e) from None
+
+    def _pull(
+        self, creds: GcsCredentials, params: PullParams | None
+    ) -> Iterator[DataEnvelope]:
         options = _options(params)
         limit = _bounded(options, "max_objects", DEFAULT_MAX_OBJECTS, MAX_OBJECTS)
         max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES)
@@ -408,4 +433,10 @@ def _after(updated: Any, since: datetime) -> bool:
         return True  # no usable time: keep it rather than lose a change
 
 
-__all__ = ["GcsAPIError", "GcsNotConfigured", "GcsPullTruncated", "GcsSource"]
+__all__ = [
+    "GcsAPIError",
+    "GcsNotConfigured",
+    "GcsPullTruncated",
+    "GcsRequestError",
+    "GcsSource",
+]

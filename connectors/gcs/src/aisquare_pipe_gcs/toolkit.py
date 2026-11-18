@@ -19,6 +19,7 @@ from aisquare.pipe import (
     ERROR_FORBIDDEN,
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_CONNECTED,
+    ERROR_NOT_FOUND,
     ERROR_RATE_LIMITED,
     ERROR_TIMEOUT,
     ERROR_UPSTREAM_ERROR,
@@ -32,6 +33,7 @@ from aisquare.pipe import (
     time_budget,
 )
 from aisquare.pipe.core.envelope import DataEnvelope
+from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_gcs.client import (
     INVALID_NAMES,
@@ -156,47 +158,83 @@ GET_OBJECT = ToolSpec(
 TOOL_SPECS = (LIST_OBJECTS, GET_OBJECT)
 
 
-def _describe(e: GcsAPIError) -> str:
-    """The failure, plus what to fix where the cause is known. Only a 401 (a
-    key or token Google refused) blames the key."""
+def _hint(e: GcsAPIError) -> str | None:
+    """What to fix, where the cause is known (no Cloud Storage text in it).
+    Only a 401 (a key or token Google refused) blames the key."""
     text = e.message.lower()
     if e.status == 401:
         return (
-            f"{e.message} — Google rejected the service account key (deleted, disabled or "
-            "expired); the tenant's GCS credential must be fixed"
+            "Google rejected the service account key (deleted, disabled or expired); the "
+            "tenant's GCS credential must be fixed"
         )
     if e.status == 403 and "vpcservicecontrols" in text:
         return (
-            f"{e.message} — a VPC Service Controls perimeter around the bucket's project "
-            "blocks the request; the customer must add an ingress rule for the service "
-            "account (see the gcs connector README)"
+            "a VPC Service Controls perimeter around the bucket's project blocks the "
+            "request; the customer must add an ingress rule for the service account (see "
+            "the gcs connector README)"
         )
     if e.status == 403:
         return (
-            f"{e.message} — the service account lacks roles/storage.objectViewer on the "
-            "bucket (or on the managed folder that holds the prefix)"
+            "the service account lacks roles/storage.objectViewer on the bucket (or on the "
+            "managed folder that holds the prefix)"
         )
     if e.status == 400 and "requester pays" in text:
-        return f"{e.message} — requester-pays buckets are not supported"
+        return "requester-pays buckets are not supported"
     if e.status == 400 and "customer-supplied encryption key" in text:
         return (
-            f"{e.message} — objects encrypted with a customer-supplied key (CSEK) can't "
-            "be read; CMEK (a Cloud KMS key on the bucket) needs nothing extra"
+            "objects encrypted with a customer-supplied key (CSEK) can't be read; CMEK "
+            "(a Cloud KMS key on the bucket) needs nothing extra"
         )
-    return e.message
+    return None
+
+
+def _describe(e: GcsAPIError) -> str:
+    """The failure, Cloud Storage's own text included, plus what to fix where
+    the cause is known: what the toolkit answers the caller."""
+    hint = _hint(e)
+    return f"{e.message} — {hint}" if hint else e.message
+
+
+def error_code(e: GcsAPIError) -> str:
+    """The canonical ``error_code`` for a GCS failure."""
+    if e.timed_out:
+        return ERROR_TIMEOUT
+    if e.status == 429:
+        return ERROR_RATE_LIMITED
+    if e.status is None or 300 <= e.status < 400:
+        return ERROR_UPSTREAM_ERROR
+    return error_code_for_status(e.status)
 
 
 def failure(e: GcsAPIError) -> ToolResult:
     """A GCS failure as a canonical ``ToolResult`` error."""
-    if e.timed_out:
-        code = ERROR_TIMEOUT
-    elif e.status == 429:
-        code = ERROR_RATE_LIMITED
-    elif e.status is None or 300 <= e.status < 400:
-        code = ERROR_UPSTREAM_ERROR
-    else:
-        code = error_code_for_status(e.status)
-    return ToolResult.fail(_describe(e), code=code, retry_after=e.retry_after)
+    return ToolResult.fail(_describe(e), code=error_code(e), retry_after=e.retry_after)
+
+
+class GcsRequestError(ValueError):
+    """Cloud Storage refused what the caller asked for: an object that does
+    not exist, a request it calls invalid. A ``ValueError``, so
+    pipe-as-service answers it 422. ``status`` is Cloud Storage's."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def source_error(e: GcsAPIError) -> Exception:
+    """A GCS failure as the source raises it: what the caller can fix
+    (``invalid_arguments``, ``not_found``) is a :class:`GcsRequestError`
+    (422 in pipe-as-service); everything else (upstream, throttling, a
+    timeout, a refused key or permission) is a
+    :class:`~aisquare.pipe.errors.PipelineError` (502), with ``retry_after``
+    when Cloud Storage gave one. The message is ``summary`` and the hint,
+    never Cloud Storage's own text (it names objects, and hosts log these)."""
+    code = error_code(e)
+    hint = _hint(e)
+    text = e.summary + (f" — {hint}" if hint else "")
+    if code in (ERROR_INVALID_ARGUMENTS, ERROR_NOT_FOUND):
+        return GcsRequestError(text, status=e.status)
+    return PipelineError(text, retry_after=e.retry_after)
 
 
 def _bounded_int(arguments: Mapping[str, Any], name: str, low: int, high: int) -> int:
