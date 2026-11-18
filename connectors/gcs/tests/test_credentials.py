@@ -10,8 +10,10 @@ import google.auth.exceptions
 import pytest
 import requests
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
-from aisquare_pipe_gcs import GcsAPIError, GcsSource, GcsToolkit
+from aisquare_pipe_gcs import GcsSource, GcsToolkit
 from aisquare_pipe_gcs.credentials import (
     READ_ONLY_SCOPE,
     GcsNotConfigured,
@@ -222,9 +224,12 @@ def test_a_token_endpoint_timeout_is_a_timeout_not_a_bad_key(error):
     assert not result.successful and result.error_code == "timeout", result.error
     assert _BAD_KEY_HINT not in (result.error or "")
     assert len(google_.token_requests) == 1 and google_.storage_calls() == []
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.timed_out and raised.value.status != 401
+    # A timeout is upstream (502 in pipe-as-service), never the key.
+    assert host_answer(raised.value).status == 502
+    assert "in time" in str(raised.value)
+    assert _BAD_KEY_HINT not in str(raised.value)
 
 
 def test_an_unreachable_token_endpoint_is_an_upstream_error_not_a_bad_key():
@@ -234,9 +239,10 @@ def test_an_unreachable_token_endpoint_is_an_upstream_error_not_a_bad_key():
     assert not result.successful and result.error_code == "upstream_error"
     assert "could not reach Google's token endpoint (ConnectionError)" in result.error
     assert _BAD_KEY_HINT not in result.error
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.status is None and not raised.value.key_refused
+    assert host_answer(raised.value).status == 502
+    assert _BAD_KEY_HINT not in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -291,9 +297,12 @@ def test_only_a_refused_key_is_unauthorized(status, body):
     assert not result.successful and result.error_code == "unauthorized"
     assert _BAD_KEY_HINT in (result.error or "")
     assert body["error"] in (result.error or "")
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.status == 401 and raised.value.key_refused
+    # The tenant's key, not the caller: upstream (502), and it says so.
+    assert host_answer(raised.value).status == 502
+    assert _BAD_KEY_HINT in str(raised.value)
+    assert "PRIVATE KEY" not in str(raised.value)
 
 
 def test_an_ec_key_is_not_configured_and_nothing_escapes():
@@ -375,6 +384,8 @@ def test_our_clock_skew_is_not_blamed_on_the_key():
     assert "clock is off" in (result.error or "")
     assert "Check your iat and exp" in (result.error or "")
     assert _BAD_KEY_HINT not in (result.error or "")
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.status != 401 and not raised.value.key_refused
+    assert host_answer(raised.value).status == 502
+    assert "clock is off" in str(raised.value)
+    assert _BAD_KEY_HINT not in str(raised.value)

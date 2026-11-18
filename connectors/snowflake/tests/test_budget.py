@@ -6,9 +6,10 @@ import time
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
 from aisquare_pipe_snowflake import (
-    SnowflakeAPIError,
     SnowflakeQuerySource,
     SnowflakeToolkit,
 )
@@ -140,13 +141,15 @@ def test_snowflake_answering_429_until_the_deadline_is_rate_limited(clock):
 
 def test_the_source_statement_deadline_bounds_its_polling(clock):
     fake = _fake(clock, 0.1, endless=True)
-    with pytest.raises(SnowflakeAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         list(
             SnowflakeQuerySource(session=fake).pull(
                 blob(), PullParams({"sql": "SELECT 1", "timeout_seconds": 7})
             )
         )
-    assert raised.value.timed_out
+    # A timeout is upstream (502 in pipe-as-service), not the caller's fault.
+    assert host_answer(raised.value).status == 502
+    assert "did not finish within its 7s deadline" in str(raised.value)
     submitted = [b for b in fake.submits() if b["statement"] == "SELECT 1"]
     assert submitted[0]["timeout"] == 7
     assert clock.now - 1000.0 < 8.5

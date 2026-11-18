@@ -11,7 +11,8 @@ pick the files, never the credential, the bucket or the key:
   included). Pass a truncated pull's ``next_start_offset`` to continue it;
 * ``modified_after`` (optional, RFC 3339): only objects updated after it;
 * ``max_objects`` (default 100, at most 1000) and ``max_bytes`` per object
-  (default 25 MiB, at most 100 MiB; a larger object is skipped and counted).
+  (default 25 MiB, at most 64 MiB, sized for a 512 MiB pod; a larger object
+  is skipped and counted).
 
 Each object becomes one envelope with its bytes and ``metadata`` ``bucket``,
 ``object_name``, ``filename``, ``size``, ``content_type`` and the version
@@ -59,11 +60,21 @@ from aisquare_pipe_gcs.credentials import (
     GcsNotConfigured,
     load_credentials,
 )
-from aisquare_pipe_gcs.toolkit import DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES, file_envelope
+from aisquare_pipe_gcs.toolkit import (
+    DEFAULT_MAX_BYTES,
+    GcsRequestError,
+    file_envelope,
+    source_error,
+)
 
 logger = logging.getLogger("aisquare.pipe.gcs")
 
 DEFAULT_MAX_OBJECTS = 100
+#: The largest object a pull reads (``max_bytes``'s ceiling), sized for a
+#: 512 MiB pod: a pull holds about two objects at a time (the one being read,
+#: and the one a consumer still holds); the README's "Memory" has the numbers.
+#: Tools read up to MAX_OBJECT_BYTES.
+MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_OBJECTS = 1000
 LIST_PAGE_SIZE = 1000
 #: Listing pages followed at most, whatever the page token says.
@@ -112,7 +123,7 @@ def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw = params.params if isinstance(params, PullParams) else params
     if not isinstance(raw, dict):
-        raise TypeError("pull params must be a mapping")
+        raise ValueError("pull params must be a mapping")  # noqa: TRY004 — a host answers TypeError 500
     server = sorted(SERVER_KEYS.intersection(raw))
     if server:
         raise ValueError(
@@ -251,13 +262,32 @@ class GcsSource(SourceConnector):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
-        """Yield one envelope per object. Raises :class:`GcsNotConfigured`
-        without a usable credential (before any request), ``ValueError`` for
-        bad params, and :class:`GcsAPIError` when Cloud Storage fails."""
+        """Yield one envelope per object.
+
+        Raises, as pipe-as-service answers them:
+
+        * 422, a ``ValueError``: :class:`GcsNotConfigured` without a usable
+          credential (before any request); bad params;
+          :class:`GcsPullTruncated`; and what Cloud Storage refused that the
+          caller can fix, a named object that does not exist
+          (:class:`~aisquare_pipe_gcs.toolkit.GcsRequestError`);
+        * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
+          Cloud Storage failure (a refused key or permission, throttling, a
+          timeout, a 5xx), with ``retry_after`` when it gave one.
+
+        Neither carries Cloud Storage's own error text."""
         creds = load_credentials(config)
+        try:
+            yield from self._pull(creds, params)
+        except GcsAPIError as e:
+            raise source_error(e) from None
+
+    def _pull(
+        self, creds: GcsCredentials, params: PullParams | None
+    ) -> Iterator[DataEnvelope]:
         options = _options(params)
         limit = _bounded(options, "max_objects", DEFAULT_MAX_OBJECTS, MAX_OBJECTS)
-        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES)
+        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_SOURCE_BYTES)
         names = options.get("object_names")
         if names is not None and (
             options.get("prefix") not in (None, "")
@@ -295,14 +325,37 @@ class GcsSource(SourceConnector):
             else:
                 records, truncation = self._listed(client, prefix, start, since, limit)
             skipped = 0
-            last: DataEnvelope | None = None
+            candidates: list[dict[str, Any]] = []
             for record in records:
+                generation = record.get("generation")
+                if generation is not None and not isinstance(generation, str):
+                    # Cloud Storage sends int64s as strings: anything else is
+                    # its answer gone wrong, not the caller's to fix (502).
+                    raise GcsAPIError(
+                        "Cloud Storage answered an object whose generation is "
+                        "not a string"
+                    )
                 if since is not None and not _after(record.get("updated"), since):
                     continue
                 size = record.get("size")
                 if isinstance(size, int) and size > max_bytes:
                     skipped += 1
                     continue
+                candidates.append(record)
+            del records
+            # A truncated pull's LAST envelope carries the marker. Each one is
+            # yielded at once, unless every candidate after it could still be
+            # skipped at download (only an object of unknown size, or one
+            # stored gzip and read inflated, can be): only then is it held
+            # back, so at most one object is in memory as a rule.
+            sure_later = [False] * len(candidates)
+            seen_sure = False
+            for index in range(len(candidates) - 1, -1, -1):
+                sure_later[index] = seen_sure
+                seen_sure = seen_sure or not _may_be_skipped(candidates[index])
+            held: DataEnvelope | None = None
+            yielded = 0
+            for index, record in enumerate(candidates):
                 try:
                     content = client.download(
                         str(record["name"]),
@@ -312,11 +365,22 @@ class GcsSource(SourceConnector):
                 except ObjectTooLarge:
                     skipped += 1
                     continue
-                # One envelope behind, so the last one can carry the
-                # truncation marker.
-                if last is not None:
-                    yield last
-                last = file_envelope(record, content, bucket=creds.bucket)
+                envelope = file_envelope(record, content, bucket=creds.bucket)
+                del content
+                if held is not None:
+                    yield held  # a later one came out: it wasn't the last
+                    held = None
+                    yielded += 1
+                if truncation is None or sure_later[index]:
+                    yield envelope
+                    yielded += 1
+                elif index == len(candidates) - 1:
+                    _mark(envelope, truncation)
+                    yield envelope
+                    yielded += 1
+                else:
+                    held = envelope
+                del envelope  # gone before the next download
             if skipped:
                 logger.info(
                     "gcs-source: skipped %d object(s) larger than max_bytes", skipped
@@ -328,16 +392,14 @@ class GcsSource(SourceConnector):
                     "under the prefix; continue with %s as start_offset",
                     reason,
                     "the last envelope's next_start_offset"
-                    if last is not None
+                    if held is not None or yielded
                     else "the error's next_start_offset (no envelope came out)",
                 )
-                if last is None:
+                if held is not None:
+                    _mark(held, truncation)
+                    yield held
+                elif not yielded:
                     raise GcsPullTruncated(reason, resume)
-                last.metadata["truncated"] = reason
-                if resume is not None:
-                    last.metadata["next_start_offset"] = resume
-            if last is not None:
-                yield last
 
     def _listed(
         self,
@@ -401,6 +463,22 @@ class GcsSource(SourceConnector):
         return None
 
 
+def _may_be_skipped(record: dict[str, Any]) -> bool:
+    """Whether a download of ``record`` could still come out over
+    ``max_bytes`` (its stored size was checked already): only when that
+    size is unknown, or the bytes are stored gzip and read inflated."""
+    return not isinstance(record.get("size"), int) or (
+        str(record.get("content_encoding") or "").lower() == "gzip"
+    )
+
+
+def _mark(envelope: DataEnvelope, truncation: tuple[str, str | None]) -> None:
+    reason, resume = truncation
+    envelope.metadata["truncated"] = reason
+    if resume is not None:
+        envelope.metadata["next_start_offset"] = resume
+
+
 def _after(updated: Any, since: datetime) -> bool:
     try:
         return _timestamp(updated, "updated") > since
@@ -408,4 +486,10 @@ def _after(updated: Any, since: datetime) -> bool:
         return True  # no usable time: keep it rather than lose a change
 
 
-__all__ = ["GcsAPIError", "GcsNotConfigured", "GcsPullTruncated", "GcsSource"]
+__all__ = [
+    "GcsAPIError",
+    "GcsNotConfigured",
+    "GcsPullTruncated",
+    "GcsRequestError",
+    "GcsSource",
+]

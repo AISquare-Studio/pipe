@@ -43,8 +43,10 @@ Errors keep the shared rule (:mod:`aisquare_pipe_aws.credentials`): a refused
 AWS call is an :class:`~aisquare_pipe_aws.credentials.AwsAccessError` with
 AWS's error code, never AWS's message. A statement that ran and FAILED is
 different: its error is the database's own (``permission denied for
-relation ...``), about the caller's own SQL, so it is passed on (bounded),
-never logged.
+relation ...``), about the caller's own SQL, so :class:`StatementFailed`
+keeps it (bounded) as ``detail``: the toolkit passes it on, and the source
+leaves it out of its error, which hosts log (it can echo the caller's
+values). Never logged here.
 """
 
 from __future__ import annotations
@@ -123,12 +125,17 @@ def cancel_note(cancelled: bool | None) -> str:
 
 class StatementFailed(PipeError):
     """The statement ran and Redshift reported ``FAILED`` or ``ABORTED``.
-    ``code`` is a toolkit error code, the message the database's own error,
-    bounded."""
+    ``code`` is a toolkit error code. The message is ``summary`` (the
+    connector's own words) then ``detail``, the database's own error,
+    bounded: it can echo the caller's values (``invalid input syntax for
+    integer: "..."``), so the toolkit, which answers the caller, shows it,
+    and the source's errors carry ``summary`` alone (hosts log those)."""
 
-    def __init__(self, message: str, *, code: str) -> None:
-        super().__init__(message)
+    def __init__(self, message: str, *, code: str, detail: str = "") -> None:
+        super().__init__(f"{message}: {detail}" if detail else message)
         self.code = code
+        self.summary = message
+        self.detail = detail
 
 
 @dataclass
@@ -359,7 +366,7 @@ def _failed(status: str, error: Any) -> StatementFailed:
     else:
         code = "invalid_arguments"
     message = f"the statement {status.lower()} in Redshift"
-    return StatementFailed(f"{message}: {text}" if text else message, code=code)
+    return StatementFailed(message, code=code, detail=text)
 
 
 def result_pages(api: Api, statement: Statement) -> Iterator[dict[str, Any]]:
@@ -378,6 +385,9 @@ def result_pages(api: Api, statement: Statement) -> Iterator[dict[str, Any]]:
         )
         yield page
         token = page.get("NextToken") or None
+        # The parsed page goes before the next one is read (the caller lets
+        # go of its reference too): one page in memory at a time.
+        del page
         if token is None:
             return
 

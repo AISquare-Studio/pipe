@@ -26,6 +26,7 @@ not a whole body, so a download also checks the deadline between chunks.
 
 from __future__ import annotations
 
+import io
 import time
 from collections.abc import Callable
 from typing import Any, Self
@@ -65,19 +66,29 @@ class GcsAPIError(Exception):
     """A failed GCS call. ``status`` is the HTTP status (None when nothing came
     back); ``retry_after`` is set for a 429/503 that said when to retry;
     ``timed_out`` for a timeout; ``key_refused`` when Google's token endpoint
-    refused the service account key itself."""
+    refused the service account key itself.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, Cloud Storage's own error text when it gave one (redacted
+    and bounded). That text names objects, so only the toolkit, which
+    answers the caller, shows it; the source's errors carry ``summary``
+    alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
         key_refused: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.retry_after = retry_after
         self.timed_out = timed_out
@@ -110,12 +121,14 @@ def _token_failure(e: GcsTokenError) -> GcsAPIError:
     refused key is 401 (unauthorized); a timeout stays a timeout, and an
     unreachable or failing endpoint is an upstream error a host may retry."""
     if e.kind == TOKEN_REFUSED:
-        return GcsAPIError(e.message, status=401, key_refused=True)
+        return GcsAPIError(e.summary, detail=e.detail, status=401, key_refused=True)
     if e.kind == TOKEN_TIMED_OUT:
-        return GcsAPIError(e.message, timed_out=True)
+        return GcsAPIError(e.summary, detail=e.detail, timed_out=True)
     if e.kind == TOKEN_RATE_LIMITED:
-        return GcsAPIError(e.message, status=429, retry_after=e.retry_after)
-    return GcsAPIError(e.message, retry_after=e.retry_after)
+        return GcsAPIError(
+            e.summary, detail=e.detail, status=429, retry_after=e.retry_after
+        )
+    return GcsAPIError(e.summary, detail=e.detail, retry_after=e.retry_after)
 
 
 def _monotonic() -> float:
@@ -221,13 +234,16 @@ class GcsClient:
 
     def download(self, name: str, *, generation: str | None, max_bytes: int) -> bytes:
         """The object's bytes at ``generation`` (so the bytes match the
-        metadata read just before), at most ``max_bytes``."""
+        metadata read just before), at most ``max_bytes``. They accumulate in
+        one buffer whose ``getvalue()`` hands its bytes over without a copy,
+        so a download holds about one copy of the object, not the chunks and
+        then their join."""
         params: dict[str, Any] = {"alt": "media"}
         if generation:
             params["generation"] = generation
         resp = self._get(f"{self._bucket_url}/{object_path(name)}", params, stream=True)
         try:
-            chunks: list[bytes] = []
+            buffer = io.BytesIO()
             total = 0
             for chunk in resp.iter_content(_CHUNK):
                 remaining = self._remaining()
@@ -239,8 +255,8 @@ class GcsClient:
                         f"{name} is larger than {max_bytes} bytes",
                         status=resp.status_code,
                     )
-                chunks.append(chunk)
-            return b"".join(chunks)
+                buffer.write(chunk)
+            return buffer.getvalue()
         except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
             # The body broke off midway: a read timeout (requests wraps it in
             # ConnectionError), a reset (ChunkedEncodingError), bad gzip...
@@ -305,7 +321,8 @@ class GcsClient:
             detail = self._detail(resp)
             resp.close()
             raise GcsAPIError(
-                f"Cloud Storage failed ({status})" + detail,
+                f"Cloud Storage failed ({status})",
+                detail=detail,
                 status=status,
                 retry_after=retry_after_seconds(resp.headers.get("Retry-After"))
                 if status in (429, 503)
@@ -343,8 +360,7 @@ class GcsClient:
                 text = error
         for token in self._sent_tokens:
             text = text.replace(token, "[redacted]")
-        text = " ".join(text.split())[:_MAX_DETAIL]
-        return f": {text}" if text else ""
+        return " ".join(text.split())[:_MAX_DETAIL]
 
 
 def object_record(item: Any) -> dict[str, Any]:

@@ -19,6 +19,11 @@ and ``timed_out`` for a timeout. A 401 drops the token from the cache, and a
 call whose cached token was rejected retries once with a new one. Error
 messages never carry the token or the key.
 
+Row pages (tabledata.list, jobs.query, jobs.getQueryResults) are read with a
+:class:`PageCap`: the body is streamed, and its bytes and cells are counted
+as they arrive, before any of it is parsed. A body over the cap is dropped
+(:class:`PageTooLarge`); the caller asks for fewer rows.
+
 Time budget: with ``budget`` (seconds; the host's
 ``config["timeout_seconds"]``) the whole call fits inside it, from the
 client's creation on. Every request, the token POST included, gets the time
@@ -33,11 +38,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any, Self
 from urllib.parse import quote
 
 import requests
+import urllib3.exceptions
 
 from aisquare_pipe_bigquery._http import retry_after_seconds, timed_out
 from aisquare_pipe_bigquery.credentials import (
@@ -65,6 +72,22 @@ JOB_LABELS = {"client": "aisquare-pipe"}
 _JOB_ID = re.compile(r"^[A-Za-z0-9_-]{1,1024}$")
 _LOCATION = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _MAX_DETAIL = 500
+#: A row page's body is read this many bytes at a time.
+READ_CHUNK = 64 * 1024
+#: What a dropped page's remainder is read through at most, discarded as it
+#: is read, to measure it (:attr:`PageCap.measure`) or to find its job:
+#: past BigQuery's own page limits (about 10 MB and 20 MB).
+DRAIN_BYTES = 64 * 1024 * 1024
+#: Every REST cell is one ``{"v": ...}`` object (a ``REPEATED`` column's every
+#: element and a ``RECORD``'s every field too): its key, counted in the raw
+#: JSON. Inside a JSON string a quote is escaped, so this is only ever a key.
+_CELL_KEY = b'"v":'
+#: Every REST row is one ``{"f": [...]}`` object (and so is every ``RECORD``
+#: value): counted the same way, at least the rows a body has begun.
+_ROW_KEY = b'"f":'
+#: A query answer's job (``{"projectId", "jobId", "location"}``, flat).
+_JOB_REFERENCE = re.compile(rb'"jobReference"\s*:\s*(\{[^{}]{0,4096}\})')
+_JOB_TAIL = 8192
 
 
 class BigQueryAPIError(Exception):
@@ -72,25 +95,110 @@ class BigQueryAPIError(Exception):
     nothing came back); ``reason`` BigQuery's error reason, if any;
     ``retry_after`` is set for a 429/503 that said when to retry;
     ``timed_out`` for a timeout; ``key_refused`` when Google's token
-    endpoint refused the service account key itself."""
+    endpoint refused the service account key itself; ``www_authenticate``
+    the answer's ``WWW-Authenticate`` header.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, BigQuery's own error text when it gave one (redacted and
+    bounded). That text can quote the statement and name tables, so only
+    the toolkit, which answers the caller, shows it; the source's errors
+    carry ``summary`` alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         reason: str | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
         key_refused: bool = False,
+        www_authenticate: str | None = None,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.reason = reason
         self.retry_after = retry_after
         self.timed_out = timed_out
         self.key_refused = key_refused
+        self.www_authenticate = www_authenticate
+
+
+@dataclass(frozen=True)
+class PageCap:
+    """The most one row page's body may hold, counted as it is read and
+    before it is parsed: ``max_bytes`` of JSON and ``max_cells`` cells (its
+    ``"v":`` keys: what :func:`~aisquare_pipe_bigquery.rows.rest_cells`
+    counts, and what parsing costs). ``measure``: when the body is over the
+    cap, read the rest of it too, discarding it, so :class:`PageTooLarge`
+    says how large the whole body is."""
+
+    max_bytes: int
+    max_cells: int
+    measure: bool = False
+
+
+class PageTooLarge(BigQueryAPIError):
+    """A row page whose body went over its :class:`PageCap`: it was dropped
+    unparsed, and the caller asks for fewer rows. ``body_bytes``, ``cells``
+    and ``rows`` (its ``"f":`` keys: the rows it began, and every ``RECORD``
+    value) are what was read of it; with ``complete``, the whole body's.
+    ``job`` is the answer's ``jobReference`` when it was asked for and could
+    be found (a jobs.query answer: the job to page from).
+
+    A :class:`BigQueryAPIError` (upstream, 502) should one ever reach a
+    host: the readers catch it."""
+
+    def __init__(
+        self,
+        body_bytes: int,
+        cells: int,
+        rows: int,
+        *,
+        complete: bool,
+        job: dict[str, Any] | None,
+    ) -> None:
+        super().__init__("a BigQuery page was larger than one read may hold")
+        self.body_bytes = body_bytes
+        self.cells = cells
+        self.rows = rows
+        self.complete = complete
+        self.job = job
+
+
+class _Counts:
+    """The cells (``"v":`` keys) and rows (``"f":`` keys) of a body read in
+    chunks: a key split across two chunks is counted once."""
+
+    def __init__(self) -> None:
+        self.cells = 0
+        self.rows = 0
+        self._tail = b""
+
+    def add(self, chunk: bytes) -> None:
+        window = self._tail + chunk
+        self.cells += window.count(_CELL_KEY)
+        self.rows += window.count(_ROW_KEY)
+        # Both keys are 4 bytes: a 3-byte tail never holds a whole one.
+        self._tail = window[-(len(_CELL_KEY) - 1) :]
+
+
+def _job_reference(data: bytes | bytearray) -> dict[str, Any] | None:
+    match = _JOB_REFERENCE.search(data)
+    if match is None:
+        return None
+    try:
+        job = json.loads(match.group(1))
+    except ValueError:
+        return None
+    if not isinstance(job, dict) or not isinstance(job.get("jobId"), str):
+        return None
+    return job
 
 
 def _segment(value: str) -> str:
@@ -114,12 +222,16 @@ def _token_failure(e: BigQueryTokenError) -> BigQueryAPIError:
     an unreachable or failing endpoint is an upstream error a host may
     retry."""
     if e.kind == TOKEN_REFUSED:
-        return BigQueryAPIError(e.message, status=401, key_refused=True)
+        return BigQueryAPIError(
+            e.summary, detail=e.detail, status=401, key_refused=True
+        )
     if e.kind == TOKEN_TIMED_OUT:
-        return BigQueryAPIError(e.message, timed_out=True)
+        return BigQueryAPIError(e.summary, detail=e.detail, timed_out=True)
     if e.kind == TOKEN_RATE_LIMITED:
-        return BigQueryAPIError(e.message, status=429, retry_after=e.retry_after)
-    return BigQueryAPIError(e.message, retry_after=e.retry_after)
+        return BigQueryAPIError(
+            e.summary, detail=e.detail, status=429, retry_after=e.retry_after
+        )
+    return BigQueryAPIError(e.summary, detail=e.detail, retry_after=e.retry_after)
 
 
 def _monotonic() -> float:
@@ -159,6 +271,8 @@ class BigQueryClient:
         self._token_from_cache = False
         #: Every token this client sent: redacted from any error text.
         self._sent_tokens: set[str] = set()
+        #: The bytes of the last JSON body read (a row page is sized from them).
+        self.last_body_bytes = 0
 
     def __enter__(self) -> Self:
         return self
@@ -263,6 +377,7 @@ class BigQueryClient:
         page_token: str | None = None,
         start_index: int | None = None,
         selected_fields: list[str] | None = None,
+        cap: PageCap | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "maxResults": page_size,
@@ -274,7 +389,7 @@ class BigQueryClient:
             params["startIndex"] = start_index
         if selected_fields:
             params["selectedFields"] = ",".join(selected_fields)
-        return self._json("GET", f"{self._table_url(ref)}/data", params)
+        return self._json("GET", f"{self._table_url(ref)}/data", params, cap=cap)
 
     def _query_body(
         self, sql: str, default_dataset: tuple[str | None, str] | None
@@ -308,10 +423,12 @@ class BigQueryClient:
         wait_ms: int,
         request_id: str,
         default_dataset: tuple[str | None, str] | None = None,
+        cap: PageCap | None = None,
     ) -> dict[str, Any]:
         """jobs.query: starts the job (``maximumBytesBilled`` and
         ``jobTimeoutMs`` set, so BigQuery itself enforces the byte cap and
-        the deadline) and waits up to ``wait_ms`` for its first page."""
+        the deadline) and waits up to ``wait_ms`` for its first page. A first
+        page over ``cap`` is :class:`PageTooLarge` with the job it named."""
         body = {
             **self._query_body(sql, default_dataset),
             "maxResults": page_size,
@@ -324,7 +441,9 @@ class BigQueryClient:
             "labels": dict(JOB_LABELS),
             "formatOptions": {"useInt64Timestamp": True},
         }
-        return self._json("POST", f"{self._project_url()}/queries", {}, body=body)
+        return self._json(
+            "POST", f"{self._project_url()}/queries", {}, body=body, cap=cap, job=True
+        )
 
     def query_results(
         self,
@@ -332,10 +451,13 @@ class BigQueryClient:
         *,
         page_size: int,
         page_token: str | None = None,
+        start_index: int | None = None,
         wait_ms: int | None = None,
+        cap: PageCap | None = None,
     ) -> dict[str, Any]:
         """jobs.getQueryResults for the job ``start_query`` started (its
-        ``jobReference``): the job's state, then its pages."""
+        ``jobReference``): the job's state, then its pages, from
+        ``page_token`` or else from row ``start_index``."""
         job_id = job.get("jobId") if isinstance(job, dict) else None
         if not isinstance(job_id, str) or not _JOB_ID.match(job_id):
             raise BigQueryAPIError("BigQuery answered without a usable job reference")
@@ -348,10 +470,12 @@ class BigQueryClient:
             params["location"] = location
         if page_token:
             params["pageToken"] = page_token
+        elif start_index:
+            params["startIndex"] = start_index
         if wait_ms is not None:
             params["timeoutMs"] = wait_ms
         url = f"{self._project_url()}/queries/{_segment(job_id)}"
-        return self._json("GET", url, params)
+        return self._json("GET", url, params, cap=cap)
 
     # -- transport -----------------------------------------------------------
 
@@ -370,12 +494,21 @@ class BigQueryClient:
         forget_token(self._creds, self._token)
         self._token = None
 
-    def _send(self, method: str, url: str, params: dict[str, Any], body: Any) -> Any:
+    def _send(
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any],
+        body: Any,
+        stream: bool = False,
+    ) -> Any:
         headers = {"Accept": "application/json", **self._auth()}
         kwargs: dict[str, Any] = {}
         if body is not None:
             headers["Content-Type"] = "application/json"
             kwargs["data"] = json.dumps(body).encode()
+        if stream:
+            kwargs["stream"] = True
         try:
             return self._session.request(
                 method,
@@ -387,14 +520,20 @@ class BigQueryClient:
                 **kwargs,
             )
         except requests.RequestException as e:
-            # Bodies aren't streamed: a connect failure and an answer that
-            # broke off midway both surface here.
+            # Bodies that aren't streamed: a connect failure and an answer
+            # that broke off midway both surface here (a streamed row page's
+            # body breaking off surfaces in _read_page).
             raise _transport_error(e, "complete the request to BigQuery") from e
 
     def _call(
-        self, method: str, url: str, params: dict[str, Any], body: Any = None
+        self,
+        method: str,
+        url: str,
+        params: dict[str, Any],
+        body: Any = None,
+        stream: bool = False,
     ) -> Any:
-        resp = self._send(method, url, params, body)
+        resp = self._send(method, url, params, body, stream)
         if resp.status_code == 401:
             # Google no longer takes this token (key deleted or disabled,
             # account disabled, token revoked): drop it so no later call
@@ -406,7 +545,7 @@ class BigQueryClient:
             self._drop_token()
             if from_cache:
                 resp.close()
-                resp = self._send(method, url, params, body)
+                resp = self._send(method, url, params, body, stream)
                 if resp.status_code == 401:
                     self._drop_token()
         status = resp.status_code
@@ -419,14 +558,17 @@ class BigQueryClient:
         if status >= 400:
             message, reason = self._detail(resp)
             resp.close()
+            headers = resp.headers or {}
+            challenge = headers.get("WWW-Authenticate")
             raise BigQueryAPIError(
-                f"BigQuery failed ({status}{', ' + reason if reason else ''})"
-                + (f": {message}" if message else ""),
+                f"BigQuery failed ({status}{', ' + reason if reason else ''})",
+                detail=message,
                 status=status,
                 reason=reason,
-                retry_after=retry_after_seconds((resp.headers or {}).get("Retry-After"))
+                retry_after=retry_after_seconds(headers.get("Retry-After"))
                 if status in (429, 503)
                 else None,
+                www_authenticate=challenge if isinstance(challenge, str) else None,
             )
         return resp
 
@@ -437,11 +579,23 @@ class BigQueryClient:
         params: dict[str, Any],
         *,
         body: Any = None,
+        cap: PageCap | None = None,
+        job: bool = False,
     ) -> dict[str, Any]:
-        resp = self._call(method, url, params, body)
+        """The answer's JSON object. With ``cap`` (a row page), its body is
+        read within it (:meth:`_read_page`) and only then parsed; ``job``:
+        a body over it names its ``jobReference``."""
+        resp = self._call(method, url, params, body, stream=cap is not None)
         try:
             try:
-                data = resp.json()
+                if cap is not None:
+                    data = self._page_json(resp, cap, job=job)
+                else:
+                    content = getattr(resp, "content", None)
+                    self.last_body_bytes = (
+                        len(content) if isinstance(content, bytes) else 0
+                    )
+                    data = resp.json()
             except ValueError as e:
                 raise BigQueryAPIError(
                     "BigQuery answered with a body that is not JSON",
@@ -454,6 +608,74 @@ class BigQueryClient:
                 "BigQuery answered with an unexpected body", status=resp.status_code
             )
         return data
+
+    def _page_json(self, resp: Any, cap: PageCap, *, job: bool) -> Any:
+        """A row page's JSON, read within ``cap`` (:meth:`_read_page`). Its
+        bytes are decoded, then let go before it is parsed, so they and its
+        objects are never held at once. (A body that isn't JSON, or isn't
+        text, is a ``ValueError``.)"""
+        body = self._read_page(resp, cap, job=job)
+        self.last_body_bytes = len(body)
+        text = body.decode(json.detect_encoding(body), "surrogatepass")
+        del body
+        return json.loads(text)
+
+    def _read_page(self, resp: Any, cap: PageCap, *, job: bool) -> bytearray:
+        """A streamed row page's body, read :data:`READ_CHUNK` bytes at a
+        time while its bytes and cells (``"v":`` keys) are within ``cap``.
+        Over either, it is dropped: :class:`PageTooLarge`. A body that breaks
+        off is a transport failure, as for any other call."""
+        body = bytearray()
+        counts = _Counts()
+        chunks: Iterator[bytes] = resp.iter_content(READ_CHUNK)
+        try:
+            for chunk in chunks:
+                counts.add(chunk)
+                body += chunk
+                if len(body) > cap.max_bytes or counts.cells > cap.max_cells:
+                    raise self._dropped(body, counts, chunks, cap, job)
+        except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
+            raise _transport_error(e, "read BigQuery's answer") from None
+        return body
+
+    @staticmethod
+    def _dropped(
+        body: bytearray,
+        counts: _Counts,
+        chunks: Iterator[bytes],
+        cap: PageCap,
+        want_job: bool,
+    ) -> PageTooLarge:
+        """The :class:`PageTooLarge` for a body over ``cap``: its job from
+        what was read, and with ``measure`` (or a job still to find) the
+        rest read through, discarded as it comes, up to :data:`DRAIN_BYTES`."""
+        found = _job_reference(body) if want_job else None
+        size = len(body)
+        job_tail = bytes(body[-_JOB_TAIL:])
+        body.clear()
+        find = want_job and found is None
+        if not (cap.measure or find):
+            return PageTooLarge(
+                size, counts.cells, counts.rows, complete=False, job=found
+            )
+        complete = True
+        for chunk in chunks:
+            counts.add(chunk)
+            size += len(chunk)
+            if find:
+                job_window = job_tail + chunk
+                found = _job_reference(job_window)
+                find = found is None
+                job_tail = job_window[-_JOB_TAIL:]
+            if not (cap.measure or find):
+                complete = False
+                break
+            if size > DRAIN_BYTES:
+                complete = False
+                break
+        return PageTooLarge(
+            size, counts.cells, counts.rows, complete=complete, job=found
+        )
 
     def redact(self, text: str) -> str:
         for token in self._sent_tokens:
@@ -499,10 +721,14 @@ def error_detail(
 
 __all__ = [
     "API_ROOT",
+    "DRAIN_BYTES",
     "JOB_LABELS",
     "MAX_WAIT_SECONDS",
     "POLL_PAUSE_SECONDS",
+    "READ_CHUNK",
     "BigQueryAPIError",
     "BigQueryClient",
+    "PageCap",
+    "PageTooLarge",
     "error_detail",
 ]

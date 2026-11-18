@@ -9,11 +9,16 @@ secret (a param naming one is refused). Exactly one of:
 * ``table``: ``schema.table`` (plain names: letters, digits, ``_``, ``$``),
   read as ``SELECT * FROM "schema"."table"``, which passes the same check.
 
-And for both: ``batch_size`` rows per envelope (default 500, at most
-10,000), ``max_rows`` (default 10,000, at most 100,000),
-``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 100 MiB)
-and ``timeout_seconds`` (default 120, at most 600; never more than the
-host's time budget): the statement is cancelled if it runs past it.
+And for both: ``batch_size`` rows per envelope (default 500, at most 10,000)
+and ``max_batch_bytes`` bytes of envelope data (default 256 KiB, what
+pipe-as-service returns inline in a synchronous pull; at least 1 KiB, at
+most 64 MiB; a single larger row still gets an envelope of its own),
+whichever comes first, ``max_rows`` (default 10,000, at most 100,000),
+``max_result_bytes`` (bytes of the envelopes' data in all, each one's
+columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB
+pod: see the README's "Memory") and ``timeout_seconds`` (default 120, at
+most 600; never more than the host's time budget): the statement is
+cancelled if it runs past it.
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``), and ``metadata`` carries the
@@ -32,6 +37,24 @@ envelope with no rows, so its markers still come out. A result cut short by
 ``max_rows`` or ``max_result_bytes`` says so on every envelope
 (``truncated``); its ``result_sha256`` covers the rows read only.
 
+A pull fails as pipe-as-service answers it (it maps a ``PipeError`` by its
+exact type, a ``ValueError`` along the MRO):
+
+* 422, a ``ValueError``: a blob that doesn't parse
+  (``RedshiftNotConfiguredError``), bad params (``ConfigValidationError``),
+  SQL that is not one SELECT (``NotReadOnly``), what the caller can fix that
+  Redshift refused (:class:`RedshiftRequestError`: a statement that failed
+  on its SQL, a relation that does not exist) and AWS's ``not_found`` and
+  ``invalid_arguments`` (``AwsRequestError``);
+* 502, a :class:`~aisquare.pipe.errors.PipelineError`: the deadline
+  (cancelled or not), a permission the database user lacks, an aborted
+  statement, and everything else AWS refused or failed (AssumeRole,
+  throttling, an expired session, a 5xx).
+
+Neither carries the database's error text (it can echo the caller's values)
+or AWS's message: the toolkit, which answers the caller, still shows the
+database's.
+
 The connector's own logs carry no SQL, no table names and no row values, and
 nothing sqlglot logs while the guard parses gets out
 (:mod:`aisquare_pipe_aws.redshift.sqlguard`). botocore's DEBUG request log,
@@ -41,14 +64,14 @@ off unless a host turns it on, does hold the SQL.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Iterator
 from typing import Any
 
 from aisquare.pipe import time_budget
+from aisquare.pipe.core.batches import INLINE_BATCH_BYTES, batch_bounds
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
-from aisquare.pipe.errors import ConfigValidationError
+from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_aws.connector import _AwsSource
 from aisquare_pipe_aws.redshift import dataapi, rows
@@ -65,15 +88,29 @@ VERSION = "0.1.0"
 
 DEFAULT_BATCH_SIZE = 500
 MAX_BATCH_SIZE = 10_000
+#: The smallest ``max_batch_bytes`` (the default is the host's inline size,
+#: :data:`~aisquare.pipe.core.batches.INLINE_BATCH_BYTES`).
+MIN_BATCH_BYTES = 1024
 DEFAULT_MAX_ROWS = 10_000
 MAX_ROWS = 100_000
 DEFAULT_MAX_RESULT_BYTES = 25 * 1024 * 1024
-MAX_RESULT_BYTES = 100 * 1024 * 1024
+#: Sized for a 512 MiB pod: the source peaks at about 1.35x the rows' JSON
+#: plus a page or two (the README's "Memory" has the measurements), and a
+#: host holds its envelopes too (pipe-as-service base64-encodes each, ~1.33x).
+MAX_RESULT_BYTES = 64 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120
 MAX_TIMEOUT_SECONDS = 600
 
 PARAMS = frozenset(
-    {"sql", "table", "batch_size", "max_rows", "max_result_bytes", "timeout_seconds"}
+    {
+        "sql",
+        "table",
+        "batch_size",
+        "max_batch_bytes",
+        "max_rows",
+        "max_result_bytes",
+        "timeout_seconds",
+    }
 )
 #: ``schema.table``: two plain Redshift names.
 _TABLE = re.compile(
@@ -127,6 +164,44 @@ def _statement(values: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if not isinstance(sql, str) or not sql.strip():
         raise ConfigValidationError("sql must be a non-empty string")
     return sql, {"query_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest()}
+
+
+class RedshiftRequestError(ValueError):
+    """Redshift ran the statement and it failed on what the caller sent (its
+    SQL, a relation that does not exist or the user can't see). A
+    ``ValueError``, so pipe-as-service answers it 422. ``code`` is the
+    toolkit error code; the database's own text is not in the message."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: StatementFailed codes the caller can fix by asking differently.
+_CALLER_CODES = frozenset({"invalid_arguments", "not_found"})
+_HINTS = {
+    "invalid_arguments": "Redshift could not run it as sent; REDSHIFT_RUN_SELECT shows "
+    "the database's own error",
+    "not_found": "a relation or column it names does not exist, or the database user "
+    "has no grant on it",
+    "forbidden": "the database user lacks a grant for this (the README's Redshift "
+    "registration checklist, step 3)",
+    "upstream_error": "Redshift aborted it (a cancel, a WLM rule or a restart); retry",
+}
+
+
+def statement_error(e: dataapi.StatementTimeout | dataapi.StatementFailed) -> Exception:
+    """A statement that timed out or failed, as the source raises it:
+    :class:`RedshiftRequestError` (422) for what the caller can fix, a
+    :class:`~aisquare.pipe.errors.PipelineError` (502) otherwise. The
+    message is the connector's own (never the database's text)."""
+    if isinstance(e, dataapi.StatementTimeout):
+        return PipelineError(str(e))
+    hint = _HINTS.get(e.code)
+    text = f"{e.summary} ({e.code})" + (f" — {hint}" if hint else "")
+    if e.code in _CALLER_CODES:
+        return RedshiftRequestError(text, code=e.code)
+    return PipelineError(text)
 
 
 class RedshiftQuerySource(_AwsSource):
@@ -192,10 +267,26 @@ class RedshiftQuerySource(_AwsSource):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
+        """Yield one envelope per batch of rows; fails as the module
+        docstring says (the AWS refusals through ``_AwsSource.pull``)."""
+        try:
+            yield from super().pull(config, params)
+        except (dataapi.StatementTimeout, dataapi.StatementFailed) as e:
+            raise statement_error(e) from None
+
+    def _pull(self, config: dict, params: PullParams | None) -> Iterator[DataEnvelope]:
         cfg = RedshiftConfig.from_config(config)
         values = _options(params)
         sql, what = _statement(values)
         batch_size = _int(values, "batch_size", DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE)
+        batch_bytes = _int(
+            values, "max_batch_bytes", INLINE_BATCH_BYTES, MAX_RESULT_BYTES
+        )
+        if batch_bytes < MIN_BATCH_BYTES:
+            raise ConfigValidationError(
+                f"max_batch_bytes must be an integer from {MIN_BATCH_BYTES} to "
+                f"{MAX_RESULT_BYTES}"
+            )
         max_rows = _int(values, "max_rows", DEFAULT_MAX_ROWS, MAX_ROWS)
         max_bytes = _int(
             values, "max_result_bytes", DEFAULT_MAX_RESULT_BYTES, MAX_RESULT_BYTES
@@ -215,30 +306,54 @@ class RedshiftQuerySource(_AwsSource):
             deadline=dataapi.Deadline(timeout),
             max_rows=max_rows,
             max_result_bytes=max_bytes,
+            encoded=True,
+            batching=(batch_size, batch_bytes),
         )
-        yield from _envelopes(result, cfg.target, what, batch_size)
+        yield from _envelopes(result, cfg.target, what, (batch_size, batch_bytes))
 
 
 def _envelopes(
-    result: Result, target: RedshiftTarget, what: dict[str, Any], batch_size: int
+    result: Result,
+    target: RedshiftTarget,
+    what: dict[str, Any],
+    batch_size: tuple[int, int],
 ) -> Iterator[DataEnvelope]:
+    """The result (read ``encoded=True``) as envelopes of at most
+    ``batch_size`` (rows, bytes of envelope data; one when empty). Each
+    batch's rows are let go once its envelope is
+    built, so the rows and the envelopes a consumer keeps add up to about
+    one copy of the result."""
     result_hash = result.result_sha256
-    batches = [
-        result.rows[start : start + batch_size]
-        for start in range(0, len(result.rows), batch_size)
-    ] or [[]]
+    encoded: list[bytes | None] = list(result.encoded or [])
+    digests = result.digests or []
+    result.encoded = result.digests = None
+    count = len(encoded)
+    bounds = (
+        result.plan.bounds()
+        if result.plan is not None
+        else batch_bounds(
+            [len(r) if r is not None else 0 for r in encoded],
+            max_rows=batch_size[0],
+            max_bytes=batch_size[1],
+            header=len(rows.envelope_batch(result.columns, [])) - 2,
+            separator=2,
+            closing=2,
+        )
+    )
     where = target.cluster_identifier or target.workgroup_name
     label = what.get("table") or f"query:{what['query_sha256'][:16]}"
-    for index, batch in enumerate(batches):
+    for index, (start, end) in enumerate(bounds):
+        batch = [r for r in encoded[start:end] if r is not None]
+        encoded[start:end] = [None] * (end - start)
         metadata: dict[str, Any] = {
             "version": result_hash,
             "result_sha256": result_hash,
             "batch_index": index,
-            "batch_count": len(batches),
-            "first_row": index * batch_size,
+            "batch_count": len(bounds),
+            "first_row": start,
             "row_count": len(batch),
-            "batch_sha256": rows.rows_sha256(batch),
-            "result_row_count": len(result.rows),
+            "batch_sha256": rows.digests_sha256(digests[start:end]),
+            "result_row_count": count,
             "statement_id": result.statement_id,
             "database": target.database,
             **what,
@@ -251,10 +366,11 @@ def _envelopes(
             metadata["workgroup_name"] = target.workgroup_name
         if result.truncated:
             metadata["truncated"] = result.truncated
-        body = {"columns": result.columns, "rows": batch}
-        yield DataEnvelope(
+        envelope = DataEnvelope(
             content_type="application/json",
-            data=json.dumps(body, ensure_ascii=False, default=str).encode("utf-8"),
+            data=rows.envelope_batch(result.columns, batch),
             source_id=f"redshift://{where}/{target.database}/{label}#batch={index}",
             metadata=metadata,
         )
+        del batch
+        yield envelope

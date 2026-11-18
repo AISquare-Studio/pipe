@@ -5,7 +5,11 @@ with a server-issued external ID) and, on it, read-only connectors and
 toolkits for Amazon Bedrock AgentCore policies and Amazon S3 objects.
 """
 
-from aisquare_pipe_aws.connector import BedrockAgentCorePoliciesSource, S3Source
+from aisquare_pipe_aws.connector import (
+    AwsRequestError,
+    BedrockAgentCorePoliciesSource,
+    S3Source,
+)
 from aisquare_pipe_aws.credentials import (
     AwsAccessError,
     AwsNotConfiguredError,
@@ -17,6 +21,7 @@ from aisquare_pipe_aws.toolkit import BedrockAgentCoreToolkit, S3Toolkit
 __all__ = [
     "AwsAccessError",
     "AwsNotConfiguredError",
+    "AwsRequestError",
     "BedrockAgentCorePoliciesSource",
     "BedrockAgentCoreToolkit",
     "CrossAccountConfig",

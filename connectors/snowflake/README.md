@@ -74,8 +74,12 @@ name gets a unique key (`A`, `A_2`) and its `source_name`.
 - `sql`: one SELECT, guarded exactly as `SNOWFLAKE_RUN_SELECT`.
 
 For both: `database` and `schema` (the defaults for names written without them), `batch_size` rows per envelope
-(default 500, at most 10,000), `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (JSON bytes of
-rows, default 25 MiB, at most 100 MiB) and `timeout_seconds` (the statement deadline, default 120, at most 600).
+(default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data (default 256 KiB, what pipe-as-service
+returns inline in a synchronous pull, which answers 400 for a larger envelope without a blob store; at least 1 KiB,
+at most 64 MiB; a single larger row still gets its own envelope), whichever comes first, `max_rows` (default 10,000,
+at most 100,000), `max_result_bytes` (bytes of the envelopes' data in all, each one's columns header included;
+default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)) and `timeout_seconds` (the statement
+deadline, default 120, at most 600).
 
 Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
 `schema` holds the columns too). A result with no rows is one envelope with no rows, so its markers still come out.
@@ -103,6 +107,58 @@ Also in `metadata`: `kind` (`table` or `query`), `table` or `query_sha256` (the 
 `start_index` and repeat until a pull is not truncated. Nothing is skipped or repeated while the table doesn't
 change. Without `order_by` (or for `sql`) a truncated pull can't be continued: add `order_by`, narrow the query or
 raise the caps. `result_sha256` then covers the rows read only.
+
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Snowflake's own error
+text, which can quote the SQL and name objects, because hosts log these):
+- **422**, a `ValueError`: the secret is missing or malformed (`SnowflakeNotConfigured`); a bad param or name; SQL
+  that is not one SELECT (`NotReadOnly`); a row over 8 MiB of JSON (`RowTooLarge`: its index, none of its values;
+  select fewer or shorter columns); and what Snowflake refused that the caller can fix, as `SnowflakeRequestError`
+  (with Snowflake's `status`, `code` and `sql_state`): a statement that does not compile (with Snowflake's "line L at
+  position P"), an object that does not exist or the role can't see, a value that can't be converted.
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when Snowflake sent `Retry-After` (a 503): a key or
+  OAuth client Snowflake refused, a missing grant or warehouse, throttling, the statement's deadline, a 5xx, the
+  network (a body that breaks off midway included), or a result body that is not the SQL API's JSON. The message says which, and what to fix, as the table below does.
+
+### Memory
+
+A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each result partition as
+fresh JSON bytes, a chunk at a time as the network does, and every envelope is kept: one inline copy each, as
+pipe-as-service keeps a pull's converted envelopes (inline up to 256 KiB; each test's docstring has the model)). Each
+pull was measured in a process of its own:
+
+| Pull | Rows | JSON of the rows | Peak | At 1a8b64e |
+|---|---|---|---|---|
+| defaults: 10,000 rows of 50 `NUMBER` columns, 10,000-row partitions | 10,000 | 6.8 MiB | 7.9 MiB | 38.4 MiB |
+| defaults: the same, partitions of 1,000 then 99,000 rows | 10,000 | 6.8 MiB | 7.9 MiB | 35.3 MiB |
+| caps: 50 `NUMBER` columns, 10,000-row partitions | 94,746 | 64 MiB | 74.1 MiB | 95.1 MiB |
+| caps: 50 `NUMBER` columns, ONE 100,000-row partition (52.5 MiB) | 94,746 | 64 MiB | 74.1 MiB | 380.0 MiB |
+| caps: 50 `NUMBER` columns, 1,000 rows then a 99,000-row partition | 94,746 | 64 MiB | 74.1 MiB | 376.8 MiB |
+| caps: 10 `NUMBER` columns, 100,000 rows in one partition | 100,000 | 12.6 MiB | 23.8 MiB | 88.2 MiB |
+| caps: 4 wide `TEXT` columns (1 KB a row), 10,000-row partitions | 64,852 | 64 MiB | 71.3 MiB | 73.9 MiB |
+| caps: the same, 60,000 rows in one 58 MiB partition | 64,852 | 64 MiB | 71.3 MiB | 135.5 MiB |
+| caps: rows of 4 `TEXT` cells of 2 MiB (8 MiB of JSON a row), ASCII | 7 | 56 MiB | 105.1 MiB | 88.0 MiB (5 rows) |
+| caps: the same, an emoji in every cell (the worst measured) | 7 | 56 MiB | **177.1 MiB** | 320.0 MiB (5 rows) |
+| defaults: the same | 3 | 24 MiB | 136.6 MiB | 320.0 MiB |
+
+(Caps: `max_rows` 100,000, `max_result_bytes` 64 MiB, `batch_size` 10,000. The review measured 417.9, 467.0 and 229.2
+MiB at 1a8b64e for three of these shapes with a fake that held each answer whole; this fake hands out chunks.)
+
+**No partition is parsed whole.** Snowflake, not the connector, decides how large a partition is (its docs show one
+of 76 MB uncompressed in one result), and parsing one whole costs about three times its bytes. So a result's body,
+the status answer that carries partition 0 included, is streamed 64 KiB at a time and split as it arrives
+(`aisquare_pipe_snowflake.stream`): every key but `data` (`resultSetMetaData`, the code, ...) is parsed on its own
+(8 MiB in all at most), and `data`'s rows (`jsonv2`: arrays of strings and nulls) one row at a time. Each row is
+converted, kept as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are
+byte for byte what they were) and let go; reading stops at `max_rows` or `max_result_bytes`, inside a partition if
+that is where the cap falls, and the partitions after it are never asked for. A batch's rows are let go once its
+envelope is built.
+
+So a pull peaks at about 1.15 times the rows' JSON plus the row being read, whatever the partitions: 74 MiB at the
+caps for ordinary rows. A row may be at most 8 MiB of JSON (`ROW_BYTES`; one over it is `RowTooLarge`, a 422, with
+its index and none of its values). Parsing one costs up to about nine times its bytes when an emoji makes Python hold
+its text at 4 bytes a character, so the worst pull measured is 177 MiB at the caps. A host keeps the envelopes too:
+pipe-as-service base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at 64 MiB on a
+512 MiB pod.
 
 ## Security
 
@@ -155,8 +211,10 @@ below are refused by both, each by itself. The few that only one of them refuses
 
    Text it can't parse is refused. sqlglot logs pieces of the SQL it parses (its "unsupported syntax" warning, and
    "Invalid JSON path syntax" with the path for any JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`),
-   so a filter on the `sqlglot` logger drops every record it emits while the guard parses, in that context only.
-   Nothing is disabled globally, and sqlglot logs as usual everywhere else.
+   so the guard parses inside `aisquare.pipe.core.sql.quiet_sqlglot()`, the helper every SQL guard shares: a filter
+   on the `sqlglot` logger drops every record it emits while the guard parses, in that context only, so not even
+   Python's `logging.lastResort` prints them. Nothing is disabled globally, and sqlglot logs as usual everywhere
+   else. On a sqlglot older than 26.25 (another package can bring one in) the guard refuses every statement.
 
 What only one check refuses:
 - Only the lexer: a write keyword as a bare word (`SELECT update FROM t`, where sqlglot reads a column), a control
@@ -185,8 +243,8 @@ refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake a
 
 **Caps.**
 - **Rows and bytes returned.** `max_rows` (sent as `ROWS_PER_RESULTSET`, so Snowflake sends no more, and cut again
-  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 100 MiB, for the source). Result
-  partitions are read only while they fit. A result cut short says `truncated`.
+  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 64 MiB, for the source). A result
+  is read a row at a time and reading stops at the cap (see [Memory](#memory)). A result cut short says `truncated`.
 - **Time.** A tool call fits inside the host's `timeout_seconds`, all of its requests together. Each request, the
   OAuth token POST included, gets the time left (at most 30 s), and a call with less than a second left fails
   `timeout` before it submits anything. Every request starts inside the budget and gets at most the time left

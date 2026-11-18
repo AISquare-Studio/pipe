@@ -128,6 +128,20 @@ A refused AWS call is a tool error with AWS's error code, never AWS's message:
 | `unauthorized` | `ExpiredToken`, `InvalidClientTokenId`, … |
 | `upstream_error` | anything else |
 
+The sources fail the same way, as pipe-as-service answers them by the exception's type (a `PipeError` by its exact
+type, so the AWS error classes themselves would be a 500):
+- **422**, a `ValueError`: `not_connected` (`AwsNotConfiguredError`, a `ValueError` first and a
+  `ConfigValidationError` too), our own checks (`ConfigValidationError`), and `not_found` and `invalid_arguments`
+  from AWS, as `AwsRequestError` (with `code` and `aws_code`).
+- **502** `upstream_error`, a `PipelineError`: `forbidden` (AssumeRole included), `rate_limited`, `unauthorized`
+  and `upstream_error`.
+
+The message is the table's: the operation and AWS's error code. An S3 object that grew past `max_object_bytes`
+between the listing and the read is skipped, as one the listing already shows too large is. An object body that
+breaks off while it is read (a read timeout, a dropped connection, a TLS record that fails mid-body, a body shorter
+than its `Content-Length`) is a 502 naming only the error's type: botocore's own message names the bucket and key,
+and urllib3's errors, which botocore passes through as they are, carry the TLS library's text.
+
 ## Customer setup (registration checklist)
 
 Order matters, in both directions:
@@ -670,8 +684,9 @@ these four shapes:
 
 ### SELECT only
 
-`REDSHIFT_RUN_SELECT` and the source's `sql` run one read-only query. Two independent checks
-refuse anything else before any AWS call (not even `sts:AssumeRole`), with
+`REDSHIFT_RUN_SELECT` and the source's `sql` run one read-only query. Two checks (the lexer
+decides where statements, strings and comments end; the parser decides what the one statement
+is) refuse anything else before any AWS call (not even `sts:AssumeRole`), with
 `invalid_arguments` and a reason that never quotes the SQL:
 
 1. **A lexer** that reads Redshift's quoting: strings `'...'` and identifiers `"..."` (quotes
@@ -706,9 +721,11 @@ Neither check logs the SQL, and nothing sqlglot logs while the guard parses gets
 does log pieces of it: "Invalid JSON path syntax. ... <the path>" at WARNING for a JSON path
 it can't read (a key with a dash, a space or an open bracket in `JSON_EXTRACT`,
 `JSON_EXTRACT_SCALAR` or `JSONB_EXISTS`, in queries the guard admits), and its "unsupported
-syntax" warning. While the guard parses, a filter on the `sqlglot` logger drops those records
-in that thread or task only, so no handler sees them, Python's last-resort stderr handler
-included. Nothing is disabled globally, and sqlglot logs as usual everywhere else.
+syntax" warning. The guard parses inside `aisquare.pipe.core.sql.quiet_sqlglot()`, the helper
+every SQL guard shares: a filter on the `sqlglot` logger drops those records in that thread or
+task only, so no handler sees them, Python's last-resort stderr handler included. Nothing is
+disabled globally, and sqlglot logs as usual everywhere else. On a sqlglot older than 26.25
+(another package can bring one in) the guard refuses every statement.
 
 A column named like a keyword is written in double quotes (`"comment"`, `"update"`).
 Redshift adds its own layer behind these: the Data API runs a single statement only, and the
@@ -754,8 +771,11 @@ Pull params, exactly one of:
 - `table`: `schema.table` (plain names: letters, digits, `_`, `$`), read as
   `SELECT * FROM "schema"."table"`.
 
-And `batch_size` (default 500, at most 10,000 rows per envelope), `max_rows` (default 10,000,
-at most 100,000), `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 100 MiB),
+And `batch_size` (default 500, at most 10,000 rows per envelope) and `max_batch_bytes` (bytes of envelope data,
+default 256 KiB: what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
+without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
+comes first, `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (bytes of the envelopes' data in all,
+each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)),
 `timeout_seconds`. Any other param is refused, and so is one naming a key of the secret.
 
 Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
@@ -792,10 +812,66 @@ As for every AWS call above, a refused call carries AWS's error code, never its 
 `timeout`, `DatabaseConnectionException` and `ExecuteStatementException` → `upstream_error`.
 
 A statement that ran and failed is different: the database's own error is about the caller's
-SQL, so it is passed on (at most 500 characters, never logged): "the statement failed in
-Redshift: ERROR: permission denied for schema hr". `permission denied` → `forbidden`,
+SQL, so the toolkit passes it on (at most 500 characters, never logged): "the statement failed
+in Redshift: ERROR: permission denied for schema hr". `permission denied` → `forbidden`,
 `does not exist` → `not_found`, anything else → `invalid_arguments`; an `ABORTED` statement
 → `upstream_error`.
+
+**How a `redshift-query-source` pull fails** (pipe-as-service answers by the exception's type:
+a `PipeError` by its exact type, a `ValueError` along the MRO). Neither message carries the
+database's error text, which can echo the caller's values (`invalid input syntax for integer:
+"123-45-6789"`) and which hosts would log, nor AWS's message:
+- **422**, a `ValueError`: a blob that doesn't parse (`RedshiftNotConfiguredError`), bad params
+  (`ConfigValidationError`), SQL that is not one SELECT (`NotReadOnly`), a statement that failed
+  on the caller's SQL (`invalid_arguments`) or names what does not exist (`not_found`), as
+  `RedshiftRequestError` ("the statement failed in Redshift (invalid_arguments) — ..."), and
+  AWS's `ValidationException`/`ResourceNotFoundException` (`AwsRequestError`).
+- **502** `upstream_error`, a `PipelineError`: the deadline ("did not finish before its
+  deadline; the statement was cancelled"), a grant the database user lacks, an `ABORTED`
+  statement, and every other AWS refusal or failure (AssumeRole, `AccessDeniedException`,
+  throttling, an expired session, a 5xx).
+
+### Memory
+
+A pull's peak memory, measured with `tracemalloc` (`tests/test_redshift_memory.py`; the fake client parses each
+`GetStatementResult` page from fresh JSON bytes, 1,000 rows a page, and every envelope is kept: one inline copy
+each, as pipe-as-service keeps a pull's converted envelopes (inline up to 256 KiB; each test's docstring has the
+model)):
+
+| Pull | Rows | JSON of the rows | Peak |
+|---|---|---|---|
+| defaults: 10,000 rows of 10 `varchar` columns (about 1 KiB a row) | 10,000 | 10 MiB | 16 MiB (29 MiB before) |
+| `max_result_bytes` 64 MiB, the same rows | 63,250 | 65 MiB | 96 MiB |
+| the old 100 MiB cap, the same rows | 98,829 | 102 MiB | 139 MiB (277 MiB before) |
+
+How: each parsed page is let go before the next is read, rows are converted one at a time,
+and the source keeps each row as the JSON its envelope carries plus the row's digest (about a
+fifth of the memory a row object takes; the envelopes and hashes are byte for byte what they
+were). A batch's rows are let go once its envelope is built. So a pull peaks at about 1.35 times
+the rows' JSON plus a page or two. A host keeps the envelopes too: pipe-as-service
+base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at 64 MiB on
+a 512 MiB pod.
+
+**What these numbers assume: AWS's page size.** AWS, not the connector, sizes the result pages:
+`GetStatementResult` takes no page size, and AWS documents none for JSON results (only that a
+result is at most 500 MB after gzip, in the Data API's "Considerations"). botocore parses each
+page whole, so the connector can't cap one, and the peak grows about nine times a page's JSON.
+Measured at the caps with 10 narrow `varchar` columns, changing only the fake's page:
+
+| One `GetStatementResult` page | Peak |
+|---|---|
+| 1,000 rows, 0.3 MiB of JSON (the tests' fake) | 35.9 MiB |
+| 10,000 rows, 2.8 MiB | 58.2 MiB |
+| 30,000 rows, 8.3 MiB | 113.1 MiB |
+| 60,000 rows, 16.7 MiB | 186.0 MiB |
+| 90,000 rows, 25 MiB | 278.7 MiB (over the 256 MiB bar) |
+
+So the bound holds while a real page is under about 20 MiB of JSON. That is unmeasured: one
+page of a wide `SELECT` on stg is the check. If pages run larger, the way out is
+`GetStatementResultV2` (`ResultFormat` `CSV`), which AWS documents at up to 15 MB of results a
+request, in 1 MB chunks. It is not used yet because AWS documents neither how a CSV record
+writes SQL `NULL` (against an empty string) nor whether a chunk carries a header row, so the
+switch needs that stg check first.
 
 ### Redshift registration checklist
 

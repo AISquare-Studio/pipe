@@ -200,12 +200,19 @@ class GcsTokenError(Exception):
         self,
         message: str,
         *,
+        detail: str = "",
         kind: str,
         status: int | None = None,
         retry_after: float | None = None,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        #: The connector's own words; ``detail`` is Google's ``error`` and
+        #: ``error_description`` (bounded, the assertion redacted), which the
+        #: toolkit shows and the source's errors leave out.
+        self.summary = message
+        self.detail = detail
         self.kind = kind
         self.status = status
         self.retry_after = retry_after
@@ -350,7 +357,6 @@ def _exchange(
         x for x in (error, detail if isinstance(detail, str) else "") if x
     )
     reason = " ".join(reason.replace(assertion, "[redacted]").split())[:200]
-    said = f": {reason}" if reason else ""
     if (
         status == 400
         and error == "invalid_grant"
@@ -359,19 +365,22 @@ def _exchange(
     ):
         raise GcsTokenError(
             "Google refused the token request's issue and expiry times: this "
-            f"host's clock is off (the key is fine; check NTP){said}",
+            "host's clock is off (the key is fine; check NTP)",
+            detail=reason,
             kind=TOKEN_CLOCK_SKEW,
             status=status,
         )
     if status in (400, 401, 403) and error not in _TRANSIENT_ERRORS:
         raise GcsTokenError(
-            f"Google did not issue a token for {who}{said}",
+            f"Google did not issue a token for {who}",
+            detail=reason,
             kind=TOKEN_REFUSED,
             status=status,
         )
     if status == 429:
         raise GcsTokenError(
-            f"Google's token endpoint is rate limiting ({status}){said}",
+            f"Google's token endpoint is rate limiting ({status})",
+            detail=reason,
             kind=TOKEN_RATE_LIMITED,
             status=status,
             retry_after=retry_after,
@@ -384,7 +393,8 @@ def _exchange(
             status=status,
         )
     raise GcsTokenError(
-        f"Google's token endpoint failed ({status}){said}",
+        f"Google's token endpoint failed ({status})",
+        detail=reason,
         kind=TOKEN_UPSTREAM,
         status=status,
         retry_after=retry_after if status == 503 else None,

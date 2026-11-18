@@ -6,9 +6,10 @@ import time
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
 from aisquare_pipe_bigquery import (
-    BigQueryAPIError,
     BigQueryQuerySource,
     BigQueryToolkit,
 )
@@ -111,14 +112,15 @@ def test_an_answer_that_comes_back_fast_and_incomplete_is_not_polled_in_a_spin(c
 
 def test_the_source_job_deadline_bounds_its_polling(clock):
     google = _google(clock, step=4.0, polls=1000)
-    with pytest.raises(BigQueryAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         list(
             BigQueryQuerySource(session=google).pull(
                 blob(), PullParams({"sql": "SELECT 1", "job_timeout_seconds": 20})
             )
         )
-    assert raised.value.timed_out
-    assert "did not finish within 20s" in raised.value.message
+    # A timeout is upstream (502 in pipe-as-service), not the caller's fault.
+    assert host_answer(raised.value).status == 502
+    assert "did not finish within 20s" in str(raised.value)
     assert google.runs()[0]["jobTimeoutMs"] == "20000"
     # the source has no host budget: each request gets the full 30 s
     assert all(r["timeout"] == 30.0 for r in google.requests)
