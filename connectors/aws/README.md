@@ -1,10 +1,10 @@
-# aisquare_pipe_aws: Bedrock AgentCore policies and S3 (read-only, cross-account role)
+# aisquare_pipe_aws: Bedrock AgentCore policies, S3 and Redshift (read-only, cross-account role)
 
 Read-only access to a customer's AWS account for [aisquare.pipe](../../README.md), through one
 cross-account IAM role. It ships inside the `aisquare-pipe` distribution:
-`pip install "aisquare-pipe[aws]"` (or `[full]`, or `[toolkits]`). The extra adds `boto3` and
-`botocore` (see [Install](#install)); without it, these connectors and toolkits count as not
-installed. It provides:
+`pip install "aisquare-pipe[aws]"` (or `[redshift]`, the same thing, or `[full]`, or
+`[toolkits]`). The extra adds `boto3`, `botocore` and `sqlglot` (see [Install](#install));
+without it, these connectors and toolkits count as not installed. It provides:
 
 | What | Registered as | Use it for |
 |---|---|---|
@@ -12,6 +12,8 @@ installed. It provides:
 | `S3Source` | connector `s3-source` | One envelope per object under the configured S3 bucket and prefix |
 | `BedrockAgentCoreToolkit` | toolkit `bedrock_agentcore` | `BEDROCK_AGENTCORE_LIST_POLICY_ENGINES`, `BEDROCK_AGENTCORE_LIST_POLICIES`, `BEDROCK_AGENTCORE_GET_POLICY` |
 | `S3Toolkit` | toolkit `s3` | `S3_LIST_OBJECTS`, `S3_GET_OBJECT`, `S3_HEAD_OBJECT` |
+| `RedshiftQuerySource` | connector `redshift-query-source` | One SELECT's rows (or a table's) from Amazon Redshift, as JSON batches: [Amazon Redshift](#amazon-redshift) |
+| `RedshiftToolkit` | toolkit `redshift` | `REDSHIFT_RUN_SELECT` (one read-only query), `REDSHIFT_LIST_SCHEMAS`, `REDSHIFT_LIST_TABLES`, `REDSHIFT_DESCRIBE_TABLE` |
 
 Every tool is read-only. Every connector and tool reads the account the same way. The
 service's own AWS principal calls STS `AssumeRole` into the customer's role, passing the
@@ -376,6 +378,289 @@ target-role example that uses an external ID splits the two statements the same 
 | `refused: the role is in this service's own AWS account` (or "an AWS account this service is set to refuse") | The blob names an AISquare role, not the customer's. |
 | `AWS refused bedrock-agentcore:… (AccessDeniedException)` or `s3:… (AccessDenied)` / `(403)` | The permissions policy, the KMS grant, or the prefix. |
 
+## Amazon Redshift
+
+`aisquare_pipe_aws.redshift` reads a customer's Amazon Redshift, provisioned or Serverless,
+through the [Redshift Data API](https://docs.aws.amazon.com/redshift/latest/mgmt/data-api.html),
+on the same cross-account role as everything above. It lives in this package, not in a
+`connectors/redshift` of its own, because it must assume the role through
+`aisquare_pipe_aws.credentials` (#31), and one connector never imports another (`pipe validate`'s
+`hygiene.no-cross-connector-imports`). Its classes are `_AwsToolkit` and `_AwsSource`
+subclasses, so they share the S3 and AgentCore connectors' session code exactly. The install
+line is `aisquare-pipe[redshift]`, an alias of `[aws]`.
+
+| Tool | Does |
+|---|---|
+| `REDSHIFT_RUN_SELECT` (primary) | Runs ONE read-only query: `ExecuteStatement` → `DescribeStatement` (polled) → `GetStatementResult` (paged). Returns `columns`, `rows` (objects keyed by column), `row_count`, `total_rows`, `truncated` (`max_rows` or `max_result_bytes`, else `null`), `result_sha256`, `statement_id`, `duration_ms`. `max_rows` 1-5000 (default 100); at most 4 MiB of JSON rows. |
+| `REDSHIFT_LIST_SCHEMAS` | `ListSchemas`, optionally filtered by a LIKE `schema_pattern`. |
+| `REDSHIFT_LIST_TABLES` | `ListTables`: each table's or view's `schema`, `name` and `type`, optionally for one exact `schema` and a LIKE `table_pattern`. |
+| `REDSHIFT_DESCRIBE_TABLE` | `DescribeTable`: a table's columns in order, with type, length, precision, scale, nullability and default. |
+
+The list tools page like the other toolkits: `items`, `has_more`, `next_token` (pass it back
+with the same filters); `limit` is 1-1000 (default 100). The metadata tools use the Data
+API's own `ListSchemas`, `ListTables` and `DescribeTable`, so no SQL is built from a caller's
+names.
+
+### The `redshift` secret
+
+The toolkit `redshift` and the source `redshift-query-source` read the same tenant secret,
+`redshift` (pipe-as-service's `credentials/catalog.TENANT_BLOBS`, #30):
+
+| `SECRETS_BACKEND=env` | `SECRETS_BACKEND=aws` (Secrets Manager) |
+|---|---|
+| `PIPE_SECRET__<TENANT>__REDSHIFT__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/redshift` |
+
+It is the [credential blob](#the-credential-blob) above plus a `redshift` section, one of
+these four shapes:
+
+```json
+{
+  "role_arn": "arn:aws:iam::210987654321:role/AISquareReadOnly",
+  "external_id": "<the external ID AISquare issued to this tenant>",
+  "regions": ["us-east-1"],
+  "redshift": {"cluster_identifier": "analytics", "database": "policies"}
+}
+```
+
+| `redshift` section | Connects as | The role needs |
+|---|---|---|
+| `{"cluster_identifier": "analytics", "database": "policies"}` | the role's own database user, `IAMR:<role name>` (e.g. `IAMR:AISquareReadOnly`) | `redshift:GetClusterCredentialsWithIAM` |
+| `{"workgroup_name": "policies-wg", "database": "policies"}` (Serverless) | the role's own database user, `IAMR:<role name>` | `redshift-serverless:GetCredentials` |
+| `{"cluster_identifier": "analytics", "database": "policies", "db_user": "aisquare_reader"}` | that database user | `redshift:GetClusterCredentials` |
+| `{"cluster_identifier": "analytics" or "workgroup_name": "policies-wg", "database": "policies", "secret_arn": "arn:aws:secretsmanager:us-east-1:210987654321:secret:redshift/aisquare-reader-AbCdEf"}` | the user in the customer's secret | `secretsmanager:GetSecretValue` on it |
+
+- `cluster_identifier` or `workgroup_name`: exactly one. A workgroup is its name (3-63 of
+  `a-z0-9-`), not an ARN.
+- `database` (required).
+- `db_user` (a cluster only) or `secret_arn`: at most one. With neither, the role's IAM
+  identity is the database user. `secret_arn` must be in the role's own account.
+- `region` (optional): the cluster's or workgroup's region; default the first of `regions`.
+- Any other key in the section is refused. Every key here is server-side: a tool argument or
+  pull param naming one is refused (`invalid_arguments` / "server-controlled").
+
+### SELECT only
+
+`REDSHIFT_RUN_SELECT` and the source's `sql` run one read-only query. Two independent checks
+refuse anything else before any AWS call (not even `sts:AssumeRole`), with
+`invalid_arguments` and a reason that never quotes the SQL:
+
+1. **A lexer** that reads Redshift's quoting: strings `'...'` and identifiers `"..."` (quotes
+   doubled to escape), comments `--` and `/* */`. With those blanked, the text must be one
+   statement (a single trailing `;` is fine) that starts with `SELECT` or `WITH` and has none
+   of `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `COPY`,
+   `UNLOAD`, `INTO` (`SELECT ... INTO` makes a table), `GRANT`, `REVOKE`, `CALL`, `EXECUTE`,
+   `PREPARE`, `SET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `LOCK`, `VACUUM`, `ANALYZE`, `FETCH`,
+   `PG_TERMINATE_BACKEND`, `PG_CANCEL_BACKEND`, `SET_CONFIG`, ... Where two readers could
+   split the text differently, it refuses rather than guess (the lessons of the BigQuery
+   guard, seq 13647):
+   - a `--` comment ends at a CR or an LF, a bare CR too, as in PostgreSQL's lexer;
+   - a `/*` inside a `/* */` comment is refused: PostgreSQL and sqlglot nest comments, a
+     non-nesting reader doesn't;
+   - a quoted string or identifier must end at the same place whether `\` escapes or not
+     (`standard_conforming_strings`, `E'...'`). Escape a quote by doubling it;
+   - `$` outside quotes is refused (`$$...$$` and `$tag$` quoting, `$1`), and so are `\`
+     outside quotes and control characters other than tab, CR, LF and form feed.
+2. **A parser** (sqlglot, Redshift dialect, `sqlglot>=26.25,<28`): exactly one statement
+   whose root is a query (`SELECT`, `WITH ... SELECT`, `UNION`/`INTERSECT`/`EXCEPT`, a
+   parenthesised query), with no write, DDL, session or transaction node at any depth
+   (`SELECT ... INTO`, `FOR UPDATE` and unparsed commands included) and no call of the
+   functions above.
+
+A column named like a keyword is written in double quotes (`"comment"`, `"update"`).
+Redshift adds its own layer behind these: the Data API runs a single statement only, and the
+database user should hold `SELECT` and nothing else (the checklist below).
+
+### Deadline and caps
+
+- A tool call fits the host's time budget (`config["timeout_seconds"]`), or 60 s without one.
+  The source's deadline is `timeout_seconds` (default 120, at most 600, never above the host's
+  budget).
+- Polling backs off from 50 ms to 1 s and stops at the deadline. The statement is then
+  cancelled (`CancelStatement`) and the call fails with `timeout`. Each request's connect and
+  read timeouts fit inside what is left, and botocore tries a request at most twice.
+- Paging `GetStatementResult` stops at `max_rows`, at the byte cap or at the deadline.
+
+### `redshift-query-source`
+
+Pull params, exactly one of:
+
+- `sql`: one read-only statement (above);
+- `table`: `schema.table` (plain names: letters, digits, `_`, `$`), read as
+  `SELECT * FROM "schema"."table"`.
+
+And `batch_size` (default 500, at most 10,000 rows per envelope), `max_rows` (default 10,000,
+at most 100,000), `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 100 MiB),
+`timeout_seconds`. Any other param is refused, and so is one naming a key of the secret.
+
+Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
+(`application/json`). Its metadata:
+
+- `version` = `result_sha256`: the whole result's hash (columns and rows, whatever the rows'
+  order), the same on every batch of one pull. It changes when the rows the pull read change:
+  keep it and re-read when it does. Redshift has no per-table last-modified time to add, so
+  the hash is the marker.
+- `batch_index`, `batch_count`, `first_row`, `row_count`, `batch_sha256`, `result_row_count`,
+  `total_rows`, `statement_id`, `database`, `cluster_identifier` or `workgroup_name`, and
+  `table` or `query_sha256` (the statement's hash, never its text).
+- `truncated` (`max_rows` or `max_result_bytes`) on every envelope of a pull cut short; its
+  `result_sha256` then covers the rows read only.
+
+A result with no rows is one envelope with no rows. Logs carry no SQL, names or values.
+
+Values: `isNull` → `null`, booleans, integers (`longValue`), floats (`NaN` and the infinities
+as strings), `NUMERIC`/`DECIMAL`, dates and timestamps as the strings Redshift sends, bytes as
+base64. A repeated column name gets `_2`, `_3`, ...
+
+### Errors
+
+As for every AWS call above, a refused call carries AWS's error code, never its message:
+`AccessDeniedException` → `forbidden`, `ValidationException` → `invalid_arguments`,
+`ResourceNotFoundException` → `not_found`, `ActiveStatementsExceededException`,
+`ActiveSessionsExceededException` and throttling → `rate_limited`, `QueryTimeoutException` →
+`timeout`, `DatabaseConnectionException` and `ExecuteStatementException` → `upstream_error`.
+
+A statement that ran and failed is different: the database's own error is about the caller's
+SQL, so it is passed on (at most 500 characters, never logged): "the statement failed in
+Redshift: ERROR: permission denied for schema hr". `permission denied` → `forbidden`,
+`does not exist` → `not_found`, anything else → `invalid_arguments`; an `ABORTED` statement
+→ `upstream_error`.
+
+### Redshift registration checklist
+
+AISquare's side is the [one above](#before-the-customer-starts-aisquare-devops): our
+principals, the external ID, our role's `sts:AssumeRole` on the customer's role. Then:
+
+**1. The customer's role.** The [trust policy above](#in-the-customers-account-the-customer)
+(step 1), in the account that holds the cluster or workgroup. The role S3 or AgentCore uses
+can serve Redshift too, or a role of its own.
+
+**2. Its Redshift permissions**, keeping the credential statement of the one mode the secret
+uses. The Data API's statement calls take no resource, so they are limited to the role's own
+statements:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RedshiftDataApiOnTheWarehouse",
+      "Effect": "Allow",
+      "Action": [
+        "redshift-data:ExecuteStatement",
+        "redshift-data:ListSchemas",
+        "redshift-data:ListTables",
+        "redshift-data:DescribeTable"
+      ],
+      "Resource": [
+        "arn:aws:redshift:<REGION>:<ACCOUNT>:cluster:<CLUSTER>",
+        "arn:aws:redshift-serverless:<REGION>:<ACCOUNT>:workgroup/<WORKGROUP_ID>"
+      ]
+    },
+    {
+      "Sid": "RedshiftDataApiOwnStatements",
+      "Effect": "Allow",
+      "Action": [
+        "redshift-data:DescribeStatement",
+        "redshift-data:GetStatementResult",
+        "redshift-data:CancelStatement"
+      ],
+      "Resource": "*",
+      "Condition": {"StringEquals": {"redshift-data:statement-owner-iam-userid": "${aws:userid}"}}
+    },
+    {
+      "Sid": "ClusterUserFromTheRole",
+      "Effect": "Allow",
+      "Action": "redshift:GetClusterCredentialsWithIAM",
+      "Resource": "arn:aws:redshift:<REGION>:<ACCOUNT>:dbname:<CLUSTER>/<DATABASE>"
+    },
+    {
+      "Sid": "ServerlessUserFromTheRole",
+      "Effect": "Allow",
+      "Action": "redshift-serverless:GetCredentials",
+      "Resource": "arn:aws:redshift-serverless:<REGION>:<ACCOUNT>:workgroup/<WORKGROUP_ID>"
+    },
+    {
+      "Sid": "ClusterNamedDatabaseUser",
+      "Effect": "Allow",
+      "Action": "redshift:GetClusterCredentials",
+      "Resource": [
+        "arn:aws:redshift:<REGION>:<ACCOUNT>:dbname:<CLUSTER>/<DATABASE>",
+        "arn:aws:redshift:<REGION>:<ACCOUNT>:dbuser:<CLUSTER>/aisquare_reader"
+      ]
+    },
+    {
+      "Sid": "DatabaseUserSecret",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:redshift/aisquare-reader-*"
+    }
+  ]
+}
+```
+
+- Keep the `Resource` of the first statement that applies (a cluster's ARN uses its
+  identifier, a workgroup's its ID, shown in the Serverless console), and ONE of the last
+  four statements: `ClusterUserFromTheRole` (cluster, no `db_user` or `secret_arn`),
+  `ServerlessUserFromTheRole` (workgroup, neither), `ClusterNamedDatabaseUser` (`db_user`) or
+  `DatabaseUserSecret` (`secret_arn`).
+- A secret encrypted with a customer managed key also needs `kms:Decrypt` on that key, with
+  `kms:ViaService` `secretsmanager.<REGION>.amazonaws.com`.
+- Nothing here writes: no `BatchExecuteStatement`, no `redshift:*` management action.
+
+**3. A read-only database user**, as a superuser. Its name depends on the mode: the role's
+own user `"IAMR:AISquareReadOnly"` (cluster or workgroup with neither key; the quotes matter),
+or `aisquare_reader` (`db_user` or `secret_arn`):
+
+```sql
+-- the role's own user: create it first so it can be granted to (it is otherwise created,
+-- without privileges, at the first call)
+CREATE USER "IAMR:AISquareReadOnly" PASSWORD DISABLE;
+-- or a named user: PASSWORD DISABLE for db_user; a password for the secret mode
+CREATE USER aisquare_reader PASSWORD DISABLE;
+
+GRANT USAGE ON SCHEMA policies TO "IAMR:AISquareReadOnly";
+GRANT SELECT ON ALL TABLES IN SCHEMA policies TO "IAMR:AISquareReadOnly";
+-- tables created later in the schema (run as the user who creates them):
+ALTER DEFAULT PRIVILEGES IN SCHEMA policies GRANT SELECT ON TABLES TO "IAMR:AISquareReadOnly";
+```
+
+- Grant only the schemas AISquare may read: they are its scope. Grant no `INSERT`,
+  `UPDATE`, `DELETE`, `CREATE` or `TEMP`, no ownership and no superuser.
+- Redshift grants `PUBLIC` `CREATE` on schema `public` and `TEMP` on a database by default.
+  Our checks never send a write, but for the database to refuse one too, revoke them from
+  `PUBLIC` (it affects every user).
+- New user-defined functions are executable by `PUBLIC` by default. A side-effecting one (a
+  Lambda UDF that writes) could run inside a `SELECT`: revoke `EXECUTE` on it from `PUBLIC`, or
+  don't create one.
+- To check the role's user after a first call: `SELECT usename FROM pg_user WHERE usename
+  LIKE 'IAMR:%';`
+
+**4. The database user's secret** (the `secret_arn` mode only), in Secrets Manager in the role's
+account, in the warehouse's region:
+
+```json
+{"username": "aisquare_reader", "password": "<its password>"}
+```
+
+For a cluster it may also hold `"dbClusterIdentifier"`, which must then match the
+`cluster_identifier`. The `RedshiftDataFullAccess` tag is needed only with AWS's managed
+policy of that name; the policy above names the secret instead.
+
+**5. The customer sends AISquare:** the role ARN, the region, the cluster identifier or the
+workgroup name, the database, and the `db_user` name or the secret's ARN if they use one.
+
+**6. AISquare stores the blob** under the `redshift` secret name ([above](#the-redshift-secret)),
+after adding the role ARN to our role's policy ([as for S3](#aisquare-stores-the-blob)).
+
+| Error | Check |
+|---|---|
+| `AWS refused sts:AssumeRole: …` | The trust policy and our role's policy, as [above](#if-it-fails). |
+| `AWS refused redshift-data:ExecuteStatement (AccessDeniedException)` | The first statement's `Resource` (the cluster identifier, or the workgroup's ID), and the credential statement of the mode in use. |
+| `AWS refused redshift-data:DescribeStatement (AccessDeniedException)` | The `RedshiftDataApiOwnStatements` statement. |
+| `AWS refused redshift-data:ExecuteStatement (ValidationException)` | The cluster or workgroup name, the database, or the region (`redshift.region`). |
+| `the statement failed in Redshift: … permission denied …` (`forbidden`) | The database user's `USAGE` and `SELECT` grants (step 3). |
+| `Amazon Redshift is not connected` (a tool, `not_connected`) or `Redshift is not configured: …` (the source) | The `redshift` secret: its `redshift` section, or the AWS keys above it. |
+
 ## Install
 
 ```bash
@@ -399,6 +684,12 @@ The `[aws]` extra needs `boto3`/`botocore` >= 1.43.32:
 No stubbed client is needed: the real `bedrock-agentcore-control` client is used, from botocore's
 own model.
 
+The `[aws]` extra also brings `sqlglot>=26.25,<28` for the Redshift SQL guard: the one
+specifier every extra naming sqlglot shares. Its Data API calls (`ExecuteStatement` with
+`ClientToken`, `DescribeStatement`, `GetStatementResult`, `CancelStatement`, `ListSchemas`,
+`ListTables`, `DescribeTable`) are all in botocore 1.43.32's model; the Redshift suite passes at
+both floors (botocore 1.43.32, sqlglot 26.25.0).
+
 ## Tests
 
 The tests are hermetic and every socket is blocked:
@@ -406,3 +697,7 @@ The tests are hermetic and every socket is blocked:
 - moto plays STS and S3, with the bucket in the customer's account;
 - AgentCore, which moto does not model, is a botocore `Stubber` on the real client, checked
   against AWS's own model (id patterns, ARN lengths, required fields).
+- The Redshift Data API is a `Stubber` on the real `redshift-data` client too
+  (`tests/redshift_fakes.py`), and its clock is fake: polling, the deadline and the cancel run
+  in no real time. The SQL guard's lexer and parser are tested apart and together
+  (`tests/test_redshift_sqlguard.py`), the BigQuery bypass of seq 13647 included.

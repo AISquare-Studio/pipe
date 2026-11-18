@@ -100,6 +100,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before any envelope came out raises `GcsPullTruncated` (a `ValueError`) with
     `next_start_offset`, so a `modified_after` sync over a big prefix still advances.
   Setup and the exact secret: `connectors/gcs/README.md`.
+- **Amazon Redshift connector** (module `aisquare_pipe_aws.redshift` in `connectors/aws`; extra
+  `aisquare-pipe[redshift]`, an alias of `[aws]`, which now also brings `sqlglot>=26.25,<28`): the
+  read-only toolkit `redshift` (`REDSHIFT_RUN_SELECT`, primary; `REDSHIFT_LIST_SCHEMAS`,
+  `REDSHIFT_LIST_TABLES`, `REDSHIFT_DESCRIBE_TABLE`) and the source `redshift-query-source`, for a
+  provisioned cluster or a Serverless workgroup, through the Redshift Data API. They read the tenant
+  secret `redshift`: the AWS blob plus `redshift: {cluster_identifier | workgroup_name, database,
+  db_user | secret_arn, region?}` (neither user key: the role's own `IAMR:` user, through
+  `GetClusterCredentialsWithIAM` or Serverless `GetCredentials`).
+  - It lives in `aisquare_pipe_aws` because it assumes the role through
+    `aisquare_pipe_aws.credentials` and one connector never imports another; the toolkit and source
+    subclass `_AwsToolkit` and `_AwsSource`, so the session, the service principal and the refusals
+    are the S3 and AgentCore connectors' own.
+  - SQL is SELECT-only, refused before any AWS call (not even `sts:AssumeRole`) otherwise: a lexer
+    and a sqlglot parse (Redshift dialect) must both find ONE `SELECT`/`WITH` statement with no
+    write, DDL, session or side-effect word or node (`SELECT ... INTO`, `UNLOAD`, `COPY`, `SET`,
+    `PG_TERMINATE_BACKEND`, ...). The lexer ends `--` comments at a CR or an LF, refuses a `/*`
+    inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
+    and control characters outside quotes.
+  - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
+    (paged) inside one deadline: the host's time budget, else 60 s (the source's
+    `timeout_seconds`, default 120, at most 600). At the deadline the statement is cancelled and
+    the call fails with `timeout`. Caps: `max_rows` and a JSON byte cap (`truncated` says which).
+    The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
+  - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
+    `version` = `result_sha256` (order-independent).
+  - CI runs the AWS suite at the sqlglot floor too: `scripts/dep_floor.py` and validate.yml's
+    "SQL guards at the sqlglot floor" step, byte for byte #37's, so the branches merge cleanly.
+  Setup, the registration checklist (the role's `redshift-data` and credential permissions, the
+  read-only database user, the secret JSON) and the exact secret: `connectors/aws/README.md`,
+  "Amazon Redshift".
 
 ## [0.5.0] - 2026-11-04
 
