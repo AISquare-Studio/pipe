@@ -198,15 +198,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Before this, 2.x raised `AttributeError`, and `composio-triggers-source`
   logged it and polled on forever, emitting nothing.
   - An SDK shape the connector doesn't know is a `ComposioSDKShapeError`, a
-    `PipelineError`. That covers a resource that is gone and an `AttributeError`
-    from any client call. A trigger-log `list()` that rejects its arguments
-    counts too.
-  - The triggers source logs that error at ERROR level and raises it instead of
-    polling on.
+    `PipelineError`. Only SDK access raises it: a method or resource that is
+    gone, a call that doesn't bind to the installed signature (every SDK call
+    is bound with `inspect.signature` first), or `tools.execute` returning
+    something other than a dict. A `TypeError` or `AttributeError` raised
+    inside an SDK call keeps its type, and malformed API data is no SDK error.
+  - A malformed trigger-log entry (the entry, or its `meta`, not an object) no
+    longer stops the triggers source. It is skipped with one WARNING, and its
+    id and time are recorded in the cursor, so one bad event can't crash-loop
+    the poller. A timestamp that isn't a finite number reads as no time.
+  - The triggers source stops on the two errors no retry can fix, a
+    `ComposioSDKShapeError` and a `ConfigValidationError` (Composio refused the
+    API key: HTTP 401/403). It logs one ERROR line, with no traceback of its
+    own (the caller logs the raised error once), and raises. Before, a 401 was
+    logged and re-polled every cycle. Other failures still retry next cycle.
+  - composio-client 2.x gives a POST no SDK retries (1.x retried a 429, 5xx or
+    connection error twice on any method). The trigger-log read is a POST that
+    only reads, so on 2.x it passes `request_options={"max_retries": 2}`: a 503
+    is tried 3 times and a 429 15 times (with our own 429 backoff), as on 1.x.
+    `tools.execute` is unaffected: composio sends it without SDK retries on
+    both lines (0.22.0 and 0.33.0). `authorize_toolkit` and
+    `initiate_connection` have no retry of their own, so on 2.x a 429 or 5xx
+    fails them at once, where 1.x retried twice. They create a connection
+    request, so that is left as is.
   - `connectors/composio/tests/test_sdk_compat.py` runs against the REAL
-    installed composio classes, with sockets blocked. An autospec of the real
-    trigger-log `list` makes a call that doesn't bind to the installed SDK fail.
-    It passes on composio 0.22.0 + client 1.43.0 and on 0.33.0 + 2.1.33.
+    installed composio classes, with sockets blocked. Autospecs of the real
+    SDK methods (all 13 this connector calls) make a call that doesn't bind to
+    the installed SDK fail, and a faked `httpx` transport runs the SDK's own
+    request, retry and parsing code. validate.yml's new `composio-sdk` job runs
+    the connector's suite on composio 0.22.0 + client 1.43.0 and on the newest
+    pair the extra resolves (0.33.0 + 2.1.33 today), on every PR and on
+    `workflow_dispatch`.
 
 ### Changed
 

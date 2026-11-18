@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -59,3 +60,40 @@ jobs:
         with:
           name: validate-report
           path: validate-report.json
+
+  # The Composio connector's suite on both composio-client lines: the pinned
+  # floor (composio 0.22.0 + composio-client 1.43.0) and the newest pair the
+  # [composio] extra resolves today, so a Dependabot composio bump checks
+  # itself. tests/test_sdk_compat.py runs against the real installed SDK.
+  composio-sdk:
+    name: composio SDK (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: pinned 0.22.0 + 1.43.0
+            pins: composio==0.22.0 composio-client==1.43.0
+          - sdk: latest
+            pins: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: venv with aisquare-pipe[composio,dev]
+        env:
+          PINS: ${{ matrix.pins }}
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip
+          # PINS is unquoted on purpose: zero or more requirement words.
+          "$RUNNER_TEMP/venv/bin/pip" install -e ".[composio,dev]" $PINS
+          "$RUNNER_TEMP/venv/bin/pip" list | grep -i '^composio'
+
+      - name: connectors/composio tests
+        working-directory: connectors/composio
+        run: '"$RUNNER_TEMP/venv/bin/python" -m pytest tests -v'

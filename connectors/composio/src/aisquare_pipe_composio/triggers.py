@@ -23,6 +23,7 @@ from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams, Resource
+from aisquare.pipe.errors import ConfigValidationError
 
 from aisquare_pipe_composio.client import (
     ComposioClient,
@@ -139,6 +140,12 @@ class ComposioTriggersSource(SourceConnector):
             since (str | int): initial watermark when no cursor file exists —
                 ISO timestamp or epoch ms (default: now, i.e. only new events)
             limit (int): event-log page size (default 100)
+
+        A failed cycle is logged and retried next cycle, except two errors
+        no retry can fix, which stop polling (raised): ``ComposioSDKShapeError``
+        (an unsupported composio SDK) and ``ConfigValidationError`` (Composio
+        refused the API key: HTTP 401/403). A malformed event is skipped with
+        a warning and recorded, so it can't stall the poller either.
         """
         if params is None:
             params = PullParams()
@@ -174,12 +181,17 @@ class ComposioTriggersSource(SourceConnector):
                 changed = yield from self._poll_once(
                     client, config, user_id, state, limit
                 )
-            except ComposioSDKShapeError:
+            except (ComposioSDKShapeError, ConfigValidationError) as e:
                 # Not transient: every cycle would fail the same way, so the
-                # failure is surfaced (logged, then raised), never polled on.
+                # failure is surfaced, never polled on. One ERROR line names
+                # why. The traceback and message travel with the raised error
+                # (the caller logs it once), and the message may carry
+                # Composio's response text, so it isn't logged here.
                 logger.error(
-                    "composio: trigger polling stopped: unsupported composio SDK",
-                    exc_info=True,
+                    "composio: trigger polling stopped: %s",
+                    "unsupported composio SDK"
+                    if isinstance(e, ComposioSDKShapeError)
+                    else "Composio refused the API key",
                 )
                 raise
             except Exception:
@@ -232,7 +244,18 @@ class ComposioTriggersSource(SourceConnector):
 
             for event in events:
                 event_id = str(event.get("id") or "")
-                if not event_id or event_id in state.seen_ids:
+                if event_id and event_id in state.seen_ids:
+                    continue
+                skipped = event.get("skipped")
+                if skipped:
+                    # Malformed API data: warned about once (its id is then
+                    # recorded) and stepped past, never retried.
+                    logger.warning(
+                        "composio: skipping trigger event %s: %s",
+                        event_id or "(no id)",
+                        skipped,
+                    )
+                if not event_id:
                     continue
 
                 state.seen_ids.append(event_id)
@@ -240,6 +263,8 @@ class ComposioTriggersSource(SourceConnector):
                 if isinstance(ts_ms, int) and ts_ms > max_ts:
                     max_ts = ts_ms
                 changed = True
+                if skipped:
+                    continue
 
                 slug = str(event.get("trigger_slug") or "").upper()
                 if trigger_slugs and slug not in trigger_slugs:

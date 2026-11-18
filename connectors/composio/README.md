@@ -161,6 +161,7 @@ for envelope in source.pull(config):               # polls forever
 - `idempotency_key` metadata (`composio:event:<id>`) is stable across re-polls, pairing with sinks that dedupe (e.g. aisquare-gateway).
 - Position is a timestamp watermark + bounded seen-id ring persisted atomically to `cursor_path`; `PullParams` `since` sets the initial watermark (default: now). `max_polls`/`sleep` params support tests and one-shot drains.
 - `cursor_path` defaults to `~/.cache/aisquare-pipe/composio-cursor.json` (honouring `$XDG_CACHE_HOME`) — per-user, not shared `/tmp`. A pre-0.1.1 cursor at `/tmp/composio-pipe-cursor.json` is migrated automatically on first run.
+- A failed poll cycle is logged and retried on the next one. Two errors stop polling instead (raised, with one ERROR log line): Composio refusing the API key (HTTP 401/403, `ConfigValidationError`) and a composio SDK this connector doesn't support (`ComposioSDKShapeError`). A malformed event-log entry is skipped with one warning and recorded in the cursor, so it can't stall the poller.
 - `list_resources(config)` browses available trigger types and your active trigger instances.
 
 ## Example pipelines
@@ -211,4 +212,4 @@ Pipeline(source=SalesforceSource(), sink=ComposioSink()).run(
 - **File downloads are buffered in memory** when yielded as envelopes (the SDK enforces a 100 MB cap per file); streamed envelopes are a future upgrade.
 - **Trigger polling reads Composio's event log** (the SDK's first-class trigger interface is a realtime websocket). The log endpoint is versioned under `/api/v3.1/internal/` — pinned SDK versions keep this stable, but it is the most drift-prone surface; all access is isolated in `client.py`.
 - **Tool arguments and results are never logged** — only tool slugs and counts.
-- The `composio` SDK is pinned `>=0.13.1,<2.0` (verified against 0.13.1 / SDK v1.0.0-rc2). All SDK touchpoints live in `client.py`; version bumps should only ever touch that file.
+- The `[composio]` extra allows `composio>=0.13.1,<2.0` with `composio-client>=1.39,<3.0` (1.x and 2.x). CI's `composio-sdk` job (validate.yml) runs this connector's tests on composio 0.22.0 + composio-client 1.43.0 and on the newest pair the extra resolves; `tests/test_sdk_compat.py` runs against the real installed SDK. All SDK touchpoints live in `client.py`; version bumps should only ever touch that file.
