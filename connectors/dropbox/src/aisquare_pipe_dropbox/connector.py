@@ -36,6 +36,19 @@ def _has_valid_auth_keys(config: dict[str, Any]) -> bool:
     return all(k in config for k in ("app_key", "app_secret", "refresh_token"))
 
 
+def _version_markers(delivered: Any, listed: dropbox.files.FileMetadata) -> dict[str, str]:
+    """``rev``, ``server_modified`` and ``content_hash`` of the bytes
+    delivered: from the download's own metadata (the same response as the
+    bytes), else the listing's. A ``content_hash`` Dropbox does not send is
+    left out, never set to "" (two empty markers would compare equal and
+    hide an edit)."""
+    meta = delivered if isinstance(delivered, dropbox.files.FileMetadata) else listed
+    markers = {"rev": meta.rev, "server_modified": meta.server_modified.isoformat()}
+    if isinstance(meta.content_hash, str) and meta.content_hash:
+        markers["content_hash"] = meta.content_hash
+    return markers
+
+
 class DropboxSource(SourceConnector):
     """Pull files from Dropbox."""
 
@@ -54,6 +67,11 @@ class DropboxSource(SourceConnector):
             type=str, required=False, description="ISO timestamp of last modification"
         ),
         "dropbox_id": MetaField(type=str, required=False, description="Dropbox file ID"),
+        "content_hash": MetaField(
+            type=str,
+            required=False,
+            description="Dropbox's content hash: changes only when the file's bytes do",
+        ),
     }
 
     def pull(
@@ -102,14 +120,15 @@ class DropboxSource(SourceConnector):
                 "filename": entry.name,
                 "path": entry.path_lower,
                 "size": entry.size,
-                "rev": entry.rev,
-                "server_modified": entry.server_modified.isoformat(),
                 "dropbox_id": entry.id,
             }
 
-            # Stream large files, buffer small ones
+            # Stream large files, buffer small ones. The version markers are
+            # the downloaded bytes' (a file edited since the listing has a
+            # newer rev than the listing's).
             if entry.size > stream_threshold:
-                _, stream = client.download_stream(entry.path_lower)
+                delivered, stream = client.download_stream(entry.path_lower)
+                metadata.update(_version_markers(delivered, entry))
                 yield DataEnvelope(
                     content_type=content_type,
                     data=b"",
@@ -118,7 +137,8 @@ class DropboxSource(SourceConnector):
                     metadata=metadata,
                 )
             else:
-                _, content = client.download(entry.path_lower)
+                delivered, content = client.download(entry.path_lower)
+                metadata.update(_version_markers(delivered, entry))
                 yield DataEnvelope(
                     content_type=content_type,
                     data=content,

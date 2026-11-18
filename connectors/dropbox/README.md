@@ -53,6 +53,8 @@ for envelope in source.pull(config, params):
     print(f"{envelope.metadata['filename']} ({envelope.content_type})")
 ```
 
+Each envelope's metadata has `filename`, `path`, `size` and `dropbox_id`, plus version markers for a scheduled re-check: `rev` (new on every upload), `server_modified`, and `content_hash` (Dropbox's hash of the bytes, so a changed `content_hash` means the file needs reading again). The markers come from the download's own metadata, so they describe the bytes delivered even when the file was edited after the folder listing. A `content_hash` Dropbox does not send is left out.
+
 ### Push files to Dropbox
 
 ```python

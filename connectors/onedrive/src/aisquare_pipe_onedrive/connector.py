@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
@@ -34,6 +34,21 @@ def _has_valid_auth_keys(config: dict[str, Any]) -> bool:
     return all(k in config for k in ("client_id", "client_secret", "tenant_id"))
 
 
+def _version_markers(*items: Mapping[str, Any]) -> dict[str, str]:
+    """``ctag`` and ``etag``: Graph's ``cTag`` and ``eTag``, verbatim, from
+    the first item that has each. A marker Graph does not send is left out,
+    never set to "" (two empty markers would compare equal and hide an edit).
+    """
+    markers: dict[str, str] = {}
+    for key, field in (("ctag", "cTag"), ("etag", "eTag")):
+        for item in items:
+            value = item.get(field)
+            if isinstance(value, str) and value:
+                markers[key] = value
+                break
+    return markers
+
+
 class OneDriveSource(SourceConnector):
     """Pull files from OneDrive via Microsoft Graph API."""
 
@@ -53,6 +68,16 @@ class OneDriveSource(SourceConnector):
         ),
         "web_url": MetaField(type=str, required=False, description="Web URL to file"),
         "mime_type": MetaField(type=str, required=False, description="MIME type from OneDrive"),
+        "ctag": MetaField(
+            type=str,
+            required=False,
+            description="Graph's cTag: changes only when the file's content does",
+        ),
+        "etag": MetaField(
+            type=str,
+            required=False,
+            description="Graph's eTag: changes on any edit, a rename or a move too",
+        ),
     }
 
     def pull(
@@ -116,9 +141,13 @@ class OneDriveSource(SourceConnector):
                 "mime_type": content_type,
             }
 
-            # Stream large files, buffer small ones
+            # Stream large files, buffer small ones. The version markers come
+            # from the item as Graph gave it just before the bytes (the
+            # listing's only if that lacks them): never newer than the bytes,
+            # so a re-check can re-read once too often but never miss an edit.
             if size > stream_threshold:
-                _, stream = client.download_stream(item_id)
+                fresh, stream = client.download_stream(item_id)
+                metadata.update(_version_markers(fresh, item))
                 yield DataEnvelope(
                     content_type=content_type,
                     data=b"",
@@ -127,7 +156,8 @@ class OneDriveSource(SourceConnector):
                     metadata=metadata,
                 )
             else:
-                _, content = client.download(item_id)
+                fresh, content = client.download(item_id)
+                metadata.update(_version_markers(fresh, item))
                 yield DataEnvelope(
                     content_type=content_type,
                     data=content,

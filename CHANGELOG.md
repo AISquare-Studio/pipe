@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Version markers on OneDrive and Dropbox pull envelopes**, so a scheduled
+  re-check can tell an edited file from an unchanged one.
+  - `onedrive-source` adds `ctag` and `etag` (Graph's `cTag` and `eTag`,
+    verbatim) to its `metadata_spec` and to each envelope. `cTag` changes only
+    when the content does. `eTag` also changes on a rename or a move. They
+    come from the item as Graph returned it just before the download, so they
+    are never newer than the bytes (the listing's values are used only if that
+    response has none).
+  - `dropbox-source` adds `content_hash` beside `rev`. `rev`,
+    `server_modified` and `content_hash` now come from the download's own
+    metadata, so they match the bytes delivered even when the file was edited
+    after the listing.
+  - A marker the provider does not send is left out, not set to `""`.
+  - `googledrive-source` already carried `modified_time` and `md5_checksum`,
+    so it is unchanged.
 - **AWS connectors** (`connectors/aws`, module `aisquare_pipe_aws`, extra
   `aisquare-pipe[aws]`, in `[full]` and `[toolkits]`): read-only access to a
   customer's AWS account through one cross-account IAM role.

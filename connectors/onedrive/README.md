@@ -136,6 +136,8 @@ params = PullParams(params={
 })
 ```
 
+Each envelope's metadata has `filename`, `path`, `size`, `item_id`, `last_modified`, `web_url` and `mime_type`, plus two version markers for a scheduled re-check. `ctag` is Graph's `cTag`, which changes only when the file's content does, so a changed `ctag` means the file needs reading again. `etag` is Graph's `eTag`, which also changes on a rename or a move. Both are Graph's values verbatim, quotes included. They come from the item as Graph returned it just before the download (the listing's values only if that response has none), so they are never newer than the bytes. A marker Graph does not send is left out, not set to `""`.
+
 ## Sink — push files to OneDrive
 
 ```python
