@@ -15,10 +15,19 @@ the token exchange's and a download that breaks off midway included, is a
 :class:`GcsAPIError` (``timed_out`` for a timeout). A 401 drops the token
 from the cache, and a call whose cached token was rejected retries once with
 a new one. Error messages never carry the token or key.
+
+Time budget: with ``budget`` (seconds; the host's ``config["timeout_seconds"]``)
+the whole call fits inside it, from the client's creation on. Every request,
+the token POST included, gets the time remaining as its timeout (never more
+than ``timeout``), and a call with no time left fails ``timed_out`` before it
+sends anything. requests' timeout bounds each connect and each socket read,
+not a whole body, so a download also checks the deadline between chunks.
 """
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from typing import Any, Self
 from urllib.parse import quote
 
@@ -109,10 +118,18 @@ def _token_failure(e: GcsTokenError) -> GcsAPIError:
     return GcsAPIError(e.message, retry_after=e.retry_after)
 
 
+def _monotonic() -> float:
+    """The clock a budget runs on (tests replace it)."""
+    return time.monotonic()
+
+
 class GcsClient:
     """One credential's view of its bucket. Use it as a context manager: a
     session it opened itself is closed on exit; a passed-in ``session`` (tests,
-    or a host that pools connections) is left open."""
+    or a host that pools connections) is left open.
+
+    ``timeout`` bounds each request; ``budget`` (None: unbounded) bounds the
+    whole call, every request together (see the module docstring)."""
 
     def __init__(
         self,
@@ -121,11 +138,17 @@ class GcsClient:
         session: Any = None,
         timeout: float = DEFAULT_TIMEOUT,
         budget: float | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._creds = credentials
         self._own_session = session is None
         self._session = session if session is not None else requests.Session()
-        self._timeout = timeout if budget is None else max(0.1, min(timeout, budget))
+        self._timeout = timeout
+        self._monotonic = monotonic if monotonic is not None else _monotonic
+        self.budget = budget if budget is not None and budget > 0 else None
+        self._deadline = (
+            self._monotonic() + self.budget if self.budget is not None else None
+        )
         self._token: str | None = None
         self._token_from_cache = False
         #: Every token this client sent: redacted from any error text.
@@ -137,6 +160,28 @@ class GcsClient:
     def __exit__(self, *exc: object) -> None:
         if self._own_session:
             self._session.close()
+
+    def _remaining(self) -> float | None:
+        """Seconds left in the budget (None: unbounded)."""
+        if self._deadline is None:
+            return None
+        return self._deadline - self._monotonic()
+
+    def _out_of_time(self) -> GcsAPIError:
+        return GcsAPIError(
+            f"the Cloud Storage call ran out of its {self.budget:g}s time budget",
+            timed_out=True,
+        )
+
+    def _request_timeout(self) -> float:
+        """The next request's timeout: ``timeout``, or the time left in the
+        budget when that is less. No time left fails the call (``timed_out``)."""
+        remaining = self._remaining()
+        if remaining is None:
+            return self._timeout
+        if remaining <= 0:
+            raise self._out_of_time()
+        return min(self._timeout, remaining)
 
     @property
     def _bucket_url(self) -> str:
@@ -185,6 +230,9 @@ class GcsClient:
             chunks: list[bytes] = []
             total = 0
             for chunk in resp.iter_content(_CHUNK):
+                remaining = self._remaining()
+                if remaining is not None and remaining <= 0:
+                    raise self._out_of_time()
                 total += len(chunk)
                 if total > max_bytes:
                     raise ObjectTooLarge(
@@ -206,7 +254,7 @@ class GcsClient:
         if self._token is None:
             try:
                 self._token, self._token_from_cache = obtain_token(
-                    self._creds, self._session, timeout=self._timeout
+                    self._creds, self._session, timeout=self._request_timeout()
                 )
             except GcsTokenError as e:
                 raise _token_failure(e) from None
@@ -218,13 +266,14 @@ class GcsClient:
         self._token = None
 
     def _send(self, url: str, params: dict[str, Any], *, stream: bool) -> Any:
+        headers = {"Accept": "application/json", **self._auth()}
         try:
             return self._session.request(
                 "GET",
                 url,
                 params=params,
-                headers={"Accept": "application/json", **self._auth()},
-                timeout=self._timeout,
+                headers=headers,
+                timeout=self._request_timeout(),
                 allow_redirects=False,
                 stream=stream,
             )

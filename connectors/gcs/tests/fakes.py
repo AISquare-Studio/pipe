@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs, unquote
@@ -90,6 +91,8 @@ class FakeResponse:
     #: (after, error): the body breaks off after that many bytes with that
     #: socket-level error. Only real_session() can play it.
     broken: tuple[int, BaseException] | None = None
+    #: Called before each chunk iter_content yields (a slow body, in tests).
+    on_chunk: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.body is not None and not self.content:
@@ -106,6 +109,8 @@ class FakeResponse:
     def iter_content(self, size: int = 1024):
         assert self.broken is None, "a broken body needs real_session()"
         for start in range(0, len(self.content), size):
+            if self.on_chunk is not None:
+                self.on_chunk()
             yield self.content[start : start + size]
 
     def close(self) -> None:
@@ -176,11 +181,17 @@ class FakeGoogle:
         #: alt=media bodies break off after ``break_after`` bytes with this.
         self.media_break: BaseException | None = None
         self.break_after = 4
+        #: Called with the URL before every request is answered, and before
+        #: every alt=media chunk (time passing, in the budget tests).
+        self.on_request: Callable[[str], None] | None = None
+        self.on_chunk: Callable[[], None] | None = None
 
     # -- the requests.Session surface ------------------------------------------------
 
     def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
         self.requests.append({"method": method, "url": url, **kwargs})
+        if self.on_request is not None:
+            self.on_request(url)
         if url == TOKEN_URL:
             return self._token(kwargs)
         if self.raise_timeout:
@@ -236,6 +247,7 @@ class FakeGoogle:
                 broken=(self.break_after, self.media_break)
                 if self.media_break is not None
                 else None,
+                on_chunk=self.on_chunk,
             )
         return FakeResponse(200, stored.resource(self.bucket, name))
 

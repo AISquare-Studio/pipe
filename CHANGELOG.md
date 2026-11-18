@@ -85,14 +85,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not configured", no request); a bucket, key or out-of-prefix name from a caller is refused.
   The configured prefix must end with `/`. The prefix is enforced by the connector, not by
   Google: the README's checklist recommends a dedicated bucket and says CMEK needs no KMS grant.
-  - A token is minted with one POST, inside the call's timeout and without hidden retries. Only a
-    key Google refuses is `unauthorized`. A token endpoint that times out is `timeout`; one that is
-    unreachable or answers 5xx is `upstream_error`. A token Cloud Storage rejects is dropped from
-    the cache, and a call whose cached token was rejected retries once.
+  - A token is minted with one POST, without hidden retries. Only a key Google refuses is
+    `unauthorized`; Google's `invalid_grant` for the assertion's times (this host's clock is off)
+    is `upstream_error`. A token endpoint that times out is `timeout`; one that is unreachable or
+    answers 5xx is `upstream_error`. A token Cloud Storage rejects is dropped from the cache, and a
+    call whose cached token was rejected retries once.
+  - A tool call fits inside the host's `timeout_seconds`: every request, the token POST included,
+    gets the time remaining, a download checks it between chunks, and a call with none left fails
+    `timeout`.
   - A download that breaks off midway, or a key that can't sign (an EC key), comes out as a typed
     error: `GcsAPIError` (`timeout`/`upstream_error`) or `GcsNotConfigured`.
   - `gcs-source` takes `start_offset`. A pull cut short by `max_objects` or the listing-page cap
-    marks its last envelope (`truncated`, `next_start_offset`) and logs a warning.
+    marks its last envelope (`truncated`, `next_start_offset`) and logs a warning. One cut short
+    before any envelope came out raises `GcsPullTruncated` (a `ValueError`) with
+    `next_start_offset`, so a `modified_after` sync over a big prefix still advances.
   Setup and the exact secret: `connectors/gcs/README.md`.
 
 ## [0.5.0] - 2026-11-04

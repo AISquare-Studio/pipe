@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from aisquare.pipe.core.envelope import PullParams
 
-from aisquare_pipe_gcs import GcsNotConfigured, GcsSource
+from aisquare_pipe_gcs import GcsNotConfigured, GcsPullTruncated, GcsSource
 from aisquare_pipe_gcs import connector as connector_mod
 from tests.fakes import FakeGoogle, StoredObject, blob
 
@@ -173,9 +173,7 @@ def test_pull_stops_at_max_objects_says_so_and_resumes_with_start_offset(
     google_ = _many(7)
     seen: list[str] = []
     params: dict[str, Any] = {"max_objects": 3}
-    rounds = 0
-    while True:
-        rounds += 1
+    for rounds in range(1, 11):  # bounded: a bug can't loop forever
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="aisquare.pipe.gcs"):
             envelopes = _pull(google_, params)
@@ -192,6 +190,8 @@ def test_pull_stops_at_max_objects_says_so_and_resumes_with_start_offset(
         assert "stopped early (max_objects)" in warning.getMessage()
         assert "policies/doc" not in warning.getMessage()  # no names in logs
         params = {"max_objects": 3, "start_offset": last["next_start_offset"]}
+    else:
+        pytest.fail("the pulls never reached the end of the listing")
     assert seen == [f"policies/doc{i:04d}.txt" for i in range(7)]
     assert rounds == 3
     lists = [c for c in google_.storage_calls() if c["url"].endswith("/o")]
@@ -206,33 +206,65 @@ def test_a_pull_that_ends_exactly_at_max_objects_is_not_truncated(monkeypatch):
     assert len(envelopes) == 4 and "truncated" not in envelopes[-1].metadata
 
 
-def test_pull_cut_by_the_page_cap_says_so_even_with_no_envelope(monkeypatch, caplog):
+def test_a_page_capped_pull_with_no_envelope_raises_where_to_continue(
+    monkeypatch, caplog
+):
     """modified_after that matches little in a big prefix: the listing stops
-    at MAX_LIST_PAGES. Before, that was silent (ok, 0 envelopes, no log)."""
+    at MAX_LIST_PAGES with nothing to return, so no envelope can carry the
+    marker. The pull raises GcsPullTruncated with next_start_offset instead
+    (tester E1, review m3): before, it ended with 0 envelopes and no way on."""
     monkeypatch.setattr(connector_mod, "LIST_PAGE_SIZE", 2)
     monkeypatch.setattr(connector_mod, "MAX_LIST_PAGES", 2)
-    google_ = _many(9)
-    with caplog.at_level(logging.WARNING, logger="aisquare.pipe.gcs"):
-        assert _pull(google_, {"modified_after": "2027-01-01T00:00:00Z"}) == []
+    google_ = _many(9)  # 9 documents and "policies/zz/": 4 names per pull
+    with (
+        caplog.at_level(logging.WARNING, logger="aisquare.pipe.gcs"),
+        pytest.raises(GcsPullTruncated) as caught,
+    ):
+        _pull(google_, {"modified_after": "2027-01-01T00:00:00Z"})
+    error = caught.value
+    assert isinstance(error, ValueError)  # a host's client error (422), not a 500
+    assert (error.reason, error.next_start_offset) == (
+        "max_list_pages",
+        "policies/doc0004.txt",
+    )
+    assert "start_offset='policies/doc0004.txt'" in str(error)
     (warning,) = caplog.records
     assert "stopped early (max_list_pages)" in warning.getMessage()
     assert "no envelope came out" in warning.getMessage()
+    assert "policies/doc" not in warning.getMessage()  # no names in logs
 
-    caplog.clear()
-    google_.objects["policies/doc0001.txt"].updated = "2027-02-01T00:00:00Z"
-    with caplog.at_level(logging.WARNING, logger="aisquare.pipe.gcs"):
-        (envelope,) = _pull(google_, {"modified_after": "2027-01-01T00:00:00Z"})
-    assert envelope.metadata["truncated"] == "max_list_pages"
-    assert envelope.metadata["next_start_offset"] == "policies/doc0004.txt"
-    assert len(caplog.records) == 1
-    rest = _pull(
-        google_,
-        {
-            "modified_after": "2027-01-01T00:00:00Z",
-            "start_offset": envelope.metadata["next_start_offset"],
-        },
-    )
-    assert rest == []  # the next 4 names hold no change either
+
+def test_a_recurring_modified_after_sync_advances_to_the_end(monkeypatch):
+    """The README's loop: follow next_start_offset, from the error or from
+    the last envelope, until a pull is not truncated. Every name is listed
+    once and the one change is found."""
+    monkeypatch.setattr(connector_mod, "LIST_PAGE_SIZE", 2)
+    monkeypatch.setattr(connector_mod, "MAX_LIST_PAGES", 2)
+    google_ = _many(9)
+    google_.objects["policies/doc0006.txt"].updated = "2027-02-01T00:00:00Z"
+    since = {"modified_after": "2027-01-01T00:00:00Z"}
+    params: dict[str, Any] = dict(since)
+    found: list[str] = []
+    offsets: list[str] = []
+    for _ in range(10):  # bounded: a bug can't loop forever
+        try:
+            envelopes = _pull(google_, params)
+        except GcsPullTruncated as e:
+            assert e.next_start_offset is not None
+            offsets.append(e.next_start_offset)
+            params = {**since, "start_offset": e.next_start_offset}
+            continue
+        found += [e.metadata["object_name"] for e in envelopes]
+        if not envelopes or "truncated" not in envelopes[-1].metadata:
+            break
+        offsets.append(envelopes[-1].metadata["next_start_offset"])
+        params = {**since, "start_offset": offsets[-1]}
+    else:
+        pytest.fail("the sync never reached the end of the listing")
+    assert found == ["policies/doc0006.txt"]
+    assert offsets == ["policies/doc0004.txt", "policies/doc0008.txt"]
+    pages = [c for c in google_.storage_calls() if c["params"].get("maxResults") == 2]
+    assert len(pages) == 5  # 2 + 2 + 1 listing pages: none listed twice
 
 
 @pytest.mark.parametrize("name", [".", ".."])

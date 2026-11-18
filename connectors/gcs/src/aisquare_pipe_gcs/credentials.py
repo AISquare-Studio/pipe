@@ -176,12 +176,17 @@ TOKEN_TIMED_OUT = "timed_out"  # the token endpoint didn't answer in time
 TOKEN_UNREACHABLE = "unreachable"  # no answer at all: DNS, connect, TLS, reset
 TOKEN_RATE_LIMITED = "rate_limited"  # 429
 TOKEN_UPSTREAM = "upstream"  # 5xx, a redirect, or an answer without a token
+#: invalid_grant for the assertion's iat/exp: THIS host's clock is off, the
+#: key is fine (Google: "Invalid JWT: Token must be a short-lived token (60
+#: minutes) and in a reasonable timeframe. Check your iat and exp values...").
+TOKEN_CLOCK_SKEW = "clock_skew"
 
 #: OAuth error codes Google uses for its own transient failures (RFC 6749
 #: 4.1.2.1), whatever the status: not the key's fault.
 _TRANSIENT_ERRORS = frozenset(
     {"internal_failure", "server_error", "temporarily_unavailable"}
 )
+_CLOCK_SKEW = re.compile(r"\biat\b.*\bexp\b|reasonable timeframe", re.IGNORECASE)
 
 
 class GcsTokenError(Exception):
@@ -346,6 +351,18 @@ def _exchange(
     )
     reason = " ".join(reason.replace(assertion, "[redacted]").split())[:200]
     said = f": {reason}" if reason else ""
+    if (
+        status == 400
+        and error == "invalid_grant"
+        and isinstance(detail, str)
+        and _CLOCK_SKEW.search(detail)
+    ):
+        raise GcsTokenError(
+            "Google refused the token request's issue and expiry times: this "
+            f"host's clock is off (the key is fine; check NTP){said}",
+            kind=TOKEN_CLOCK_SKEW,
+            status=status,
+        )
     if status in (400, 401, 403) and error not in _TRANSIENT_ERRORS:
         raise GcsTokenError(
             f"Google did not issue a token for {who}{said}",
@@ -377,6 +394,7 @@ def _exchange(
 __all__ = [
     "READ_ONLY_SCOPE",
     "SERVER_KEYS",
+    "TOKEN_CLOCK_SKEW",
     "TOKEN_RATE_LIMITED",
     "TOKEN_REFUSED",
     "TOKEN_TIMED_OUT",

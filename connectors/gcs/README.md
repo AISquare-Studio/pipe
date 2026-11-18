@@ -28,14 +28,18 @@ Each envelope carries the object's bytes and `metadata`: `bucket`, `object_name`
 `content_type`, `generation`, `md5_hash`, `updated`, `etag`, `crc32c`, `time_created`, and `content_encoding`
 when the stored bytes are gzip. "Folder" placeholders (names ending in `/`) are skipped.
 
-**A pull that stops early says so.** It can stop at `max_objects`, or after 100 listing pages, for example
-when a `modified_after` matches little in a big prefix. Then:
+**A pull that stops early says so.** It can stop at `max_objects`, or after 100 listing pages (100,000
+names), for example when a `modified_after` matches little in a big prefix. Then:
 - the LAST envelope's metadata carries `truncated` (`max_objects` or `max_list_pages`) and
   `next_start_offset`;
-- a warning is logged, also when no envelope came out. Logs never carry object names.
+- if no envelope came out (every name listed was older than `modified_after`, or too large), the pull raises
+  `GcsPullTruncated` (a `ValueError`) with `reason` and `next_start_offset`. Its message names the
+  `start_offset` to continue with, and pipe-as-service passes it on (422 `bad_request`);
+- a warning is logged either way. Logs never carry object names.
 
-Pass `next_start_offset` as `start_offset` to continue. Nothing is skipped and nothing is repeated. A caller
-that keeps `max(updated)` as its watermark must finish a truncated pull first, or it misses changes.
+Pass `next_start_offset` as `start_offset` to continue, and repeat until a pull is not truncated. Nothing is
+skipped and nothing is repeated. A caller that keeps `max(updated)` as its watermark must finish a truncated
+pull first, or it misses changes.
 
 **Version markers.**
 - `generation` changes on every content write. Store it and re-read the object when it changes.
@@ -67,10 +71,16 @@ Read-only by construction: the token's scope is `devstorage.read_only`, the serv
   signed assertion only ever goes to Google. Every API call goes to `https://storage.googleapis.com`.
   Redirects are not followed. Errors and logs never carry the key, the assertion or a token.
 - **Tokens:**
-  - A token is minted with ONE POST to the token endpoint, inside the call's timeout, with no hidden retries.
+  - A token is minted with ONE POST to the token endpoint, with no hidden retries.
   - Tokens are cached in memory per key until five minutes before they expire.
   - A token Cloud Storage rejects (401) is dropped from the cache. A call whose cached token was rejected
     retries once with a new token.
+- **Time budget.** A tool call fits inside the host's `timeout_seconds`, all of its requests together.
+  `GCS_GET_OBJECT` makes up to three requests (token, metadata, download), or four after a rejected cached
+  token (the rejected one, a new token, then the retry and the download). Each one, the token POST included, gets the time remaining (at most 30 s), and a call with no time
+  left fails `timeout` before it sends anything more. requests' timeout bounds each connect and each socket
+  read, not a whole body, so a download also checks the deadline between 64 KiB chunks. `gcs-source` has no
+  budget: each request gets 30 s.
 
 | Failure | `error_code` | Meaning |
 |---|---|---|
@@ -80,6 +90,7 @@ Read-only by construction: the token's scope is `devstorage.read_only`, the serv
 | "... VPC Service Controls perimeter ..." | `forbidden` | The bucket's project is inside a perimeter with no ingress rule for the service account. |
 | "... requester-pays buckets are not supported" / "... (CSEK) can't be read" | `invalid_arguments` | Not supported (see "Not supported"). |
 | a timeout, "could not reach ...", "... token endpoint failed (5xx)", a 5xx | `timeout`, `upstream_error`, `rate_limited` | Google or the network. Retryable. The credential is fine. |
+| "Google refused the token request's issue and expiry times: this host's clock is off ..." | `upstream_error` | Our clock is off (Google: "Check your iat and exp values"). Fix NTP on the host. The credential is fine. |
 
 **Not supported:**
 - Requester-pays buckets. No `userProject` is sent, so Google answers 400.
@@ -91,17 +102,20 @@ Read-only by construction: the token's scope is `devstorage.read_only`, the serv
 
 ### The customer: who can do it
 
-Steps 2 to 4 need one admin, or several, holding:
+The steps need one admin, or several, holding:
 - `roles/iam.serviceAccountAdmin` (or `roles/iam.serviceAccountCreator`) on the project, to create the
   service account.
 - `storage.buckets.setIamPolicy` on the bucket, for example `roles/storage.admin`, to bind the role. With a
-  managed folder, `roles/storage.admin` also covers creating the folder and setting its policy.
+  managed folder, `roles/storage.admin` also covers creating the folder, setting its policy and turning on
+  uniform bucket-level access (`storage.buckets.update`).
 - `roles/iam.serviceAccountKeyAdmin` on the project or the service account, to create the key.
+- Only behind VPC Service Controls: `roles/accesscontextmanager.policyEditor` on the access policy, to add
+  the ingress rule (below).
 
 Check these organization settings first:
 - **Key creation may be blocked.** In organizations created on or after 3 May 2024, Google enforces
-  `iam.disableServiceAccountKeyCreation` by default (or its managed form,
-  `iam.managed.disableServiceAccountKeyCreation`). Step 4 then fails until an org-policy admin
+  `iam.managed.disableServiceAccountKeyCreation` by default (older organizations may set the legacy
+  constraint `iam.disableServiceAccountKeyCreation`). Step 4 then fails until an org-policy admin
   (`roles/orgpolicy.policyAdmin`) makes an exception for this project.
 - **Keys may expire.** If `iam.serviceAccountKeyExpiryHours` is set, the key expires after that time and the
   connector goes `unauthorized`. Put the rotation (below) on a calendar ahead of the expiry.
@@ -135,9 +149,11 @@ Check these organization settings first:
    The key can read every object its grant covers, through any client. With a bucket-level grant, that is
    the whole bucket: if `hr/` sits next to `policies/`, the key can read `hr/` too. So grant only what
    AISquare may read:
-   - **Recommended: a dedicated bucket** that holds only those documents. Copy or sync them in, for example
-     on a schedule: `gcloud storage rsync gs://<source-bucket>/policies gs://<aisquare-bucket>/policies --recursive`.
-     Then do step 3a on that bucket.
+   - **Recommended: a dedicated bucket** that holds only those documents. Sync them in on a schedule:
+     `gcloud storage rsync gs://<source-bucket>/policies gs://<aisquare-bucket>/policies --recursive --delete-unmatched-destination-objects`.
+     Without `--delete-unmatched-destination-objects`, a document you delete at the source, or move out of
+     `policies/`, stays in the AISquare bucket and AISquare keeps reading it. With it, removals reach the
+     AISquare bucket at the next sync. Then do step 3a on that bucket.
    - **Or a managed folder** (step 3b). It needs uniform bucket-level access. **We have not verified this
      option.** Our tests are hermetic, with no real Google project, so we have not confirmed that
      `GCS_LIST_OBJECTS` and `gcs-source` can list with `prefix=policies/` under a grant on the folder only.
@@ -146,6 +162,10 @@ Check these organization settings first:
      and `gcloud storage cat gs://<bucket>/policies/<a file> --impersonate-service-account=...`. The tester
      needs `roles/iam.serviceAccountTokenCreator` on the service account. Also check that `gcloud storage
      ls gs://<bucket>/hr/` is refused.
+   - **Either way, keep Object Versioning off on the bucket AISquare reads** (the dedicated bucket, or the
+     managed folder's bucket). With versioning on, an overwritten or deleted document stays readable:
+     `objectViewer` covers its noncurrent versions, and `GCS_GET_OBJECT` reads one by `generation`. If the
+     bucket must keep versions, treat every version as readable by AISquare.
 2. **Create a service account** for AISquare:
    `gcloud iam service-accounts create aisquare-reader --project=<project> --display-name="AISquare read-only (GCS)"`.
 3. **Grant it `roles/storage.objectViewer`** on ONE bucket (3a) or ONE managed folder (3b), never on the
@@ -170,28 +190,73 @@ Check these organization settings first:
      ticket.
    - Delete your local copy of key.json afterwards.
 
+**Offboarding** (when AISquare should stop reading): remove the role binding from step 3
+(`gcloud storage buckets remove-iam-policy-binding gs://<bucket> --member=serviceAccount:aisquare-reader@<project>.iam.gserviceaccount.com --role=roles/storage.objectViewer`,
+or `gcloud storage managed-folders remove-iam-policy-binding` with the same flags for 3b), then delete the
+key (`gcloud iam service-accounts keys delete <key-id> --iam-account=aisquare-reader@<project>.iam.gserviceaccount.com`)
+or the whole service account (`gcloud iam service-accounts delete aisquare-reader@<project>.iam.gserviceaccount.com`).
+Removing the binding stops every read, a token AISquare already holds included, once the IAM change takes
+effect (usually within a few minutes).
+
 ### AISquare devops
 
-**When "no deploy" holds.** All three of these must be true:
+**What has to be true first** (both):
 1. pipe-as-service runs credential-driven routing (task #30).
 2. Its image has a pipe release that contains `gcs` (`aisquare-pipe[toolkits]`, from the first release with
    this connector).
-3. It runs `PIPE_SERVICE_SECRETS_BACKEND=aws`, with a role allowed `secretsmanager:GetSecretValue` on
-   `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/*`.
 
-Then a new secret is picked up within about 6 minutes (the 60 s routing TTL plus the 300 s secret cache),
-with no deploy. With the shipped env backend instead, the blob reaches the pod only as the env var
-`PIPE_SECRET__<TENANT>__GCS__JSON`: a `secretEnv` entry in the EKS release, or the ECS task definition's
-`secrets:`. That is a deploy. Add the entry only once the secret has a value.
+**Turning GCS on for a tenant is a deploy, today.** Every environment runs the env secrets backend
+(`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS task definitions in
+pipe-as-service). The blob reaches the pod only as the env var `PIPE_SECRET__<TENANT>__GCS__JSON`, from a
+secret that devops creates:
 
-**Store one secret per tenant.** pipe-as-service reads it as the tenant's credential blob for both `gcs` and
+- **EKS:** Secrets Manager `<secrets.prefix>/pipe-service/gcs-<tenant>` (for example
+  `nonprod/stg/pipe-service/gcs-<tenant>`), created empty by aisquare-infra and filled by its secrets
+  workflow, like pipe-service's other secrets (values never go in git). Then add to aisquare-releases
+  `environments/<env>/services/pipe-service/release.yaml`:
+
+  ```yaml
+  secretEnv:
+    PIPE_SECRET__<TENANT>__GCS__JSON: { from: pipe-service/gcs-<tenant> }
+  ```
+
+  A code owner merging that PR is the deploy; Argo CD applies it.
+- **ECS:** Secrets Manager `ais-pipe-service/<env>/gcs-<tenant>` (the execution role already reads
+  `ais-pipe-service/<env>/*`). Then add to the task definition's `secrets:`
+  (`deploy/ecs/<env>/task-definition-pipe-service.json` in pipe-as-service), in the same ARN form as the
+  entries already there:
+
+  ```json
+  {
+    "name": "PIPE_SECRET__<TENANT>__GCS__JSON",
+    "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/gcs-<tenant>"
+  }
+  ```
+
+  The new task-definition revision (the Deploy workflow) is the deploy.
+
+`<TENANT>` is the tenant id upper-cased, with every run of characters other than A-Z and 0-9 written as one
+`_` and any `_` at either end dropped (`goodrx-prod` gives `PIPE_SECRET__GOODRX_PROD__GCS__JSON`). Add the
+entry only once its secret has a value: on EKS, Argo CD waits for the ExternalSecret before the Deployment,
+so a missing secret holds the release; on ECS, a task whose secret doesn't exist does not start. The new
+value is read when the pod or task starts.
+
+**Never switch the secrets backend for GCS.** `PIPE_SERVICE_SECRETS_BACKEND=aws` moves EVERY secret the
+service reads, the shared Composio key included: under it, that key is read from
+`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/_shared/composio/api_key`, and a missing or denied secret reads as no
+key. Flipping it "for GCS" takes Composio down for every connector in that environment. Moving to the aws
+backend is a whole-service migration (pipe-as-service `DEPLOYMENT.md`, go-live checklist: the Composio key
+and the OAuth apps first), never a GCS step. After that migration, the tenant's secret is
+`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/gcs` and needs no deploy: a new secret is picked up within
+about 60 s (a missing secret is not cached, so only the 60 s routing TTL applies), and a changed one within
+300 s (the secret cache).
+
+**Fill the secret.** pipe-as-service reads it as the tenant's credential blob for both `gcs` and
 `gcs-source`:
 1. Copy key.json from the vault into the secret.
-2. Delete the vault item and any local copy.
+2. Delete the vault item and any local copy. Then remove the customer's guest access and the handoff vault.
 
-- AWS Secrets Manager name: `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/gcs`.
-- Env backend: `PIPE_SECRET__<TENANT>__GCS__JSON`.
-- Secret value, one JSON object:
+The secret's value, one JSON object:
 
 ```json
 {
@@ -215,12 +280,16 @@ is optional and must end with `/`. Until the secret is read, pipe-as-service ans
 `connector_unavailable` / `not_configured`, naming "credentials for gcs".
 
 **Rotation**, at least before any key expiry:
-1. The customer creates a new key for the same service account (step 4).
+1. The customer creates a new key for the same service account (step 4) and hands it over as in step 5.
 2. Devops replaces `service_account_json` in the secret.
-3. Wait until every pod reads the new key:
-   - with the AWS backend, at least 6 minutes: the 300 s secret cache plus the 60 s routing TTL;
-   - with the env backend, until the rollout has finished.
+3. Wait until every pod reads the new key. On the env backend (today) the value is read when a pod or task
+   starts: redeploy the service after the secret changes (on EKS, once External Secrets has synced it) and
+   wait until the rollout has finished. After a migration to the aws backend, wait at least 300 s.
 4. Only then does the customer delete the old key. Deleting it earlier breaks calls on pods that still hold it.
+
+**Offboarding:** remove the `secretEnv` entry or the task definition's `secrets:` entry (a deploy), then
+delete the secret. Tell the customer to do their offboarding (above) as well: deleting our copy does not
+revoke the key.
 
 **Later (not built):** Workload Identity Federation from our AWS principal to the customer's service
 account. It avoids a long-lived key, and needs setup on both sides.

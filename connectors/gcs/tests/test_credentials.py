@@ -354,3 +354,27 @@ def test_a_cached_token_rejected_after_the_key_was_deleted_is_unauthorized():
     assert "invalid_grant" in (result.error or "")
     google_.token_error = None  # the customer fixed it: the next call recovers
     assert _list(google_).successful
+
+
+def test_our_clock_skew_is_not_blamed_on_the_key():
+    """Google's invalid_grant for the assertion's iat/exp means THIS host's
+    clock is off: upstream_error with Google's text, not unauthorized "the
+    key was rejected" (review n5). A bad signature stays unauthorized."""
+    google_ = FakeGoogle()
+    google_.token_error = (
+        400,
+        {
+            "error": "invalid_grant",
+            "error_description": "Invalid JWT: Token must be a short-lived token (60 "
+            "minutes) and in a reasonable timeframe. Check your iat and exp values in "
+            "the JWT claim.",
+        },
+    )
+    result = _list(google_)
+    assert not result.successful and result.error_code == "upstream_error"
+    assert "clock is off" in (result.error or "")
+    assert "Check your iat and exp" in (result.error or "")
+    assert _BAD_KEY_HINT not in (result.error or "")
+    with pytest.raises(GcsAPIError) as raised:
+        _pull(google_)
+    assert raised.value.status != 401 and not raised.value.key_refused

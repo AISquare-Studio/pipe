@@ -6,13 +6,14 @@ Credentials are never used.
 """
 
 from aisquare_pipe_gcs.client import GcsAPIError
-from aisquare_pipe_gcs.connector import GcsSource
+from aisquare_pipe_gcs.connector import GcsPullTruncated, GcsSource
 from aisquare_pipe_gcs.credentials import GcsNotConfigured, load_credentials
 from aisquare_pipe_gcs.toolkit import GcsToolkit
 
 __all__ = [
     "GcsAPIError",
     "GcsNotConfigured",
+    "GcsPullTruncated",
     "GcsSource",
     "GcsToolkit",
     "load_credentials",

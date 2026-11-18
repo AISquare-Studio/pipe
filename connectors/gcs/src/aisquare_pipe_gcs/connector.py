@@ -24,9 +24,12 @@ skipped.
 A listing that stops before its end says so: on ``max_objects``, or after
 ``MAX_LIST_PAGES`` pages (a ``modified_after`` that matches little in a big
 prefix), the LAST envelope's metadata carries ``truncated`` (``max_objects``
-or ``max_list_pages``) and ``next_start_offset``, and a warning is logged
-(also when no envelope came out). A caller that keeps ``max(updated)`` as a
-watermark must finish a truncated pull first, or it misses changes.
+or ``max_list_pages``) and ``next_start_offset``, and a warning is logged.
+When no envelope came out (every name listed was older than
+``modified_after``, or too large), there is no last envelope to carry them:
+the pull raises :class:`GcsPullTruncated` instead, with ``reason`` and
+``next_start_offset``. A caller that keeps ``max(updated)`` as a watermark
+must finish a truncated pull first, or it misses changes.
 
 A param naming a credential key (``service_account_json``, ``bucket``) is
 refused, and so is a prefix or name outside the configured prefix. Skipped
@@ -77,6 +80,31 @@ _PARAMS = frozenset(
 )
 TRUNCATED_MAX_OBJECTS = "max_objects"
 TRUNCATED_MAX_LIST_PAGES = "max_list_pages"
+
+
+class GcsPullTruncated(ValueError):
+    """A pull stopped early (``reason``: ``max_objects`` or
+    ``max_list_pages``) before any envelope came out, so no envelope can
+    carry where to go on. Pull again with ``start_offset`` =
+    ``next_start_offset`` (None when the resume point couldn't be read: retry
+    the pull, or narrow the prefix or the ``modified_after`` window).
+
+    A ``ValueError``, so a host that answers those as a client error (as
+    pipe-as-service does, 422) passes the message, which carries the name to
+    continue at, to the caller. Logs never carry it."""
+
+    def __init__(self, reason: str, next_start_offset: str | None) -> None:
+        self.reason = reason
+        self.next_start_offset = next_start_offset
+        how = (
+            f"continue with start_offset={next_start_offset!r}"
+            if next_start_offset is not None
+            else "the name to continue at could not be read: retry the pull"
+        )
+        super().__init__(
+            f"gcs-source: the listing stopped early ({reason}) before any object came "
+            f"out; {how}, or narrow the prefix or the modified_after window"
+        )
 
 
 def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
@@ -297,18 +325,17 @@ class GcsSource(SourceConnector):
                 reason, resume = truncation
                 logger.warning(
                     "gcs-source: the listing stopped early (%s): more objects remain "
-                    "under the prefix; continue with the last envelope's "
-                    "next_start_offset as start_offset%s",
+                    "under the prefix; continue with %s as start_offset",
                     reason,
-                    ""
+                    "the last envelope's next_start_offset"
                     if last is not None
-                    else " (no envelope came out: narrow the "
-                    "prefix or the modified_after window)",
+                    else "the error's next_start_offset (no envelope came out)",
                 )
-                if last is not None:
-                    last.metadata["truncated"] = reason
-                    if resume is not None:
-                        last.metadata["next_start_offset"] = resume
+                if last is None:
+                    raise GcsPullTruncated(reason, resume)
+                last.metadata["truncated"] = reason
+                if resume is not None:
+                    last.metadata["next_start_offset"] = resume
             if last is not None:
                 yield last
 
@@ -381,4 +408,4 @@ def _after(updated: Any, since: datetime) -> bool:
         return True  # no usable time: keep it rather than lose a change
 
 
-__all__ = ["GcsAPIError", "GcsNotConfigured", "GcsSource"]
+__all__ = ["GcsAPIError", "GcsNotConfigured", "GcsPullTruncated", "GcsSource"]
