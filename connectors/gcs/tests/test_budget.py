@@ -89,8 +89,9 @@ def test_a_budget_spent_on_the_token_post_sends_nothing_else(clock):
 
 
 def test_the_retry_after_a_rejected_cached_token_shares_the_budget(clock):
-    """A cached token's 401 adds a token POST and a retry (5 requests): they
-    get what is left, not a fresh budget each."""
+    """A cached token's 401 adds a token POST and a retry (4 requests: the
+    rejected metadata call, a new token, the retried metadata call and the
+    download): they get what is left, not a fresh budget each."""
     google_ = _google(clock, per_request=0)
     assert _get(google_, 30).successful  # caches a token
     google_.requests.clear()
