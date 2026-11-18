@@ -566,10 +566,15 @@ def shim_files(name: str) -> dict[str, str]:
         f"The old release and {FRAMEWORK} install the same files, and removing the old "
         f"release removes them. Uninstall it first, then install the extra:\n\n"
         f'```bash\npip uninstall -y {project}\npip install "{FRAMEWORK}[{name}]>={SHIM_FLOOR}"\n```\n\n'
-        f"If you already upgraded in place, never `pip uninstall {project}` without running "
-        f"`pip install --force-reinstall --no-deps {FRAMEWORK}` afterwards. The same command "
-        f"repairs an environment where `{module}` fails to import. A fresh environment is "
-        f"never affected.\n"
+        # The same text as README.md's, for this connector (a test checks it).
+        f"**If you already upgraded in place**, this command restores the files:\n\n"
+        f"```bash\npip install --force-reinstall --no-deps {FRAMEWORK}\n```\n\n"
+        f"- `pip install -U {project}` over an old release breaks the connector at once. "
+        f"Run the command right after.\n"
+        f"- If you installed `{FRAMEWORK}[{name}]` over the old package, never "
+        f"`pip uninstall {project}` without running the command afterwards.\n\n"
+        f"The same command repairs an environment where `{module}` fails to import. "
+        f"A fresh environment is never affected.\n"
     )
     pyproject = f'''[build-system]
 requires = ["setuptools>=77.0"]

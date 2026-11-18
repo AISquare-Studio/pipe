@@ -94,10 +94,13 @@ In an environment that has an old per-connector package (`aisquare-pipe-onedrive
 The old package and `aisquare-pipe` 0.5.0 install the same files, so pip
 removing the old one (`pip install -U aisquare-pipe-<x>`, or a later `pip
 uninstall aisquare-pipe-<x>`) deletes the connector. If you already upgraded
-in place, never uninstall the old package without running `pip install
---force-reinstall --no-deps aisquare-pipe` afterwards; the same command
-repairs a broken environment. Fresh environments are not affected. Details:
-README.md, "Upgrading from `aisquare-pipe-<x>`".
+in place, the repair is `pip install --force-reinstall --no-deps
+aisquare-pipe`: run it right after a `pip install -U aisquare-pipe-<x>` over
+an old release, which breaks the connector at once, and if you installed
+`aisquare-pipe[<x>]` over the old package, never uninstall it without running
+it afterwards. The same command repairs a broken environment. Fresh
+environments are not affected. Details: README.md, "Upgrading from
+`aisquare-pipe-<x>`".
 
 ### Changed
 
@@ -117,7 +120,8 @@ README.md, "Upgrading from `aisquare-pipe-<x>`".
     (`registry.not_installed`, `registry.missing_requirements`,
     `registry.connector_extra`), instead of a load-error warning. That takes
     a missing third-party module (a `ModuleNotFoundError`, or an error raised
-    from one) and a missing requirement of the connector's own extra, counted
+    from one or while handling one, the chain a traceback prints; `from None`
+    hides it) and a missing requirement of the connector's own extra, counted
     only where its env marker applies. Anything else stays a broken-plugin
     warning, even with the extra missing: a missing `aisquare.*` or
     `aisquare_pipe_*` module (a half-removed install), or `cannot import

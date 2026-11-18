@@ -69,13 +69,16 @@ pip uninstall -y aisquare-pipe-onedrive
 pip install "aisquare-pipe[onedrive]>=0.5.0"
 ```
 
-**If you already upgraded in place** (`pip install -U aisquare-pipe-<x>`, or `aisquare-pipe[<x>]` installed over the old package), never `pip uninstall aisquare-pipe-<x>` without restoring the files afterwards:
+**If you already upgraded in place**, this command restores the files:
 
 ```bash
 pip install --force-reinstall --no-deps aisquare-pipe
 ```
 
-The same command repairs a broken environment. The symptom is a warning such as `Failed to load toolkit onedrive: No module named 'aisquare_pipe_onedrive.constants'`, while `pip check` reports nothing wrong. A fresh environment (a Docker build, CI) is never affected.
+- `pip install -U aisquare-pipe-<x>` over an old release breaks the connector at once. Run the command right after.
+- If you installed `aisquare-pipe[<x>]` over the old package, never `pip uninstall aisquare-pipe-<x>` without running the command afterwards.
+
+The same command repairs any broken environment. The symptom is a warning such as `Failed to load toolkit onedrive: No module named 'aisquare_pipe_onedrive.constants'`, while `pip check` reports nothing wrong. A fresh environment (a Docker build, CI) is never affected.
 
 Third-party connectors in their own distribution (any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 

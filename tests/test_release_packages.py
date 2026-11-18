@@ -466,6 +466,37 @@ def test_shim_sources_have_no_code_and_one_requirement():
     assert readme.index('pip install "aisquare-pipe[onedrive]>=0.5.0"') > upgrade
 
 
+def _readme_in_place_upgrade() -> str:
+    """README.md's "If you already upgraded in place" text: the repair
+    command and its two cases, up to the paragraph after the list."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    start = readme.index("**If you already upgraded in place**")
+    return readme[start : readme.index("\n\n", readme.index("\n- ", start)) + 1]
+
+
+def test_readme_splits_the_two_in_place_upgrades():
+    """`pip install -U aisquare-pipe-<x>` breaks the connector at once; the
+    extra installed over the old package breaks only at a later uninstall."""
+    text = _readme_in_place_upgrade()
+    assert "pip install --force-reinstall --no-deps aisquare-pipe\n" in text
+    immediate, later = (line for line in text.splitlines() if line.startswith("- "))
+    assert immediate.startswith("- `pip install -U aisquare-pipe-<x>`")
+    assert "at once" in immediate and "right after" in immediate
+    assert immediate.index("at once") < immediate.index("right after")
+    assert later.startswith(
+        "- If you installed `aisquare-pipe[<x>]` over the old package"
+    )
+    assert "never `pip uninstall aisquare-pipe-<x>`" in later and "afterwards" in later
+
+
+@pytest.mark.parametrize("name", sorted(rp.SHIM_PROJECTS))
+def test_each_shim_readme_has_the_readme_s_in_place_upgrade_text(name):
+    """The shim README (PyPI's page for aisquare-pipe-<x>) says what
+    README.md (aisquare-pipe's page) says, for that connector."""
+    expected = _readme_in_place_upgrade().replace("<x>", name)
+    assert expected in rp.shim_files(name)["README.md"]
+
+
 def test_plan_cli_writes_github_outputs_and_fails_on_a_problem(tmp_path, monkeypatch):
     _repo(tmp_path / "repo")
     output, summary = tmp_path / "out", tmp_path / "summary"
