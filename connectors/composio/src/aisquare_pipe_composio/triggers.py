@@ -26,6 +26,7 @@ from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams, Res
 
 from aisquare_pipe_composio.client import (
     ComposioClient,
+    ComposioSDKShapeError,
     TriggerCursor,
     _epoch_ms,
     default_cursor_path,
@@ -173,6 +174,14 @@ class ComposioTriggersSource(SourceConnector):
                 changed = yield from self._poll_once(
                     client, config, user_id, state, limit
                 )
+            except ComposioSDKShapeError:
+                # Not transient: every cycle would fail the same way, so the
+                # failure is surfaced (logged, then raised), never polled on.
+                logger.error(
+                    "composio: trigger polling stopped: unsupported composio SDK",
+                    exc_info=True,
+                )
+                raise
             except Exception:
                 logger.exception("composio: trigger poll cycle failed")
                 changed = False
