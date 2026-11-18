@@ -66,8 +66,10 @@ Done already, and never needed again for a new connector:
 - **PyPI:** a trusted publisher on the `aisquare-pipe` project with Owner
   `AISquare-Studio`, Repository `pipe`, Workflow `publish.yml`, Environment
   `pypi`. The same publisher already covers the ten per-connector projects
-  that get a shim (see below), because each of them was first published by
-  this workflow.
+  that get a shim (see below). Each one has passed PyPI's upload-permission
+  check in a run of this workflow: on 2026-06-29 (run 28394718052) for the
+  older eight, and on 2026-07-10 for github and graphify, which this workflow
+  created.
 - **GitHub:** the `pypi` environment (Settings → Environments). Optionally,
   add required reviewers. If you restrict its deployment refs, allow the
   release branch you publish from and tags `v*`.
