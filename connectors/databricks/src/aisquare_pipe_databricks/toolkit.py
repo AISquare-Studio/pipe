@@ -35,6 +35,7 @@ from aisquare.pipe import (
     error_code_for_status,
     time_budget,
 )
+from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_databricks.client import (
     DatabricksAPIError,
@@ -67,8 +68,11 @@ DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 INLINE_TEXT_MAX = 1024 * 1024
 MAX_ROWS = 10_000
 DEFAULT_ROWS = 1000
-#: The statement API's inline result cap (25 MiB) is the ceiling; this is ours.
-SQL_BYTE_LIMIT = 16 * 1024 * 1024
+#: The statement API's inline result cap (25 MiB) is the ceiling; this is
+#: ours, sized for a 512 MiB pod: a result of many short values parses into
+#: about 12 times its size in Python objects (117 MiB at 8 MiB of JSON, 232
+#: MiB at 16 MiB; tests/test_memory.py).
+SQL_BYTE_LIMIT = 8 * 1024 * 1024
 DEFAULT_SQL_SECONDS = 60
 MAX_SQL_SECONDS = 120
 MIN_SQL_SECONDS = 5
@@ -306,6 +310,51 @@ def _describe(e: DatabricksAPIError) -> str:
             "on the volume, SELECT on the table, CAN USE on the warehouse)"
         )
     return e.message
+
+
+class DatabricksRequestError(ValueError):
+    """Databricks refused what the caller asked for: a path that does not
+    exist, a request it calls invalid (400). A ``ValueError``, so
+    pipe-as-service answers it 422. ``status`` is Databricks's."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _source_hint(e: DatabricksAPIError) -> str:
+    if e.timed_out:
+        return ""
+    if e.status == 401:
+        return "the tenant's Databricks credential was refused and must be fixed"
+    if e.status == 403:
+        return (
+            "the Databricks principal lacks the grant this needs (READ VOLUME on the "
+            "volume, or access to the DBFS path)"
+        )
+    if e.status == 404:
+        return "the path does not exist"
+    if e.status == 400:
+        return "Databricks called the request invalid (check the path)"
+    if e.status == 429:
+        return "Databricks throttled the pull; retry later"
+    return ""
+
+
+def source_error(e: DatabricksAPIError) -> Exception:
+    """A Databricks failure as the source raises it: what the caller can fix
+    (a 400, a path that does not exist: 404) is a
+    :class:`DatabricksRequestError` (422 in pipe-as-service); everything else
+    (a refused credential or grant, throttling, a timeout, a 5xx, no answer)
+    is a :class:`~aisquare.pipe.errors.PipelineError` (502), with
+    ``retry_after`` when Databricks gave one. The message is ``summary`` and
+    a hint, never Databricks's own text (it can name paths, and hosts log
+    these)."""
+    hint = _source_hint(e)
+    text = "databricks-files-source: " + e.summary + (f" — {hint}" if hint else "")
+    if not e.timed_out and e.status in (400, 404):
+        return DatabricksRequestError(text, status=e.status)
+    return PipelineError(text, retry_after=e.retry_after)
 
 
 def failure(e: DatabricksAPIError) -> ToolResult:
@@ -571,7 +620,7 @@ class DatabricksToolkit(Toolkit):
             _int(arguments, "timeout_seconds", MIN_SQL_SECONDS, MAX_SQL_SECONDS)
         )
         if budget is not None:
-            seconds = max(1.0, min(seconds, budget))
+            seconds = min(seconds, budget)
         result = client.run_statement(
             statement,
             warehouse_id=creds.warehouse_id,
@@ -637,7 +686,9 @@ __all__ = [
     "READ_FILE",
     "RUN_SELECT",
     "TOOL_SPECS",
+    "DatabricksRequestError",
     "DatabricksToolkit",
     "failure",
+    "source_error",
     "sql_result",
 ]

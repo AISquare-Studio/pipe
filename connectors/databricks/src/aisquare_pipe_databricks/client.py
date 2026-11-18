@@ -10,23 +10,29 @@ Endpoints (docs.databricks.com/api):
   ``GET /api/2.0/dbfs/read?path&offset&length`` (base64, at most 1 MB a read).
 * SQL Statement Execution: ``POST /api/2.0/sql/statements`` then
   ``GET /api/2.0/sql/statements/{id}`` until a terminal state;
-  ``POST /api/2.0/sql/statements/{id}/cancel`` when the deadline passes.
+  ``POST /api/2.0/sql/statements/{id}/cancel`` when the deadline passes
+  (:meth:`DatabricksClient.run_statement` says how the deadline holds).
 * Unity Catalog: ``GET /api/2.1/unity-catalog/{catalogs|schemas|tables}``.
 
 Every request goes to the credential's workspace host only, with its bearer
-token. Redirects are never followed. Downloads stop at ``max_bytes``. Error
-messages never carry a secret.
+token. Redirects are never followed. Downloads stop at ``max_bytes`` and
+accumulate in one buffer. Error messages never carry a secret; a
+:class:`DatabricksAPIError`'s ``summary`` carries none of Databricks's own
+text either.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
+import io
 import time
 from collections.abc import Callable
 from typing import Any, Self
 from urllib.parse import quote
 
 import requests
+import urllib3
 
 from aisquare_pipe_databricks.credentials import (
     DatabricksCredentials,
@@ -35,6 +41,18 @@ from aisquare_pipe_databricks.credentials import (
 )
 
 DEFAULT_TIMEOUT = 30.0
+#: The statement API's ``wait_timeout``: ``0s`` (asynchronous), or 5 to 50 s.
+API_MIN_WAIT = 5
+API_MAX_WAIT = 50
+#: How much longer than ``wait_timeout`` the submit's HTTP read timeout is:
+#: the warehouse answers when ``wait_timeout`` passes, and this covers that
+#: answer and the network.
+ANSWER_SLACK = 5.0
+#: Kept back from a statement's deadline for its cancel (at most a quarter of
+#: the deadline).
+CANCEL_RESERVE = 2.0
+#: The shortest timeout a request is sent with.
+MIN_REQUEST_TIMEOUT = 0.2
 #: DBFS returns at most 1 MB per read.
 DBFS_READ_CHUNK = 1024 * 1024
 _STREAM_CHUNK = 64 * 1024
@@ -45,7 +63,10 @@ TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"})
 
 class DatabricksAPIError(Exception):
     """A failed Databricks call. ``status`` is the HTTP status (None when
-    nothing came back); ``retry_after`` is set for a 429/503 that said when."""
+    nothing came back); ``retry_after`` is set for a 429/503 that said when.
+    ``message`` may end with Databricks's own error text (secrets redacted),
+    for the toolkit's caller; ``summary`` is the message without it, for a
+    host's logs (Databricks's text can echo paths, names or values)."""
 
     def __init__(
         self,
@@ -54,9 +75,11 @@ class DatabricksAPIError(Exception):
         status: int | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
+        summary: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
+        self.summary = message if summary is None else summary
         self.status = status
         self.retry_after = retry_after
         self.timed_out = timed_out
@@ -132,16 +155,24 @@ class DatabricksClient:
     def download_file(
         self, path: str, *, max_bytes: int
     ) -> tuple[bytes, dict[str, Any]]:
+        """The file's bytes, at most ``max_bytes``. They accumulate in one
+        buffer whose ``getvalue()`` hands them over without a copy, so a
+        download holds about one copy of the file, not its chunks and then
+        their join."""
         resp = self._request("GET", f"/api/2.0/fs/files{files_path(path)}", stream=True)
         try:
-            chunks: list[bytes] = []
+            buffer = io.BytesIO()
             total = 0
             for chunk in resp.iter_content(_STREAM_CHUNK):
                 total += len(chunk)
                 if total > max_bytes:
                     raise FileTooLarge(f"{path} is larger than {max_bytes} bytes")
-                chunks.append(chunk)
-            return b"".join(chunks), _file_headers(resp.headers)
+                buffer.write(chunk)
+            return buffer.getvalue(), _file_headers(resp.headers)
+        except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
+            # The body broke off midway: a read timeout (requests wraps it in
+            # ConnectionError), a reset (ChunkedEncodingError), ...
+            raise _transport_error(e) from e
         finally:
             resp.close()
 
@@ -156,7 +187,7 @@ class DatabricksClient:
     def dbfs_read(self, path: str, *, size: int, max_bytes: int) -> bytes:
         if size > max_bytes:
             raise FileTooLarge(f"{path} is larger than {max_bytes} bytes")
-        data = bytearray()
+        buffer = io.BytesIO()  # getvalue() hands the bytes over without a copy
         offset = 0
         while offset < size:
             body = self._json(
@@ -168,11 +199,16 @@ class DatabricksClient:
             chunk = body.get("data")
             if not isinstance(read, int) or not isinstance(chunk, str) or read <= 0:
                 break
-            data.extend(base64.b64decode(chunk))
+            try:
+                buffer.write(base64.b64decode(chunk, validate=True))
+            except (binascii.Error, ValueError):
+                raise DatabricksAPIError(
+                    "DBFS answered a read whose data is not base64"
+                ) from None
             offset += read
-            if len(data) > max_bytes:
+            if buffer.tell() > max_bytes:
                 raise FileTooLarge(f"{path} is larger than {max_bytes} bytes")
-        return bytes(data)
+        return buffer.getvalue()
 
     # -- SQL Statement Execution -----------------------------------------------------------
 
@@ -187,26 +223,86 @@ class DatabricksClient:
         catalog: str | None = None,
         schema: str | None = None,
     ) -> dict[str, Any]:
-        """Run one statement (already checked SELECT-only) and wait for it,
-        at most ``deadline_seconds`` from now. Past the deadline the statement
-        is cancelled and a timed-out :class:`DatabricksAPIError` raised."""
+        """Run one statement (already checked SELECT-only) and wait for it, at
+        most ``deadline_seconds`` from now, the OAuth token included. Every
+        request's timeout fits what is left; past the deadline the statement
+        is cancelled and a timed-out :class:`DatabricksAPIError` raised.
+
+        * With 6 to 55 s left (:data:`API_MIN_WAIT` + 1 to
+          :data:`API_MAX_WAIT` + :data:`ANSWER_SLACK`), one synchronous call:
+          ``wait_timeout`` is what is left less ``ANSWER_SLACK`` (5 to 50 s),
+          the HTTP read timeout is ``wait_timeout`` + ``ANSWER_SLACK`` (never
+          past what is left), and ``on_wait_timeout`` is ``CANCEL``. So the
+          warehouse cancels the statement itself at ``wait_timeout``, even if
+          its answer never arrives (a client timeout).
+        * Otherwise (``timeout_seconds`` above 55, or a host budget under
+          6 s), asynchronously: ``wait_timeout`` ``0s`` answers at once with
+          the ``statement_id``, which is polled until the statement ends and
+          cancelled when the deadline comes (:data:`CANCEL_RESERVE` is kept
+          back for the cancel). A poll that fails or times out cancels it too.
+        """
         started = self._clock()
-        wait = int(max(5, min(50, deadline_seconds)))
+
+        def left() -> float:
+            return deadline_seconds - (self._clock() - started)
+
+        reserve = min(CANCEL_RESERVE, deadline_seconds / 4)
+        self._auth(timeout=_fit(left() - reserve))
+        remaining = left()
+        if remaining - reserve < MIN_REQUEST_TIMEOUT:
+            raise DatabricksAPIError(
+                f"the statement could not start within {deadline_seconds:g}s",
+                timed_out=True,
+            )
+        synchronous = API_MIN_WAIT + 1 <= remaining <= API_MAX_WAIT + ANSWER_SLACK
         body: dict[str, Any] = {
             "statement": statement,
             "warehouse_id": warehouse_id,
-            "wait_timeout": f"{wait}s" if deadline_seconds >= 5 else "0s",
-            "on_wait_timeout": "CONTINUE",
             "disposition": "INLINE",
             "format": "JSON_ARRAY",
             "row_limit": row_limit,
             "byte_limit": byte_limit,
         }
+        if synchronous:
+            wait = int(min(API_MAX_WAIT, max(API_MIN_WAIT, remaining - ANSWER_SLACK)))
+            body["wait_timeout"] = f"{wait}s"
+            body["on_wait_timeout"] = "CANCEL"
+            timeout = min(wait + ANSWER_SLACK, remaining)
+        else:
+            wait = 0
+            body["wait_timeout"] = "0s"
+            body["on_wait_timeout"] = "CONTINUE"
+            timeout = _fit(remaining - reserve)
         if catalog:
             body["catalog"] = catalog
         if schema:
             body["schema"] = schema
-        result = self._json("POST", "/api/2.0/sql/statements", body=body)
+        try:
+            result = self._json(
+                "POST", "/api/2.0/sql/statements", body=body, timeout=timeout
+            )
+        except DatabricksAPIError as e:
+            if not e.timed_out:
+                raise
+            then = (
+                f"the warehouse cancels it after {wait}s (on_wait_timeout CANCEL)"
+                if synchronous
+                else "if it started, the warehouse's STATEMENT_TIMEOUT ends it"
+            )
+            raise DatabricksAPIError(
+                f"Databricks did not answer the statement within {timeout:g}s; {then}",
+                timed_out=True,
+            ) from None
+        if (
+            synchronous
+            and _state(result) == "CANCELED"
+            and self._clock() - started >= wait - 1
+        ):
+            raise DatabricksAPIError(
+                f"the statement did not finish within {wait}s and the warehouse "
+                f"cancelled it (deadline {deadline_seconds:g}s)",
+                timed_out=True,
+            )
         delay = 0.5
         while _state(result) not in TERMINAL_STATES:
             statement_id = result.get("statement_id")
@@ -214,25 +310,40 @@ class DatabricksClient:
                 raise DatabricksAPIError(
                     "the statement API answered without a statement_id"
                 )
-            if self._clock() - started >= deadline_seconds:
-                self._cancel(statement_id)
+            if left() - reserve >= MIN_REQUEST_TIMEOUT:
+                self._sleep(min(delay, left() - reserve - MIN_REQUEST_TIMEOUT))
+                delay = min(delay * 2, 5.0)
+            if left() - reserve < MIN_REQUEST_TIMEOUT:
+                # Only the reserve is left: it is the cancel's.
+                self._cancel(statement_id, left)
                 raise DatabricksAPIError(
                     f"the statement did not finish within {deadline_seconds:g}s and was cancelled",
                     timed_out=True,
                 )
-            self._sleep(
-                min(delay, max(0.0, deadline_seconds - (self._clock() - started)))
-            )
-            delay = min(delay * 2, 5.0)
-            result = self._json(
-                "GET", f"/api/2.0/sql/statements/{quote(statement_id, safe='')}"
-            )
+            try:
+                result = self._json(
+                    "GET",
+                    f"/api/2.0/sql/statements/{quote(statement_id, safe='')}",
+                    timeout=_fit(left() - reserve),
+                )
+            except DatabricksAPIError as e:
+                self._cancel(statement_id, left)
+                if e.timed_out:
+                    raise DatabricksAPIError(
+                        "Databricks did not answer a statement poll in time; the "
+                        "statement was cancelled",
+                        timed_out=True,
+                    ) from None
+                raise
         return result
 
-    def _cancel(self, statement_id: str) -> None:
+    def _cancel(self, statement_id: str, left: Callable[[], float]) -> None:
+        """Cancel the statement, on what is left of its deadline (the reserve)."""
         try:
             self._request(
-                "POST", f"/api/2.0/sql/statements/{quote(statement_id, safe='')}/cancel"
+                "POST",
+                f"/api/2.0/sql/statements/{quote(statement_id, safe='')}/cancel",
+                timeout=_fit(left()),
             ).close()
         except DatabricksAPIError:
             pass  # best effort: the deadline error is what the caller needs
@@ -244,14 +355,20 @@ class DatabricksClient:
 
     # -- transport -------------------------------------------------------------------------
 
-    def _auth(self) -> dict[str, str]:
+    def _auth(self, *, timeout: float | None = None) -> dict[str, str]:
         if self._token is None:
             try:
                 self._token = bearer_token(
-                    self._creds, self._session, timeout=self._timeout
+                    self._creds,
+                    self._session,
+                    timeout=self._timeout if timeout is None else timeout,
                 )
             except DatabricksTokenError as e:
-                raise DatabricksAPIError(str(e), status=401) from None
+                raise DatabricksAPIError(
+                    str(e),
+                    status=None if e.unreachable else 401,
+                    timed_out=e.timed_out,
+                ) from None
         return {"Authorization": f"Bearer {self._token}"}
 
     def _request(
@@ -262,15 +379,17 @@ class DatabricksClient:
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
         stream: bool = False,
+        timeout: float | None = None,
     ) -> Any:
+        headers = {"Accept": "application/json", **self._auth(timeout=timeout)}
         try:
             resp = self._session.request(
                 method,
                 f"{self._creds.base_url}{path}",
                 params=params,
                 json=body,
-                headers={"Accept": "application/json", **self._auth()},
-                timeout=self._timeout,
+                headers=headers,
+                timeout=self._timeout if timeout is None else timeout,
                 allow_redirects=False,
                 stream=stream,
             )
@@ -294,6 +413,7 @@ class DatabricksClient:
             resp.close()
             raise DatabricksAPIError(
                 f"Databricks failed ({status})" + detail,
+                summary=f"Databricks failed ({status})",
                 status=status,
                 retry_after=_retry_after(resp.headers.get("Retry-After"))
                 if status in (429, 503)
@@ -308,8 +428,9 @@ class DatabricksClient:
         *,
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        resp = self._request(method, path, params=params, body=body)
+        resp = self._request(method, path, params=params, body=body, timeout=timeout)
         try:
             data = resp.json()
         except ValueError as e:
@@ -341,6 +462,24 @@ class DatabricksClient:
         return f": {text}" if text else ""
 
 
+def _fit(seconds: float) -> float:
+    """A request timeout for ``seconds`` left: at most :data:`DEFAULT_TIMEOUT`,
+    at least :data:`MIN_REQUEST_TIMEOUT`."""
+    return max(MIN_REQUEST_TIMEOUT, min(DEFAULT_TIMEOUT, seconds))
+
+
+def _transport_error(e: BaseException) -> DatabricksAPIError:
+    """A body that broke off midway, as a :class:`DatabricksAPIError`."""
+    timed_out = (
+        isinstance(e, (requests.Timeout, urllib3.exceptions.ReadTimeoutError))
+        or "timed out" in str(e).lower()
+    )
+    return DatabricksAPIError(
+        f"the download from Databricks broke off ({type(e).__name__})",
+        timed_out=timed_out,
+    )
+
+
 def _state(result: dict[str, Any]) -> str:
     status = result.get("status")
     state = status.get("state") if isinstance(status, dict) else None
@@ -362,6 +501,10 @@ def _file_headers(headers: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "ANSWER_SLACK",
+    "API_MAX_WAIT",
+    "API_MIN_WAIT",
+    "CANCEL_RESERVE",
     "TERMINAL_STATES",
     "DatabricksAPIError",
     "DatabricksClient",

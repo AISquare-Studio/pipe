@@ -2,9 +2,17 @@
 
 Serves the OIDC token endpoint (client credentials), the Files API
 (directories, files, HEAD), DBFS (list, get-status, base64 read), SQL
-statement execution (a scripted list of states per statement, cancel
-recorded) and the Unity Catalog listings. Every request is recorded; a wrong
-bearer is a 401.
+statement execution and the Unity Catalog listings. Every request is
+recorded; a wrong bearer is a 401.
+
+A statement either follows a scripted list of states (one per answer), or,
+with ``run_seconds`` and a :class:`Clock`, runs on that clock as a warehouse
+does: the submit is held for ``min(wait_timeout, run_seconds)``; past
+``wait_timeout`` it is answered RUNNING (``on_wait_timeout`` CONTINUE) or
+cancelled by the warehouse (CANCEL); and a hold longer than the request's
+``timeout`` raises ``requests.ReadTimeout`` after ``timeout``, with the
+statement still running (or cancelled at ``wait_timeout``, under CANCEL), as
+a real client would see it. ``running()`` lists what is still running.
 """
 
 from __future__ import annotations
@@ -14,6 +22,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
+
+import requests
 
 HOST = "acme.cloud.databricks.com"
 BASE = f"https://{HOST}"
@@ -80,6 +90,22 @@ class StoredFile:
     etag: str = '"etag-1"'
 
 
+class Clock:
+    """A fake monotonic clock; sleeping advances it (at least 0.5 s a sleep,
+    as a slow scheduler might)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += max(seconds, 0.5)
+
+
 @dataclass
 class Statement:
     states: list[str]
@@ -87,10 +113,26 @@ class Statement:
     columns: list[dict[str, str]] = field(default_factory=list)
     total: int | None = None
     error: dict[str, str] | None = None
+    #: How long it runs on the fake's clock (None: the scripted states;
+    #: math.inf: it never finishes).
+    run_seconds: float | None = None
+    #: How long the submit is held whatever wait_timeout says (a slow or
+    #: lost answer), on the fake's clock.
+    submit_hold: float | None = None
+    started: float = 0.0
+    #: "warehouse" (on_wait_timeout CANCEL) or "cancel" (a cancel request).
+    cancelled_by: str | None = None
 
 
 class FakeDatabricks:
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
+        self.clock = clock
+        #: How long each statement poll takes, on the clock.
+        self.poll_seconds = 0.0
+        #: Raised by a file download's body midway, when set.
+        self.body_breaks: Exception | None = None
+        #: The most a DBFS read returns.
+        self.dbfs_read_size = 4
         self.volume: dict[str, StoredFile] = {}
         self.dbfs: dict[str, StoredFile] = {}
         self.catalog: dict[str, list[dict[str, Any]]] = {
@@ -110,7 +152,8 @@ class FakeDatabricks:
     # -- the requests.Session surface -------------------------------------------------
 
     def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
-        self.requests.append({"method": method, "url": url, **kwargs})
+        at = self.clock.now if self.clock is not None else None
+        self.requests.append({"method": method, "url": url, "at": at, **kwargs})
         if not url.startswith(BASE + "/"):
             return FakeResponse(404, {"message": "wrong host"})
         path = url[len(BASE) :]
@@ -139,13 +182,16 @@ class FakeDatabricks:
         if path == "/api/2.0/dbfs/read":
             return self._dbfs_read(params)
         if path == "/api/2.0/sql/statements" and method == "POST":
-            return self._submit(kwargs.get("json") or {})
+            return self._submit(kwargs.get("json") or {}, kwargs.get("timeout"))
         if path.startswith("/api/2.0/sql/statements/"):
             rest = path[len("/api/2.0/sql/statements/") :]
             if rest.endswith("/cancel"):
-                self.cancelled.append(rest[: -len("/cancel")])
+                statement_id = rest[: -len("/cancel")]
+                self.cancelled.append(statement_id)
+                if statement_id in self.statements:
+                    self.statements[statement_id].cancelled_by = "cancel"
                 return FakeResponse(200, {})
-            return self._poll(rest)
+            return self._poll(rest, kwargs.get("timeout"))
         if path.startswith("/api/2.1/unity-catalog/"):
             kind = path.rsplit("/", 1)[-1]
             return FakeResponse(200, {kind: self.catalog.get(kind, [])})
@@ -218,9 +264,12 @@ class FakeDatabricks:
             "Last-Modified": "Mon, 17 Nov 2025 10:00:00 GMT",
             "ETag": stored.etag,
         }
-        return FakeResponse(
+        response = FakeResponse(
             200, content=b"" if method == "HEAD" else stored.data, headers=headers
         )
+        if self.body_breaks is not None and method == "GET":
+            return BrokenBody(response, self.body_breaks)
+        return response
 
     def _dbfs_list(self, path: str) -> FakeResponse:
         prefix = path.rstrip("/") + "/"
@@ -266,28 +315,68 @@ class FakeDatabricks:
     def _dbfs_read(self, params: dict[str, Any]) -> FakeResponse:
         stored = self.dbfs[params["path"]]
         offset, length = int(params["offset"]), int(params["length"])
-        chunk = stored.data[
-            offset : offset + min(length, 4)
-        ]  # tiny reads: exercises the loop
+        # Tiny reads by default: they exercise the loop.
+        chunk = stored.data[offset : offset + min(length, self.dbfs_read_size)]
         return FakeResponse(
             200, {"bytes_read": len(chunk), "data": base64.b64encode(chunk).decode()}
         )
 
-    def _submit(self, body: dict[str, Any]) -> FakeResponse:
+    def _submit(self, body: dict[str, Any], timeout: Any) -> FakeResponse:
         statement = self.next_statement or Statement(["SUCCEEDED"])
         statement_id = f"stmt-{len(self.statements) + 1}"
         self.statements[statement_id] = statement
+        if statement.run_seconds is None or self.clock is None:
+            return self._answer(statement_id)
+        statement.started = self.clock.now
+        wait = int(str(body["wait_timeout"]).removesuffix("s"))
+        cancel = body.get("on_wait_timeout") == "CANCEL"
+        hold = min(wait, statement.run_seconds)
+        if statement.submit_hold is not None:
+            hold = max(hold, statement.submit_hold)
+        if cancel and statement.run_seconds > wait:
+            # The warehouse cancels it at wait_timeout, answered or not.
+            statement.cancelled_by = "warehouse"
+            statement.run_seconds = float(wait)
+        if not isinstance(timeout, int | float) or hold > timeout:
+            self.clock.now += timeout if isinstance(timeout, int | float) else hold
+            raise requests.ReadTimeout("fake warehouse: read timed out")
+        self.clock.now += hold
         return self._answer(statement_id)
 
-    def _poll(self, statement_id: str) -> FakeResponse:
+    def _poll(self, statement_id: str, timeout: Any) -> FakeResponse:
         statement = self.statements[statement_id]
-        if len(statement.states) > 1:
+        if self.clock is not None and self.poll_seconds:
+            if not isinstance(timeout, int | float) or self.poll_seconds > timeout:
+                self.clock.now += timeout if isinstance(timeout, int | float) else 0
+                raise requests.ReadTimeout("fake warehouse: read timed out")
+            self.clock.now += self.poll_seconds
+        if statement.run_seconds is None and len(statement.states) > 1:
             statement.states.pop(0)
         return self._answer(statement_id)
 
+    def _state(self, statement: Statement) -> str:
+        if statement.run_seconds is None or self.clock is None:
+            return statement.states[0]
+        if statement.cancelled_by == "cancel":
+            return "CANCELED"
+        if statement.cancelled_by == "warehouse":
+            done = self.clock.now - statement.started >= statement.run_seconds
+            return "CANCELED" if done else "RUNNING"
+        if self.clock.now - statement.started >= statement.run_seconds:
+            return "SUCCEEDED"
+        return "RUNNING"
+
+    def running(self) -> list[str]:
+        """The statements still running on the warehouse now."""
+        return [
+            statement_id
+            for statement_id, statement in self.statements.items()
+            if self._state(statement) in ("PENDING", "RUNNING")
+        ]
+
     def _answer(self, statement_id: str) -> FakeResponse:
         statement = self.statements[statement_id]
-        state = statement.states[0]
+        state = self._state(statement)
         body: dict[str, Any] = {
             "statement_id": statement_id,
             "status": {"state": state},
@@ -314,3 +403,20 @@ class FakeDatabricks:
         return [
             r for r in self.requests if r["url"].endswith("/api/2.0/sql/statements")
         ]
+
+
+class BrokenBody:
+    """A download whose body breaks off after its first chunk."""
+
+    def __init__(self, response: FakeResponse, error: Exception) -> None:
+        self._response = response
+        self._error = error
+        self.status_code = response.status_code
+        self.headers = response.headers
+
+    def iter_content(self, size: int = 1024):
+        yield self._response.content[:size]
+        raise self._error
+
+    def close(self) -> None:
+        pass

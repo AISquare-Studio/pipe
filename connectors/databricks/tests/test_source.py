@@ -5,10 +5,14 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import requests
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
 from aisquare_pipe_databricks import DatabricksFilesSource, DatabricksNotConfigured
 from aisquare_pipe_databricks import connector as connector_mod
+from aisquare_pipe_databricks.toolkit import DatabricksRequestError
 from tests.fakes import FakeDatabricks, StoredFile, m2m_blob, pat_blob
 
 VOL = "/Volumes/main/policies/docs"
@@ -127,3 +131,102 @@ def test_pull_without_credentials_fails_closed_before_any_request(config):
         _pull(fake, {"path": VOL}, config)
     assert fake.requests == []
     assert not DatabricksFilesSource().validate_config(config)  # type: ignore[arg-type]
+
+
+# -- how pipe-as-service answers a failed pull (#46, seq 13861) --------------------
+
+LEAKY = "/Volumes/main/policies/docs/member-123-45-6789.pdf is private"
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "answer"),
+    [
+        (400, {}, 422),
+        (404, {}, 422),
+        (401, {}, 502),
+        (403, {}, 502),
+        (429, {"Retry-After": "7"}, 502),
+        (500, {}, 502),
+        (503, {"Retry-After": "3"}, 502),
+        (307, {}, 502),
+    ],
+)
+def test_a_databricks_failure_is_a_502_or_a_422_without_its_text(
+    status, headers, answer
+):
+    fake = _fake()
+    fake.fail_with = (status, {"error_code": "X", "message": LEAKY}, headers)
+    with pytest.raises(Exception) as raised:
+        _pull(fake, {"path": f"{VOL}/a.txt"})
+    got = host_answer(raised.value)
+    assert got.status == answer, (status, type(raised.value))
+    if answer == 502:
+        assert type(raised.value) is PipelineError  # the host maps it by exact type
+    else:
+        assert isinstance(raised.value, DatabricksRequestError)
+    assert "123-45-6789" not in str(raised.value)
+    assert got.retry_after == (float(headers["Retry-After"]) if headers else None)
+
+
+def test_a_missing_path_is_a_422():
+    with pytest.raises(DatabricksRequestError) as raised:
+        _pull(_fake(), {"path": f"{VOL}/nope.txt"})
+    assert host_answer(raised.value).status == 422
+    assert "does not exist" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.ChunkedEncodingError("connection broken: 123-45-6789"),
+        requests.exceptions.ConnectionError("read timed out"),
+    ],
+)
+def test_a_download_that_breaks_off_is_a_502(error):
+    fake = _fake()
+    fake.body_breaks = error
+    with pytest.raises(PipelineError) as raised:
+        _pull(fake, {"path": f"{VOL}/a.txt"})
+    assert type(raised.value) is PipelineError
+    assert host_answer(raised.value).status == 502
+    assert "123-45-6789" not in str(raised.value)
+
+
+def test_a_token_endpoint_that_does_not_answer_is_a_502():
+    class Unreachable(FakeDatabricks):
+        def request(self, method, url, **kwargs):
+            if url.endswith("/oidc/v1/token"):
+                raise requests.ConnectTimeout("no route")
+            return super().request(method, url, **kwargs)
+
+    with pytest.raises(PipelineError) as raised:
+        list(
+            DatabricksFilesSource(session=Unreachable()).pull(
+                m2m_blob(), PullParams(params={"path": VOL})
+            )
+        )
+    assert host_answer(raised.value).status == 502
+
+
+@pytest.mark.parametrize("params", [["path"], "path=/Volumes/x", 7])
+def test_pull_params_that_are_not_a_mapping_are_a_422(params):
+    with pytest.raises(ValueError) as raised:
+        list(
+            DatabricksFilesSource(session=_fake()).pull(
+                pat_blob(),
+                PullParams(params=params),  # type: ignore[arg-type]
+            )
+        )
+    assert host_answer(raised.value).status == 422
+
+
+def test_an_unusable_port_in_the_blob_is_not_configured():
+    """seq 13947 NIT: urllib's own ValueError never escapes the source."""
+    fake = _fake()
+    for url in (
+        "https://a.cloud.databricks.com:abc",
+        "https://a.cloud.databricks.com:99999",
+    ):
+        with pytest.raises(DatabricksNotConfigured, match="workspace_url must be"):
+            _pull(fake, {"path": VOL}, pat_blob(workspace_url=url))
+    assert fake.requests == []

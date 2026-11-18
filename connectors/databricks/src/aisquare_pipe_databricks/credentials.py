@@ -62,7 +62,16 @@ class DatabricksNotConfigured(ValueError):
 
 
 class DatabricksTokenError(Exception):
-    """The workspace refused the service principal's OAuth secret."""
+    """The workspace refused the service principal's OAuth secret, or its
+    token endpoint could not be reached (``unreachable``; ``timed_out`` when
+    it did not answer in time)."""
+
+    def __init__(
+        self, message: str, *, unreachable: bool = False, timed_out: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.unreachable = unreachable
+        self.timed_out = timed_out
 
 
 @dataclass(frozen=True)
@@ -104,11 +113,19 @@ def _host(value: Any) -> str:
         raise DatabricksNotConfigured(
             "workspace_url is missing (e.g. https://acme.cloud.databricks.com)"
         )
-    parts = urlsplit(value.strip())
-    host = (parts.hostname or "").lower()
+    refused = DatabricksNotConfigured(
+        "workspace_url must be https://<workspace> on cloud.databricks.com, "
+        "azuredatabricks.net or gcp.databricks.com (no port, path or userinfo)"
+    )
+    try:
+        parts = urlsplit(value.strip())
+        host = (parts.hostname or "").lower()
+        port = parts.port  # raises ValueError on a port that is not a number
+    except ValueError:
+        raise refused from None
     if (
         parts.scheme != "https"
-        or parts.port is not None
+        or port is not None
         or parts.username is not None
         or parts.password is not None
         or parts.path not in ("", "/")
@@ -116,10 +133,7 @@ def _host(value: Any) -> str:
         or parts.fragment
         or not WORKSPACE_HOST.match(host)
     ):
-        raise DatabricksNotConfigured(
-            "workspace_url must be https://<workspace> on cloud.databricks.com, "
-            "azuredatabricks.net or gcp.databricks.com (no port, path or userinfo)"
-        )
+        raise refused
     return host
 
 
@@ -183,7 +197,9 @@ def bearer_token(creds: DatabricksCredentials, session: Any, *, timeout: float) 
         )
     except requests.RequestException as e:
         raise DatabricksTokenError(
-            f"could not reach the workspace's token endpoint ({type(e).__name__})"
+            f"could not reach the workspace's token endpoint ({type(e).__name__})",
+            unreachable=True,
+            timed_out=isinstance(e, requests.Timeout),
         ) from None
     if resp.status_code != 200:
         raise DatabricksTokenError(

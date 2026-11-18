@@ -3,29 +3,15 @@
 from __future__ import annotations
 
 import pytest
+import requests
 from aisquare.pipe import PRIMARY_TAG
 
 from aisquare_pipe_databricks import DatabricksToolkit
 from aisquare_pipe_databricks.toolkit import READ_FILE, TOOL_SPECS
-from tests.fakes import PAT, FakeDatabricks, Statement, StoredFile, pat_blob
+from tests.fakes import PAT, Clock, FakeDatabricks, Statement, StoredFile, pat_blob
 
 VOL = "/Volumes/main/policies/docs"
 TEXT = b"Travel policy: economy class.\n"
-
-
-class Clock:
-    """A fake monotonic clock; sleeping advances it."""
-
-    def __init__(self) -> None:
-        self.now = 1000.0
-        self.slept: list[float] = []
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.now += max(seconds, 0.5)
 
 
 def _fake() -> FakeDatabricks:
@@ -214,7 +200,7 @@ def test_run_select_returns_rows_with_the_caps_sent():
     (submit,) = fake.sql_submissions()
     body = submit["json"]
     assert body["warehouse_id"] == "abc123def456" and body["row_limit"] == 50
-    assert body["byte_limit"] == 16 * 1024 * 1024 and body["disposition"] == "INLINE"
+    assert body["byte_limit"] == 8 * 1024 * 1024 and body["disposition"] == "INLINE"
     assert (body["catalog"], body["schema"]) == ("main", "policies")
     assert body["on_wait_timeout"] == "CONTINUE"
 
@@ -285,8 +271,10 @@ def test_the_statement_deadline_is_honoured_and_the_statement_cancelled():
     assert not result.successful and result.error_code == "timeout"
     assert "cancelled" in (result.error or "")
     assert fake.cancelled == ["stmt-1"]
-    assert 10 <= clock.now - started <= 11  # stopped at the deadline, not after it
-    assert fake.sql_submissions()[0]["json"]["wait_timeout"] == "10s"
+    # Polling stops with the cancel's reserve left, so the cancel fits too.
+    assert 8 <= clock.now - started <= 10
+    body = fake.sql_submissions()[0]["json"]
+    assert (body["wait_timeout"], body["on_wait_timeout"]) == ("5s", "CANCEL")
 
 
 def test_a_failed_statement_is_reported_and_a_permission_error_is_forbidden():
@@ -404,3 +392,18 @@ def test_the_toolkit_is_found_by_search_scored_and_search_connectors():
         limit=1,
     )
     assert sql[0].tool.slug == "DATABRICKS_RUN_SELECT"
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (requests.exceptions.ChunkedEncodingError("broken"), "upstream_error"),
+        (requests.exceptions.ConnectionError("Read timed out."), "timeout"),
+    ],
+)
+def test_a_download_that_breaks_off_is_a_tool_error(error, code):
+    fake = _fake()
+    fake.body_breaks = error
+    result = _call(fake, "DATABRICKS_READ_FILE", {"path": f"{VOL}/travel.txt"})
+    assert not result.successful and result.error_code == code
+    assert "broke off" in (result.error or "")

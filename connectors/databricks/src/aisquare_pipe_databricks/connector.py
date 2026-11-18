@@ -9,7 +9,8 @@ pick the files, never the credential, the host or the warehouse:
   ``MAX_DEPTH`` levels);
 * ``modified_after`` (optional, RFC 3339): only files modified after it;
 * ``max_files`` (default 100, at most 1000) and ``max_bytes`` per file
-  (default 25 MiB, at most 100 MiB; a larger file is skipped and counted).
+  (default 25 MiB, at most 64 MiB, sized for a 512 MiB pod; a larger file is
+  skipped and counted).
 
 Each file becomes one envelope with its bytes and ``metadata`` ``filename``,
 ``path``, ``storage`` (volume | dbfs), ``size``, ``content_type`` and the
@@ -18,6 +19,9 @@ caller keeps them and re-reads the file when they change.
 
 A param naming a credential key (``workspace_url``, ``token``, ...) is
 refused. Skipped files are counted in one log line, with no paths.
+
+A pull holds about two files at a time: the one being read, and the one the
+consumer still holds (the README's "Memory" has the numbers).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from aisquare_pipe_databricks.client import (
 )
 from aisquare_pipe_databricks.credentials import (
     SERVER_KEYS,
+    DatabricksCredentials,
     DatabricksNotConfigured,
     load_credentials,
 )
@@ -48,10 +53,18 @@ from aisquare_pipe_databricks.files import (
     parse_path,
     read_file,
 )
-from aisquare_pipe_databricks.toolkit import DEFAULT_MAX_BYTES, MAX_FILE_BYTES
+from aisquare_pipe_databricks.toolkit import (
+    DEFAULT_MAX_BYTES,
+    DatabricksRequestError,
+    source_error,
+)
 
 logger = logging.getLogger("aisquare.pipe.databricks")
 
+#: The largest file a pull reads (``max_bytes``'s ceiling), sized for a
+#: 512 MiB pod: a pull holds about two files at a time. Tools read up to
+#: MAX_FILE_BYTES.
+MAX_SOURCE_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_FILES = 100
 MAX_FILES = 1000
 LIST_PAGE_SIZE = 1000
@@ -66,7 +79,7 @@ def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw = params.params if isinstance(params, PullParams) else params
     if not isinstance(raw, dict):
-        raise TypeError("pull params must be a mapping")
+        raise ValueError("pull params must be a mapping")  # noqa: TRY004 — a 422, not a 500
     server = sorted(SERVER_KEYS.intersection(raw))
     if server:
         raise ValueError(
@@ -182,10 +195,29 @@ class DatabricksFilesSource(SourceConnector):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
-        """Yield one envelope per file. Raises :class:`DatabricksNotConfigured`
-        without a usable credential (before any request), ``ValueError`` for
-        bad params, and :class:`DatabricksAPIError` when Databricks fails."""
+        """Yield one envelope per file.
+
+        Raises, as pipe-as-service answers them:
+
+        * 422, a ``ValueError``: :class:`DatabricksNotConfigured` without a
+          usable credential (before any request); bad params; and what
+          Databricks refused that the caller can fix, a path that does not
+          exist or a request it calls invalid
+          (:class:`~aisquare_pipe_databricks.toolkit.DatabricksRequestError`);
+        * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
+          Databricks failure (a refused credential or grant, throttling, a
+          timeout, a 5xx, no answer), with ``retry_after`` when it gave one.
+
+        Neither carries Databricks's own error text."""
         creds = load_credentials(config)
+        try:
+            yield from self._pull(creds, params)
+        except DatabricksAPIError as e:
+            raise source_error(e) from None
+
+    def _pull(
+        self, creds: DatabricksCredentials, params: PullParams | None
+    ) -> Iterator[DataEnvelope]:
         options = _options(params)
         try:
             root = parse_path(options.get("path"), directory=True)
@@ -197,7 +229,7 @@ class DatabricksFilesSource(SourceConnector):
         after = options.get("modified_after")
         since = None if after is None else _timestamp(after, "modified_after")
         limit = _bounded(options, "max_files", DEFAULT_MAX_FILES, MAX_FILES)
-        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_FILE_BYTES)
+        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_SOURCE_BYTES)
 
         with DatabricksClient(creds, session=self._session) as client:
             skipped = 0
@@ -216,7 +248,10 @@ class DatabricksFilesSource(SourceConnector):
                     skipped += 1
                     continue
                 yielded += 1
-                yield file_envelope(record, content, source_id=self.name)
+                envelope = file_envelope(record, content, source_id=self.name)
+                del content
+                yield envelope
+                del envelope  # gone before the next download
             if skipped:
                 logger.info(
                     "databricks-files-source: skipped %d file(s) larger than max_bytes",
@@ -267,4 +302,10 @@ class DatabricksFilesSource(SourceConnector):
                     break
 
 
-__all__ = ["DatabricksAPIError", "DatabricksFilesSource", "DatabricksNotConfigured"]
+__all__ = [
+    "MAX_SOURCE_BYTES",
+    "DatabricksAPIError",
+    "DatabricksFilesSource",
+    "DatabricksNotConfigured",
+    "DatabricksRequestError",
+]

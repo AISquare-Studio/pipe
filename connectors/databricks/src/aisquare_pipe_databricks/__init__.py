@@ -13,12 +13,13 @@ from aisquare_pipe_databricks.credentials import (
     load_credentials,
 )
 from aisquare_pipe_databricks.sqlguard import NotReadOnly, check_select_only
-from aisquare_pipe_databricks.toolkit import DatabricksToolkit
+from aisquare_pipe_databricks.toolkit import DatabricksRequestError, DatabricksToolkit
 
 __all__ = [
     "DatabricksAPIError",
     "DatabricksFilesSource",
     "DatabricksNotConfigured",
+    "DatabricksRequestError",
     "DatabricksToolkit",
     "NotReadOnly",
     "check_select_only",

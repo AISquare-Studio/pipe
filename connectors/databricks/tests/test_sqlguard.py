@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import itertools
+import logging
+import random
+import re
+
 import pytest
 
-from aisquare_pipe_databricks import sqlguard
+from aisquare_pipe_databricks import DatabricksToolkit, sqlguard
 from aisquare_pipe_databricks.sqlguard import NotReadOnly, check_select_only
+from tests.fakes import FakeDatabricks, pat_blob
 
 READS = [
     "SELECT 1",
@@ -96,3 +102,412 @@ def test_the_lexer_alone_refuses_them(sql):
 def test_overlong_sql_is_refused():
     with pytest.raises(NotReadOnly, match="longer than"):
         check_select_only("SELECT " + "1," * sqlguard.MAX_SQL_CHARS + "1")
+
+
+# -- seq 13947: Spark's own reading ------------------------------------------------
+#
+# Spark (SqlBaseLexer.g4): a -- comment runs past a backslash-LF and ends at
+# CR or LF; block comments nest; backslash escapes in '...' and "..." but not
+# in backticks. Each payload hides a DROP from a reader that disagrees.
+
+#: The reopen's payloads (python literals as given), and their parts.
+REOPEN_PAYLOADS = {
+    # FAIL 1: Spark reads a comment, DROP TABLE t, a comment.
+    "backslash_lf_continues_the_comment": "-- \\\nSELECT 1, ' \nDROP TABLE t -- '",
+    # FAIL 2: Spark nests: a comment, then DROP TABLE t.
+    "nested_comment_hides_the_drop": "/* /* */ SELECT 1, ' */ DROP TABLE t -- '",
+    # FAIL 3.
+    "dash_comment_ended_by_cr": "SELECT 1 --\r; DROP TABLE t",
+    "nested_comment_then_a_string": "SELECT 1 /* /* */ ' */ ; DROP TABLE t; -- '",
+    "backslash_in_quotes_not_backticks": "SELECT '\\'' `\\` ; DROP TABLE t ; -- ` /* ' */",
+    "backslash_lf_then_a_string": "SELECT 1 -- \\\n' \n; DROP TABLE t; -- '",
+}
+
+
+@pytest.mark.parametrize("sql", REOPEN_PAYLOADS.values(), ids=REOPEN_PAYLOADS)
+def test_the_lexer_alone_refuses_the_reopen_payloads(sql):
+    assert sqlguard._lexical(sql) is not None
+    with pytest.raises(NotReadOnly):
+        check_select_only(sql)
+
+
+@pytest.mark.parametrize(
+    ("sql", "why"),
+    [
+        ("SELECT 1 -- \\\nFROM t", "backslash before its line break"),
+        ("SELECT 1 -- \\\r\nFROM t", "backslash before its line break"),
+        ("SELECT 1 --\\\n, 2", "backslash before its line break"),
+        ("SELECT 1 -- x\r, 2", "bare CR"),
+        ("SELECT 1 /* a /* b */ c */", r"/\* inside a /\* \*/"),
+        ("SELECT 1 /* a /*/ FROM t", r"/\* inside a /\* \*/"),
+        ("SELECT 1 /* a /*+ b */", r"/\* inside a /\* \*/"),
+        ("SELECT 1 /* never closed", "unterminated"),
+        ("SELECT 'a\\'b' FROM t", "backslash in a string"),
+        ('SELECT "a\\"b" FROM t', "backslash in a string"),
+        ("SELECT `a\\` FROM t", "backslash in a string"),
+        ("SELECT r'\\' FROM t", "backslash in a string"),
+    ],
+)
+def test_the_lexer_refuses_where_readers_disagree(sql, why):
+    assert re.search(why, sqlguard._lexical(sql) or "")
+
+
+def test_line_comments_end_at_cr_lf_and_hide_nothing():
+    assert (
+        check_select_only("SELECT 1 -- note\r\nFROM t") == "SELECT 1 -- note\r\nFROM t"
+    )
+    assert check_select_only("SELECT 1 -- a \\ in a comment\nFROM t")
+    assert check_select_only("SELECT 1 -- ends the text \\")
+
+
+def test_quotes_read_one_way_whatever_the_reader():
+    for sql in (
+        'SELECT \'it\'\'s\', "a ""b""", `c``d` FROM t',
+        "SELECT 'C:\\\\dir\\\\', r'\\d+', '\\n' FROM t",
+        'SELECT "it\'s" FROM t',
+    ):
+        assert check_select_only(sql) == sql
+
+
+# The two layers are composed: each catches what the other admits. A
+# check_select_only that dropped either one fails here.
+ONLY_THE_LEXER_REFUSES = [
+    REOPEN_PAYLOADS["backslash_lf_continues_the_comment"],
+    "SELECT 1 /*+ DELETE */",  # sqlglot reads a hint here as a comment
+    "SELECT '${env:HOME}'",
+    "SELECT `a` -- \\\n, `b` FROM t",
+]
+ONLY_THE_PARSER_REFUSES = [
+    "SELECT * FROM t FOR SHARE",  # a row lock: no write word to see
+    "SELECT (",
+    "SELECT * FROM t WHERE",
+]
+
+
+@pytest.mark.parametrize("sql", ONLY_THE_LEXER_REFUSES)
+def test_what_only_the_lexer_refuses_is_refused(sql):
+    assert sqlguard._parsed(sql) is None, "the parser admits it: that is the point"
+    assert sqlguard._lexical(sql) is not None
+    with pytest.raises(NotReadOnly):
+        check_select_only(sql)
+
+
+@pytest.mark.parametrize("sql", ONLY_THE_PARSER_REFUSES)
+def test_what_only_the_parser_refuses_is_refused(sql):
+    assert sqlguard._lexical(sql) is None, "the lexer admits it: that is the point"
+    assert sqlguard._parsed(sql) is not None
+    with pytest.raises(NotReadOnly):
+        check_select_only(sql)
+
+
+@pytest.mark.parametrize("layer", ["_lexical", "_parsed"])
+def test_dropping_either_layer_lets_something_through(layer, monkeypatch):
+    """The mutation the tester ran (seq 13947 FAIL 3): with one layer
+    admitting everything, the other layer's only-catches get through, so
+    the two tests above are what pin the composition."""
+    monkeypatch.setattr(sqlguard, layer, lambda sql: None)
+    caught_by_it = (
+        ONLY_THE_LEXER_REFUSES if layer == "_lexical" else ONLY_THE_PARSER_REFUSES
+    )
+    for sql in caught_by_it:
+        assert check_select_only(sql)
+
+
+def test_check_select_only_runs_both_layers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sqlguard, "_lexical", lambda sql: calls.append("lexer"))
+    monkeypatch.setattr(sqlguard, "_parsed", lambda sql: calls.append("parser"))
+    check_select_only("SELECT 1")
+    assert calls == ["lexer", "parser"]
+
+
+SIDE_EFFECTS = [
+    "SELECT http_request(conn => 'c', method => 'POST', path => '/x')",
+    "SELECT * FROM remote_query('c', query => 'DELETE FROM x')",
+    "SELECT reflect('java.lang.Thread', 'sleep', 1000L)",
+    "SELECT java_method('java.lang.Thread', 'sleep', 1000L)",
+    "SELECT try_reflect('a', 'b')",
+    "SELECT system.builtin.reflect('a', 'b')",
+    "SELECT `reflect`('a', 'b')",
+    "SELECT `system`.`builtin`.`reflect`('a', 'b')",
+    "SELECT reflect /* c */ ('a', 'b')",
+    "SELECT secret('scope', 'key')",
+    "SELECT try_secret('scope', 'key')",
+    "SELECT ai_query('endpoint', body) FROM t",
+    "SELECT AI_SUMMARIZE(body) FROM t",
+    "SELECT * FROM IDENTIFIER('main.p.docs')",
+    "SELECT TRANSFORM(a) USING 'cat' AS (b) FROM t",
+    "SELECT TRANSFORM(a) USING r'cat' FROM t",
+]
+
+
+@pytest.mark.parametrize("sql", SIDE_EFFECTS)
+def test_side_effect_calls_are_refused_by_each_layer(sql):
+    assert sqlguard._lexical(sql) is not None
+    assert sqlguard._parsed(sql) is not None
+
+
+def test_names_like_side_effect_functions_are_fine_when_not_called():
+    sql = "SELECT secret, ai_score, identifier, transform(a, x -> x + 1) FROM t"
+    assert check_select_only(sql) == sql
+
+
+@pytest.mark.parametrize(
+    ("sql", "why"),
+    [
+        ("SELECT '${spark.sql.x}'", r"\$\{"),
+        ("SELECT 1 -- ${x}", r"\$\{"),
+        ("SELECT ınsert FROM t", "non-ASCII"),  # Spark 3 upper-cases ı to I
+        ("SELECT 1 FROM t\u00a0", "non-ASCII"),
+        ("SELECT 1\x0b FROM t", "control character"),
+        ("SELECT 1\x00", "control character"),
+        ("SELECT 'a\u2028b'", "NEL, LS, PS"),
+        ("SELECT 1 \\ 2", "backslash outside quotes"),
+        ("SELECT /*+ x */* ; DROP TABLE t; */ 1", "more than one statement"),
+    ],
+)
+def test_the_lexer_refuses_what_spark_reads_another_way(sql, why):
+    assert re.search(why, sqlguard._lexical(sql) or "")
+
+
+def test_non_ascii_text_in_strings_and_comments_is_fine():
+    sql = "SELECT 'Zoë Ünal' AS `naïve` FROM t -- café"
+    assert check_select_only(sql) == sql
+
+
+def test_a_hint_is_read_as_tokens():
+    assert check_select_only("SELECT /*+ BROADCAST(t) */ * FROM t")
+    assert "names DELETE" in (sqlguard._lexical("SELECT /*+ DELETE */ 1") or "")
+
+
+def test_below_the_sqlglot_floor_nothing_runs(monkeypatch):
+    """sqlglot 25.0 to 25.2 don't nest Spark's block comments (FAIL 2): a host
+    with an older sqlglot than the extra's floor runs nothing."""
+    import sqlglot
+
+    monkeypatch.setattr(sqlglot, "__version__", "25.0.0")
+    with pytest.raises(NotReadOnly, match="needs sqlglot 26.25"):
+        check_select_only("SELECT 1")
+    monkeypatch.setattr(sqlglot, "__version__", "26.25.0")
+    assert check_select_only("SELECT 1")
+
+
+# -- no SQL in logs (seq 13947 FAIL 4) ---------------------------------------------
+
+#: Valid Databricks SQL the guard ADMITS, whose JSON path sqlglot can't read:
+#: it logs "Invalid JSON path syntax. ... <the path>" at WARNING.
+ADMITTED_WITH_DASHED_JSON_PATHS = [
+    "SELECT get_json_object(payload, '$.member.ssn-123-45-6789') FROM claims",
+    "SELECT get_json_object(v, '$.dob-1970') FROM t",
+]
+
+
+@pytest.fixture
+def sqlglot_records(caplog):
+    """Every record the "sqlglot" logger emits, at DEBUG and up."""
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sqlglot_logger = logging.getLogger("sqlglot")
+    keep = Keep(level=logging.DEBUG)
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlglot")
+    sqlglot_logger.addHandler(keep)
+    try:
+        yield records
+    finally:
+        sqlglot_logger.removeHandler(keep)
+
+
+def test_the_guard_never_logs_the_sql(caplog, sqlglot_records):
+    for sql in ADMITTED_WITH_DASHED_JSON_PATHS:
+        assert check_select_only(sql) == sql
+    for sql in (
+        "SELECT 1 FROM t WHERE a IN (SELECT x FROM private_t",
+        "DROP TABLE private_t",
+    ):
+        with pytest.raises(NotReadOnly):
+            check_select_only(sql)
+    for secret in ("ssn", "123-45-6789", "1970", "private_t"):
+        assert secret not in caplog.text
+    assert [r.getMessage() for r in sqlglot_records] == []
+
+
+def test_the_toolkit_logs_no_sql_either(caplog, sqlglot_records):
+    fake = FakeDatabricks()
+    result = DatabricksToolkit(session=fake).call_tool(
+        "DATABRICKS_RUN_SELECT",
+        {"statement": ADMITTED_WITH_DASHED_JSON_PATHS[0]},
+        pat_blob(),
+    )
+    assert result.successful, result.error
+    assert "123-45-6789" not in caplog.text
+    assert sqlglot_records == []
+
+
+def test_sqlglot_still_logs_outside_the_guard(sqlglot_records):
+    """Quiet only while the guard parses: nothing is switched off globally."""
+    import sqlglot
+
+    check_select_only(ADMITTED_WITH_DASHED_JSON_PATHS[0])
+    sqlglot.parse_one(
+        "SELECT get_json_object(v, '$.outside-the-guard') FROM t", read="databricks"
+    )
+    assert any("outside-the-guard" in r.getMessage() for r in sqlglot_records)
+    assert logging.root.manager.disable == logging.NOTSET
+
+
+# -- the reopen payloads never reach Databricks ------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [*REOPEN_PAYLOADS.values(), *SIDE_EFFECTS],
+    ids=[*REOPEN_PAYLOADS, *range(len(SIDE_EFFECTS))],
+)
+def test_run_select_refuses_them_with_no_request(sql):
+    fake = FakeDatabricks()
+    result = DatabricksToolkit(session=fake).call_tool(
+        "DATABRICKS_RUN_SELECT", {"statement": sql}, pat_blob()
+    )
+    assert not result.successful and result.error_code == "forbidden"
+    assert fake.requests == []
+
+
+# -- a differential fuzz against Spark's own reading -------------------------------
+
+
+def spark_tokens(sql: str) -> list[str] | None:
+    """The tokens Spark's lexer (SqlBaseLexer.g4) reads in ``sql``, upper-cased,
+    comments dropped; None when Spark can't lex it. Only the rules that decide
+    where tokens end: SIMPLE_COMMENT ('--' ('\\\\\\n' | ~[\\r\\n])* '\\r'? '\\n'?),
+    nested BRACKETED_COMMENT (not '/*+'), HINT_START/HINT_END, STRING_LITERAL
+    (backslash escapes, '' or adjacent literals; R'...' raw), DOUBLEQUOTED_STRING,
+    BACKQUOTED_IDENTIFIER ('``', no escapes), IDENTIFIER runs, one-char tokens."""
+    tokens: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if sql.startswith("--", i):
+            j = i + 2
+            while j < n:
+                if sql.startswith("\\\n", j):
+                    j += 2
+                elif sql[j] in "\r\n":
+                    break
+                else:
+                    j += 1
+            i = j + (1 if sql.startswith("\r", j) else 0)
+            i += 1 if sql.startswith("\n", i) else 0
+        elif sql.startswith("/*+", i):
+            tokens.append("/*+")
+            i += 3
+        elif sql.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if sql.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                elif sql.startswith("/*", j) and not sql.startswith("/*+", j):
+                    depth, j = depth + 1, j + 2
+                else:
+                    j += 1
+            if depth:
+                return None
+            i = j
+        elif sql.startswith("*/", i):
+            tokens.append("*/")
+            i += 2
+        elif c in "'\"`" or (
+            c in "rR"
+            and sql[i + 1 : i + 2] in ("'", '"')
+            and not (i and (sql[i - 1].isalnum() or sql[i - 1] == "_"))
+        ):
+            raw = c in "rR"
+            q = sql[i + 1] if raw else c
+            j = i + 2 if raw else i + 1
+            while True:
+                if j >= n:
+                    return None
+                if sql[j] == "\\" and q != "`" and not raw:
+                    j += 2
+                    continue
+                if sql[j] == q:
+                    if q == "`" and sql.startswith("``", j):
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            tokens.append("<quoted>")
+            i = j
+        elif c.isalnum() or c == "_":
+            j = i
+            while j < n and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            tokens.append(sql[i:j].upper())
+            i = j
+        elif c in " \t\r\n":
+            i += 1
+        else:
+            tokens.append(c)
+            i += 1
+    return tokens
+
+
+PIECES = [
+    "'",
+    '"',
+    "`",
+    "\\",
+    "--",
+    "/*",
+    "*/",
+    "/*+",
+    "\n",
+    "\r",
+    "r",
+    " ; DROP x ",
+    " ",
+]
+#: For the longer random strings: fewer pieces, and the FAIL 1 opener whole.
+LONG_PIECES = ["'", "`", '"', "\\", "--", "/*", "*/", "\n", ";DROP x", "--\\\n"]
+
+
+def _spark_sees_a_write(sql: str) -> bool:
+    tokens = spark_tokens(sql)
+    if tokens is None:
+        return False  # Spark refuses to read it at all
+    after = tokens[tokens.index(";") :] if ";" in tokens else []
+    return "DROP" in tokens or set(after) - {";"} != set()
+
+
+def test_whatever_the_lexer_admits_spark_reads_as_one_statement_without_a_write():
+    """Every "SELECT 1 " + up to four pieces from the quote, comment and
+    escape alphabet, and 400,000 seeded random strings of five to eight
+    longer pieces: whatever the lexer admits, Spark's reading has no DROP
+    and nothing after a ';'. (The parser is not consulted.) With this seed
+    the fuzz also catches each of these lexer mutations on its own: a --
+    comment ended at LF only, a hint read as a comment, ``*/`` not read as one
+    token, no refusal of a backslash-LF in a -- comment, no refusal of a
+    nested /*, and quotes read only with (or only without) backslash
+    escapes."""
+    checked = admitted = 0
+    for count in range(1, 5):
+        for pieces in itertools.product(PIECES, repeat=count):
+            sql = "SELECT 1 " + "".join(pieces)
+            checked += 1
+            if sqlguard._lexical(sql) is None:
+                admitted += 1
+                assert not _spark_sees_a_write(sql), repr(sql)
+    rng = random.Random(34)
+    for _ in range(400_000):
+        count = rng.randint(5, 8)
+        sql = "SELECT 1 " + "".join(rng.choice(LONG_PIECES) for _ in range(count))
+        checked += 1
+        if sqlguard._lexical(sql) is None:
+            admitted += 1
+            assert not _spark_sees_a_write(sql), repr(sql)
+    assert checked > 430_000 and admitted > 10_000
