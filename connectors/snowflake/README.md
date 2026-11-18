@@ -71,7 +71,8 @@ name gets a unique key (`A`, `A_2`) and its `source_name`.
 
 For both: `database` and `schema` (the defaults for names written without them), `batch_size` rows per envelope
 (default 500, at most 10,000), `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (JSON bytes of
-rows, default 25 MiB, at most 100 MiB) and `timeout_seconds` (the statement deadline, default 120, at most 600).
+rows, default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)) and `timeout_seconds` (the
+statement deadline, default 120, at most 600).
 
 Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
 `schema` holds the columns too). A result with no rows is one envelope with no rows, so its markers still come out.
@@ -100,6 +101,42 @@ Also in `metadata`: `kind` (`table` or `query`), `table` or `query_sha256` (the 
 change. Without `order_by` (or for `sql`) a truncated pull can't be continued: add `order_by`, narrow the query or
 raise the caps. `result_sha256` then covers the rows read only.
 
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Snowflake's own error
+text, which can quote the SQL and name objects, because hosts log these):
+- **422**, a `ValueError`: the secret is missing or malformed (`SnowflakeNotConfigured`); a bad param or name; SQL
+  that is not one SELECT (`NotReadOnly`); and what Snowflake refused that the caller can fix, as
+  `SnowflakeRequestError` (with Snowflake's `status`, `code` and `sql_state`): a statement that does not compile
+  (with Snowflake's "line L at position P"), an object that does not exist or the role can't see, a value that
+  can't be converted.
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when Snowflake sent `Retry-After` (a 503): a key or
+  OAuth client Snowflake refused, a missing grant or warehouse, throttling, the statement's deadline, a 5xx or the
+  network. The message says which, and what to fix, as the table below does.
+
+### Memory
+
+A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each result partition as
+fresh JSON bytes, 10,000 rows a partition, and every envelope is kept, as pipe-as-service keeps a pull's envelopes for
+its response):
+
+| Pull | Rows | JSON of the rows | Peak |
+|---|---|---|---|
+| defaults: 10,000 rows of 50 `NUMBER` columns | 10,000 | 6.7 MiB | 47 MiB (65 MiB before) |
+| defaults: 10,000 rows of 18 mixed columns | 10,000 | 3.2 MiB | 21 MiB |
+| defaults: 10,000 rows of 4 wide `TEXT` columns (1 KB a row) | 10,000 | 9.9 MiB | 42 MiB |
+| `max_result_bytes` 64 MiB, 50 `NUMBER` columns | 90,000 | 60 MiB | 104 MiB (367 MiB at the old 100 MiB) |
+| `max_rows` 100,000, 18 mixed columns | 100,000 | 32 MiB | 53 MiB |
+| `max_result_bytes` 64 MiB, wide rows | 60,000 | 59 MiB | 93 MiB |
+| the same, in 50,000-row (49 MiB) partitions | 50,000 | 49 MiB | 207 MiB |
+
+How: each parsed partition is let go before the next is read, rows are converted one at a time, and the source keeps
+each row as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are byte for
+byte what they were). A batch's rows are let go once its envelope is built. Snowflake, not the connector, sizes the
+partitions; one is fetched only while its `uncompressedSize` fits the bytes left, so one partition is at most
+`max_result_bytes`. A pull peaks at about 1.35 times the rows' JSON plus about three times the largest partition
+(its bytes, their text, and the parsed rows): under 256 MiB at the caps whatever the partitions. A host keeps the
+envelopes too: pipe-as-service base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at
+64 MiB on a 512 MiB pod.
+
 ## Security
 
 **SELECT only, before any request.** `SNOWFLAKE_RUN_SELECT` and a `sql` pull refuse anything but ONE read-only
@@ -124,9 +161,11 @@ statement before a token is even signed. Two independent checks must both pass:
    session, transaction, bind-variable or unparsed node anywhere in its tree, no `NEXTVAL` name (quoted or not), and
    no table function outside that list (a qualified one is outside it). Text it can't parse is refused. sqlglot logs
    pieces of the SQL it parses (its "unsupported syntax" warning, and "Invalid JSON path syntax" with the path for any
-   JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`), so a filter on the `sqlglot` logger drops every
-   record it emits while the guard parses, in that context only. Nothing is disabled globally, and sqlglot logs
-   as usual everywhere else.
+   JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`), so the guard parses inside
+   `aisquare.pipe.core.sql.quiet_sqlglot()`, the helper every SQL guard shares: a filter on the `sqlglot` logger
+   drops every record it emits while the guard parses, in that context only, so not even Python's
+   `logging.lastResort` prints them. Nothing is disabled globally, and sqlglot logs as usual everywhere else. On a
+   sqlglot older than 26.25 (another package can bring one in) the guard refuses every statement.
 
 So DML, DDL, DCL, `COPY`, `CALL`, Snowflake Scripting blocks, `EXECUTE IMMEDIATE` and several statements are
 refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake adds its own layers behind these:
@@ -137,7 +176,7 @@ refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake a
 
 **Caps.**
 - **Rows and bytes returned.** `max_rows` (sent as `ROWS_PER_RESULTSET`, so Snowflake sends no more, and cut again
-  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 100 MiB, for the source). Result
+  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 64 MiB, for the source). Result
   partitions are read only while they fit. A result cut short says `truncated`.
 - **Time.** A tool call fits inside the host's `timeout_seconds`, all of its requests together. Each request, the
   OAuth token POST included, gets the time left (at most 30 s), and a call with less than a second left fails

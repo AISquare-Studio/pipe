@@ -122,6 +122,17 @@ A refused AWS call is a tool error with AWS's error code, never AWS's message:
 | `unauthorized` | `ExpiredToken`, `InvalidClientTokenId`, … |
 | `upstream_error` | anything else |
 
+The sources fail the same way, as pipe-as-service answers them by the exception's type (a `PipeError` by its exact
+type, so the AWS error classes themselves would be a 500):
+- **422**, a `ValueError`: `not_connected` (`AwsNotConfiguredError`, a `ValueError` first and a
+  `ConfigValidationError` too), our own checks (`ConfigValidationError`), and `not_found` and `invalid_arguments`
+  from AWS, as `AwsRequestError` (with `code` and `aws_code`).
+- **502** `upstream_error`, a `PipelineError`: `forbidden` (AssumeRole included), `rate_limited`, `unauthorized`
+  and `upstream_error`.
+
+The message is the table's: the operation and AWS's error code. An S3 object that grew past `max_object_bytes`
+between the listing and the read is skipped, as one the listing already shows too large is.
+
 ## Customer setup (registration checklist)
 
 Order matters, in both directions:

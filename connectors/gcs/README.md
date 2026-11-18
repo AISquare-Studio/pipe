@@ -52,6 +52,14 @@ pull first, or it misses changes.
 Read-only by construction: the token's scope is `devstorage.read_only`, the service account only needs
 `roles/storage.objectViewer`, and no tool writes.
 
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Cloud Storage's own
+error text, which names objects, because hosts log these):
+- **422**, a `ValueError`: the secret is missing or malformed (`GcsNotConfigured`); a bad param or a name outside
+  the prefix; `GcsPullTruncated`; and what Cloud Storage refused that the caller can fix, as `GcsRequestError` (with
+  its `status`): a named object that does not exist (404), a request it calls invalid (400).
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when Cloud Storage sent `Retry-After` (a 429 or
+  503): a key Google refused, a missing role, VPC Service Controls, throttling, a timeout, a 5xx or the network.
+
 ## Security
 
 - **The prefix is enforced by this connector, not by Google.** The key can read everything its IAM grant

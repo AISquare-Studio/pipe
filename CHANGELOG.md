@@ -154,7 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     sent with `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and
     warehouse, which no tool argument or pull param can change.
   - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
-    tool call, at most 100 MiB for the source; partitions are read only while they fit), and the
+    tool call, at most 64 MiB for the source; partitions are read only while they fit), and the
     statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
     `timeout`; polling stops there and the statement is cancelled. Snowflake's error codes pick the
     canonical code (`002003` not_found, `003001`/`000606` forbidden, `000630` timeout, ...).
@@ -166,6 +166,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `next_start_index`.
   - Not built: stage file listing and reading (GoodRx hasn't said policies live in stages).
   Setup, the registration checklist and the exact secret: `connectors/snowflake/README.md`.
+- `aisquare.pipe.core.sql.quiet_sqlglot()`: the one helper every connector's SQL guard parses inside.
+  sqlglot logs pieces of the SQL while it parses ("Invalid JSON path syntax ... <path>" at WARNING for a
+  JSON key with a dash, in statements the guards admit); a ContextVar-gated filter on the `sqlglot`
+  logger drops them in that context only, before any handler, so `logging.lastResort` never prints
+  them either. Nothing is disabled globally. `sqlglot_at_least()` lets a guard refuse every statement
+  below its extra's floor (BigQuery and Snowflake do, at 26.25).
+- `aisquare.pipe.testing.host.host_answer(exc)`: the HTTP status pipe-as-service answers a source's
+  exception with, for connector tests.
+
+### Changed
+
+- `PipelineError` takes an optional `retry_after` (seconds). It is what a source raises for an upstream
+  or transient failure: pipe-as-service answers it 502 `upstream_error`, by its exact type.
+- The BigQuery, Cloud Storage, Glean, Snowflake, S3 and Bedrock AgentCore sources no longer raise their
+  connector's API error (a bare `Exception` or `PipeError` subclass, which pipe-as-service answered 500
+  with the provider's text in its log). An upstream or transient failure is a `PipelineError` (502,
+  `retry_after` from the provider's `Retry-After`); what the caller can fix is a `ValueError` subclass
+  (422: `BigQueryRequestError`, `GcsRequestError`, `GleanRequestError`, `SnowflakeRequestError`,
+  `AwsRequestError`). Neither carries the provider's own error text; the toolkits still show it.
+  `AwsNotConfiguredError` is a `ValueError` first (422). Non-mapping pull params are a `ValueError`.
+- BigQuery and Snowflake sources fit a 512 MiB pod: pages and partitions are let go before the next is
+  read (BigQuery pages hold at most 50,000 cells), rows convert one at a time and are kept as their
+  canonical JSON (the envelopes and hashes are unchanged, byte for byte), and a batch's rows are let go
+  once its envelope is built. `max_result_bytes` is at most 64 MiB (was 100 MiB). Peaks (tracemalloc,
+  every envelope kept): BigQuery 21 MiB at the defaults (was 149) and 103 MiB at the caps; Snowflake
+  47 MiB (was 65) and 93-104 MiB (was 367 MiB at 100 MiB). The READMEs' "Memory" sections have the
+  numbers.
+- BigQuery: "Custom quota exceeded" is `forbidden` with when it resets, not `rate_limited`; a job error
+  inside a 200 maps by its reason (`accessDenied` is `forbidden`); `WWW-Authenticate` reaches
+  `error_code_for_status` (`insufficient_scope`); Drive-backed external tables are listed as not
+  supported.
+- `scripts/dep_floor.py --connectors` exits 1 when no connector suite matches, and validate.yml's floor
+  step fails when it ran none (it used to pass having tested nothing).
+- S3: an object that grew past `max_object_bytes` between the listing and the read is skipped, not
+  raised mid-pull.
 
 ## [0.5.0] - 2026-11-04
 

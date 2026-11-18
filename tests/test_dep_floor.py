@@ -87,3 +87,28 @@ def test_it_refuses_extras_without_one_floor(tmp_path, capsys, extras, problem):
         df.floor(root, "sqlglot")
     assert df.main(["sqlglot", "--root", str(root)]) == 1
     assert problem in capsys.readouterr().err
+
+
+def test_no_matching_connector_directory_fails_the_floor_step(tmp_path, capsys):
+    """The CI floor step would pass having tested nothing when --connectors
+    prints nothing (review #37 n1): that exits 1, and says why."""
+    root = _repo(tmp_path, {"alpha": ["sqlglot>=26.25,<28"]})
+    (root / "connectors" / "alpha").rmdir()
+    (root / "connectors" / "beta").mkdir()
+    assert df.main(["sqlglot", "--root", str(root)]) == 0
+    capsys.readouterr()
+    assert df.main(["sqlglot", "--root", str(root), "--connectors"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no connectors/<dir>" in captured.err and "alpha" in captured.err
+
+
+def test_the_floor_step_reads_the_list_before_it_loops():
+    """validate.yml reads --connectors into a variable (set -e stops on its
+    failure there, not in a for list) and fails when no suite ran."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "validate.yml").read_text()
+    step = workflow.split("name: SQL guards at the sqlglot floor", 1)[1]
+    assert 'dirs="$(python scripts/dep_floor.py sqlglot --connectors)"' in step
+    assert "for dir in $dirs; do" in step
+    assert 'test "$ran" -gt 0' in step
+    assert "for dir in $(" not in step

@@ -15,7 +15,7 @@ floor is raised once and holds for every connector that uses it.
 Reads the root pyproject only (no install, no import, stdlib only):
 
     python scripts/dep_floor.py sqlglot               # sqlglot==<floor>; exit 1 on a problem
-    python scripts/dep_floor.py sqlglot --connectors  # each connectors/<dir> whose extra names it
+    python scripts/dep_floor.py sqlglot --connectors  # each connectors/<dir> whose extra names it; exit 1 if none
     python scripts/dep_floor.py sqlglot --root R      # another checkout
 """
 
@@ -120,7 +120,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"dep_floor: {problem}", file=sys.stderr)
         return 1
     if args.connectors:
-        for path in connectors(root, found):
+        paths = connectors(root, found)
+        if not paths:
+            # A floor step that finds no suite would pass having tested
+            # nothing (review #37 n1).
+            print(
+                f"dep_floor: no connectors/<dir> is named like an extra that names "
+                f"{found.dist} ({', '.join(sorted(found.extras))})",
+                file=sys.stderr,
+            )
+            return 1
+        for path in paths:
             print(path)
     else:
         print(found.pin)
