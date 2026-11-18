@@ -164,7 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and warehouse,
     which no tool argument or pull param can change.
   - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
-    tool call, at most 64 MiB for the source; partitions are read only while they fit), and the
+    tool call, at most 64 MiB for the source; a result is read a row at a time, up to the cap), and the
     statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
     `timeout`; polling stops there and the statement is cancelled. Snowflake's error codes pick the
     canonical code (`002003` not_found, `003001`/`000606` forbidden, `000630` timeout, ...).
@@ -280,6 +280,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invalid_arguments`) with its index and size, none of its values. Rows with `ARRAY_AGG` arrays of 20,000-34,000
   elements: 266-344 -> 37-38 MiB at the defaults and the same 266-344 -> 74-77 MiB at the caps, on the first page
   or after short ones (#46 reopen seq 14031).
+- BigQuery: each page is sized from the LAST page's widest row, not the pull's: one row of 60,000 elements held every
+  later page to one row (the default 10,000 rows came back as 5,048 in 5,001 requests, labelled `max_rows`); now
+  pages double back up and all 10,000 come back in 15 requests. A pull that reads `MAX_PAGES` (5,000) pages with
+  rows left says `truncated` `max_pages`. A dropped page is asked for again from its first row (`startIndex`), not
+  with its page token and a smaller `maxResults` (undocumented). The README's worst case is measured: 160 MiB at
+  the caps, an emoji in every cell of rows right under both read caps (#46 review seq 14088 M1, n1, n2).
+- Snowflake: a result is read a row at a time, never a partition whole (`aisquare_pipe_snowflake.stream`).
+  Snowflake sizes the partitions (its docs show 76 MB), and partition 0 came inside the status answer unchecked:
+  one 100,000-row partition of 50 `NUMBER` columns peaked at 380 MiB at the caps. Now every result body is
+  streamed 64 KiB at a time and split into rows as it arrives, and reading stops at the cap, inside a partition
+  when that is where it falls (a partition is no longer skipped whole because its `uncompressedSize` would not
+  fit). The same pull peaks at 74 MiB, whatever the partitions; the worst measured, rows of 8 MiB with an emoji in
+  each cell, 177 MiB. A row over 8 MiB of JSON is `RowTooLarge` (422; tools: `invalid_arguments`), with its
+  index and none of its values; a result body that isn't the SQL API's JSON, or breaks off, is a 502 (#46 review
+  seq 14088 M2).
+- Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
+  document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
+  `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
+- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor)` is how every SQL guard parses (BigQuery,
+  Snowflake, Redshift): the sqlglot floor check, a quiet tokenize and parse, and any exception a refusal, in one
+  place. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it differs from the floor
+  `scripts/dep_floor.py` reads from the pyproject, and when a connector module that imports sqlglot parses,
+  tokenizes or checks the floor itself, or keeps its own floor (#46 review seq 14088 m2).
+- `scripts/dep_floor.py --connectors` also exits 1 when an extra that names the dependency has no
+  `connectors/<extra>` directory (it was skipped silently while another suite matched); an aggregate extra (one
+  that names the project itself, as `[full]` does) needs none (#46 review seq 14088 n3).
 - `max_result_bytes` (BigQuery, Snowflake, Redshift) counts what the envelopes hold, each one's columns header
   included (`aisquare.pipe.core.batches.BatchPlan` plans the cuts while the rows are read): 200 columns in 1 KiB
   envelopes made 256 MiB of envelopes under a 64 MiB cap.

@@ -627,7 +627,28 @@ fifth of the memory a row object takes; the envelopes and hashes are byte for by
 were). A batch's rows are let go once its envelope is built. So a pull peaks at about 1.35 times
 the rows' JSON plus a page or two. A host keeps the envelopes too: pipe-as-service
 base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at 64 MiB on
-a 512 MiB pod. AWS, not the connector, sizes the result pages.
+a 512 MiB pod.
+
+**What these numbers assume: AWS's page size.** AWS, not the connector, sizes the result pages:
+`GetStatementResult` takes no page size, and AWS documents none for JSON results (only that a
+result is at most 500 MB after gzip, in the Data API's "Considerations"). botocore parses each
+page whole, so the connector can't cap one, and the peak grows about nine times a page's JSON.
+Measured at the caps with 10 narrow `varchar` columns, changing only the fake's page:
+
+| One `GetStatementResult` page | Peak |
+|---|---|
+| 1,000 rows, 0.3 MiB of JSON (the tests' fake) | 35.9 MiB |
+| 10,000 rows, 2.8 MiB | 58.2 MiB |
+| 30,000 rows, 8.3 MiB | 113.1 MiB |
+| 60,000 rows, 16.7 MiB | 186.0 MiB |
+| 90,000 rows, 25 MiB | 278.7 MiB (over the 256 MiB bar) |
+
+So the bound holds while a real page is under about 20 MiB of JSON. That is unmeasured: one
+page of a wide `SELECT` on stg is the check. If pages run larger, the way out is
+`GetStatementResultV2` (`ResultFormat` `CSV`), which AWS documents at up to 15 MB of results a
+request, in 1 MB chunks. It is not used yet because AWS documents neither how a CSV record
+writes SQL `NULL` (against an empty string) nor whether a chunk carries a header row, so the
+switch needs that stg check first.
 
 ### Redshift registration checklist
 
