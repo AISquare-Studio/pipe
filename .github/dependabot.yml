@@ -8,10 +8,11 @@ updates:
       - "dependencies"
       - "ci"
 
+  # One distribution (D8): every dependency, each connector's extra
+  # included, is in the root pyproject.toml. connectors/*/pyproject.toml
+  # hold tool settings only, so they are not listed.
   - package-ecosystem: "pip"
-    directories:
-      - "/"
-      - "/connectors/*"
+    directory: "/"
     schedule:
       interval: "weekly"
     labels:

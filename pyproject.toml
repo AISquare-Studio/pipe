@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm"]
+requires = ["setuptools>=84.2.1", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
     "click>=8.0",
     # Used by most connectors, so they ship with the core.
-    "requests>=2.31",
+    "requests>=2.34.2",
     "urllib3>=1.26",
 ]
 
@@ -39,7 +39,7 @@ Changelog = "https://github.com/AISquare-Studio/pipe/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
+    "pytest>=9.2.0",
     "pytest-cov",
     "ruff",
     "mypy",
@@ -72,11 +72,11 @@ graphify = [
     "tiktoken>=0.7",
 ]
 # The graph engine itself, heavy and pinned; not part of [full].
-graphify-engine = ["graphifyy==0.9.72"]
+graphify-engine = ["graphifyy==0.9.106"]
 local = []
 n8n = []
 onedrive = [
-    "azure-identity>=1.15.0",
+    "azure-identity>=1.27.0",
 ]
 salesforce = [
     "simple-salesforce>=1.12",
