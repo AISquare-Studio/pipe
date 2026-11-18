@@ -67,6 +67,7 @@ from aisquare_pipe_snowflake.refs import (
 from aisquare_pipe_snowflake.sqlguard import (
     MAX_SQL_CHARS,
     NotReadOnly,
+    check_context,
     check_select_only,
 )
 
@@ -168,6 +169,22 @@ _DATABASE = {
     "description": "A database name (default: the configured database). Unquoted names are "
     'case-insensitive; "Quoted" keeps the case.',
 }
+# Composio's in_scope: which scope a SHOW lists. Each value maps to the scope
+# the tool builds from database / schema (and their configured defaults).
+_SCHEMA_SCOPES = ("ACCOUNT", "DATABASE")
+_TABLE_SCOPES = ("ACCOUNT", "DATABASE", "SCHEMA")
+
+
+def _in_scope_schema(scopes: tuple[str, ...], meaning: str) -> dict[str, Any]:
+    # No "enum": core would refuse "database" for DATABASE, and Composio's
+    # callers may send either case.
+    return {
+        "type": "string",
+        "maxLength": 16,
+        "description": f"Where to list: {' or '.join(scopes)} (any case). {meaning} "
+        "Default: the narrowest scope the arguments and the configured defaults give.",
+    }
+
 
 SHOW_DATABASES = ToolSpec(
     slug="SNOWFLAKE_SHOW_DATABASES",
@@ -204,6 +221,11 @@ SHOW_SCHEMAS = ToolSpec(
         "type": "object",
         "properties": {
             "database": _DATABASE,
+            "in_scope": _in_scope_schema(
+                _SCHEMA_SCOPES,
+                "ACCOUNT lists every database's schemas (without database); DATABASE "
+                "lists one database's (database, or the configured one).",
+            ),
             "like_pattern": _LIKE,
             "starts_with": _STARTS_WITH,
             "limit": _LIMIT,
@@ -236,6 +258,12 @@ SHOW_TABLES = ToolSpec(
                 "description": "A schema name, or DATABASE.SCHEMA (default: the configured "
                 "schema; without one, the whole database).",
             },
+            "in_scope": _in_scope_schema(
+                _TABLE_SCOPES,
+                "ACCOUNT lists every table we can see (without database or schema); "
+                "DATABASE one database's (database, or the configured one; without "
+                "schema); SCHEMA one schema's (schema, or the configured one).",
+            ),
             "like_pattern": _LIKE,
             "starts_with": _STARTS_WITH,
             "limit": _LIMIT,
@@ -444,6 +472,23 @@ def literal(text: str) -> str:
     return "'" + text.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
+def _scope_word(arguments: Mapping[str, Any], scopes: tuple[str, ...]) -> str | None:
+    """Composio's ``in_scope``, upper-cased: one of ``scopes``, or None."""
+    value = arguments.get("in_scope")
+    if value is None or value == "":
+        return None
+    word = value.strip().upper() if isinstance(value, str) else None
+    if word not in scopes:
+        raise ToolError(
+            "in_scope must be " + " or ".join(scopes), code=ERROR_INVALID_ARGUMENTS
+        )
+    return word
+
+
+def _bad_scope(message: str) -> ToolError:
+    return ToolError(message, code=ERROR_INVALID_ARGUMENTS)
+
+
 def _reference(parse: Any, *args: Any, **kwargs: Any) -> Any:
     try:
         return parse(*args, **kwargs)
@@ -625,12 +670,23 @@ class SnowflakeToolkit(Toolkit):
         self, creds: SnowflakeCredentials, arguments: dict[str, Any]
     ) -> Any:
         limit = self._limit(arguments)
+        in_scope = _scope_word(arguments, _SCHEMA_SCOPES)
         text = _text(arguments, "database", MAX_REF_CHARS)
         database = (
             _reference(parse_identifier, text, "database")
             if text is not None
             else creds.database
         )
+        if in_scope == "ACCOUNT":
+            if text is not None:
+                raise _bad_scope(
+                    "in_scope ACCOUNT lists every database's schemas: leave database out"
+                )
+            database = None
+        elif in_scope == "DATABASE" and not database:
+            raise _bad_scope(
+                "in_scope DATABASE needs a database (none is given or configured)"
+            )
         scope = f"IN DATABASE {quote(database)}" if database else "IN ACCOUNT"
         statement = _show("SCHEMAS", arguments, scope=scope, limit=limit)
         seconds = deadline(arguments, METADATA_TIMEOUT)
@@ -657,6 +713,7 @@ class SnowflakeToolkit(Toolkit):
         self, creds: SnowflakeCredentials, arguments: dict[str, Any]
     ) -> Any:
         limit = self._limit(arguments)
+        in_scope = _scope_word(arguments, _TABLE_SCOPES)
         db_text = _text(arguments, "database", MAX_REF_CHARS)
         database = (
             _reference(parse_identifier, db_text, "database")
@@ -665,10 +722,31 @@ class SnowflakeToolkit(Toolkit):
         )
         schema_text = _text(arguments, "schema", MAX_REF_CHARS)
         where: SchemaRef | str | None
-        if schema_text is not None:
+        if in_scope == "ACCOUNT":
+            if db_text is not None or schema_text is not None:
+                raise _bad_scope(
+                    "in_scope ACCOUNT lists every table: leave database and schema out"
+                )
+            where = None
+        elif in_scope == "DATABASE":
+            if schema_text is not None:
+                raise _bad_scope(
+                    "in_scope DATABASE lists a whole database: leave schema out"
+                )
+            if not database:
+                raise _bad_scope(
+                    "in_scope DATABASE needs a database (none is given or configured)"
+                )
+            where = database
+        elif schema_text is not None:
             where = _reference(parse_schema, schema_text, "schema", database=database)
-        elif db_text is None and database and creds.schema:
+        elif database and creds.schema and (db_text is None or in_scope == "SCHEMA"):
             where = SchemaRef(database, creds.schema)
+        elif in_scope == "SCHEMA":
+            raise _bad_scope(
+                "in_scope SCHEMA needs a schema and its database (none is given or "
+                "configured)"
+            )
         else:
             where = database
         if isinstance(where, SchemaRef):
@@ -740,6 +818,10 @@ class SnowflakeToolkit(Toolkit):
             if schema_text is not None
             else None
         )
+        try:
+            check_context(database or creds.database, schema or creds.schema)
+        except NotReadOnly as e:
+            raise ToolError(str(e), code=ERROR_INVALID_ARGUMENTS) from None
         max_rows = _bounded_int(arguments, "max_rows", 1, MAX_ROWS) or DEFAULT_ROWS
         seconds = deadline(arguments, RUN_SELECT_TIMEOUT)
 

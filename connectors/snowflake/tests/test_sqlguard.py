@@ -41,7 +41,82 @@ READ_ONLY = [
     "SELECT /* a block comment */ 1 // a line comment",
     "SELECT 1 -- a comment ended by CR LF\r\nFROM t // another\r\n",
     "SELECT 1 /* a * comment / with * and / */ FROM t",
+    # Inside a string, the forms the guard refuses are data.
+    "SELECT 'price $5', '@home', 'AI_COMPLETE(x)', 'SNOWFLAKE.CORTEX.x', 'a!b' FROM t",
+    # Backslash escapes that every reading ends at the same quote.
+    "SELECT 'C:\\\\dir\\\\', 'tab\\tnew\\nline' FROM t",
+    "SELECT * FROM t WHERE a != 1",
+    "SELECT EXTRACT(year FROM TO_DATE(x)) FROM t",
+    # Named like an AI function or CORTEX, but neither called nor a qualifier.
+    'SELECT "AI_SCORE", ai_score, cortex, "!" FROM t',
+    "SELECT TRANSLATE(name, 'ab', 'xy') FROM t",
 ]
+
+# Reviewer seq 13859 M1. The lexer read a backslash as an escape in BOTH
+# '...' and "..." or in NEITHER; Snowflake reads it in '...' only. In
+# Snowflake's reading this is the string ''' with the alias "\", then the
+# call, then a -- comment, and both old readings hid the call in quotes.
+QUOTE_READING_REPRO = (
+    "SELECT '\\'' \"\\\" , SYSTEM$CANCEL_ALL_QUERIES(CURRENT_SESSION()) -- \" /* ' */"
+)
+
+
+def _wrapped(form: str) -> str:
+    """``form`` inside the M1 wrapper, hidden from both old readings."""
+    return "SELECT '\\'' \"\\\" , " + form + " -- \" /* ' */"
+
+
+QUOTE_READING_WRAPPED = {
+    "wrapped_abort_session": _wrapped("SYSTEM$ABORT_SESSION(CURRENT_SESSION())"),
+    "wrapped_user_stage": _wrapped("x FROM @~/f.csv"),
+    "wrapped_named_stage": _wrapped("x FROM @db.s.st/f.csv"),
+    "wrapped_dollar_string": _wrapped("$$x$$"),
+    "wrapped_session_variable": _wrapped("$x"),
+    "wrapped_cortex": _wrapped("SNOWFLAKE.CORTEX.COMPLETE('m', 'p')"),
+    "wrapped_drop": "SELECT '\\'' \"\\\" ; DROP TABLE t ; SELECT 1 -- \" /* ' */",
+}
+# Reviewer seq 13859 m4, manager decision: Cortex AI functions bill AI
+# credits, which no warehouse limit bounds. Refused, fail-closed.
+CORTEX_CALLS = {
+    "cortex_complete": "SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', body) FROM t",
+    "cortex_quoted": 'SELECT "SNOWFLAKE"."CORTEX"."COMPLETE"(\'m\', body) FROM t',
+    "cortex_spaced": "SELECT SNOWFLAKE . /* c */ CORTEX . SENTIMENT(body) FROM t",
+    "cortex_schema_only": "SELECT CORTEX.SUMMARIZE(body) FROM t",
+    "cortex_in_where": "SELECT id FROM t WHERE SNOWFLAKE.CORTEX.SENTIMENT(body) > 0",
+    "ai_complete": "SELECT AI_COMPLETE('mistral-large2', body) FROM t",
+    "ai_quoted": "SELECT \"AI_COMPLETE\"('m', body) FROM t",
+    "ai_lower_case": "SELECT ai_filter(body) FROM t",
+    "ai_in_where": "SELECT id FROM t WHERE AI_FILTER(PROMPT('is {0} ok', body))",
+    "ai_typed_in_sqlglot": "SELECT AI_CLASSIFY(body, ['a', 'b']) FROM t",
+    "ai_aggregate": "SELECT AI_AGG(body, 'sum up') FROM t",
+    "ai_spaced": "SELECT AI_EMBED /* c */ ('m', body) FROM t",
+    # Found by a fuzz: a name can't start with a digit, so Snowflake (and
+    # sqlglot) read 1AI_COMPLETE as the number 1, then AI_COMPLETE.
+    "ai_after_a_digit": "SELECT 1AI_COMPLETE('m', body) FROM t",
+    "cortex_after_a_digit": "SELECT 1CORTEX.COMPLETE('m', body) FROM t",
+    "model_method": "SELECT m!PREDICT(body) FROM t",
+    "qualified_model_method": "SELECT db.s.m ! PREDICT(body, 1) FROM t",
+}
+# M1 (b): a name holding $ that only quotes hide, or a string IDENTIFIER
+# turns into a name.
+DOLLAR_NAMES = {
+    "quoted_system_function": 'SELECT "SYSTEM$ABORT_SESSION"(1)',
+    "quoted_dollar_column": 'SELECT "a$b" FROM t',
+    "identifier_system_function": "SELECT IDENTIFIER('SYSTEM$ABORT_SESSION')(1)",
+    "identifier_cortex": "SELECT IDENTIFIER('SNOWFLAKE.CORTEX.COMPLETE')('m', 'p')",
+    "identifier_column": "SELECT IDENTIFIER('c') FROM t",
+}
+# Reviewer seq 13859 m5: a qualified table function in a bare FROM or JOIN.
+BARE_QUALIFIED_TABLE_FUNCTIONS = {
+    "bare_from_qualified_flatten": "SELECT * FROM s.FLATTEN(input => t.v)",
+    "bare_from_deep_qualified_flatten": "SELECT * FROM db.s.FLATTEN(input => t.v)",
+    "bare_from_quoted_flatten": 'SELECT * FROM s."FLATTEN"(input => t.v)',
+    "comma_join_qualified_flatten": "SELECT * FROM t, s.FLATTEN(input => t.v)",
+    "join_qualified_flatten": "SELECT * FROM t JOIN s.FLATTEN(input => t.v) ON 1 = 1",
+    "bare_from_qualified_generator": "SELECT * FROM s.GENERATOR(ROWCOUNT => 1)",
+    # The same fuzz: TABLE( right after a digit.
+    "table_call_after_a_digit": "SELECT * FROM t, 1TABLE(my_proc(1))",
+}
 
 REFUSED = {
     "insert": "INSERT INTO t VALUES (1)",
@@ -121,6 +196,11 @@ REFUSED = {
     "spaced_qualified_flatten": "SELECT * FROM TABLE(x /* c */ . FLATTEN(input => v))",
     "lateral_qualified_flatten": "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
     "qualified_generator": "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
+    "quote_reading_repro": QUOTE_READING_REPRO,
+    **QUOTE_READING_WRAPPED,
+    **CORTEX_CALLS,
+    **DOLLAR_NAMES,
+    **BARE_QUALIFIED_TABLE_FUNCTIONS,
 }
 
 
@@ -179,6 +259,13 @@ LEXER_CATCHES = [
     "SELECT * FROM TABLE(evil.s.FLATTEN(input => v))",
     "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
     "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
+    QUOTE_READING_REPRO,
+    *QUOTE_READING_WRAPPED.values(),
+    *CORTEX_CALLS.values(),
+    *DOLLAR_NAMES.values(),
+    # m5 in the lexer: a qualified call named like a built-in table function.
+    # A bare FROM f(...) by any other name is the parser's alone (below).
+    *BARE_QUALIFIED_TABLE_FUNCTIONS.values(),
 ]
 
 
@@ -189,25 +276,54 @@ def test_the_lexer_alone_refuses_what_the_parser_might_admit(sql, monkeypatch):
         check_select_only(sql)
 
 
-PARSER_CATCHES = [
+def _unique(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
+ONLY_THE_PARSER_REFUSES = [
     "SELECT * FROM t WHERE a = ?",
     "SELECT * FROM t WHERE a = :1",
-    "SELECT * FROM TABLE(my_proc(1))",
-    "SELECT * FROM t, LATERAL my_udtf(t.a)",
-    "SHOW TABLES",
-    "DESCRIBE TABLE t",
-    "INSERT INTO t SELECT 1",
-    "SELECT 1; SELECT 2",
-    "SELECT seq.NEXTVAL",
-    "SELECT seq.nextval FROM t",
-    'SELECT s."NEXTVAL"',
-    'SELECT "NEXTVAL" FROM t',
-    "SELECT NEXTVAL()",
-    "SELECT * FROM TABLE(x.FLATTEN(input => v))",
-    "SELECT * FROM TABLE(evil.s.FLATTEN(input => v))",
-    "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
-    "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
+    "SELECT * FROM my_udtf(1)",
+    "SELECT * FROM t, my_udtf(t.a)",
+    "SELECT * FROM t JOIN my_udtf(t.a) ON 1 = 1",
 ]
+
+PARSER_CATCHES = _unique(
+    [
+        "SELECT * FROM t WHERE a = ?",
+        "SELECT * FROM t WHERE a = :1",
+        "SELECT * FROM TABLE(my_proc(1))",
+        "SELECT * FROM t, LATERAL my_udtf(t.a)",
+        "SHOW TABLES",
+        "DESCRIBE TABLE t",
+        "INSERT INTO t SELECT 1",
+        "SELECT 1; SELECT 2",
+        "SELECT seq.NEXTVAL",
+        "SELECT seq.nextval FROM t",
+        'SELECT s."NEXTVAL"',
+        'SELECT "NEXTVAL" FROM t',
+        "SELECT NEXTVAL()",
+        "SELECT * FROM TABLE(x.FLATTEN(input => v))",
+        "SELECT * FROM TABLE(evil.s.FLATTEN(input => v))",
+        "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
+        "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
+        # M1 (b): the parser alone refuses $ names, stages and $$ strings.
+        QUOTE_READING_REPRO,
+        *QUOTE_READING_WRAPPED.values(),
+        "SELECT SYSTEM$CANCEL_ALL_QUERIES(1)",
+        "SELECT a$b FROM t",
+        "SELECT $1 FROM @stage",
+        "SELECT * FROM t WHERE a = $x",
+        "SELECT $$DROP TABLE t$$",
+        "SELECT * FROM @mystage/file.csv",
+        "SELECT x FROM @~/f.csv",
+        "SELECT * FROM @%t",
+        *CORTEX_CALLS.values(),
+        *DOLLAR_NAMES.values(),
+        *BARE_QUALIFIED_TABLE_FUNCTIONS.values(),
+        *ONLY_THE_PARSER_REFUSES,
+    ]
+)
 
 
 @pytest.mark.parametrize("sql", PARSER_CATCHES)
@@ -215,6 +331,17 @@ def test_the_parser_alone_refuses_what_the_lexer_might_admit(sql, monkeypatch):
     monkeypatch.setattr(sqlguard, "_lex", lambda text: sqlguard._Lexed(text, None))
     with pytest.raises(NotReadOnly):
         check_select_only(sql)
+
+
+@pytest.mark.parametrize("sql", ONLY_THE_PARSER_REFUSES)
+def test_what_the_lexer_leaves_to_the_parser(sql, monkeypatch):
+    """The exceptions the README and the module docstring name: the lexer
+    can't tell a bare FROM's table function from EXTRACT(... FROM f(x)), and
+    has no rule for binds. If a lexer rule starts catching one, move it to
+    LEXER_CATCHES and update both texts."""
+    assert sqlguard._lex(sql).problem is None
+    monkeypatch.setattr(sqlguard, "_parsed_problem", lambda statement: None)
+    assert check_select_only(sql) == sql
 
 
 # A bare CR ends a line for some readers (sqlglot) and not for others, and
@@ -249,9 +376,86 @@ def test_a_line_comment_ended_by_cr_lf_hides_nothing():
 
 
 def test_a_quote_escaped_with_a_backslash_reads_two_ways_and_is_refused():
-    with pytest.raises(NotReadOnly, match="unterminated|two ways"):
+    with pytest.raises(NotReadOnly, match="more than one way"):
         check_select_only("SELECT 'a\\'b' FROM t")
     assert check_select_only("SELECT 'a''b' FROM t")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Snowflake: an identifier named a\ (no escape in "..."), then FROM t.
+        'SELECT 1 AS "a\\" FROM t',
+        # Snowflake: the string a'b. A reader without escapes ends it early.
+        "SELECT 'a\\'b' FROM t",
+        # Snowflake: the string x\' (an escaped backslash, an escaped quote).
+        "SELECT 'x\\\\\\'' FROM t",
+    ],
+)
+def test_quoting_that_reads_more_than_one_way_is_refused(sql):
+    with pytest.raises(NotReadOnly, match="more than one way"):
+        check_select_only(sql)
+
+
+def test_the_lexer_reads_quotes_as_snowflake_does():
+    """M1 (a): Snowflake's reading (a backslash escapes in '...' only)
+    decides, so it sees the call that both old readings hid. The other three
+    readings must agree with it."""
+    assert sqlguard._READINGS[0] == (True, False)
+    assert set(sqlguard._READINGS) == {
+        (strings, names) for strings in (True, False) for names in (True, False)
+    }
+    blanked = sqlguard._blank(
+        QUOTE_READING_REPRO, escapes_in_strings=True, escapes_in_names=False
+    )
+    assert "SYSTEM$CANCEL_ALL_QUERIES(CURRENT_SESSION())" in blanked
+    assert sqlguard._lex(QUOTE_READING_REPRO).problem == sqlguard._DOLLAR
+
+
+@pytest.mark.parametrize("schema", ["CORTEX", "cortex", '"CORTEX"'])
+def test_run_select_refuses_the_default_schema_cortex(schema):
+    """m4: with SNOWFLAKE.CORTEX as the default, an unqualified COMPLETE(...)
+    is SNOWFLAKE.CORTEX.COMPLETE."""
+    fake = FakeSnowflake()
+    result = SnowflakeToolkit(session=fake).call_tool(
+        "SNOWFLAKE_RUN_SELECT",
+        {
+            "statement": "SELECT COMPLETE('m', 'p')",
+            "database": "SNOWFLAKE",
+            "schema_name": schema,
+        },
+        blob(),
+    )
+    assert not result.successful
+    assert result.error_code == "invalid_arguments", result.error
+    assert "CORTEX" in result.error
+    configured = SnowflakeToolkit(session=fake).call_tool(
+        "SNOWFLAKE_RUN_SELECT",
+        {"statement": "SELECT COMPLETE('m', 'p')"},
+        blob(database="SNOWFLAKE", schema="CORTEX"),
+    )
+    assert configured.error_code == "invalid_arguments", configured.error
+    assert fake.requests == []
+
+
+def test_a_sql_pull_refuses_the_default_schema_cortex():
+    fake = FakeSnowflake()
+    source = SnowflakeQuerySource(session=fake)
+    with pytest.raises(ValueError, match="CORTEX"):
+        list(
+            source.pull(
+                blob(),
+                PullParams({"sql": "SELECT COMPLETE('m', 'p')", "schema": "cortex"}),
+            )
+        )
+    with pytest.raises(ValueError, match="CORTEX"):
+        list(
+            source.pull(
+                blob(database="SNOWFLAKE", schema="CORTEX"),
+                PullParams({"sql": "SELECT COMPLETE('m', 'p')"}),
+            )
+        )
+    assert fake.requests == []
 
 
 def test_a_column_named_like_a_write_keyword_needs_double_quotes():
@@ -375,3 +579,52 @@ def test_table_references_leave_ctes_out_and_flag_what_cant_be_read():
         [],
         False,
     )
+
+
+# Reviewer seq 13859: the earlier quote fuzz missed M1 because its alphabet
+# had no comment characters, and comments bring two wrong readings back into
+# step. This one has them, and checks the lexer alone against sqlglot's
+# tokenizer, which reads quotes and comments as Snowflake does. It found
+# "1AI_COMPLETE(": a name can't start with a digit, so that is 1, then a call.
+_FUZZ_ATOMS = [
+    *("'", '"', "\\", "''", '""'),
+    *("--", "//", "/*", "*/", "\n", "\r"),
+    *(";", " ", ",", "(", ")", "x", "1", "!", "$", "@"),
+    *("SYSTEM$X()", "DROP TABLE t", "AI_C(1)", "CORTEX.F(1)"),
+]
+
+
+def test_what_the_lexer_admits_sqlglot_reads_the_same_way():
+    import random
+
+    from sqlglot.tokens import TokenType
+
+    rng = random.Random(13859)
+    admitted = 0
+    for _ in range(50_000):
+        atoms = rng.randint(1, 14)
+        sql = "SELECT 1 , " + "".join(rng.choice(_FUZZ_ATOMS) for _ in range(atoms))
+        lexed = sqlguard._lex(sql)
+        if lexed.problem is not None:
+            continue
+        admitted += 1
+        try:
+            tokens = sqlguard._DIALECT.tokenize(lexed.statement)
+        except Exception:  # noqa: BLE001, S112 — sqlglot can't read it: the parser refuses
+            continue
+        for index, token in enumerate(tokens):
+            kind, text = token.token_type, token.text
+            following = (
+                tokens[index + 1].token_type if index + 1 < len(tokens) else None
+            )
+            assert kind not in (TokenType.SEMICOLON, TokenType.PARAMETER), sql
+            assert kind != TokenType.RAW_STRING, sql  # $$...$$
+            assert text.upper() != "DROP", sql
+            if kind in (TokenType.STRING, TokenType.IDENTIFIER):
+                continue  # a literal's value, or a quoted name not called
+            assert "$" not in text and text != "!", sql
+            assert not (
+                text.upper().startswith("AI_") and following == TokenType.L_PAREN
+            )
+            assert not (text.upper() == "CORTEX" and following == TokenType.DOT), sql
+    assert admitted > 5_000  # the alphabet still reaches the checks

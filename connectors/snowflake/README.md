@@ -30,12 +30,16 @@ Composio's slugs and argument names for the read tools both have:
 |---|---|---|
 | `SNOWFLAKE_EXECUTE_SQL` (`statement`, `database`, `schema_name`, `timeout`) | `SNOWFLAKE_RUN_SELECT` (primary; same arguments, plus `max_rows`) | SELECT only, checked before any call; row, byte and time caps. Composio's runs DDL and DML too. |
 | `SNOWFLAKE_SHOW_DATABASES` | `SNOWFLAKE_SHOW_DATABASES` | Same arguments (`like_pattern`, `starts_with`, `limit`, `from_name`, `terse`, `history`, `timeout`); `next_from_name` pages. |
-| `SNOWFLAKE_SHOW_SCHEMAS` | `SNOWFLAKE_SHOW_SCHEMAS` | Same, plus `database`. |
-| `SNOWFLAKE_SHOW_TABLES` | `SNOWFLAKE_SHOW_TABLES` | Same, plus `database` and `schema`. |
+| `SNOWFLAKE_SHOW_SCHEMAS` | `SNOWFLAKE_SHOW_SCHEMAS` | Same as above, plus `database` and `in_scope` (`ACCOUNT` or `DATABASE`). |
+| `SNOWFLAKE_SHOW_TABLES` | `SNOWFLAKE_SHOW_TABLES` | Same as above, plus `database`, `schema` and `in_scope` (`ACCOUNT`, `DATABASE` or `SCHEMA`). |
 | (none) | `SNOWFLAKE_DESCRIBE_TABLE` | Columns, kind, size and the version marker `last_altered`. |
 
-Composio's `role` and `warehouse` arguments are server-controlled here: a call that sends them is refused
-(`invalid_arguments`). `SNOWFLAKE_EXECUTE_SQL` needs one row in pipe-as-service's `NATIVE_TOOL_RENAMES`
+`in_scope` takes any case and picks the scope the tool lists: `ACCOUNT` (with no `database` or `schema`), `DATABASE`
+(`database`, else the configured one) or `SCHEMA` (`schema`, else the configured one). Without it, the tool lists the
+narrowest scope its arguments and the configured defaults give. An `in_scope` the other arguments contradict
+(`ACCOUNT` with a `database`, `DATABASE` with a `schema`) is refused, and so is one with nothing to list in (`SCHEMA`
+with no schema given or configured). Composio's `role` and `warehouse` arguments are server-controlled here: a call
+that sends them is refused (`invalid_arguments`). `SNOWFLAKE_EXECUTE_SQL` needs one row in pipe-as-service's `NATIVE_TOOL_RENAMES`
 (`SNOWFLAKE_EXECUTE_SQL` → `SNOWFLAKE_RUN_SELECT`; the arguments need no translation). Composio's other tools
 (warehouse, user and grant management) have no native counterpart, on purpose.
 
@@ -45,8 +49,8 @@ Composio's `role` and `warehouse` arguments are server-controlled here: a call t
 |---|---|
 | `SNOWFLAKE_RUN_SELECT` (primary) | ONE `SELECT` or `WITH ... SELECT`: the rows (objects keyed by column name), the columns' types, `row_count`, `truncated`, `query_id`. `max_rows` (default 100, at most 5,000). `database` and `schema_name` for names written without them (default: the configured ones). `timeout` (seconds, at most 600). |
 | `SNOWFLAKE_DESCRIBE_TABLE` | One table or view: its columns (name, type, nullable, default, comment), `kind`, `row_count`, `bytes`, `created`, `comment`, `clustering_key` and the version marker `last_altered`. |
-| `SNOWFLAKE_SHOW_TABLES` | The tables in a schema (default: the configured one) or a database, with kind, row count, size, owner and comment. |
-| `SNOWFLAKE_SHOW_SCHEMAS` | The schemas in a database (default: the configured one; without one, every database the role sees). |
+| `SNOWFLAKE_SHOW_TABLES` | The tables in a schema (default: the configured one), a database or the account (`in_scope`), with kind, row count, size, owner and comment. |
+| `SNOWFLAKE_SHOW_SCHEMAS` | The schemas in a database (default: the configured one; without one, or with `in_scope` `ACCOUNT`, every database the role sees). |
 | `SNOWFLAKE_SHOW_DATABASES` | The databases the role sees. |
 
 The SHOW tools list `limit` objects (default 100, at most 1,000) and answer `has_more` and `next_from_name`: pass
@@ -103,36 +107,66 @@ raise the caps. `result_sha256` then covers the rows read only.
 ## Security
 
 **SELECT only, before any request.** `SNOWFLAKE_RUN_SELECT` and a `sql` pull refuse anything but ONE read-only
-statement before a token is even signed. Two independent checks must both pass:
-1. **A lexer.** It blanks `'...'` strings, `"..."` identifiers and `--`, `//` and `/* */` comments, reading the text
-   once with backslash escapes and once without. Both readings must agree, so write a quote inside a string as `''`,
-   not `\'`. A `--` or `//` comment ends at the first CR or LF; one that a bare CR (no LF after it) ends is refused,
-   and so is a `/*` inside a `/* */` comment: readers disagree on both (sqlglot ends a line at a CR, and some
-   versions nest comments), and the disagreement could hide a statement from one check. The text must then be one
-   statement (one trailing `;` is dropped) that starts with `SELECT` or `WITH`.
+statement before a token is even signed. Two checks must both pass. Each reads the text on its own, and most forms
+below are refused by both, each by itself. The few that only one of them refuses are listed after the two.
+1. **A lexer.** It blanks `'...'` strings, `"..."` identifiers and `--`, `//` and `/* */` comments.
+   - Backslashes: it reads them as Snowflake does, as an escape in a `'...'` string and never in a `"..."`
+     identifier. Then it reads the text the three other ways a reader could (escapes in both, in neither, in
+     `"..."` only). All four readings must agree on where every quote, every comment and the statement end, so
+     write a quote inside a string as `''`, not `\'`.
+   - Comments: a `--` or `//` comment ends at the first CR or LF. One that a bare CR (no LF after it) ends is
+     refused, and so is a `/*` inside a `/* */` comment. Readers disagree on both (sqlglot ends a line at a CR, and
+     some versions nest comments), and the disagreement could hide a statement from one check.
+   - In Snowflake's reading, the text must be one statement (one trailing `;` is dropped) that starts with `SELECT`
+     or `WITH`.
    - It may name none of `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `UPSERT`, `TRUNCATE`, `CREATE`, `ALTER`, `DROP`,
      `UNDROP`, `RENAME`, `SWAP`, `CLONE`, `RESTORE`, `COPY`, `PUT`, `REMOVE`, `RM`, `LOAD`, `GRANT`, `REVOKE`,
      `USE`, `SET`, `UNSET`, `RESET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `DECLARE`, `CALL`, `EXEC`,
      `EXECUTE`, `IMMEDIATE`, `PROCEDURE`, `ANALYZE`, `INTO`, `NEXTVAL`. A column with one of those names must be in
      double quotes, except `NEXTVAL`, which is refused quoted too (`s."NEXTVAL"` still takes a sequence's next value).
    - It may hold none of: `$` (`$$` strings, `SYSTEM$` functions, session variables, stage columns), `@` (stages),
-     `->`/`->>` (the flow operator chains statements), `|>`, backticks, or a backslash outside a string.
+     `->`/`->>` (the flow operator chains statements), `|>`, a `!` other than `!=` (a model's method,
+     `m!PREDICT(...)`), backticks, or a backslash outside a string. No `"..."` name may hold a `$` either
+     (`"SYSTEM$ABORT_SESSION"(...)`).
+   - It may call no Cortex AI function: no `AI_*` call and no `CORTEX` qualifier (`SNOWFLAKE.CORTEX.COMPLETE`),
+     quoted or not. `IDENTIFIER(...)` is refused too: it turns a string, which neither check reads, into a name.
    - A table function (`TABLE(f(...))`, `LATERAL f(...)`) must be `FLATTEN`, `SPLIT_TO_TABLE`,
      `STRTOK_SPLIT_TO_TABLE` or `GENERATOR`, unqualified (`s.FLATTEN(...)` is a user-defined function): Snowflake can
-     call a stored procedure from `FROM TABLE(...)`, and a procedure may write.
-2. **A parser** (sqlglot, Snowflake dialect): exactly one statement whose root is a query, with no write, DDL,
-   session, transaction, bind-variable or unparsed node anywhere in its tree, no `NEXTVAL` name (quoted or not), and
-   no table function outside that list (a qualified one is outside it). Text it can't parse is refused. sqlglot logs
-   pieces of the SQL it parses (its "unsupported syntax" warning, and "Invalid JSON path syntax" with the path for any
-   JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`), so a filter on the `sqlglot` logger drops every
-   record it emits while the guard parses, in that context only. Nothing is disabled globally, and sqlglot logs
-   as usual everywhere else.
+     call a stored procedure from `FROM TABLE(...)`, and a procedure may write. A qualified call named like one of
+     them is refused wherever it stands.
+2. **A parser**: sqlglot's tokens and tree (Snowflake dialect; its tokenizer reads quotes as Snowflake does). The
+   text must be exactly one statement whose root is a query, and nowhere in it may there be:
+   - a write, DDL, session, transaction, bind-variable or unparsed node;
+   - a `$` or `@` token, a `$$` string, a name holding `$` (quoted or not, a function's too), or a table named `@...`;
+   - a `NEXTVAL` name (quoted or not);
+   - an `AI_*` call, a `CORTEX` qualifier, an `IDENTIFIER(...)` or a model's method;
+   - a table function outside that list, including a qualified one in a bare `FROM` or `JOIN`
+     (`FROM s.FLATTEN(...)`).
+
+   Text it can't parse is refused. sqlglot logs pieces of the SQL it parses (its "unsupported syntax" warning, and
+   "Invalid JSON path syntax" with the path for any JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`),
+   so a filter on the `sqlglot` logger drops every record it emits while the guard parses, in that context only.
+   Nothing is disabled globally, and sqlglot logs as usual everywhere else.
+
+What only one check refuses:
+- Only the lexer: a write keyword as a bare word (`SELECT update FROM t`, where sqlglot reads a column), `|>`, a
+  control character, a second `;`, and the text readers are known to disagree on (a backslash before a quote, a
+  bare CR, a nested comment). The parser reads such text one way, as Snowflake does where they are known to agree.
+  The lexer refuses it because the parser is only as faithful as sqlglot's reading of Snowflake.
+- Only the parser: a table function in a bare `FROM` or `JOIN` under a name other than the built-ins'
+  (`FROM t, my_udtf(1)`), which the lexer can't tell from `EXTRACT(YEAR FROM TO_DATE(x))`, and the `?` and `:1`
+  binds. `test_what_the_lexer_leaves_to_the_parser` lists them.
+- Neither looks inside a string: what it holds is data.
+
+A default schema named `CORTEX` (the `schema_name` argument, a pull's `schema`, or the blob's `schema`) is refused as
+well: there, an unqualified `COMPLETE(...)` is `SNOWFLAKE.CORTEX.COMPLETE`.
 
 So DML, DDL, DCL, `COPY`, `CALL`, Snowflake Scripting blocks, `EXECUTE IMMEDIATE` and several statements are
 refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake adds its own layers behind these:
 - Every request sets `MULTI_STATEMENT_COUNT` to 1, so Snowflake itself refuses a second statement.
 - The role holds read-only grants (checklist step 3), and the user has no other role: `DEFAULT_SECONDARY_ROLES` is
-  empty, so no other role's privileges join in.
+  empty, so no other role's privileges join in. The exception is `PUBLIC`, which every role inherits: whatever the
+  customer granted to `PUBLIC` is readable too, and step 3 has them check it.
 - Every statement carries `QUERY_TAG` `aisquare-pipe`: the customer finds AISquare's queries in `QUERY_HISTORY`.
 
 **Caps.**
@@ -147,7 +181,11 @@ refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake a
   metadata without a budget, 120 s for the source) is sent as the statement's `timeout`, so Snowflake stops it then
   too. Polling stops at the deadline, the statement is cancelled, and the call fails `timeout`.
 - **Cost.** Snowflake bills warehouse time, not bytes scanned. The deadline bounds each statement. The warehouse's
-  own `STATEMENT_TIMEOUT_IN_SECONDS`, its size and a resource monitor bound the rest (checklist step 2).
+  own `STATEMENT_TIMEOUT_IN_SECONDS`, its size and a resource monitor bound the rest (checklist step 2). Cortex AI
+  functions are the exception: they bill AI credits by the token, and no warehouse limit or resource monitor bounds
+  those. So the guard refuses every `SNOWFLAKE.CORTEX.*` and `AI_*` call and a model's methods. A view or a function
+  that calls Cortex itself is out of the guard's sight, and only the role's grants stop it (checklist step 3,
+  `CORTEX_USER`).
 
 **Server-controlled.** The account, the user, the key or OAuth client, the role and the warehouse come only from the
 tenant's server-side blob. The tool schemas reject them (`additionalProperties: false`), and the source refuses them
@@ -187,6 +225,8 @@ The connector's own logs carry no SQL, table names or row values.
 
 **Not supported:**
 - Bind variables, session variables, Snowflake Scripting, stored procedures and user-defined table functions.
+- Cortex AI functions (`SNOWFLAKE.CORTEX.*`, `AI_*`) and a model's methods (`m!PREDICT(...)`): they bill AI credits
+  outside the warehouse's limits. `IDENTIFIER(...)`, and `$` in any name.
 - Stages: listing and reading staged files (`LIST @stage`, `GET`) is not built. GoodRx has not yet said whether
   policies live in stages. An external stage is a pointer to an S3, GCS or Azure bucket, and pipe's `s3` and `gcs`
   connectors read the bucket directly with narrower grants. Reading an internal stage needs `GET_PRESIGNED_URL` and
@@ -205,7 +245,9 @@ The connector's own logs carry no SQL, table names or row values.
 - `USERADMIN` (or `SECURITYADMIN`) to create the user and the role and to grant the role to the user.
 - `SECURITYADMIN`, or the owner of the database or schema, to grant `USAGE` and `SELECT`.
 - `SYSADMIN` (or a role with `CREATE WAREHOUSE`) for the warehouse. `ACCOUNTADMIN` for a resource monitor.
-- Optional: `SECURITYADMIN` for a network policy; `ACCOUNTADMIN` for an External OAuth security integration.
+- `ACCOUNTADMIN` to revoke `SNOWFLAKE.CORTEX_USER` from `PUBLIC`, if you decide to (step 3).
+- Optional: `SECURITYADMIN` for a network policy, with `CREATE NETWORK RULE` on the schema that holds its rule;
+  `ACCOUNTADMIN` for an External OAuth security integration.
 
 Find the account identifier (`<orgname>-<account_name>`) with
 `SELECT CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME();`. A legacy account locator also works, in
@@ -248,6 +290,30 @@ regions with `fhplus.` or `dod.` first). Any other suffix is refused. For Privat
    Never grant this role `OWNERSHIP`, any `CREATE ...`, `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`, `MODIFY` or `OPERATE`
    on the warehouse, `USAGE` on procedures, functions, external functions or integrations, `MANAGE GRANTS`, or
    another role. It needs none of them.
+
+   Then check what the role gets without being granted it. Every role inherits `PUBLIC`:
+
+   ```sql
+   SHOW GRANTS TO ROLE PUBLIC;
+   ```
+
+   - Whatever `PUBLIC` holds there (`USAGE` on a database or schema, `SELECT` on a table or view) AISquare can read
+     too. Revoke from `PUBLIC` what AISquare must not read.
+   - By default, Snowflake grants the database role `SNOWFLAKE.CORTEX_USER` to `PUBLIC` (look for that name in the
+     list). It lets every role call the Cortex AI functions. They bill AI credits, which no warehouse limit or
+     resource monitor bounds. The connector refuses direct calls
+     (`SNOWFLAKE.CORTEX.*`, `AI_*`), but a view or a function that the role reads can call Cortex itself. Decide:
+     - AISquare's role gets no Cortex (recommended). Revoke it from `PUBLIC` and grant it only to the roles that use
+       Cortex. This changes every role in the account, so check with whoever uses Cortex first:
+
+       ```sql
+       USE ROLE ACCOUNTADMIN;
+       REVOKE DATABASE ROLE SNOWFLAKE.CORTEX_USER FROM ROLE PUBLIC;
+       GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE <a role that uses Cortex>;
+       ```
+
+     - Or keep it. Then a view or function that calls Cortex spends AI credits whenever AISquare reads it. Don't
+       grant AISquare's role such views, and tell AISquare devops that this is your choice.
 4. **Create the service user** with AISquare's public key (step 6 of the devops part sends it to you; it is not a
    secret):
 
@@ -265,11 +331,13 @@ regions with `fhplus.` or `dod.` first). Any other suffix is refused. For Privat
    `DESC USER AISQUARE_READER` shows `RSA_PUBLIC_KEY_FP`, which must equal the fingerprint AISquare devops sends with
    the key.
 5. **If the account has a network policy**, AISquare's egress IP addresses must be allowed (AISquare devops gives
-   them for each environment). Or restrict this user to them alone:
+   them for each environment). Or restrict this user to them alone. A network rule is a schema-level object: create
+   it in a schema AISquare's role can't read, as a role with `CREATE NETWORK RULE` on that schema, and name it in
+   full (`<db>.<schema>.AISQUARE_EGRESS`) in the policy:
 
    ```sql
-   CREATE NETWORK RULE AISQUARE_EGRESS MODE = INGRESS TYPE = IPV4 VALUE_LIST = ('<ip-1>', '<ip-2>');
-   CREATE NETWORK POLICY AISQUARE_ONLY ALLOWED_NETWORK_RULE_LIST = ('AISQUARE_EGRESS');
+   CREATE NETWORK RULE <db>.<schema>.AISQUARE_EGRESS MODE = INGRESS TYPE = IPV4 VALUE_LIST = ('<ip-1>', '<ip-2>');
+   CREATE NETWORK POLICY AISQUARE_ONLY ALLOWED_NETWORK_RULE_LIST = ('<db>.<schema>.AISQUARE_EGRESS');
    ALTER USER AISQUARE_READER SET NETWORK_POLICY = AISQUARE_ONLY;
    ```
 
@@ -306,7 +374,7 @@ issues them and Snowflake trusts it through an External OAuth security integrati
 ALTER USER AISQUARE_READER SET DISABLED = TRUE;   -- stops every call at once
 REVOKE ROLE AISQUARE_READONLY FROM USER AISQUARE_READER;
 DROP USER AISQUARE_READER;
-DROP ROLE AISQUARE_READONLY;                       -- and the warehouse, monitor and policy if made for AISquare
+DROP ROLE AISQUARE_READONLY;                       -- and the warehouse, monitor, policy and rule if made for AISquare
 ```
 
 ### AISquare devops
@@ -361,23 +429,25 @@ below, then delete both files.
   - A value edited in Secrets Manager is overwritten with the GitHub one at the next sync.
   - A listed secret whose GitHub value is missing stops the sync for EVERY secret.
 
-  1. Store the value: `gh secret set SNOWFLAKE_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`
-     (the JSON below, from a file that is deleted afterwards). Each environment gets its own key, so its own GitHub
-     secret: `SNOWFLAKE_<TENANT>_JSON` for `stg`, `DEV_SNOWFLAKE_<TENANT>_JSON` for `dev` (as
-     `DEV_INTERNAL_AUTH_TOKEN` is).
+  Each environment gets its own key, so its own GitHub secret. Below, `<GH_SECRET>` is its name:
+  `SNOWFLAKE_<TENANT>_JSON` for `stg`, `DEV_SNOWFLAKE_<TENANT>_JSON` for `dev` (as `DEV_INTERNAL_AUTH_TOKEN` is).
+
+  1. Store the value: `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`
+     (the JSON below, from a file that is deleted afterwards).
   2. In aisquare-infra, add to `live/nonprod/data/supplied-secrets.json`:
 
      ```json
      {
        "nonprod/<env>/pipe-service/snowflake-<tenant>": {
-         "github_secret": "SNOWFLAKE_<TENANT>_JSON",
+         "github_secret": "<GH_SECRET>",
          "description": "PIPE_SECRET__<TENANT>__SNOWFLAKE__JSON of the <env> pipe service: the Snowflake service user blob of <tenant>"
        }
      }
      ```
 
      Also add its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
-     `SNOWFLAKE_<TENANT>_JSON: ${{ secrets.SNOWFLAKE_<TENANT>_JSON }}`. Then:
+     `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}` (for dev,
+     `DEV_SNOWFLAKE_<TENANT>_JSON: ${{ secrets.DEV_SNOWFLAKE_<TENANT>_JSON }}`). Then:
      - Merge. The GitHub secret is already set, so the sync can't fail on it.
      - Let `apply-nonprod` create the secret.
      - Check that `secrets-nonprod` ran green.
@@ -401,7 +471,9 @@ pod or task starts.
 service reads, the shared Composio key included, and a missing secret reads as no key. Flipping it "for Snowflake"
 takes Composio down for every connector in that environment. Moving to the aws backend is a whole-service migration
 (pipe-as-service `DEPLOYMENT.md`). After that migration, the tenant's secret is
-`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/snowflake`, picked up within about 60 s with no deploy.
+`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/snowflake`, read with no deploy. A new secret is picked up within
+about 60 s (`PIPE_SERVICE_NATIVE_CREDENTIALS_TTL_SECONDS`). A changed value can be served from the service's cache
+for up to 300 s, so a rotation keeps the old key valid at least that long.
 
 **The secret's value**, one JSON object, read for both `snowflake` and `snowflake-query-source`. Key-pair (the
 default):
@@ -450,8 +522,8 @@ access and the handoff vault. Until the secret is read, pipe-as-service answers 
 2. Replace `private_key_pem` in the value:
    - ECS: put the new value into `ais-pipe-service/<env>/snowflake-<tenant>`, then force a new deployment of the
      service and wait until the old tasks are gone.
-   - EKS: run `gh secret set SNOWFLAKE_<TENANT>_JSON --env nonprod-secrets ...` and `secrets-nonprod`, never an edit
-     in Secrets Manager.
+   - EKS: run `gh secret set <GH_SECRET> --env nonprod-secrets ...` (`DEV_SNOWFLAKE_<TENANT>_JSON` for dev) and
+     `secrets-nonprod`, never an edit in Secrets Manager.
      - Wait for External Secrets to refresh (interval 1 h), or force it:
        `kubectl annotate externalsecret <name> -n <namespace> force-sync=$(date +%s) --overwrite`.
      - Restart the Deployment (`kubectl rollout restart`). The chart has no checksum or reloader, so pods keep the
@@ -467,7 +539,8 @@ For OAuth, the customer adds a second client secret in the identity provider, an
 - EKS:
   - Remove the `secretEnv` entry from `release.yaml` (a deploy).
   - In one PR, remove the `supplied-secrets.json` entry and the `secrets-nonprod.yml` env line.
-  - Run `gh secret delete SNOWFLAKE_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`.
+  - Run `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`
+    (`DEV_SNOWFLAKE_<TENANT>_JSON` for dev).
   - Deleting the Secrets Manager secret by hand while the entry is listed does nothing lasting: the next apply
     re-creates it and the sync refills it.
 - Tell the customer to do their offboarding (above) as well. Deleting our copy of the key does not disable the

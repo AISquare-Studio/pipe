@@ -89,6 +89,7 @@ from aisquare_pipe_snowflake.refs import (
 from aisquare_pipe_snowflake.rows import canonical, result_sha256, rows_sha256
 from aisquare_pipe_snowflake.sqlguard import (
     NotReadOnly,
+    check_context,
     check_select_only,
     table_references,
 )
@@ -340,6 +341,7 @@ class SnowflakeQuerySource(SourceConnector):
                 statement = _table_select(ref, columns, order_by, start, max_rows)
             else:
                 statement = check_select_only(options["sql"])
+                check_context(database, schema)
         except BadReference as e:
             raise ValueError(str(e)) from None
         with SnowflakeClient(creds, session=self._session) as client:
