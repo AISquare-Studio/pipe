@@ -36,10 +36,13 @@ warning (switched off in :class:`_QuietParser`), and "Invalid JSON path
 syntax. ... <the path>" at WARNING for a JSON path it can't read (a key with
 a dash, a space or an open bracket, in ``JSON_EXTRACT``,
 ``JSON_EXTRACT_SCALAR`` or ``JSONB_EXISTS``), for statements this guard
-admits. So while this module parses, a filter on the "sqlglot" logger (every
-sqlglot module logs through that one logger) drops its records, in this
-context only: they reach no handler, and not Python's ``lastResort`` either.
-Nothing is disabled globally, and sqlglot logs as usual everywhere else.
+admits. So this module parses inside
+:func:`aisquare.pipe.core.sql.quiet_sqlglot`, the helper every SQL guard
+shares: a filter on the "sqlglot" logger drops its records, in this context
+only, so they reach no handler, and not Python's ``lastResort`` either.
+Nothing is disabled globally, and sqlglot logs as usual everywhere else. A
+sqlglot older than the extra's floor (:data:`SQLGLOT_FLOOR`; another package
+can bring one in) refuses every statement.
 
 Behind these, Redshift itself: the database user the blob names should hold
 only ``USAGE`` and ``SELECT`` grants (see the README), so a write that got
@@ -48,18 +51,18 @@ past both checks would still be refused by the database.
 
 from __future__ import annotations
 
-import logging
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 
+import sqlglot
+from aisquare.pipe.core.sql import quiet_sqlglot, sqlglot_at_least
 from sqlglot import exp
 from sqlglot.dialects.redshift import Redshift
 from sqlglot.errors import SqlglotError
 
 MAX_SQL_CHARS = 20_000
+#: The oldest sqlglot the guard runs on: the ``[aws]`` extra's floor.
+SQLGLOT_FLOOR = (26, 25)
 
 # Statement roots that read.
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = tuple(
@@ -192,44 +195,18 @@ class _QuietParser(Redshift.Parser):
 
 _DIALECT = Redshift()
 
-# sqlglot logs pieces of the SQL it parses ("Invalid JSON path syntax. ...
-# <the path>" at WARNING, for statements this guard admits). Every sqlglot
-# module logs through the one "sqlglot" logger, and a logger's filter runs
-# before any handler, Python's lastResort included. This filter drops its
-# records while THIS module parses, in this context only (a ContextVar: another
-# thread or task logging through sqlglot meanwhile is untouched). Nothing is
-# disabled globally.
-_SQLGLOT_LOGGER = logging.getLogger("sqlglot")
-_PARSING: ContextVar[bool] = ContextVar(
-    "aisquare_pipe_aws_redshift_sqlguard_parsing", default=False
-)
-
-
-class _DropWhileParsing(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _PARSING.get()
-
-
-_QUIET_WHILE_PARSING = _DropWhileParsing()
-
-
-@contextmanager
-def _sqlglot_silenced() -> Iterator[None]:
-    # Re-attached on every parse: a host that resets the logger's filters
-    # doesn't bring the leak back.
-    if _QUIET_WHILE_PARSING not in _SQLGLOT_LOGGER.filters:
-        _SQLGLOT_LOGGER.addFilter(_QUIET_WHILE_PARSING)
-    token = _PARSING.set(True)
-    try:
-        yield
-    finally:
-        _PARSING.reset(token)
-
 
 def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
     pass): stripped, and without a single trailing ``;``. Else
     :class:`NotReadOnly`."""
+    if not sqlglot_at_least(str(getattr(sqlglot, "__version__", "")), SQLGLOT_FLOOR):
+        raise NotReadOnly(
+            "the SQL guard needs sqlglot "
+            + ".".join(map(str, SQLGLOT_FLOOR))
+            + " or later and this host has an older one, so no statement may run; "
+            "the host must install aisquare-pipe[redshift] as declared"
+        )
     if not isinstance(sql, str) or not sql.strip():
         raise NotReadOnly("the statement is empty")
     if len(sql) > MAX_SQL_CHARS:
@@ -397,7 +374,7 @@ def _blank(sql: str, *, quoted_names: list[str] | None = None) -> tuple[str, lis
 def _parse(sql: str) -> list[exp.Expression]:
     """Every statement in ``sql`` (sqlglot, Redshift dialect, silently:
     nothing sqlglot logs while it parses gets out)."""
-    with _sqlglot_silenced():
+    with quiet_sqlglot():
         tokens = _DIALECT.tokenize(sql)
         parser = _QuietParser(dialect=_DIALECT)
         return [s for s in parser.parse(tokens, sql) if s is not None]
@@ -433,6 +410,7 @@ def _parsed_problem(sql: str) -> str | None:
 
 __all__ = [
     "MAX_SQL_CHARS",
+    "SQLGLOT_FLOOR",
     "NotReadOnly",
     "check_select_only",
     "quote_identifier",

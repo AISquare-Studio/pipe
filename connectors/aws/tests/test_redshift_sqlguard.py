@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from aisquare.pipe.core import sql as core_sql
 
 from aisquare_pipe_aws.redshift import sqlguard
 from aisquare_pipe_aws.redshift.sqlguard import (
@@ -451,7 +452,20 @@ def test_the_guard_stays_quiet_if_its_filter_was_removed(
         sqlglot_logger.addFilter(lambda record: True)
     assert check_select_only(ADMITTED_WITH_JSON_PATHS[0])
     assert sqlglot_records == []
-    assert sqlguard._QUIET_WHILE_PARSING in sqlglot_logger.filters
+    # The shared helper's filter (aisquare.pipe.core.sql), back on the logger.
+    assert core_sql._FILTER in sqlglot_logger.filters
+
+
+def test_an_old_sqlglot_refuses_every_statement(monkeypatch):
+    """The [aws] extra needs sqlglot >= 26.25; a host that got an older one
+    from another package fails closed."""
+    import sqlglot
+
+    monkeypatch.setattr(sqlglot, "__version__", "26.24.0")
+    with pytest.raises(NotReadOnly, match="needs sqlglot 26.25 or later"):
+        check_select_only("SELECT 1")
+    monkeypatch.setattr(sqlglot, "__version__", "26.25.0")
+    assert check_select_only("SELECT 1") == "SELECT 1"
 
 
 def test_another_thread_logging_through_sqlglot_meanwhile_is_untouched(

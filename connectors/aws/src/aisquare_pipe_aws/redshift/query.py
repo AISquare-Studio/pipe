@@ -8,6 +8,7 @@ one read-only query never reaches AWS, not even STS.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -32,9 +33,22 @@ class Result:
     truncated: str | None
     result_bytes: int
     duration_ms: int | None
+    #: Read with ``encoded=True``: each row as the source's envelopes carry
+    #: it (:func:`~aisquare_pipe_aws.redshift.rows.envelope_json`) and its
+    #: :func:`~aisquare_pipe_aws.redshift.rows.row_digest`, instead of
+    #: ``rows`` (about a fifth of the memory row objects take).
+    encoded: list[bytes] | None = None
+    digests: list[str] | None = None
+
+    @property
+    def count(self) -> int:
+        """The rows read, as objects or encoded."""
+        return len(self.rows) if self.encoded is None else len(self.encoded)
 
     @property
     def result_sha256(self) -> str:
+        if self.digests is not None:
+            return rows.result_sha256_of_digests(self.columns, self.digests)
         return rows.result_sha256(self.columns, self.rows)
 
 
@@ -46,9 +60,12 @@ def run_select(
     deadline: dataapi.Deadline,
     max_rows: int,
     max_result_bytes: int,
+    encoded: bool = False,
 ) -> Result:
     """Check ``sql``, then run it and read at most ``max_rows`` rows and
-    ``max_result_bytes`` bytes of JSON rows. Raises
+    ``max_result_bytes`` bytes of JSON rows (``encoded``: kept as JSON
+    bytes and digests, :class:`Result`). One parsed page is held at a time,
+    and its rows are converted one by one. Raises
     :class:`~aisquare_pipe_aws.redshift.sqlguard.NotReadOnly` before any AWS
     call; :class:`~aisquare_pipe_aws.redshift.dataapi.StatementTimeout`,
     :class:`~aisquare_pipe_aws.redshift.dataapi.StatementFailed` and
@@ -59,6 +76,9 @@ def run_select(
     statement = dataapi.execute(api, target, statement_sql)
     cols: list[dict[str, Any]] = []
     out: list[dict[str, Any]] = []
+    as_json: list[bytes] | None = [] if encoded else None
+    digests: list[str] | None = [] if encoded else None
+    count = 0
     size = 0
     total = statement.result_rows
     truncated: str | None = None
@@ -67,21 +87,28 @@ def run_select(
             cols = rows.columns(page.get("ColumnMetadata"))
         if total is None and isinstance(page.get("TotalNumRows"), int):
             total = page["TotalNumRows"]
-        for row in rows.convert_page(cols, page.get("Records")):
-            if len(out) >= max_rows:
+        for row in rows.iter_page(cols, page.get("Records")):
+            if count >= max_rows:
                 truncated = TRUNCATED_ROWS
                 break
-            row_bytes = rows.json_size(row)
+            stable = rows.canonical(row)
+            row_bytes = len(stable)  # rows.json_size, without a second dump
             if size + row_bytes > max_result_bytes:
                 truncated = TRUNCATED_BYTES
                 break
-            out.append(row)
+            if as_json is None or digests is None:
+                out.append(row)
+            else:
+                as_json.append(rows.envelope_json(row))
+                digests.append(hashlib.sha256(stable).hexdigest())
+            count += 1
             size += row_bytes
         if truncated is not None:
             break
-        if len(out) >= max_rows and page.get("NextToken"):
+        if count >= max_rows and page.get("NextToken"):
             truncated = TRUNCATED_ROWS
             break
+        del page  # let go before the generator reads the next page
     duration = statement.duration_ns
     return Result(
         statement_id=statement.id,
@@ -91,4 +118,6 @@ def run_select(
         truncated=truncated,
         result_bytes=size,
         duration_ms=duration // 1_000_000 if duration is not None else None,
+        encoded=as_json,
+        digests=digests,
     )

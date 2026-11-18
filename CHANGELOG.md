@@ -185,9 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
     and control characters outside quotes, and the side-effect functions in double quotes.
     Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
-    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so a filter on
-    the `sqlglot` logger drops its records in the parsing thread or task only (no global
-    switch). Python's last-resort stderr handler doesn't see them either.
+    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so the guard
+    parses inside `aisquare.pipe.core.sql.quiet_sqlglot()` (the parsing thread or task only, no
+    global switch). Python's last-resort stderr handler doesn't see them either.
   - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
     (paged) inside one deadline: the host's time budget, else 60 s (the source's
     `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
@@ -209,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON key with a dash, in statements the guards admit); a ContextVar-gated filter on the `sqlglot`
   logger drops them in that context only, before any handler, so `logging.lastResort` never prints
   them either. Nothing is disabled globally. `sqlglot_at_least()` lets a guard refuse every statement
-  below its extra's floor (BigQuery and Snowflake do, at 26.25).
+  below its extra's floor (BigQuery, Snowflake and Redshift do, at 26.25).
 - `aisquare.pipe.testing.host.host_answer(exc)`: the HTTP status pipe-as-service answers a source's
   exception with, for connector tests.
 
@@ -217,20 +217,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `PipelineError` takes an optional `retry_after` (seconds). It is what a source raises for an upstream
   or transient failure: pipe-as-service answers it 502 `upstream_error`, by its exact type.
-- The BigQuery, Cloud Storage, Glean, Snowflake, S3 and Bedrock AgentCore sources no longer raise their
-  connector's API error (a bare `Exception` or `PipeError` subclass, which pipe-as-service answered 500
-  with the provider's text in its log). An upstream or transient failure is a `PipelineError` (502,
-  `retry_after` from the provider's `Retry-After`); what the caller can fix is a `ValueError` subclass
-  (422: `BigQueryRequestError`, `GcsRequestError`, `GleanRequestError`, `SnowflakeRequestError`,
-  `AwsRequestError`). Neither carries the provider's own error text; the toolkits still show it.
-  `AwsNotConfiguredError` is a `ValueError` first (422). Non-mapping pull params are a `ValueError`.
-- BigQuery and Snowflake sources fit a 512 MiB pod: pages and partitions are let go before the next is
+- The BigQuery, Cloud Storage, Glean, Snowflake, S3, Bedrock AgentCore and Redshift sources no longer
+  raise their connector's API error (a bare `Exception` or `PipeError` subclass, which pipe-as-service
+  answered 500 with the provider's text in its log). An upstream or transient failure is a
+  `PipelineError` (502, `retry_after` from the provider's `Retry-After`); what the caller can fix is a
+  `ValueError` subclass (422: `BigQueryRequestError`, `GcsRequestError`, `GleanRequestError`,
+  `SnowflakeRequestError`, `AwsRequestError`, `RedshiftRequestError`). Redshift's `StatementTimeout` is
+  a `PipelineError`, and a `StatementFailed` is a `RedshiftRequestError` (its SQL, a missing relation)
+  or a `PipelineError` (a grant, an abort). Neither carries the provider's own error text (a database
+  error can echo the caller's values); the toolkits still show it. `AwsNotConfiguredError` is a
+  `ValueError` first (422). Non-mapping pull params are a `ValueError`.
+- BigQuery, Snowflake and Redshift sources fit a 512 MiB pod: pages and partitions are let go before the next is
   read (BigQuery pages hold at most 50,000 cells), rows convert one at a time and are kept as their
   canonical JSON (the envelopes and hashes are unchanged, byte for byte), and a batch's rows are let go
   once its envelope is built. `max_result_bytes` is at most 64 MiB (was 100 MiB). Peaks (tracemalloc,
   every envelope kept): BigQuery 21 MiB at the defaults (was 149) and 103 MiB at the caps; Snowflake
-  47 MiB (was 65) and 93-104 MiB (was 367 MiB at 100 MiB). The READMEs' "Memory" sections have the
-  numbers.
+  47 MiB (was 65) and 93-104 MiB (was 367 MiB at 100 MiB); Redshift 16 MiB (was 29) and 96 MiB
+  (was 277 MiB at 100 MiB, seq 13894). The READMEs' "Memory" sections have the numbers.
 - BigQuery: "Custom quota exceeded" is `forbidden` with when it resets, not `rate_limited`; a job error
   inside a 200 maps by its reason (`accessDenied` is `forbidden`); `WWW-Authenticate` reaches
   `error_code_for_status` (`insufficient_scope`); Drive-backed external tables are listed as not

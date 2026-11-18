@@ -17,7 +17,10 @@ from aisquare_pipe_aws.redshift.config import (
     RedshiftNotConfiguredError,
     RedshiftTarget,
 )
-from aisquare_pipe_aws.redshift.connector import RedshiftQuerySource
+from aisquare_pipe_aws.redshift.connector import (
+    RedshiftQuerySource,
+    RedshiftRequestError,
+)
 from aisquare_pipe_aws.redshift.sqlguard import NotReadOnly, check_select_only
 from aisquare_pipe_aws.redshift.toolkit import RedshiftToolkit
 
@@ -26,6 +29,7 @@ __all__ = [
     "RedshiftConfig",
     "RedshiftNotConfiguredError",
     "RedshiftQuerySource",
+    "RedshiftRequestError",
     "RedshiftTarget",
     "RedshiftToolkit",
     "check_select_only",
