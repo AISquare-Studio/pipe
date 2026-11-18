@@ -13,8 +13,10 @@ Subcommands:
                  (the default): the distribution; it checks the version is
                  static and valid, the extras that name each other exist, and
                  on a release that the tag is ``v<version>``. ``--target shims``:
-                 the ten shim projects. With ``--pypi``, look each version up
-                 on PyPI. Writes GitHub Actions outputs and a step summary.
+                 the ten shim projects. A pull request (``--event
+                 pull_request``, the default) plans both, as a dry run. With
+                 ``--pypi``, look each version up on PyPI. Writes GitHub
+                 Actions outputs and a step summary.
     build        Build one planned package (the distribution, or a shim) into
                  a dist directory.
     check-dist   A built dist directory holds exactly one wheel and one sdist
@@ -81,6 +83,9 @@ USER_AGENT = "aisquare-pipe-release-check (+https://github.com/AISquare-Studio/p
 
 TARGET_FRAMEWORK = "aisquare-pipe"
 TARGET_SHIMS = "shims"
+#: A pull request's dry run: the distribution and every shim, so each PR
+#: builds and checks everything a publish run could upload.
+TARGET_ALL = "all"
 
 #: The connectors that were their own PyPI projects (aisquare-pipe-<name>)
 #: before 0.5.0. Fixed: no other connector ever gets a PyPI project.
@@ -244,8 +249,10 @@ def packages_for(tree: Tree, target: str) -> list[Package]:
         return [framework_package(tree)]
     if target == TARGET_SHIMS:
         return shim_packages()
+    if target == TARGET_ALL:
+        return [framework_package(tree), *shim_packages()]
     raise ReleaseError(
-        f"unknown target {target!r} ({TARGET_FRAMEWORK} or {TARGET_SHIMS})"
+        f"unknown target {target!r} ({TARGET_FRAMEWORK}, {TARGET_SHIMS} or {TARGET_ALL})"
     )
 
 
@@ -484,10 +491,12 @@ def make_plan(
         target = (
             TARGET_FRAMEWORK  # a GitHub Release only ever publishes the distribution
         )
+    elif event == "pull_request":
+        target = TARGET_ALL  # a PR uploads nothing, and checks everything
     packages = packages_for(tree, target)
     upload = event == "release" or (event == "workflow_dispatch" and not dry_run)
     plan = Plan(target=target, packages=packages, upload=upload)
-    if target == TARGET_FRAMEWORK:
+    if target in (TARGET_FRAMEWORK, TARGET_ALL):
         framework = packages[0]
         plan.problems += internal_problems(framework, tree)
         if event == "release" and tag != f"v{framework.version}":
@@ -515,6 +524,7 @@ def make_plan(
                 f"{pkg.name} is not on PyPI at all, and this workflow never creates a project"
             )
     if target == TARGET_SHIMS:
+        # Only a shim run can upload a shim; a PR's shims are a build check.
         _check_shim_floor(plan, fetch)
     if upload and not plan.problems and not plan.to_upload():
         plan.warnings.append("every version is already on PyPI: nothing to upload")
@@ -550,12 +560,16 @@ def shim_files(name: str) -> dict[str, str]:
         f"third-party dependencies as the `[{name}]` extra:\n\n"
         f'```bash\npip install "{FRAMEWORK}[{name}]"\n```\n\n'
         f"This release has no code. It only requires `{FRAMEWORK}[{name}]>={SHIM_FLOOR}`, so "
-        f"existing `pip install {project}` lines keep working. The module is still "
+        f"existing `pip install {project}` lines keep working in a fresh environment. The module is still "
         f"`{module}`.\n\n"
-        f"Upgrading an environment that has an older {project} installed: afterwards run "
-        f"`pip install --force-reinstall --no-deps {FRAMEWORK}`, or use a fresh environment. "
+        f"## Upgrading from an older {project}\n\n"
         f"The old release and {FRAMEWORK} install the same files, and removing the old "
-        f"release removes them.\n"
+        f"release removes them. Uninstall it first, then install the extra:\n\n"
+        f'```bash\npip uninstall -y {project}\npip install "{FRAMEWORK}[{name}]>={SHIM_FLOOR}"\n```\n\n'
+        f"If you already upgraded in place, never `pip uninstall {project}` without running "
+        f"`pip install --force-reinstall --no-deps {FRAMEWORK}` afterwards. The same command "
+        f"repairs an environment where `{module}` fails to import. A fresh environment is "
+        f"never affected.\n"
     )
     pyproject = f'''[build-system]
 requires = ["setuptools>=77.0"]

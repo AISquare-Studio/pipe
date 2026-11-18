@@ -11,10 +11,12 @@ name: publish
 # be their own PyPI projects get a code-free shim release requiring
 # `aisquare-pipe[<name>]`: Run workflow with target "shims".
 #
-# - pull_request, or Run workflow with "dry-run" ticked (the default): build,
-#   check (name/version, the wheel's RECORD against connectors/, `twine check
-#   --strict`) and upload nothing. A dry run of target "shims" builds and
-#   checks all ten shims.
+# - pull_request: a dry run of everything a publish could upload, the
+#   distribution and all ten shims. Build, check (name/version, the wheel's
+#   RECORD against connectors/, a shim's lone requirement, `twine check
+#   --strict`) and upload nothing.
+# - Run workflow with "dry-run" ticked (the default): the same for the chosen
+#   target, aisquare-pipe or the shims.
 # - A published GitHub Release (its tag must be v<aisquare-pipe version>), or
 #   Run workflow with "dry-run" unticked: the same build and checks, then the
 #   upload if that version isn't on PyPI yet. Then `verify` checks each file

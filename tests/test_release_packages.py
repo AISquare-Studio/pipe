@@ -227,24 +227,53 @@ def test_internal_problems_flag_metadata_that_would_not_install(tmp_path):
 # -------------------------------------------------------------------- plan
 
 
-def test_pr_dry_run_builds_the_distribution_and_uploads_nothing(tmp_path):
+@pytest.mark.parametrize("target", ["aisquare-pipe", "shims"])
+def test_pr_dry_run_builds_the_distribution_and_every_shim_and_uploads_nothing(
+    tmp_path, target
+):
+    """Whatever the target input says: a PR checks everything a publish
+    could build, and the shims' floor (aisquare-pipe 0.5.0 on PyPI) is no
+    concern of a PR's."""
     plan = rp.make_plan(
         rp.FsTree(_repo(tmp_path)),
         event="pull_request",
-        fetch=FakePypi(projects={"aisquare-pipe"}),
+        fetch=_pypi_with_shim_projects(),
+        target=target,
     )
     out = plan.outputs()
-    assert plan.problems == []
+    assert (plan.problems, plan.warnings) == ([], [])
     assert json.loads(out["packages"]) == [
         {"path": ".", "name": "aisquare-pipe", "version": "0.5.0"}
+    ] + [
+        {"path": f"shims/{n}", "name": f"aisquare-pipe-{n}", "version": "0.5.0"}
+        for n in rp.SHIM_PROJECTS
     ]
-    assert (out["upload"], out["uploads"], out["shims"], out["target"]) == (
+    assert (
+        out["upload"],
+        out["uploads"],
+        out["shims"],
+        out["framework"],
+        out["target"],
+    ) == (
         "false",
         "[]",
         "[]",
-        "aisquare-pipe",
+        "false",
+        "all",
     )
-    assert "would upload" in plan.summary() and "**upload**" not in plan.summary()
+    summary = plan.summary()
+    assert summary.count("would upload") == 11 and "**upload**" not in summary
+
+
+def test_a_pr_dry_run_fails_when_a_shim_project_is_gone(tmp_path):
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="pull_request",
+        fetch=FakePypi(projects={"aisquare-pipe", *SHIM_NAMES[:-1]}),
+    )
+    assert plan.problems == [
+        "aisquare-pipe-salesforce is not on PyPI at all, and this workflow never creates a project"
+    ]
 
 
 def test_a_release_uploads_the_new_version(tmp_path):
@@ -322,7 +351,7 @@ def test_a_failed_lookup_stops_a_publish_but_only_warns_in_a_dry_run(tmp_path):
     )
     assert publish.problems and all("HTTP 403" in p for p in publish.problems)
     dry = rp.make_plan(tree, event="pull_request", fetch=FakePypi(status=403))
-    assert dry.problems == [] and len(dry.warnings) == 1
+    assert dry.problems == [] and len(dry.warnings) == 1 + len(rp.SHIM_PROJECTS)
     assert json.loads(dry.outputs()["uploads"]) == []
 
 
@@ -431,6 +460,10 @@ def test_shim_sources_have_no_code_and_one_requirement():
     assert data["tool"]["setuptools"] == {"packages": [], "py-modules": []}
     assert 'pip install "aisquare-pipe[onedrive]"' in files["README.md"]
     assert "--force-reinstall --no-deps aisquare-pipe" in files["README.md"]
+    # Uninstall-first comes before the install of the extra.
+    readme = files["README.md"]
+    upgrade = readme.index("pip uninstall -y aisquare-pipe-onedrive\n")
+    assert readme.index('pip install "aisquare-pipe[onedrive]>=0.5.0"') > upgrade
 
 
 def test_plan_cli_writes_github_outputs_and_fails_on_a_problem(tmp_path, monkeypatch):
