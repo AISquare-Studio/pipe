@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
 
-from aisquare_pipe_glean import GleanAPIError, GleanNotConfigured, GleanSource
+from aisquare_pipe_glean import (
+    GleanAPIError,
+    GleanNotConfigured,
+    GleanSource,
+    connector,
+)
 from tests.fakes import (
     GLOBAL_BLOB,
     HOST,
@@ -80,6 +86,92 @@ def test_an_edited_document_shows_a_new_marker():
     after = _pull(src, {"document_ids": ["d1"]})[0]
     assert before.metadata["update_time"] != after.metadata["update_time"]
     assert after.data == "edited"
+
+
+def test_a_document_without_update_time_falls_back_to_a_content_hash_marker(caplog):
+    src, _ = _source(
+        response(
+            200,
+            documents(
+                document("d1", updated=None),
+                document("d2"),
+                document("d3", text=["other text"], updated=None),
+            ),
+        )
+    )
+    with caplog.at_level(logging.INFO, logger="aisquare.pipe.glean"):
+        d1, d2, d3 = _pull(src, {"document_ids": ["d1", "d2", "d3"]})
+    # No updateTime: the marker is the SHA-256 of the text, under its own key.
+    for env in (d1, d3):
+        assert "update_time" not in env.metadata
+        assert (
+            env.metadata["content_sha256"]
+            == hashlib.sha256(env.data.encode("utf-8")).hexdigest()
+        )
+    assert d1.metadata["content_sha256"] != d3.metadata["content_sha256"]
+    # With updateTime, that is the marker and there is no hash.
+    assert d2.metadata["update_time"] == "2026-11-01T10:00:00Z"
+    assert "content_sha256" not in d2.metadata
+    # Counted in one line, with no ids or text.
+    assert [r.getMessage() for r in caplog.records] == [
+        (
+            "glean-source: 2 document(s) had no updateTime; their version marker "
+            "is content_sha256"
+        )
+    ]
+
+
+def test_the_content_hash_marker_changes_when_the_text_changes():
+    src, _ = _source(
+        response(200, documents(document("d1", updated=None))),
+        response(200, documents(document("d1", text=["edited"], updated=None))),
+    )
+    before = _pull(src, {"document_ids": ["d1"]})[0]
+    after = _pull(src, {"document_ids": ["d1"]})[0]
+    assert before.metadata["content_sha256"] != after.metadata["content_sha256"]
+
+
+def test_hitting_the_search_page_cap_logs_one_warning_with_counts_only(
+    caplog, monkeypatch
+):
+    monkeypatch.setattr(connector, "MAX_SEARCH_PAGES", 2)
+    src, session = _source(
+        response(200, search_page("d1", cursor="c-2")),
+        response(200, search_page("d2", cursor="c-3")),  # Glean still has more
+        response(200, documents(document("d1"), document("d2"))),
+    )
+    with caplog.at_level(logging.INFO, logger="aisquare.pipe.glean"):
+        envelopes = _pull(src, {"query": "secret policy", "max_documents": 10})
+    assert [e.metadata["glean_document_id"] for e in envelopes] == ["d1", "d2"]
+    assert [c.endpoint for c in session.calls] == ["search", "search", "getdocuments"]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert [r.getMessage() for r in warnings] == [
+        (
+            "glean-source: stopped the search at the 2-page cap with more results "
+            "available; read 2 of up to 10 document(s)"
+        )
+    ]
+    assert "secret policy" not in caplog.text and "d1" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [
+        # Glean says there is nothing more.
+        [search_page("d1", cursor="c-2"), search_page("d2")],
+        # max_documents is reached first.
+        [search_page("d1", cursor="c-2"), search_page("d2", "d3", cursor="c-3")],
+    ],
+)
+def test_a_search_that_ends_within_the_cap_logs_no_warning(caplog, monkeypatch, pages):
+    monkeypatch.setattr(connector, "MAX_SEARCH_PAGES", 2)
+    src, _ = _source(
+        *(response(200, p) for p in pages),
+        response(200, documents(document("d1"), document("d2"))),
+    )
+    with caplog.at_level(logging.INFO, logger="aisquare.pipe.glean"):
+        _pull(src, {"query": "q", "max_documents": 2})
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_document_ids_are_read_in_batches_of_twenty():

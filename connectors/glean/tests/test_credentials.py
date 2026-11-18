@@ -110,3 +110,54 @@ def test_missing_or_malformed_blob_is_not_configured(blob):
     with pytest.raises(GleanNotConfigured) as e:
         load_credentials(blob)
     assert TOKEN not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        {**USER_BLOB, "token": "glean_tok\u20acn"},  # not latin-1
+        {**USER_BLOB, "token": "glean_tok\u00e9n"},  # latin-1, not ASCII
+        {**USER_BLOB, "token": "glean_\u0442\u043e\u043a\u0435\u043d"},
+        {**GLOBAL_BLOB, "act_as": "r\u00ebader@acme.com"},
+        {**GLOBAL_BLOB, "act_as": "reader@acm\u00e9.com"},
+        {**GLOBAL_BLOB, "act_as": "reader@acme.com\u20ac"},
+        {**GLOBAL_BLOB, "act_as": "rea\x00der@acme.com"},
+    ],
+)
+def test_a_non_ascii_token_or_act_as_is_not_configured(blob):
+    # Both go into HTTP headers, which must be ASCII: refuse them up front
+    # instead of failing later as an internal error.
+    with pytest.raises(GleanNotConfigured, match="ASCII") as e:
+        load_credentials(blob)
+    assert TOKEN not in str(e.value)
+
+
+@pytest.mark.parametrize(
+    "ip",
+    [
+        "169.254.169.254",
+        "127.0.0.1",
+        "10.0.0.1",
+        "127.1",  # inet_aton's short forms
+        "169.254.43518",
+        "0xa9.0xfe.0xa9.0xfe",  # hex
+        "0251.0376.0251.0376",  # octal
+        "0x7f.1",
+    ],
+)
+def test_allowed_hosts_refuses_ip_literals(ip):
+    with pytest.raises(GleanNotConfigured, match="IP address"):
+        load_credentials({**USER_BLOB, "host": ip, "allowed_hosts": [ip]})
+    # Listing an IP is refused even when host is a normal Glean host.
+    with pytest.raises(GleanNotConfigured, match="IP address"):
+        load_credentials({**USER_BLOB, "allowed_hosts": [ip]})
+
+
+@pytest.mark.parametrize(
+    "host", ["10-0-0-1.acme.internal", "10.0.0.acme.com", "0x7f.acme.com"]
+)
+def test_an_allowed_host_with_numeric_labels_is_still_a_hostname(host):
+    assert (
+        load_credentials({**USER_BLOB, "host": host, "allowed_hosts": [host]}).host
+        == host
+    )

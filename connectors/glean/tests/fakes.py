@@ -121,9 +121,14 @@ def search_page(*ids: str, cursor: str | None = None) -> dict:
 
 
 def document(
-    doc_id: str, *, text: list[str] | None = None, updated: str = "2026-11-01T10:00:00Z"
+    doc_id: str,
+    *,
+    text: list[str] | None = None,
+    updated: str | None = "2026-11-01T10:00:00Z",
 ) -> dict:
-    return {
+    """A ``getdocuments`` document. ``updated=None`` leaves out
+    ``metadata.updateTime``, as Glean may."""
+    doc: dict[str, Any] = {
         "id": doc_id,
         "datasource": "confluence",
         "docType": "Page",
@@ -143,6 +148,9 @@ def document(
             "author": {"name": "Ann Author"},
         },
     }
+    if updated is None:
+        del doc["metadata"]["updateTime"]
+    return doc
 
 
 def documents(*docs: dict, errors: dict[str, str] | None = None) -> dict:

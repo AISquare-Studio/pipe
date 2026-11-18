@@ -185,6 +185,14 @@ def test_get_document_needs_exactly_one_of_id_and_url(arguments):
     assert session.calls == []
 
 
+def test_get_document_permission_error_entry_is_forbidden():
+    kit, _ = _toolkit(
+        response(200, documents(errors={"d9": "Permission denied for this user"}))
+    )
+    result = kit.call_tool("GLEAN_GET_DOCUMENT", {"document_id": "d9"}, USER_BLOB)
+    assert (result.successful, result.error_code) == (False, "forbidden")
+
+
 def test_get_document_error_entry_is_not_found():
     kit, _ = _toolkit(response(200, documents(errors={"d9": "Document not found"})))
     result = kit.call_tool("GLEAN_GET_DOCUMENT", {"document_id": "d9"}, USER_BLOB)
@@ -218,6 +226,24 @@ def test_without_usable_credentials_every_tool_fails_closed_with_no_request(conf
         assert TOKEN not in result.error
         assert session.calls == []
     assert GleanToolkit().validate_config(config or {}) is False
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {**USER_BLOB, "token": "glean_tok\u20acn"},
+        {**GLOBAL_BLOB, "act_as": "r\u00ebader@acme.com"},
+        {**USER_BLOB, "host": "169.254.169.254", "allowed_hosts": ["169.254.169.254"]},
+    ],
+)
+def test_a_credential_that_cannot_be_sent_is_not_connected_not_an_internal_error(
+    config,
+):
+    kit, session = _toolkit()
+    result = kit.call_tool("GLEAN_SEARCH", {"query": "q"}, config)
+    assert (result.successful, result.error_code) == (False, "not_connected")
+    assert result.error.startswith("Glean is not configured: ")
+    assert session.calls == []
 
 
 @pytest.mark.parametrize(
@@ -276,6 +302,8 @@ def test_requests_go_only_to_the_blob_host_and_never_follow_redirects():
             "token_kind 'global'",
         ),
         (response(408, {}), "timeout", ""),
+        (response(504, {}), "timeout", ""),
+        (response(502, {}), "upstream_error", ""),
         (
             response(422, {"message": "Invalid Query"}),
             "invalid_arguments",

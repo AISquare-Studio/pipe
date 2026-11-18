@@ -1,31 +1,50 @@
-# Glean for aisquare.pipe
+# aisquare-pipe[glean]
 
-Read-only access to a customer's [Glean](https://www.glean.com/) index over
-Glean's Client API. Composio has no Glean toolkit, so this connector is native.
+Glean for [aisquare.pipe](../../README.md): read-only access to a customer's
+[Glean](https://www.glean.com/) index over Glean's Client API. Composio has no
+Glean toolkit, so this connector is native.
 
 - **Toolkit `glean`**: `GLEAN_SEARCH` (the primary tool) and `GLEAN_GET_DOCUMENT`.
 - **Source `glean-source`**: a saved query or a list of document ids, turned into
-  `text/plain` envelopes. Each envelope carries the document's full text and its
-  update time, which serves as the version marker.
+  `text/plain` envelopes. Each envelope carries the document's full text and a
+  version marker: its update time, or a hash of the text when Glean sends no
+  update time.
 
 Nothing here writes to Glean.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[glean]` extra:
+
 ```bash
-pip install "aisquare-pipe[glean]"   # or [full] / [toolkits]
+pip install "aisquare-pipe[glean]"   # or "aisquare-pipe[full]": every connector
 ```
 
-The connector ships inside the `aisquare-pipe` distribution. Its HTTP goes
-through `requests`, which core pipe already depends on, so the `[glean]` extra
-adds no packages.
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/glean && pytest tests
+```
+
+The `[glean]` extra adds no packages: HTTP goes through `requests`, which core
+pipe already depends on.
 
 ## Auth: what the customer sets up
 
-Glean issues the token. There is no OAuth here. A host such as pipe-as-service
-treats the connector as a **per-tenant credential (FIRST_PARTY)**: the toolkit
-declares no `OAuthSpec`. The credential comes from the tenant's server-side
-secret only. Callers cannot set the host, the token or the user Glean reads as.
+Glean issues the token. There is no OAuth here: the toolkit declares no
+`OAuthSpec`, and the credential is a per-tenant blob that comes from the
+tenant's server-side secret only. Callers cannot set the host, the token or
+the user Glean reads as.
+
+**What pipe-as-service runs today.** Only `glean-source` runs through
+pipe-as-service: its credential resolver classifies `glean-source` as a
+per-tenant credential (FIRST_PARTY) and reads the tenant's `glean` blob below.
+pipe-as-service does not serve the `GLEAN_SEARCH` and `GLEAN_GET_DOCUMENT`
+tools yet: its catalogue marks a toolkit that has no registry card and no
+`OAuthSpec` as unsupported. The tools work in any host that loads the toolkit
+directly with the blob as its config. Serving them from pipe-as-service waits
+on its native-toolkit routing work.
 
 ### 1. Find the host
 
@@ -34,7 +53,9 @@ example `acme-be.glean.com`. It must match `^[a-z0-9-]+-be\.glean\.com$`.
 
 If the customer puts its own domain in front of Glean, list that exact host in
 the secret's `allowed_hosts`. Any other host is refused before a request is
-sent, and redirects are never followed.
+sent, and redirects are never followed. IP addresses are refused, both as
+`host` and in `allowed_hosts`, in every form a resolver reads as one (for
+example `169.254.169.254`, `127.1` or `0xa9.0xfe.0xa9.0xfe`).
 
 ### 2. Create a Client API token (Glean admin)
 
@@ -50,9 +71,16 @@ sent, and redirects are never followed.
        create USER tokens for anyone. Admins and API Token Creators can create
        them only for themselves.
      - **GLOBAL**: only Super Admins can create these. Every call must say
-       which user to read as. The service sends `X-Glean-ActAs: <act_as>` on
+       which user to read as. The connector sends `X-Glean-ActAs: <act_as>` on
        every call; the `act_as` value comes from the secret. Rate limits count
        against that user.
+
+       **Warning:** a GLOBAL token can read as *any* user in the Glean
+       tenant, so it is a tenant-wide secret: whoever holds it can read
+       everything any employee can. The connector always reads as the one
+       `act_as` fixed in the secret (no caller can change it), but the token
+       itself is not limited to that user. Prefer a USER token, and if you
+       use a GLOBAL one, store it like any other tenant-wide admin credential.
    - **Scopes**: `SEARCH` (search) and `DOCUMENTS` (reading a document).
    - **Expires**: optional. Put the expiry date in the runbook.
 4. Copy the token secret. Glean shows it only once, and its permissions and
@@ -92,11 +120,14 @@ The keys:
 
 | Key | Required | Meaning |
 |---|---|---|
-| `host` | yes | `<instance>-be.glean.com`, or an entry of `allowed_hosts`. A bare hostname: no scheme, port or path. |
-| `token` | yes | The Glean-issued token. |
+| `host` | yes | `<instance>-be.glean.com`, or an entry of `allowed_hosts`. A bare hostname: no scheme, port, path or IP address. |
+| `token` | yes | The Glean-issued token: printable ASCII, no spaces. |
 | `token_kind` | no (`user`) | `user` or `global`. |
-| `act_as` | only with `global` | The email Glean reads as. It is refused with a `user` token. |
-| `allowed_hosts` | no | Extra hosts allowed for `host`, exact hostnames. |
+| `act_as` | only with `global` | The email Glean reads as, in ASCII. It is fixed here: no caller can change it. It is refused with a `user` token. |
+| `allowed_hosts` | no | Extra hosts allowed for `host`, exact hostnames (no IP addresses). |
+
+The token and `act_as` are sent as HTTP headers, so both must be ASCII. A
+value that is not is refused as not configured.
 
 If the secret is missing or malformed, every tool fails with `not_connected`
 ("Glean is not configured: …") and the source raises `GleanNotConfigured`, both
@@ -120,10 +151,11 @@ How Glean failures map to error codes:
 | 403 | `forbidden`: a scope is missing, or the user cannot see the document |
 | 400 or 422 | `invalid_arguments`. Glean's "Required header missing: X-Glean-ActAs" means a GLOBAL token is configured as `user`. |
 | 429 | `rate_limited`, with `retry_after` when Glean sends it |
-| 408 or a client timeout | `timeout` |
-| 5xx, a redirect, or a body that is not JSON | `upstream_error` |
+| 408, 504 or a client timeout | `timeout` |
+| any other 5xx, a redirect, or a body that is not JSON | `upstream_error` |
 
-A document that Glean answers with `{"error": …}` is `not_found`.
+A document that Glean answers with `{"error": …}` is `forbidden` when the
+error mentions permission, and `not_found` otherwise.
 
 ## Source
 
@@ -131,8 +163,10 @@ A document that Glean answers with `{"error": …}` is `not_found`.
 from aisquare.pipe import PullParams
 from aisquare_pipe_glean import GleanSource
 
-for env in GleanSource().pull(blob, PullParams({"query": "policy", "datasources": ["confluence"]})):
-    env.metadata["update_time"]   # the version marker
+for env in GleanSource().pull(
+    blob, PullParams({"query": "policy", "datasources": ["confluence"]})
+):
+    env.metadata.get("update_time") or env.metadata["content_sha256"]  # the marker
 ```
 
 Pull params:
@@ -141,12 +175,21 @@ Pull params:
 - `datasources`: only together with `query`.
 - `max_documents`: 1-1000, default 100.
 
-Documents are read 20 per `getdocuments` call.
+Documents are read 20 per `getdocuments` call. A query follows at most 50
+search pages. Glean can send short pages, so a pull can stop at that cap with
+fewer than `max_documents` documents; when it does while Glean still has
+results, the source logs one WARNING with the counts (no query, ids or text).
 
 Each envelope's `metadata` holds `glean_document_id`, `title`, `url`,
-`datasource`, `mime_type`, `create_time`, `author` and `update_time` (Glean's
-`metadata.updateTime`). To re-read a document only when it changes, keep
-`update_time` and compare it on the next pull.
+`datasource`, `mime_type`, `create_time`, `author` and exactly one version
+marker:
+
+- `update_time`: Glean's `metadata.updateTime`, when Glean sends one;
+- `content_sha256`: otherwise, the hex SHA-256 of the envelope's `data`
+  (UTF-8). The source counts these documents in one INFO line.
+
+To re-read a document only when it changes, keep its marker and compare it on
+the next pull.
 
 A param that names a credential key (`host`, `token`, `token_kind`, `act_as`,
 `allowed_hosts`) is refused, and so is any unknown param. Documents Glean
@@ -176,7 +219,9 @@ no ids or text.
 
 ## Tests
 
+Every test is hermetic: an autouse guard fails any test that opens a socket,
+and Glean is faked. After the dev install above:
+
 ```bash
-pip install -e ".[full,dev]"           # from the repo root
-cd connectors/glean && pytest tests     # hermetic: sockets are blocked, Glean is faked
+cd connectors/glean && pytest tests
 ```

@@ -10,17 +10,26 @@ pick the documents, never the credential:
 
 Each readable document becomes one ``text/plain`` envelope whose ``data`` is
 the document's full text, with ``metadata`` ``glean_document_id``, ``title``,
-``url``, ``datasource``, ``mime_type``, ``create_time``, ``author`` and
-``update_time``: the version marker (Glean's ``metadata.updateTime``). A
-caller keeps it and re-reads the document when it changes.
+``url``, ``datasource``, ``mime_type``, ``create_time``, ``author`` and a
+version marker. A caller keeps the marker and re-reads the document when it
+changes:
+
+* ``update_time``: Glean's ``metadata.updateTime``, when Glean sends one;
+* otherwise ``content_sha256``: the hex SHA-256 of ``data`` (UTF-8). Such
+  documents are counted in one INFO line.
+
+Every envelope carries exactly one of the two.
 
 A param naming a credential key (``host``, ``token``, ``token_kind``,
 ``act_as``, ``allowed_hosts``) is refused. Documents Glean cannot read for
-this user are skipped and counted in one log line, with no ids or text.
+this user are skipped and counted in one log line, with no ids or text. A
+search that reaches the page cap while Glean still has results logs one
+WARNING with counts only.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterator
 from typing import Any
@@ -126,6 +135,14 @@ class GleanSource(SourceConnector):
             required=False,
             description="RFC 3339 last update: the version marker",
         ),
+        "content_sha256": MetaField(
+            type=str,
+            required=False,
+            description=(
+                "Hex SHA-256 of the text: the version marker when Glean sends "
+                "no updateTime"
+            ),
+        ),
         "author": MetaField(type=str, required=False, description="Author's name"),
     }
 
@@ -190,7 +207,8 @@ class GleanSource(SourceConnector):
     ) -> list[str]:
         ids: dict[str, None] = {}
         cursor: str | None = None
-        for _ in range(MAX_SEARCH_PAGES):
+        pages = MAX_SEARCH_PAGES
+        for _ in range(pages):
             response = client.search(
                 query,
                 page_size=min(SEARCH_PAGE_SIZE, limit),
@@ -211,10 +229,21 @@ class GleanSource(SourceConnector):
             )
             if response.get("hasMoreResults") is not True or not cursor:
                 break
+        else:
+            # The cap, not Glean, ended the search: say so (counts only; no
+            # query, ids or text).
+            logger.warning(
+                "glean-source: stopped the search at the %d-page cap with more "
+                "results available; read %d of up to %d document(s)",
+                pages,
+                len(ids),
+                limit,
+            )
         return list(ids)
 
     def _read(self, client: GleanClient, ids: list[str]) -> Iterator[DataEnvelope]:
         skipped = 0
+        hashed = 0
         for start in range(0, len(ids), READ_BATCH):
             batch = ids[start : start + READ_BATCH]
             readable, failed = split_documents(client.get_documents(ids=batch))
@@ -233,6 +262,12 @@ class GleanSource(SourceConnector):
                         if v is not None and k != "doc_type"
                     }
                 )
+                if "update_time" not in metadata:
+                    # No updateTime from Glean: the text's hash is the marker.
+                    metadata["content_sha256"] = hashlib.sha256(
+                        text.encode("utf-8")
+                    ).hexdigest()
+                    hashed += 1
                 yield DataEnvelope(
                     content_type="text/plain",
                     data=text,
@@ -242,6 +277,12 @@ class GleanSource(SourceConnector):
         if skipped:
             logger.info(
                 "glean-source: skipped %d document(s) Glean could not read", skipped
+            )
+        if hashed:
+            logger.info(
+                "glean-source: %d document(s) had no updateTime; their version "
+                "marker is content_sha256",
+                hashed,
             )
 
 

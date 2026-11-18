@@ -9,12 +9,17 @@ The blob is one JSON object (see the README for the Secrets Manager name)::
 * ``host`` is a bare hostname. It must match ``<instance>-be.glean.com``,
   unless the blob itself lists it in ``allowed_hosts`` (a customer with its own
   domain in front of Glean). It is never taken from a caller: tool arguments
-  and pull params cannot carry it.
-* ``token`` is a Glean-issued Client API token.
+  and pull params cannot carry it. Neither ``host`` nor an ``allowed_hosts``
+  entry may be an IP address, in any form the resolver reads as one.
+* ``token`` is a Glean-issued Client API token: printable ASCII, no spaces.
 * ``token_kind`` ``user`` (default): the token reads as the user it was issued
   for, and ``act_as`` must be absent. ``global``: a Super Admin's token that
-  must name the user it reads as in ``act_as``, sent as ``X-Glean-ActAs`` on
-  every call.
+  must name the user it reads as in ``act_as`` (an ASCII email), sent as
+  ``X-Glean-ActAs`` on every call.
+
+The token and ``act_as`` go into HTTP headers, which must be ASCII, so a
+value that is not is refused here as not configured rather than failing later
+inside the HTTP library.
 
 Anything missing or malformed raises :class:`GleanNotConfigured` with a reason
 that never contains the token, and no request is made.
@@ -34,6 +39,10 @@ _HOSTNAME = re.compile(
     r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+#: A label the C resolver (``inet_aton``) reads as a number: decimal, octal
+#: (leading 0) or hex (0x). A name made only of such labels is an IPv4
+#: literal, including short forms like ``127.1`` and ``0xa9.0xfe.0xa9.0xfe``.
+_NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]*|[0-9]+)$")
 
 TOKEN_KINDS = ("user", "global")
 
@@ -68,6 +77,14 @@ class GleanCredentials:
         return headers
 
 
+def _is_ip_literal(host: str) -> bool:
+    return all(_NUMERIC_LABEL.match(label) for label in host.split("."))
+
+
+def _ascii_printable(value: str) -> bool:
+    return value.isascii() and value.isprintable()
+
+
 def _host(value: Any, allowed: frozenset[str]) -> str:
     if not isinstance(value, str) or not value.strip():
         raise GleanNotConfigured("host is missing (expected <instance>-be.glean.com)")
@@ -77,6 +94,8 @@ def _host(value: Any, allowed: frozenset[str]) -> str:
             "host must be a bare hostname such as acme-be.glean.com "
             "(no scheme, port, path or trailing dot)"
         )
+    if _is_ip_literal(host):
+        raise GleanNotConfigured(f"host {host!r} is an IP address, not a hostname")
     if GLEAN_HOST_PATTERN.match(host) or host in allowed:
         return host
     raise GleanNotConfigured(
@@ -96,6 +115,11 @@ def _allowed_hosts(value: Any) -> frozenset[str]:
         raise GleanNotConfigured(
             f"allowed_hosts holds a value that is not a bare hostname: {bad[0]!r}"
         )
+    ips = sorted(h for h in hosts if _is_ip_literal(h))
+    if ips:
+        raise GleanNotConfigured(
+            f"allowed_hosts holds an IP address, not a hostname: {ips[0]!r}"
+        )
     return hosts
 
 
@@ -110,6 +134,8 @@ def load_credentials(config: Any) -> GleanCredentials:
     token = token.strip()
     if any(ch.isspace() for ch in token) or not token.isprintable():
         raise GleanNotConfigured("token holds whitespace or control characters")
+    if not token.isascii():
+        raise GleanNotConfigured("token must be ASCII (it is sent in a header)")
     kind = config.get("token_kind", "user")
     if kind not in TOKEN_KINDS:
         raise GleanNotConfigured("token_kind must be 'user' or 'global'")
@@ -120,6 +146,10 @@ def load_credentials(config: Any) -> GleanCredentials:
                 "a global token needs act_as: the email of the user Glean reads as"
             )
         act_as = act_as.strip()
+        if not _ascii_printable(act_as):
+            raise GleanNotConfigured(
+                "act_as must be a printable ASCII email (it is sent in a header)"
+            )
     elif act_as not in (None, ""):
         raise GleanNotConfigured(
             "act_as is only for a global token (token_kind 'global')"

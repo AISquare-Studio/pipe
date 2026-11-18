@@ -14,14 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Glean's Client API.
   - **Toolkit `glean`**: `GLEAN_SEARCH` (`pipe:primary`) and `GLEAN_GET_DOCUMENT`.
   - **Source `glean-source`**: a saved query or document ids, read as
-    `text/plain` envelopes. Each carries the document's `update_time` as its
-    version marker.
+    `text/plain` envelopes. Each carries exactly one version marker: the
+    document's `update_time`, or `content_sha256` (the SHA-256 of the text)
+    when Glean sends no update time. Those documents are counted in one INFO
+    line, and a search that stops at the 50-page cap while Glean still has
+    results logs one WARNING (counts only).
   - **Auth**: a Glean-issued token, held in a per-tenant credential blob
     `{host, token, token_kind: user|global, act_as?, allowed_hosts?}`. No
-    OAuthSpec, so a host classifies it as first party.
+    OAuthSpec. pipe-as-service runs `glean-source` with this blob; it does not
+    serve the `GLEAN_*` tools yet.
     - A global token always sends `X-Glean-ActAs`; a user token never does.
     - `host` must match `<instance>-be.glean.com` or the blob's own
-      `allowed_hosts`. Redirects are not followed.
+      `allowed_hosts`. IP addresses are refused in both. Redirects are not
+      followed.
+    - `token` and `act_as` must be ASCII (they are sent as headers).
     - Neither tool arguments nor pull params can set any credential key.
     - Without a usable blob it fails closed (`not_connected` /
       `GleanNotConfigured`) before any request.
