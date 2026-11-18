@@ -65,6 +65,8 @@ dropbox = [
 ]
 gateway = []
 github = []
+# Glean: HTTP via requests (core), no deps of its own.
+glean = []
 gmail = []
 googlecalendar = []
 googledrive = []
@@ -85,11 +87,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,composio,docusign,gateway,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,composio,docusign,gateway,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -106,6 +108,7 @@ dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
 dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
 aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
 github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
+glean-source = "aisquare_pipe_glean.connector:GleanSource"
 googledrive-source = "aisquare_pipe_googledrive.connector:GoogleDriveSource"
 googledrive-sink = "aisquare_pipe_googledrive.connector:GoogleDriveSink"
 graphify-source = "aisquare_pipe_graphify.connector:GraphifySource"
@@ -125,6 +128,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
+glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
 gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
 googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
 googledrive = "aisquare_pipe_googledrive.toolkit:GoogleDriveToolkit"
@@ -140,6 +144,7 @@ where = [
     "connectors/dropbox/src",
     "connectors/gateway/src",
     "connectors/github/src",
+    "connectors/glean/src",
     "connectors/gmail/src",
     "connectors/googlecalendar/src",
     "connectors/googledrive/src",
