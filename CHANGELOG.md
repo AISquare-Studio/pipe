@@ -333,6 +333,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rows left says `truncated` `max_pages`. A dropped page is asked for again from its first row (`startIndex`), not
   with its page token and a smaller `maxResults` (undocumented). The README's worst case is measured: 160 MiB at
   the caps, an emoji in every cell of rows right under both read caps (#46 review seq 14088 M1, n1, n2).
+- BigQuery: each page is sized from the LAST page's MEAN cells a row, not its widest row (#46 re-review seq
+  14138 nit a): a wide row that recurs held the page after each one to a row. 100,000 rows with a row of 25,001
+  cells every 500th: 1,786 requests -> 104; every 74th: 62,410 rows in 5,000 requests (`max_pages`) -> 94,423
+  rows in 761 (`max_result_bytes`); one wide row, then narrow ones: 15 -> 9. The read cap still bounds every
+  page (one that meets a row wider than the mean is dropped and asked for again with fewer rows), so this is
+  speed only: the README's peaks for rows that grow after the first page, re-measured a process each, are
+  unchanged.
 - Snowflake: a result is read a row at a time, never a partition whole (`aisquare_pipe_snowflake.stream`).
   Snowflake sizes the partitions (its docs show 76 MB), and partition 0 came inside the status answer unchecked:
   one 100,000-row partition of 50 `NUMBER` columns peaked at 380 MiB at the caps. Now every result body is
@@ -342,6 +349,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each cell, 177 MiB. A row over 8 MiB of JSON is `RowTooLarge` (422; tools: `invalid_arguments`), with its
   index and none of its values; a result body that isn't the SQL API's JSON, or breaks off, is a 502 (#46 review
   seq 14088 M2).
+- Snowflake: rows read through and never taken are scanned and let go unparsed (`stream.Body.pass_rows`), so
+  the row cap no longer applies to rows the caller never gets (#46 re-review seq 14138 nit d). That is the rest
+  of partition 0 after a cut, when the statement's handle comes after `data` (a result the POST answered at
+  once), and rows that come before the columns (partition 0 is read again). A cut at row 1 with a row over
+  8 MiB at row 2 was `RowTooLarge` (422); it is now the row before the cut, `truncated`. (A cut by `max_rows`
+  leaves nothing to read through: the POST asks for `max_rows + 1` rows.) The README no longer says the
+  review's 1a8b64e numbers came from a fake that held each answer whole (nit e).
 - Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
   document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
   `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
@@ -356,6 +370,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse_one as po`, `_p = sqlglot.parse_one`, a dialect's `parser()`, a subclass of an aliased `Parser`, a
   `floor=` handed to `parse_statements`); mutations fed to it in memory pin each (#46 review seq 14088 m2,
   re-review seq 14138 nit c).
+- The SQL tripwire (#50 review seq 14161): a `floor=` handed to `parse_statements` under an import alias is
+  flagged, and so is any reference to it that isn't a call (`_ps = parse_statements`,
+  `functools.partial(parse_statements, floor=...)`), so a guard calls it directly (n1). sqlglot's module-level
+  string builders (`exp.condition`, `exp.select`, `exp.DataType.build`, `to_table`, ...) and its
+  optimizer/executor/planner/lineage/diff modules count as parsing where a guard reaches them through sqlglot:
+  they parse a string, and log as they do, outside `parse_statements`; an Expression's builder methods are left
+  to review, as the module docstring says (n2). `parse_statements` says that `check_tokens` gets a copy of the
+  token list but the tokens themselves, which it must not change (n3).
 - `scripts/dep_floor.py --connectors` also exits 1 when an extra that names the dependency has no
   `connectors/<extra>` directory (it was skipped silently while another suite matched); an aggregate extra (one
   that names the project itself, as `[full]` does) needs none (#46 review seq 14088 n3).

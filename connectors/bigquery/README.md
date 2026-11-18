@@ -151,10 +151,14 @@ both read caps; every envelope kept, a process per pull):
 | 64 characters, each with an emoji | 120.7 MiB | **160.4 MiB** (the worst) |
 
 A `REPEATED` column's schema can't say how many elements a row holds: the FIRST page guesses 1,000 a column
-(`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the most cells a row
-of the LAST page held, never the most of the whole pull: one wide row would hold every later page to a row. After a
-page of one wide row (60,000 elements, then 20,000 rows of one), pages double back up (1, 2, 4, ... 4,096) and the
-default 10,000 rows come back in 15 requests (5,001 when the pull's widest row sized every page). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
+(`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the MEAN cells a row
+of the LAST page held. Not the most of the whole pull: one wide row would hold every later page to a row. Not the
+last page's widest row either: a wide row that recurs would hold the page after each one to a row (100,000 rows with
+a row of 25,001 cells every 500th: 1,786 requests sized from the widest, 104 from the mean). A page sized from the
+mean may meet a row wider than it; the read cap bounds that page all the same (below), so the sizing is speed,
+never memory. One wide row first (60,000 elements in the first page's 49 rows, then 20,000 rows of one): the next
+page asks for 40 rows, pages double back up (40, 80, ... 2,560), and the default 10,000 rows come back in 9 requests
+(15 sized from the last page's widest row, 5,001 from the pull's). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
 elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
 and 10 MB for a table; 1,000 rows, so both stop at `max_result_bytes`):
 
@@ -178,8 +182,8 @@ later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones 
 | 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
 | `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
 
-A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`). A row of more than 25,000 cells
-(every column's, a `REPEATED` column's every element) pages alone (`PAGE_CELLS` // its cells is 1), and
+A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`). Rows of more than 25,000 cells
+each (every column's, a `REPEATED` column's every element) page one at a time (`PAGE_CELLS` // their cells is 1), and
 `max_result_bytes` stops a run of such rows within about 1,350 pages at its 64 MiB cap (1,342 measured, for rows of
 25,001 one-digit integers: the fewest bytes such a row holds).
 

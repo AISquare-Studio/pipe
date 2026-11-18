@@ -8,6 +8,17 @@ guards admitting the old one. Now :func:`aisquare.pipe.core.sql.parse_statements
 does all of it and :data:`~aisquare.pipe.core.sql.SQLGLOT_FLOOR` is the only
 floor. These tests read every connector module that imports sqlglot (its
 AST, nothing is imported) so a new guard can't skip either.
+
+What counts as parsing outside parse_statements: sqlglot's parsing
+primitives (``_PARSING_NAMES``, under any name), its module-level string
+builders (``_BUILDER_NAMES``: ``exp.condition(sql)`` parses its string, and
+logs as it does, #50 review seq 14161 n2) and the modules that parse what
+they are handed (``_PARSING_MODULES``: ``sqlglot.optimizer.optimize(sql)``),
+those two where a guard reaches them through sqlglot. An Expression's own
+builder methods (``.where()``, ``.select()``, ``.join()``, ...) parse a
+string too, and are not listed (their names are everyday words): a guard
+reads the trees parse_statements gives it and builds no SQL; review keeps
+it so.
 """
 
 from __future__ import annotations
@@ -50,6 +61,52 @@ _PARSING_NAMES = frozenset(
         "Tokenizer",
     }
 )
+#: sqlglot's module-level builders that parse a string argument (through
+#: ``maybe_parse``), outside parse_statements and its quiet logging (#50
+#: review seq 14161 n2). Flagged where a guard reaches one through sqlglot
+#: (``exp.condition``, ``exp.DataType.build``, ``from sqlglot.expressions
+#: import select``, ``getattr(exp, "func")``), not as a bare local name: they
+#: are everyday words.
+_BUILDER_NAMES = frozenset(
+    {
+        "alias_",
+        "and_",
+        "array",
+        "build",
+        "case",
+        "cast",
+        "column_table_names",
+        "condition",
+        "delete",
+        "except_",
+        "expand",
+        "from_",
+        "func",
+        "insert",
+        "intersect",
+        "merge",
+        "not_",
+        "or_",
+        "paren",
+        "parse_identifier",
+        "replace_placeholders",
+        "replace_tables",
+        "select",
+        "subquery",
+        "table_name",
+        "to_column",
+        "to_interval",
+        "to_table",
+        "tuple_",
+        "union",
+        "update",
+        "xor",
+    }
+)
+#: sqlglot's modules whose entry points parse a string they are handed
+#: (``optimizer.optimize(sql)``, ``executor.execute(sql)``, ...): a guard
+#: reaches none of them.
+_PARSING_MODULES = frozenset({"optimizer", "executor", "planner", "lineage", "diff"})
 #: core.sql's own pieces of what parse_statements does: a guard that
 #: references one is doing that part itself.
 _CORE_ONLY = frozenset({"sqlglot_at_least", "quiet_parser_class"})
@@ -137,6 +194,24 @@ def _resolved(name: str, imports: dict[str, tuple[str, str]]) -> str:
     return imports[name][1] if name in imports else name
 
 
+def _sqlglot_path(node: ast.AST, modules: dict[str, str]) -> str | None:
+    """The dotted sqlglot path ``node`` (a name or an attribute chain) reaches
+    through the module's imports (``exp.DataType`` ->
+    ``sqlglot.exp.DataType``); None when it isn't sqlglot's."""
+    if not isinstance(node, (ast.Name, ast.Attribute)):
+        return None
+    head, _, rest = ast.unparse(node).partition(".")
+    if head not in modules:
+        return None
+    path = ".".join(filter(None, (modules[head], rest)))
+    return path if _is_sqlglot(path) else None
+
+
+def _parsing_module(path: str) -> bool:
+    """``path`` (dotted, sqlglot's) is in or under one of _PARSING_MODULES."""
+    return bool(_PARSING_MODULES & set(path.split(".")[1:]))
+
+
 def _uses_parse_statements(tree: ast.Module) -> bool:
     """``from aisquare.pipe.core.sql import parse_statements [as x]``, or
     ``.parse_statements`` on a name bound to that module."""
@@ -169,6 +244,7 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
     if not _uses_parse_statements(tree):
         problems.append(f"{module} imports sqlglot, not parse_statements")
     imports = _from_imports(tree)
+    modules = _module_aliases(tree)
 
     def flag(node: ast.AST, name: str) -> None:
         line = f"{module}:{getattr(node, 'lineno', '?')}"
@@ -180,8 +256,9 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if _is_sqlglot(alias.name) and _PARSING_NAMES & set(
-                    alias.name.split(".")
+                if _is_sqlglot(alias.name) and (
+                    _PARSING_NAMES & set(alias.name.split("."))
+                    or _parsing_module(alias.name)
                 ):
                     flag(node, alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
@@ -189,7 +266,9 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
                 if _is_sqlglot(node.module) and (
                     alias.name == "*"
                     or alias.name in _PARSING_NAMES
+                    or alias.name in _BUILDER_NAMES
                     or _PARSING_NAMES & set(node.module.split("."))
+                    or _parsing_module(f"{node.module}.{alias.name}")
                 ):
                     flag(node, f"{node.module}.{alias.name}")
                 if node.module == _CORE_SQL and alias.name in _CORE_ONLY:
@@ -197,6 +276,10 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
         elif isinstance(node, ast.Attribute):
             if node.attr in _PARSING_NAMES or node.attr in _CORE_ONLY:
                 flag(node, node.attr)
+            elif (path := _sqlglot_path(node, modules)) is not None and (
+                node.attr in _BUILDER_NAMES or _parsing_module(path)
+            ):
+                flag(node, path)
         elif isinstance(node, ast.Name):
             original = _resolved(node.id, imports)
             if original in _PARSING_NAMES or original in _CORE_ONLY:
@@ -205,7 +288,13 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
             # getattr(sqlglot, "parse_one") and the like
             name = _constant_arg(node, 1)
             if _called_name(node) in _ATTRIBUTE_CALLS and (
-                name in _PARSING_NAMES or name in _CORE_ONLY
+                name in _PARSING_NAMES
+                or name in _CORE_ONLY
+                or (
+                    (name in _BUILDER_NAMES or name in _PARSING_MODULES)
+                    and len(node.args) > 0
+                    and _sqlglot_path(node.args[0], modules) is not None
+                )
             ):
                 flag(node, str(name))
         elif isinstance(node, ast.ClassDef):
@@ -222,10 +311,23 @@ def _parsing_problems(module: str, tree: ast.Module) -> list[str]:
 
 def _floor_problems(module: str, tree: ast.Module) -> list[str]:
     """Where a module keeps a sqlglot floor of its own (binds the name, sets
-    core's, or hands parse_statements one); empty when it doesn't."""
+    core's, or hands parse_statements one); empty when it doesn't. A call of
+    parse_statements under an alias (``ps(...)``) is read as one; any other
+    reference to it (``_ps = parse_statements``, ``partial(parse_statements,
+    ...)``) is flagged: a floor= handed through it would go unseen (#50
+    review seq 14161 n1). So a guard calls parse_statements directly."""
     problems = []
+    imports = _from_imports(tree)
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     for node in ast.walk(tree):
         line = f"{module}:{getattr(node, 'lineno', '?')}"
+        if isinstance(node, (ast.Name, ast.Attribute)) and id(node) not in called:
+            name = node.id if isinstance(node, ast.Name) else node.attr
+            if _resolved(name, imports) == "parse_statements":
+                problems.append(
+                    f"{line} passes parse_statements around ({ast.unparse(node)}): "
+                    "call it, so no floor= reaches it unseen"
+                )
         if (
             isinstance(node, ast.Name)
             and node.id == _FLOOR
@@ -248,7 +350,7 @@ def _floor_problems(module: str, tree: ast.Module) -> list[str]:
                 if (alias.asname or alias.name) == _FLOOR and not core_floor:
                     problems.append(f"{line} binds {_FLOOR} to {alias.name}")
         elif isinstance(node, ast.Call):
-            if _called_name(node) == "parse_statements":
+            if _resolved(_called_name(node), imports) == "parse_statements":
                 for keyword in node.keywords:
                     if keyword.arg is None or keyword.arg == "floor":
                         problems.append(
@@ -339,6 +441,34 @@ PARSING_MUTATIONS = {
         "from aisquare.pipe.core.sql import quiet_parser_class\n"
         "_P = quiet_parser_class(_DIALECT)\n"
     ),
+    # #50 review seq 14161 n2: string builders and the optimizer, which parse
+    # (and log) outside parse_statements. Each passed at a554b7b.
+    "exp.condition": (
+        "from sqlglot import exp\n\ndef _m(sql):\n    return exp.condition(sql)\n"
+    ),
+    "exp.select": (
+        "from sqlglot import exp\n\ndef _m(sql):\n    return exp.select(sql)\n"
+    ),
+    "a builder, imported under another name": (
+        "from sqlglot.expressions import to_table as tt\n\n"
+        "def _m(sql):\n    return tt(sql)\n"
+    ),
+    "DataType.build": (
+        "from sqlglot import exp\n\ndef _m(t):\n    return exp.DataType.build(t)\n"
+    ),
+    "a builder through getattr": (
+        "from sqlglot import exp\n\ndef _m(sql):\n"
+        "    return getattr(exp, 'condition')(sql)\n"
+    ),
+    "the optimizer": (
+        "import sqlglot\nimport sqlglot.optimizer\n\n"
+        "def _m(sql):\n    return sqlglot.optimizer.optimize(sql)\n"
+    ),
+    "the optimizer, imported from": (
+        "from sqlglot.optimizer import optimize\n\n"
+        "def _m(sql):\n    return optimize(sql)\n"
+    ),
+    "the executor": "import sqlglot.executor as ex\n",
 }
 FLOOR_MUTATIONS = {
     "an assignment": "SQLGLOT_FLOOR = (25, 0)\n",
@@ -362,6 +492,19 @@ FLOOR_MUTATIONS = {
         "from aisquare.pipe.core.sql import SQLGLOT_LOGGER as SQLGLOT_FLOOR\n"
     ),
     "a floor from elsewhere": "from aisquare_pipe_x.floors import SQLGLOT_FLOOR\n",
+    # #50 review seq 14161 n1: parse_statements under another name, or
+    # handed on before it is called. Each passed at a554b7b.
+    "a floor passed to an aliased import": (
+        "from aisquare.pipe.core.sql import parse_statements as ps\n\n"
+        "def _m(sql):\n    return ps(sql, _DIALECT, floor=(25, 0))\n"
+    ),
+    "a floor passed to a local alias": (
+        "_ps = parse_statements\n\n"
+        "def _m(sql):\n    return _ps(sql, _DIALECT, floor=(25, 0))\n"
+    ),
+    "a floor bound by functools.partial": (
+        "import functools\n_ps = functools.partial(parse_statements, floor=(25, 0))\n"
+    ),
 }
 
 
@@ -397,6 +540,21 @@ def test_the_tripwire_flags_a_module_without_parse_statements():
     assert _parsing_problems(
         "m.py", ast.parse("from aisquare_pipe_x.sql import parse_statements\n")
     )
+
+
+def test_builder_names_count_only_where_they_are_sqlglot_s():
+    """``case``, ``select``, ``union`` as a guard's own names, a method of
+    something else, or sqlglot's classes (``exp.Select``) are not parsing."""
+    source = (
+        "from aisquare.pipe.core.sql import parse_statements\n"
+        "from sqlglot import exp\n"
+        "def _m(sql, rows, case=None):\n"
+        "    select = union = parse_statements(sql, _DIALECT).statements\n"
+        "    rows.update({}); rows.select(1)\n"
+        "    return [s for s in select if isinstance(s, (exp.Select, exp.Union))], case\n"
+    )
+    assert _parsing_problems("m.py", ast.parse(source)) == []
+    assert _floor_problems("m.py", ast.parse(source)) == []
 
 
 def test_a_dynamic_import_of_sqlglot_is_scanned_too():

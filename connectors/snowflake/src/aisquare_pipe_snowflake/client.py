@@ -394,9 +394,11 @@ class SnowflakeClient:
                         head[key] = body.value()
                         continue
                     if not isinstance(head.get("resultSetMetaData"), dict):
-                        # Rows before the columns: read through, keeping none,
-                        # and read partition 0 again once the columns are known.
-                        body.skip_rows()
+                        # Rows before the columns: read through, keeping and
+                        # parsing none (so no row cap: the read again from
+                        # partition 0 applies it to the rows it takes), and
+                        # read partition 0 again once the columns are known.
+                        body.pass_rows()
                         again = True
                         continue
                     result = self._result(head, handle, encoded, batching)
@@ -407,9 +409,11 @@ class SnowflakeClient:
                     if cut and result.query_id is not None:
                         break  # the rest is never read
                     if cut:
-                        # The handle comes after the rows: read through to it.
-                        for _ in rows:
-                            pass
+                        # The handle comes after the rows: read through to
+                        # it, keeping and parsing none. The caller gets none
+                        # of them, so none meets the row cap (#46 review seq
+                        # 14138 nit d: a row over it there was RowTooLarge).
+                        body.pass_rows()
             except RowOverCap as over:
                 raise RowTooLarge(body.rows_read - 1, over.read, over.limit) from None
         if result is None:
