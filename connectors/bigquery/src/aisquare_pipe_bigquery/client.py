@@ -127,12 +127,16 @@ def _token_failure(e: BigQueryTokenError) -> BigQueryAPIError:
     an unreachable or failing endpoint is an upstream error a host may
     retry."""
     if e.kind == TOKEN_REFUSED:
-        return BigQueryAPIError(e.message, status=401, key_refused=True)
+        return BigQueryAPIError(
+            e.summary, detail=e.detail, status=401, key_refused=True
+        )
     if e.kind == TOKEN_TIMED_OUT:
-        return BigQueryAPIError(e.message, timed_out=True)
+        return BigQueryAPIError(e.summary, detail=e.detail, timed_out=True)
     if e.kind == TOKEN_RATE_LIMITED:
-        return BigQueryAPIError(e.message, status=429, retry_after=e.retry_after)
-    return BigQueryAPIError(e.message, retry_after=e.retry_after)
+        return BigQueryAPIError(
+            e.summary, detail=e.detail, status=429, retry_after=e.retry_after
+        )
+    return BigQueryAPIError(e.summary, detail=e.detail, retry_after=e.retry_after)
 
 
 def _monotonic() -> float:

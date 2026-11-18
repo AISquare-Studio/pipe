@@ -151,7 +151,7 @@ def get_object(
                 f"object is {size} bytes, over the {max_bytes}-byte read limit",
                 code="invalid_arguments",
             )
-        data = body.read(max_bytes + 1)
+        data = _read(body, max_bytes + 1)
         if len(data) > max_bytes:
             raise S3ObjectTooLarge(
                 f"object is over the {max_bytes}-byte read limit",
@@ -160,6 +160,23 @@ def get_object(
     finally:
         body.close()
     return data, object_metadata(location, key, response)
+
+
+def _read(body: Any, amount: int) -> bytes:
+    """``body.read(amount)``. The body streams after GetObject has answered,
+    outside :func:`~aisquare_pipe_aws.credentials.call`, so a read that fails
+    there (a timeout, a dropped connection, a short body) is mapped here the
+    same way: an :class:`AwsAccessError` naming the error's type only (its
+    text names the bucket and key)."""
+    from botocore.exceptions import BotoCoreError
+
+    try:
+        return bytes(body.read(amount))
+    except BotoCoreError as e:
+        raise AwsAccessError(
+            f"AWS s3:GetObject failed while reading the object ({type(e).__name__})",
+            code="upstream_error",
+        ) from None
 
 
 def object_metadata(

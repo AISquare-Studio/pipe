@@ -14,7 +14,12 @@ import pytest
 from aisquare.pipe import PullParams
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 from aisquare.pipe.testing.host import host_answer
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import (
+    ConnectionClosedError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    ResponseStreamingError,
+)
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
@@ -277,3 +282,56 @@ def test_agentcore_refused_params_are_a_422(stubbed, params):
     with pytest.raises(ConfigValidationError) as raised:
         _policies_pull(**params)
     assert host_answer(raised.value).status == 422
+
+
+class _BrokenRaw:
+    """A GetObject body whose read fails as botocore's stream does."""
+
+    def __init__(self, error: BaseException | None) -> None:
+        self.error = error
+
+    def read(self, *_: Any) -> bytes:
+        if self.error is not None:
+            raise self.error
+        return b""  # nothing, though ContentLength said 10: IncompleteReadError
+
+    def close(self) -> None:
+        pass
+
+
+_KEY_URL = f"https://{BUCKET}.s3.amazonaws.com/rulebooks/{LEAK}.pdf"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ReadTimeoutError(endpoint_url=_KEY_URL), id="ReadTimeoutError"),
+        pytest.param(
+            ConnectionClosedError(endpoint_url=_KEY_URL), id="ConnectionClosedError"
+        ),
+        pytest.param(
+            ResponseStreamingError(error=OSError(_KEY_URL)), id="ResponseStreamingError"
+        ),
+        pytest.param(None, id="IncompleteReadError"),
+    ],
+)
+def test_a_body_read_that_fails_is_a_502_without_the_key(stubbed, error):
+    """GetObject answered, then reading its body failed (#46 reopen seq 13961,
+    FAIL 1): botocore's error names the bucket and key, and it was a 500."""
+    listed = {
+        "Contents": [{"Key": f"rulebooks/{LEAK}.pdf", "Size": 10, "ETag": '"e"'}],
+        "IsTruncated": False,
+    }
+    body = StreamingBody(_BrokenRaw(error), 10)
+    stubbed["s3"] += [
+        ("list_objects_v2", listed),
+        ("get_object", {"Body": body, "ContentLength": 10, "ETag": '"e"'}),
+    ]
+    with pytest.raises(PipelineError) as raised:
+        _s3_pull()
+    e = raised.value
+    assert type(e) is PipelineError
+    assert host_answer(e).status == 502
+    assert "s3:GetObject" in str(e)
+    assert LEAK not in str(e)
+    assert e.__cause__ is None and e.__suppress_context__

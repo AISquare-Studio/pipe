@@ -296,3 +296,54 @@ def test_an_insufficient_scope_challenge_is_insufficient_scope():
         "BIGQUERY_LIST_DATASETS", {}, blob()
     )
     assert result.error_code == "insufficient_scope", result.error
+
+
+# Google's token endpoint answers: (status, body, the host's status). The
+# source's error never carries Google's error/error_description (#46 reopen
+# seq 13961, FAIL 2); the toolkit, which answers the caller, still does.
+TOKEN_FAILURES = [
+    (400, {"error": "invalid_grant", "error_description": f"Invalid JWT {LEAK}"}, 502),
+    (
+        400,
+        {
+            "error": "invalid_grant",
+            "error_description": f"Token must be a short-lived token (60 minutes) and in a reasonable timeframe {LEAK}",
+        },
+        502,
+    ),
+    (
+        403,
+        {"error": "access_denied", "error_description": f"account disabled {LEAK}"},
+        502,
+    ),
+    (
+        429,
+        {"error": "rate_limit_exceeded", "error_description": f"slow down {LEAK}"},
+        502,
+    ),
+    (500, {"error": "internal_failure", "error_description": f"backend {LEAK}"}, 502),
+    (
+        503,
+        {"error": "temporarily_unavailable", "error_description": f"later {LEAK}"},
+        502,
+    ),
+]
+
+
+@pytest.mark.parametrize(("status", "body", "answer"), TOKEN_FAILURES)
+def test_token_endpoint_text_stays_out_of_the_source_s_error(status, body, answer):
+    google = _google()
+    google.token_error = (status, body)
+    with pytest.raises(PipelineError) as raised:
+        _pull(google)
+    assert host_answer(raised.value).status == answer
+    assert LEAK not in str(raised.value)
+    assert body["error"] not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    # The toolkit keeps Google's words for the caller.
+    google = _google()
+    google.token_error = (status, body)
+    result = BigQueryToolkit(session=google).call_tool(
+        "BIGQUERY_LIST_DATASETS", {}, blob()
+    )
+    assert LEAK in (result.error or "")
