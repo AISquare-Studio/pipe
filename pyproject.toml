@@ -66,6 +66,13 @@ aws = [
     "boto3>=1.43.32,<2",
     "botocore>=1.43.32,<2",
 ]
+# BigQuery: google-auth signs the service account key into tokens (explicit
+# credentials only, never Application Default Credentials); sqlglot parses
+# SQL so only one SELECT is ever sent. HTTP via requests (core).
+bigquery = [
+    "google-auth>=2.20,<3",
+    "sqlglot>=25,<28",
+]
 composio = [
     "composio>=0.13.1,<2.0",
     "composio-client>=1.39,<2.0",
@@ -105,11 +112,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,aws,bigquery,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[aws,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[aws,bigquery,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -119,6 +126,7 @@ mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
 mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
 bedrock-agentcore-policies-source = "aisquare_pipe_aws.connector:BedrockAgentCorePoliciesSource"
 s3-source = "aisquare_pipe_aws.connector:S3Source"
+bigquery-query-source = "aisquare_pipe_bigquery.connector:BigQueryQuerySource"
 composio-source = "aisquare_pipe_composio.connector:ComposioSource"
 composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
 composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
@@ -150,6 +158,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
 bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
 s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
+bigquery = "aisquare_pipe_bigquery.toolkit:BigQueryToolkit"
 gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
@@ -164,6 +173,7 @@ slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
 where = [
     "src",
     "connectors/aws/src",
+    "connectors/bigquery/src",
     "connectors/composio/src",
     "connectors/docusign/src",
     "connectors/dropbox/src",

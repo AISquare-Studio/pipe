@@ -100,6 +100,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before any envelope came out raises `GcsPullTruncated` (a `ValueError`) with
     `next_start_offset`, so a `modified_after` sync over a big prefix still advances.
   Setup and the exact secret: `connectors/gcs/README.md`.
+- **Google BigQuery connector** (`connectors/bigquery`, module `aisquare_pipe_bigquery`, extra
+  `aisquare-pipe[bigquery]`, in `[full]` and `[toolkits]`): the read-only toolkit `bigquery`
+  (`BIGQUERY_RUN_SELECT`, primary; `BIGQUERY_READ_TABLE_ROWS`, `BIGQUERY_GET_TABLE_SCHEMA`,
+  `BIGQUERY_LIST_TABLES`, `BIGQUERY_LIST_DATASETS`) and the source `bigquery-query-source`, on the tenant's
+  credential blob `{service_account_json, project_id, location?, max_bytes_billed?}`. It is the native
+  replacement for Composio's `googlebigquery` (a distinct name; the README maps the tools). Tokens are minted
+  from the service account key (scope `bigquery.readonly`; `google-auth>=2.20,<3`) and never from Application
+  Default Credentials; a missing or malformed blob fails closed ("BigQuery is not configured", no request).
+  - SQL is SELECT-only, refused before any request otherwise: a lexer that reads GoogleSQL's quoting and
+    comments and a sqlglot parse (`sqlglot>=25,<28`, BigQuery dialect) must both find ONE `SELECT`/`WITH`
+    statement with no write, DDL or scripting keyword or node. The dry run's `statementType` must be `SELECT`.
+  - Caps: a dry run refuses a query over `max_bytes_processed` (default 1 GiB, never above the tenant's
+    `max_bytes_billed` ceiling, default 10 GiB) before it runs, and the job carries the same cap as
+    `maximumBytesBilled`; `max_rows` and a JSON byte cap on the rows returned (`truncated` says which); the job
+    deadline (the host's time budget left, 60 s without one, `job_timeout_seconds` for the source) is sent as
+    `jobTimeoutMs`, and polling stops there.
+  - BigQuery's rate-limit and quota 403s are `rate_limited`; its error `reason` picks the code.
+  - `bigquery-query-source` pulls a `table` (tabledata.list, no job) or one `sql` SELECT, one envelope per row
+    batch. Each carries `result_sha256` (order-independent) and the table's `lastModifiedTime`
+    (`table_last_modified`, read before the rows; for a query the latest over the tables it names), combined as
+    `version`. A pull cut at `max_rows` or `max_result_bytes` says `truncated`, and a table pull
+    `next_start_index`.
+  Setup, the registration checklist and the exact secret: `connectors/bigquery/README.md`.
 
 ## [0.5.0] - 2026-11-04
 
