@@ -111,12 +111,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     client_id + client_secret + token_url (+scope), role, warehouse, database?, schema?}`. Key-pair
     JWT (RS256, signed with `cryptography>=42,<60`) is the default; `oauth_client` is a client
     credentials grant at the customer's identity provider (External OAuth). `account` must be a
-    Snowflake account identifier, so every call goes to `https://<account>.snowflakecomputing.com`.
+    Snowflake account identifier (`<orgname>-<account_name>`, or a legacy locator with a known region
+    or a region and the cloud `aws`/`gcp`/`azure`), so every call goes to
+    `https://<account>.snowflakecomputing.com`.
     Ambient `SNOWFLAKE_*` settings and `connections.toml` are never read; a missing or malformed
     blob fails closed ("Snowflake is not configured", no request).
   - SQL is SELECT-only, refused before any request otherwise: a lexer (strings, quoted identifiers
-    and comments blanked, with and without backslash escapes) and a sqlglot parse (`sqlglot>=25,<28`,
-    Snowflake dialect) must both find ONE `SELECT`/`WITH` with no write, DDL, session or scripting
+    and comments blanked, with and without backslash escapes; a `--`/`//` comment ends at a CR or an
+    LF, one ended by a bare CR is refused, and so is a `/*` inside a `/* */` comment) and a sqlglot
+    parse (`sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and CI runs this
+    suite at that floor too, `scripts/dep_floor.py`; Snowflake dialect) must both find ONE
+    `SELECT`/`WITH` with no write, DDL, session or scripting
     keyword or node, no `$`, `@` or `->>`, and no table function but FLATTEN, SPLIT_TO_TABLE,
     STRTOK_SPLIT_TO_TABLE or GENERATOR (a stored procedure can be called as one). Every statement is
     sent with `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and

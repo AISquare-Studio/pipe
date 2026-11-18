@@ -11,7 +11,11 @@
    statements), ``|>``, backticks and backslashes. A table function
    (``TABLE(f(...))``, ``LATERAL f(...)``) must be one of the built-in
    read-only ones (:data:`TABLE_FUNCTIONS`): a stored procedure can be
-   called that way, and it may write.
+   called that way, and it may write. A ``--`` or ``//`` comment ends at
+   the first CR or LF, and one a bare CR ends (no LF after it) is refused;
+   so is a ``/*`` inside a ``/* */`` comment. Readers disagree on both
+   (sqlglot ends a line at a CR; sqlglot 25.3 to 26.24 nested BigQuery's
+   comments), and a disagreement can hide a statement from one check.
 2. **The parser** (sqlglot, Snowflake dialect): exactly ONE statement whose
    root is a query (``SELECT``, ``WITH ... SELECT``, ``UNION`` /
    ``INTERSECT`` / ``EXCEPT`` / ``MINUS``, or a parenthesised one), with no
@@ -152,6 +156,7 @@ _WRITE_KEYWORDS = frozenset(
 _FIRST_KEYWORDS = frozenset({"SELECT", "WITH"})
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _QUOTES = "'\""
+_LINE_END = re.compile(r"[\r\n]")
 # Outside literals, identifiers and comments: forms no read here needs.
 _FORBIDDEN = (
     ("$", "it uses $ ($$ strings, SYSTEM$ functions, variables or stage columns)"),
@@ -170,6 +175,10 @@ _CALLED = re.compile(
 
 class NotReadOnly(ValueError):
     """The SQL is not one read-only query. The message says why."""
+
+
+class _Unreadable(Exception):
+    """The lexer can't read the text one way (the message says why)."""
 
 
 class _QuietParser(Snowflake.Parser):
@@ -215,9 +224,10 @@ def _lex(sql: str) -> _Lexed:
         return _Lexed(sql, "it holds a control character")
     statements: set[str] = set()
     for backslash in (True, False):
-        blanked = _blank(sql, backslash_escapes=backslash)
-        if blanked is None:
-            return _Lexed(sql, "it has an unterminated string, identifier or comment")
+        try:
+            blanked = _blank(sql, backslash_escapes=backslash)
+        except _Unreadable as unreadable:
+            return _Lexed(sql, str(unreadable))
         problem, cut = _read(blanked)
         if problem is not None:
             return _Lexed(sql, problem)
@@ -272,10 +282,12 @@ def _table_function_problem() -> str:
     return "it calls a table function other than " + ", ".join(sorted(TABLE_FUNCTIONS))
 
 
-def _blank(sql: str, *, backslash_escapes: bool) -> str | None:
+def _blank(sql: str, *, backslash_escapes: bool) -> str:
     """``sql`` with quoted text and ``--`` / ``//`` / ``/* */`` comments
-    turned into spaces, same length (so positions match); None when a quote
-    or a block comment never closes."""
+    turned into spaces, same length (so positions match). A line comment
+    ends at the first CR or LF. :class:`_Unreadable` when a quote or a block
+    comment never closes, a line comment ends at a bare CR, or a block
+    comment holds a ``/*``."""
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -284,7 +296,9 @@ def _blank(sql: str, *, backslash_escapes: bool) -> str | None:
             j = i + 1
             while True:
                 if j >= n:
-                    return None
+                    raise _Unreadable(
+                        "it has an unterminated string or quoted identifier"
+                    )
                 if backslash_escapes and sql[j] == "\\":
                     j += 2
                     continue
@@ -299,14 +313,28 @@ def _blank(sql: str, *, backslash_escapes: bool) -> str | None:
             out.append(" " * (j - i))
             i = j
         elif sql.startswith("--", i) or sql.startswith("//", i):
-            end = sql.find("\n", i)
-            end = n if end < 0 else end
+            # To the line's end: the first CR or LF (a reader that stops only
+            # at LF hides what follows a bare CR, and sqlglot stops at both).
+            line_end = _LINE_END.search(sql, i)
+            end = n if line_end is None else line_end.start()
+            if sql.startswith("\r", end) and not sql.startswith("\r\n", end):
+                raise _Unreadable(
+                    "it has a -- or // comment ended by a bare CR "
+                    "(readers disagree where it ends)"
+                )
             out.append(" " * (end - i))
             i = end
         elif sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
             if end < 0:
-                return None
+                raise _Unreadable("it has an unterminated /* */ comment")
+            # Up to the closer's '*' included: in '/* a /*/', a nesting reader
+            # takes '/*' first and the comment runs on.
+            if "/*" in sql[i + 2 : end + 1]:
+                raise _Unreadable(
+                    "it has a /* inside a /* */ comment (readers disagree whether "
+                    "comments nest)"
+                )
             out.append(" " * (end + 2 - i))
             i = end + 2
         else:

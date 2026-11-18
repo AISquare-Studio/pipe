@@ -8,7 +8,8 @@ Connectors, item 3d).
 
 Ships inside the `aisquare-pipe` distribution: `pip install "aisquare-pipe[snowflake]"` (or `[full]`, or
 `[toolkits]`). The extra adds two dependencies: `cryptography>=42,<60`, which signs the key-pair JWT with the
-service user's RSA key, and `sqlglot>=25,<28`, which parses SQL for the SELECT-only guard. HTTP goes through
+service user's RSA key, and `sqlglot>=26.25,<28`, which parses SQL for the SELECT-only guard (the same specifier
+as every extra that names sqlglot; CI also runs this suite at that floor, `scripts/dep_floor.py`). HTTP goes through
 `requests` (core). Without the extra, `snowflake` and `snowflake-query-source` count as not installed.
 
 **Why the SQL API and not `snowflake-connector-python`.** Snowflake's SQL API (`/api/v2/statements`) is plain
@@ -105,7 +106,10 @@ raise the caps. `result_sha256` then covers the rows read only.
 statement before a token is even signed. Two independent checks must both pass:
 1. **A lexer.** It blanks `'...'` strings, `"..."` identifiers and `--`, `//` and `/* */` comments, reading the text
    once with backslash escapes and once without. Both readings must agree, so write a quote inside a string as `''`,
-   not `\'`. The text must then be one statement (one trailing `;` is dropped) that starts with `SELECT` or `WITH`.
+   not `\'`. A `--` or `//` comment ends at the first CR or LF; one that a bare CR (no LF after it) ends is refused,
+   and so is a `/*` inside a `/* */` comment: readers disagree on both (sqlglot ends a line at a CR, and some
+   versions nest comments), and the disagreement could hide a statement from one check. The text must then be one
+   statement (one trailing `;` is dropped) that starts with `SELECT` or `WITH`.
    - It may name none of `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `UPSERT`, `TRUNCATE`, `CREATE`, `ALTER`, `DROP`,
      `UNDROP`, `RENAME`, `SWAP`, `CLONE`, `RESTORE`, `COPY`, `PUT`, `REMOVE`, `RM`, `LOAD`, `GRANT`, `REVOKE`,
      `USE`, `SET`, `UNSET`, `RESET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `DECLARE`, `CALL`, `EXEC`,
@@ -200,8 +204,11 @@ The connector's own logs carry no SQL, table names or row values.
 - Optional: `SECURITYADMIN` for a network policy; `ACCOUNTADMIN` for an External OAuth security integration.
 
 Find the account identifier (`<orgname>-<account_name>`) with
-`SELECT CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME();`. A legacy account locator with its region
-(`xy12345.us-east-2.aws`) also works. For PrivateLink, append `.privatelink`.
+`SELECT CURRENT_ORGANIZATION_NAME() || '-' || CURRENT_ACCOUNT_NAME();`. A legacy account locator also works, in
+one of Snowflake's forms: alone (`xy12345`, AWS US West Oregon), with a region for the five AWS regions written
+without a cloud (`xy12345.us-east-1`, `eu-west-1`, `eu-central-1`, `ap-southeast-1`, `ap-southeast-2`), or with a
+region and its cloud (`xy12345.us-east-2.aws`, `xy12345.us-central1.gcp`, `xy12345.west-europe.azure`; government
+regions with `fhplus.` or `dod.` first). Any other suffix is refused. For PrivateLink, append `.privatelink`.
 
 ### The customer: steps
 

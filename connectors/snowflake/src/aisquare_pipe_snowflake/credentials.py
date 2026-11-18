@@ -16,11 +16,13 @@ The blob is one JSON object (the README gives the secret's name)::
 
 * ``account`` is a Snowflake account identifier, never a URL or a host:
   ``<orgname>-<account_name>`` (Snowflake's preferred form), or a legacy
-  account locator with its region and cloud (``xy12345``,
-  ``xy12345.us-east-2.aws``), either one optionally ``.privatelink``. Every
-  request goes to ``https://<account>.snowflakecomputing.com`` (an underscore
-  in the account name is written ``-`` in the host, as Snowflake
-  recommends). Nothing a caller sends can change it.
+  account locator in one of Snowflake's forms (``xy12345``,
+  ``xy12345.us-east-1``, ``xy12345.us-east-2.aws``: a known region, or a
+  region and the cloud ``aws``, ``gcp`` or ``azure``), either one optionally
+  ``.privatelink``. Every request goes to
+  ``https://<account>.snowflakecomputing.com`` (an underscore in the account
+  name is written ``-`` in the host, as Snowflake recommends). Nothing a
+  caller sends can change it.
 * ``auth`` ``keypair`` (the default, for service use) needs ``user`` and
   ``private_key_pem``: an RSA key of at least 2048 bits, PKCS#8 or PKCS#1,
   encrypted with ``private_key_passphrase`` or not. Each client signs a
@@ -71,9 +73,19 @@ from aisquare_pipe_snowflake.refs import BadReference, parse_identifier
 #: digits, the account name letters, digits and underscores (lower-cased
 #: before matching).
 _ORG_ACCOUNT = r"[a-z0-9]{1,64}-[a-z0-9_]{1,255}"
-#: A legacy account locator, optionally ``.<region>`` and ``.<cloud>``
-#: (``xy12345.us-east-2.aws``, ``xy12345.us-central1.gcp``).
-_LOCATOR = r"[a-z][a-z0-9]{1,31}(?:\.[a-z0-9]+(?:-[a-z0-9]+)*){0,2}"
+#: A legacy account locator in one of the forms Snowflake's "non-VPS account
+#: locator formats" table gives: alone (AWS us-west-2), ``.<region>`` for the
+#: five AWS regions written without a cloud, or ``.<region>.<cloud>`` with a
+#: cloud of ``aws``, ``gcp`` or ``azure`` (``xy12345.us-east-2.aws``,
+#: ``xy12345.mexicocentral.azure``), a government one with ``fhplus`` or
+#: ``dod`` before the region. Any other suffix is refused: ``evil.com`` is no
+#: locator.
+_BARE_AWS_REGIONS = r"us-east-1|eu-west-1|eu-central-1|ap-southeast-1|ap-southeast-2"
+_LOCATOR = (
+    r"[a-z][a-z0-9]{1,31}"
+    rf"(?:\.(?:{_BARE_AWS_REGIONS})"
+    r"|(?:\.(?:fhplus|dod))?\.[a-z0-9]+(?:-[a-z0-9]+)*\.(?:aws|gcp|azure))?"
+)
 ACCOUNT = re.compile(rf"^(?:{_ORG_ACCOUNT}|{_LOCATOR})(?:\.privatelink)?$")
 HOST_SUFFIX = ".snowflakecomputing.com"
 AUTH_KEYPAIR = "keypair"

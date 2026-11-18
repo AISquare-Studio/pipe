@@ -104,10 +104,12 @@ salesforce = [
 slack = []
 # Snowflake (SQL API over requests, core): cryptography signs the key-pair
 # JWT with the tenant's RSA key; sqlglot parses SQL so only one SELECT is
-# ever sent (the same bound as [bigquery] and [databricks], so they agree).
+# ever sent. Every extra naming sqlglot gives it this same specifier (from
+# 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested); CI runs
+# their suites at its floor (scripts/dep_floor.py).
 snowflake = [
     "cryptography>=42,<60",
-    "sqlglot>=25,<28",
+    "sqlglot>=26.25,<28",
 ]
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]

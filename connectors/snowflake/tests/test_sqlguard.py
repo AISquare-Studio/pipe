@@ -39,6 +39,8 @@ READ_ONLY = [
     "SELECT * FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY a ORDER BY b) = 1",
     "SELECT updated_at, created_by FROM t",
     "SELECT /* a block comment */ 1 // a line comment",
+    "SELECT 1 -- a comment ended by CR LF\r\nFROM t // another\r\n",
+    "SELECT 1 /* a * comment / with * and / */ FROM t",
 ]
 
 REFUSED = {
@@ -101,6 +103,15 @@ REFUSED = {
     "only_whitespace": "   ",
     "only_comment": "-- nothing\n",
     "control_character": "SELECT 1\x00",
+    # The BigQuery finding (manager note #13650), and its parts.
+    "cr_and_nested_comments": (
+        "SELECT 1 --\r/* /* */; DROP TABLE t; SELECT 1 /* */ -- */"
+    ),
+    "dash_comment_ended_by_cr": "SELECT 1 --\r; DROP TABLE t",
+    "slash_comment_ended_by_cr": "SELECT 1 //\r; DROP TABLE t",
+    "crlf_ends_the_comment": "SELECT 1 -- x\r\n; DROP TABLE t",
+    "nested_block_comment": "SELECT 1 /* /* */ ; DROP TABLE t; /* */ */",
+    "nested_by_shared_star": "SELECT 1 /* a /*/ FROM t",
 }
 
 
@@ -180,6 +191,37 @@ def test_the_parser_alone_refuses_what_the_lexer_might_admit(sql, monkeypatch):
     monkeypatch.setattr(sqlguard, "_lex", lambda text: sqlguard._Lexed(text, None))
     with pytest.raises(NotReadOnly):
         check_select_only(sql)
+
+
+# A bare CR ends a line for some readers (sqlglot) and not for others, and
+# some readers nest /* */ comments (sqlglot 25.3 to 26.24, for BigQuery):
+# either one hides text from a reader that disagrees. The lexer reads a line
+# comment to the first CR or LF, refuses one a bare CR ends, and refuses a /*
+# inside a /* */ comment, whatever the parser makes of them.
+@pytest.mark.parametrize(
+    ("sql", "why"),
+    [
+        (
+            "SELECT 1 --\r/* /* */; DROP TABLE t; SELECT 1 /* */ -- */",
+            "bare CR",
+        ),
+        ("SELECT 1 --\r; DROP TABLE t", "bare CR"),
+        ("SELECT 1 //\r; DROP TABLE t", "bare CR"),
+        ("SELECT 1 -- x\r\n; DROP TABLE t", "more than one statement"),
+        ("SELECT 1 /* /* */ ; DROP TABLE t; /* */ */", r"/\* inside a /\* \*/"),
+        ("SELECT 1 /* a /*/ FROM t", r"/\* inside a /\* \*/"),
+        ("SELECT 1 /* a */ /* b /* c */", r"/\* inside a /\* \*/"),
+    ],
+)
+def test_the_lexer_alone_refuses_comments_readers_disagree_on(sql, why, monkeypatch):
+    monkeypatch.setattr(sqlguard, "_parsed_problem", lambda statement: None)
+    with pytest.raises(NotReadOnly, match=why):
+        check_select_only(sql)
+
+
+def test_a_line_comment_ended_by_cr_lf_hides_nothing():
+    assert check_select_only("SELECT 1 -- note\r\n") == "SELECT 1 -- note"
+    assert check_select_only("SELECT 1 // note\r\n, 2") == "SELECT 1 // note\r\n, 2"
 
 
 def test_a_quote_escaped_with_a_backslash_reads_two_ways_and_is_refused():
