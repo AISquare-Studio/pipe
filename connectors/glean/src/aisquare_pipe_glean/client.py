@@ -32,18 +32,28 @@ _MAX_DETAIL = 300
 
 class GleanAPIError(Exception):
     """A failed Glean call. ``status`` is the HTTP status (None when nothing
-    came back); ``retry_after`` is set for a 429 that said when to retry."""
+    came back); ``retry_after`` is set for a 429 that said when to retry.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, Glean's own error text when it gave one (redacted and
+    bounded). That text can quote the query, so only the toolkit, which
+    answers the caller, shows it; the source's errors carry ``summary``
+    alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.retry_after = retry_after
         self.timed_out = timed_out
@@ -153,7 +163,8 @@ class GleanClient:
             )
         if status >= 400:
             raise GleanAPIError(
-                f"Glean {endpoint} failed ({status})" + self._detail(resp),
+                f"Glean {endpoint} failed ({status})",
+                detail=self._detail(resp),
                 status=status,
                 retry_after=_retry_after(resp.headers.get("Retry-After"))
                 if status == 429
@@ -184,5 +195,4 @@ class GleanClient:
                     break
         elif isinstance(getattr(resp, "text", None), str):
             text = resp.text
-        text = self._redact(" ".join(text.split()))[:_MAX_DETAIL]
-        return f": {text}" if text else ""
+        return self._redact(" ".join(text.split()))[:_MAX_DETAIL]

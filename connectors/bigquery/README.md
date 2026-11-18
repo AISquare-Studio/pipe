@@ -37,8 +37,9 @@ Composio's other ~58 BigQuery tools (job, table, dataset and routine writes) hav
 | `BIGQUERY_LIST_TABLES` | The tables and views in one dataset, with their types. |
 | `BIGQUERY_LIST_DATASETS` | The datasets the key can read, in the configured project or in another `project`. |
 
-A tool returns at most 4 MiB of JSON rows. Tables are written `dataset.table` or `project.dataset.table` (backticks
-allowed); datasets `dataset` or `project.dataset`. Without a project, the tenant's `project_id` is meant.
+A tool returns at most 4 MiB of JSON rows, and a single row larger than one page may hold (8 MiB of JSON or 100,000
+values, see [Memory](#memory)) is `invalid_arguments`. Tables are written `dataset.table` or `project.dataset.table`
+(backticks allowed); datasets `dataset` or `project.dataset`. Without a project, the tenant's `project_id` is meant.
 
 Values come back as JSON: `INT64` as numbers, `FLOAT64` as numbers (`NaN` and the infinities as strings), `BOOL` as
 booleans, `TIMESTAMP` as RFC 3339 UTC with microseconds, `NUMERIC`/`BIGNUMERIC` as exact strings, `RECORD` as
@@ -53,8 +54,12 @@ rest as the strings BigQuery sends.
 - `sql`: one SELECT, guarded exactly as `BIGQUERY_RUN_SELECT`. Optional `default_dataset`, `max_bytes_processed`
   (default 1 GiB, never above the ceiling) and `job_timeout_seconds` (default 120, at most 600).
 
-For both: `batch_size` rows per envelope (default 500, at most 10,000), `max_rows` (default 10,000, at most 100,000)
-and `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 100 MiB).
+For both: `batch_size` rows per envelope (default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data
+(default 256 KiB, what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
+without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
+comes first, `max_rows` (default 10,000, at most 100,000) and `max_result_bytes` (bytes of the envelopes' data in
+all, each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see
+[Memory](#memory)).
 
 Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
 `schema` holds the columns too). A result with no rows is one envelope with no rows, so its markers still come out.
@@ -77,15 +82,111 @@ Also in `metadata`: `kind` (`table` or `query`), `table` or `query_sha256` (the 
 `batch_index`, `batch_count`, `first_row`, `row_count`, `batch_sha256`, `result_row_count`, `total_rows`, and for
 `sql` `job_id` and `total_bytes_processed`.
 
-**A pull that stops early says so.** At `max_rows` or `max_result_bytes`, every envelope carries `truncated`
-(`max_rows` or `max_result_bytes`), and a `table` pull also `next_start_index`: pass it as `start_index` and repeat
-until a pull is not truncated. Nothing is skipped or repeated while the table doesn't change. A truncated `sql` pull
+**A pull that stops early says so.** At `max_rows`, `max_result_bytes` or 5,000 pages read, every envelope carries
+`truncated` (`max_rows`, `max_result_bytes` or `max_pages`), and a `table` pull also `next_start_index`: pass it as
+`start_index` and repeat until a pull is not truncated. Nothing is skipped or repeated while the table doesn't change. A truncated `sql` pull
 can't be continued: narrow the query or raise the caps. `result_sha256` then covers the rows read only.
+
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries BigQuery's own error
+text, which can quote the SQL and name tables, nor the token endpoint's `error` and `error_description`, because
+hosts log these; the toolkit, which answers the caller, still shows both):
+- **422**, a `ValueError`: the secret is missing or malformed (`BigQueryNotConfigured`); a bad param; SQL that is
+  not one SELECT (`NotReadOnly`); the dry run over `max_bytes_processed` (`CapExceeded`); a single row larger than
+  one page may hold, 8 MiB of JSON or 100,000 values (`RowTooLarge`: its index and size, none of its values; see
+  [Memory](#memory)); and what BigQuery refused
+  that the caller can fix, as `BigQueryRequestError` (with BigQuery's `status` and `reason`): `invalidQuery` (with
+  BigQuery's "at [line:column]"), `invalid`, `notFound`, `responseTooLarge`, `resourcesExceeded`,
+  `bytesBilledLimitExceeded`, `billingTierLimitExceeded`.
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when BigQuery sent `Retry-After` (a 429 or 503):
+  everything else. A key Google refused, a missing role, VPC Service Controls, billing off, a custom quota used up,
+  rate limits, timeouts, `backendError` and 5xx. The message says which, and what to fix, as the table below does.
+
+### Memory
+
+A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each REST page as fresh
+JSON bytes, and every envelope is kept: one inline copy each, as pipe-as-service keeps a pull's converted envelopes
+(inline up to 256 KiB; each test's docstring has the model)). Each pull was measured in a process of its own:
+
+| Pull | Rows | JSON of the rows | Peak |
+|---|---|---|---|
+| defaults: 10,000 rows of 50 `INT64` columns | 10,000 | 6.8 MiB | 20 MiB (149 MiB before pages were bounded) |
+| defaults: 10,000 rows of 20 mixed columns (`INT64`, `FLOAT64`, `BOOL`, `TIMESTAMP`, `DATE`, `NUMERIC`, short `STRING`s) | 10,000 | 4.1 MiB | 18 MiB |
+| defaults: 10,000 rows of 4 wide `STRING` columns (1 KB a row) | 10,000 | 9.9 MiB | 21 MiB (41 MiB when the first 10 MB page was parsed whole) |
+| `max_result_bytes` 64 MiB, 50 `INT64` columns | 94,709 | 64 MiB | 81 MiB |
+| `max_rows` 100,000, 20 mixed columns | 100,000 | 41 MiB | 58 MiB |
+| `max_result_bytes` 64 MiB, wide rows (the most bytes held) | 64,849 | 64 MiB | 82 MiB (241 MiB at the old 100 MiB) |
+
+How a page is sized: it asks for at most 50,000 cells (`PAGE_CELLS`; each REST cell is a `{"v": "..."}` object, about
+250 bytes once parsed), so 1,000 rows of 50 columns or 10,000 of 5. Once a page has come back, the next also asks for
+at most the rows that fit 4 MiB of JSON at its bytes a row (`PAGE_BYTES`; long values), and at most twice its rows
+(`PAGE_GROWTH`; a page that came back short grows back a step at a time). Each page is let go before the next is
+read, rows are converted one at a time, and the source keeps each row as its canonical JSON (about a fifth of the
+memory a row object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once
+its envelope is built. So a pull of ordinary rows peaks at about 1.35 times the rows' JSON plus 20-40 MiB (82 MiB at
+the caps); the worst page the read cap admits adds up to about 90 MiB (below), so the worst measured pull is 160 MiB
+at the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
+response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod.
+
+**What bounds a page is the read cap, not its sizing.** A page's body (every one: tabledata.list's, a query's first
+page in jobs.query's answer, and getQueryResults') is streamed, and its bytes and its cells (its `"v":` keys: a
+`REPEATED` column's every element and a `RECORD`'s every field included) are counted as they arrive, before any of
+it is parsed. A page over 8 MiB of JSON (`READ_BYTES`) or 100,000 cells (`READ_CELLS`) is dropped, and asked for
+again from its first row (`startIndex`, which tabledata.list and getQueryResults both document; not its page token
+sent again with a smaller `maxResults`, which BigQuery doesn't document) with fewer rows: half, or fewer when what was read of it says fewer fit 4 MiB and 50,000 cells (BigQuery's own
+page limit answers a page of long rows with as many as fit, whatever was asked, so halving alone would drop page
+after page). A query's dropped first page is asked for again from the job jobs.query's answer named. Down to one
+row: a single row over either cap is **refused**, `RowTooLarge` (422), which says the row's index and the size of
+the page that holds it alone (its bytes and values) and nothing of its values. A dropped page costs a request and at
+most 8 MiB read.
+
+So a page parsed holds at most 100,000 cells from at most 8 MiB of JSON, however long its arrays are. What parsing it
+costs depends on its text: Python holds a string with one astral character (an emoji, say) at 4 bytes a character.
+The worst shapes measured (`tests/test_memory.py`; one row a page, 99,002 cells in 7.4-7.7 MB of JSON, right under
+both read caps; every envelope kept, a process per pull):
+
+| Each cell (a `REPEATED STRING` element) | Peak at the defaults | Peak at the caps |
+|---|---|---|
+| 64 ASCII characters | 63.1 MiB | 102.2 MiB |
+| 64 characters, one row's first cell with an emoji | 99.2 MiB | 143.5 MiB |
+| 64 characters, each with an emoji | 120.7 MiB | **160.4 MiB** (the worst) |
+
+A `REPEATED` column's schema can't say how many elements a row holds: the FIRST page guesses 1,000 a column
+(`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the most cells a row
+of the LAST page held, never the most of the whole pull: one wide row would hold every later page to a row. After a
+page of one wide row (60,000 elements, then 20,000 rows of one), pages double back up (1, 2, 4, ... 4,096) and the
+default 10,000 rows come back in 15 requests (5,001 when the pull's widest row sized every page). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
+elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
+and 10 MB for a table; 1,000 rows, so both stop at `max_result_bytes`):
+
+| Rows | Pull | Peak at the defaults (rows) | Peak at the caps (rows) | At e3d068b, defaults / caps |
+|---|---|---|---|---|
+| 20,000 elements each | `sql` | 36.7 MiB (163) | 76.0 MiB (419) | 266.1 / 266.1 MiB |
+| 22,000 elements each | `sql` | 37.9 MiB (148) | 77.1 MiB (381) | 292.9 / 292.9 MiB |
+| 34,000 one-character elements each | `sql` | 38.2 MiB (385) | 73.9 MiB (986) | 343.5 / 343.5 MiB |
+| `[]` for 50 rows, then 22,000 elements | `sql` | 37.9 MiB (198) | 77.2 MiB (431) | 286.9 / 286.9 MiB |
+| 20,000 elements each | `table` | 36.7 MiB (163) | 76.0 MiB (419) | 146.6 / 146.6 MiB |
+
+At e3d068b the first page asked for 49 rows (the guess, then a floor for every page) whatever their arrays held: up
+to 1.67 million cells, a 20 MB page parsed whole. BigQuery's page limit bounds a page's bytes, not what parsing it
+costs. Now that page is dropped once 100,000 of its cells are read, and asked for again with the rows that fit (one
+or two), then pages of two (one for the one-character rows). Rows whose arrays are short and then long (a column added
+later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones last), on the `sql` path:
+
+| First 50 rows, then the rest | Peak at the defaults | Peak at the caps (rows) |
+|---|---|---|
+| `[]`, then 100 elements | 21 MiB | 81 MiB (82,051, `max_result_bytes`) |
+| 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
+| `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
+
+A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`); rows of 50,000 cells or more page
+one at a time, and `max_result_bytes` stops those within about 700.
 
 ## Security
 
 **SELECT only, before any request.** `BIGQUERY_RUN_SELECT` and a `sql` pull refuse anything but ONE read-only
-statement before a token is even minted. Two independent checks must both pass:
+statement before a token is even minted. Two checks must both pass. The lexer decides where statements, strings and
+comments end; the parser decides what the one statement is. Neither alone is a complete guard (two escape payloads
+fool sqlglot about where a quote ends, so the lexer has the last word on that):
 1. **A lexer** that reads text as BigQuery does (backslash escapes always on in `'...'`, `"..."`, `'''...'''`,
    `"""..."""` and backtick identifiers; `--`, `#` and `/* */` comments). With those blanked, the text must be one
    statement (one trailing `;` is dropped) starting with `SELECT` or `WITH`, naming none of `INSERT`, `UPDATE`,
@@ -97,8 +198,12 @@ statement before a token is even minted. Two independent checks must both pass:
    refused. GoogleSQL `/* */` comments don't nest (the first `*/` ends one), so a `/*` inside one is refused.
 2. **A parser** (sqlglot `>=26.25`, BigQuery dialect; 25.3 to 26.24 read `/* */` comments as nested): exactly
    one statement whose root is a query, with no write, DDL, scripting or transaction node anywhere in its tree.
-   Text it can't parse is refused. Its "unsupported syntax" warning, which would log the SQL, is switched off. CI
-   runs this suite a second time at the sqlglot floor (`scripts/dep_floor.py`), not only at the newest sqlglot.
+   Text it can't parse is refused. sqlglot logs pieces of the SQL while it parses (its "unsupported syntax"
+   warning, and "Invalid JSON path syntax" with the path for `JSON_VALUE(p, '$.a-1')`), so the guard parses inside
+   `aisquare.pipe.core.sql.quiet_sqlglot()`, the helper every SQL guard shares: nothing sqlglot logs then gets out,
+   not even through Python's `logging.lastResort`, and sqlglot logs as usual everywhere else. On a sqlglot older
+   than 26.25 (another package can bring one in) the guard refuses every statement. CI runs this suite a second
+   time at the sqlglot floor (`scripts/dep_floor.py`), not only at the newest sqlglot.
 
 So DML, DDL, DCL, scripts (`DECLARE`, `BEGIN ... END`, `EXECUTE IMMEDIATE`, `CALL`, `ASSERT`...) and several
 statements are refused (`invalid_arguments`), and the message never echoes the SQL. Google adds its own layers
@@ -115,7 +220,7 @@ behind these:
   1 GiB; a caller may ask for more, up to the tenant's `max_bytes_billed` ceiling (default 10 GiB, at most 1 TiB).
   It is at least 10 MiB, BigQuery's minimum charge per table.
 - **Rows and bytes returned.** `max_rows`, and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most
-  100 MiB, for the source). A result cut short says `truncated`.
+  64 MiB, for the source). A result cut short says `truncated`.
 - **Time.** A tool call fits inside the host's `timeout_seconds`, all of its requests together: each one, the token
   POST included, gets the time left (at most 30 s), and a call with no time left fails `timeout` before it sends
   anything more. Every request starts inside the budget and gets at most the time left (requests bounds each connect
@@ -146,19 +251,25 @@ retries once with a new one (a retried `jobs.query` keeps its `requestId`, so Bi
 |---|---|---|
 | "BigQuery is not configured: ..." | `not_connected` | The secret is missing or malformed (the message says what). Fix the secret. |
 | "Google did not issue a token ...", "BigQuery failed (401 ...)" | `unauthorized` | Google refused the key: deleted, disabled or expired key, or a disabled service account. The customer makes a new key. |
-| "... lacks roles/bigquery.dataViewer ..." / "... lacks roles/bigquery.jobUser ..." | `forbidden` | The role is missing, or on another dataset or project. |
+| "... lacks roles/bigquery.dataViewer ..." / "... lacks roles/bigquery.jobUser ..." | `forbidden` | The role is missing, or on another dataset or project. A job that fails `accessDenied` inside a finished answer maps the same way. |
+| "... backed by Google Drive ..." | `forbidden` | A Sheet or Drive-file external table: it needs a Drive scope, which no role grants. Not supported. |
+| "... the token lacks a scope ..." | `insufficient_scope` | Google's `WWW-Authenticate` challenge says the scope is short; the connector asks for `bigquery.readonly` only. |
 | "... VPC Service Controls perimeter ..." | `forbidden` | The project is in a perimeter with no ingress rule for the service account. |
 | "... billing is not enabled on project ..." | `forbidden` | The job project has no billing account. |
 | "only one SELECT (or WITH ... SELECT) may run: ..." | `invalid_arguments` | The SQL is not one read-only query. |
 | "the query would process N bytes, over max_bytes_processed ..." / `bytesBilledLimitExceeded` | `invalid_arguments` | The byte cap. Filter on the partition column, select fewer columns, or raise the cap (up to the ceiling). |
 | `invalidQuery`, `responseTooLarge`, `resourcesExceeded` | `invalid_arguments` | Fix the query (add a `LIMIT`, simplify it). |
-| `rateLimitExceeded`, `quotaExceeded` (BigQuery sends them as 403) | `rate_limited` | Retry later. |
+| "Custom quota exceeded ..." (`quotaExceeded`) | `forbidden` | A custom quota the customer's administrator set (query usage per day, per project or per user; checklist step 1) is used up. Retries fail until it resets at midnight Pacific time, or until the administrator raises it. |
+| `rateLimitExceeded`, other `quotaExceeded` (BigQuery sends them as 403) | `rate_limited` | Retry later. |
 | a timeout, "could not reach ...", `backendError`, a 5xx | `timeout`, `upstream_error` | Google or the network. Retryable. The credential is fine. |
 | "Google refused the token request's issue and expiry times: this host's clock is off ..." | `upstream_error` | Our clock is off. Fix NTP on the host. |
 
 **Not supported:**
 - Legacy SQL (every query runs as GoogleSQL), query parameters, sessions and multi-statement scripts.
 - Reading a view, materialized view or external table with `BIGQUERY_READ_TABLE_ROWS` or a `table` pull: use a SELECT.
+- External tables backed by Google Drive (a Sheet, a Drive file), even with a SELECT: reading them needs a Drive
+  scope on the token, and the connector only ever asks for `bigquery.readonly`. BigQuery answers `accessDenied`
+  ("Permission denied while getting Drive credentials"), and no role fixes it.
 - Continuing a truncated `BIGQUERY_RUN_SELECT` result page by page: narrow the query.
 - Cancelling a running job: the `bigquery.readonly` scope can't. The job deadline (`jobTimeoutMs`) stops it instead.
 
@@ -203,10 +314,13 @@ Check these organization settings first:
      `roles/bigquery.dataViewer` on a dataset covers every table and view in it. To share some tables or some rows
      only, put authorized views in a dedicated dataset (`aisquare_shared`, say) and grant on that dataset alone.
    - The **job project**: every query runs as a job in ONE project and is billed there (on-demand, by bytes
-     processed). That is `project_id`. It may be the data's project or another one. A query reads data in other
+     processed). On BigQuery Editions or a reservation the cost is slot time instead, which the job deadline
+     (`jobTimeoutMs`) bounds and the byte cap doesn't. That is `project_id`. It may be the data's project or another one. A query reads data in other
      projects when the data's datasets grant `dataViewer`.
    - **Cost**: tell AISquare the most one query may process (`max_bytes_billed`; we default to 10 GiB). For a hard
      daily limit too, set the job project's custom quota "Query usage per day per user" for the service account.
+     Once it is used up, queries fail "Custom quota exceeded" (`forbidden`, not a retry-later rate limit) until it
+     resets at midnight Pacific time.
    - **Location**: if the data lives in one location (`US`, `EU`, `europe-west2`...), tell AISquare; jobs then run
      there.
 2. **Create a service account** in the job project:

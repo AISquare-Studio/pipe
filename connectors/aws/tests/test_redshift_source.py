@@ -9,14 +9,13 @@ from typing import Any
 
 import pytest
 from aisquare.pipe import PullParams
-from aisquare.pipe.errors import ConfigValidationError
+from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_aws import connector as aws_connector
 from aisquare_pipe_aws import credentials as aws_credentials
 from aisquare_pipe_aws.credentials import AwsNotConfiguredError
 from aisquare_pipe_aws.redshift.config import SERVER_KEYS
 from aisquare_pipe_aws.redshift.connector import RedshiftQuerySource
-from aisquare_pipe_aws.redshift.dataapi import StatementTimeout
 from aisquare_pipe_aws.redshift.sqlguard import NotReadOnly
 from tests import redshift_fakes as fakes
 from tests.conftest import AMBIENT_KEY, EXTERNAL_ID, ROLE_ARN, access_key_of
@@ -157,7 +156,7 @@ def test_the_statement_is_cancelled_at_timeout_seconds(data_api, clock):
         fakes.describe(data_api, "STARTED")
     data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
     started = clock.now
-    with pytest.raises(StatementTimeout):
+    with pytest.raises(PipelineError, match="the statement was cancelled"):
         pull({"sql": SQL, "timeout_seconds": 5})
     assert clock.now - started <= 5
     assert data_api.operations()[-1] == "CancelStatement"
@@ -169,7 +168,7 @@ def test_the_hosts_budget_caps_timeout_seconds(data_api, clock):
         fakes.describe(data_api, "STARTED")
     data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
     started = clock.now
-    with pytest.raises(StatementTimeout):
+    with pytest.raises(PipelineError, match="deadline"):
         pull({"sql": SQL, "timeout_seconds": 600}, {**blob(), "timeout_seconds": 2})
     assert clock.now - started <= 2
 
@@ -256,8 +255,10 @@ def test_our_logs_carry_no_sql_and_no_values(data_api, caplog):
     fakes.describe(
         data_api, "FAILED", Error="ERROR: permission denied for relation rules"
     )
-    with pytest.raises(Exception, match="permission denied"):
+    # The source's error leaves the database's text out too (hosts log it).
+    with pytest.raises(PipelineError, match="lacks a grant") as raised:
         pull({"sql": SQL})
+    assert "permission denied" not in str(raised.value)
     ours = "\n".join(
         r.getMessage() for r in caplog.records if r.name.startswith("aisquare")
     )

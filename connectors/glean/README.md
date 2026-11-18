@@ -427,6 +427,17 @@ A param that names a credential key (`host`, `token`, `token_kind`, `act_as`,
 cannot read for this user are skipped. They are counted in one INFO line, with
 no ids or text.
 
+How a pull fails (pipe-as-service answers by the exception's type; neither
+message carries Glean's own error text, which can quote the query, because
+hosts log these):
+
+- **422**, a `ValueError`: the secret is missing or malformed
+  (`GleanNotConfigured`); a bad param; and what Glean refused that the caller
+  can fix, as `GleanRequestError` (with its `status`: 400, 404, 422);
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when Glean
+  sent `Retry-After` (a 429): a refused token or scope, throttling, a timeout,
+  a 5xx or the network.
+
 ## Limits and follow-ups
 
 - **Rate limits**, from Glean's published limits: `/search` allows 5 requests

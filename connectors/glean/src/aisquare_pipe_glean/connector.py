@@ -40,10 +40,12 @@ from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
 from aisquare_pipe_glean.client import GleanAPIError, GleanClient
 from aisquare_pipe_glean.credentials import (
     SERVER_KEYS,
+    GleanCredentials,
     GleanNotConfigured,
     load_credentials,
 )
 from aisquare_pipe_glean.documents import document_record, search_hit, split_documents
+from aisquare_pipe_glean.toolkit import GleanRequestError, source_error
 
 logger = logging.getLogger("aisquare.pipe.glean")
 
@@ -61,7 +63,7 @@ def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw = params.params if isinstance(params, PullParams) else params
     if not isinstance(raw, dict):
-        raise TypeError("pull params must be a mapping")
+        raise ValueError("pull params must be a mapping")  # noqa: TRY004 — a host answers TypeError 500
     server = sorted(SERVER_KEYS.intersection(raw))
     if server:
         raise ValueError(
@@ -159,11 +161,28 @@ class GleanSource(SourceConnector):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
-        """Yield one envelope per readable document. Raises
-        :class:`GleanNotConfigured` without a usable credential (before any
-        request), ``ValueError`` for bad params, and :class:`GleanAPIError`
-        when Glean fails."""
+        """Yield one envelope per readable document.
+
+        Raises, as pipe-as-service answers them:
+
+        * 422, a ``ValueError``: :class:`GleanNotConfigured` without a usable
+          credential (before any request); bad params; and what Glean
+          refused that the caller can fix
+          (:class:`~aisquare_pipe_glean.toolkit.GleanRequestError`);
+        * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
+          Glean failure (a refused token or scope, throttling, a timeout, a
+          5xx), with ``retry_after`` when Glean gave one.
+
+        Neither carries Glean's own error text."""
         creds = load_credentials(config)
+        try:
+            yield from self._pull(creds, params)
+        except GleanAPIError as e:
+            raise source_error(e) from None
+
+    def _pull(
+        self, creds: GleanCredentials, params: PullParams | None
+    ) -> Iterator[DataEnvelope]:
         options = _options(params)
         query = options.get("query")
         ids = options.get("document_ids")
@@ -286,4 +305,4 @@ class GleanSource(SourceConnector):
             )
 
 
-__all__ = ["GleanAPIError", "GleanNotConfigured", "GleanSource"]
+__all__ = ["GleanAPIError", "GleanNotConfigured", "GleanRequestError", "GleanSource"]

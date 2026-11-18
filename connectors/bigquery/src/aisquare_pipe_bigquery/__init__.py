@@ -9,7 +9,7 @@ before any request (:mod:`aisquare_pipe_bigquery.sqlguard`).
 from aisquare_pipe_bigquery.client import BigQueryAPIError
 from aisquare_pipe_bigquery.connector import BigQueryQuerySource
 from aisquare_pipe_bigquery.credentials import BigQueryNotConfigured, load_credentials
-from aisquare_pipe_bigquery.query import CapExceeded, NotATable
+from aisquare_pipe_bigquery.query import CapExceeded, NotATable, RowTooLarge
 from aisquare_pipe_bigquery.sqlguard import NotReadOnly, check_select_only
 from aisquare_pipe_bigquery.toolkit import BigQueryToolkit
 
@@ -21,6 +21,7 @@ __all__ = [
     "CapExceeded",
     "NotATable",
     "NotReadOnly",
+    "RowTooLarge",
     "check_select_only",
     "load_credentials",
 ]

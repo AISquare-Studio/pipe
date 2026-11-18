@@ -164,9 +164,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in double quotes. It reads a number whole, exponent included, before any word, as Redshift
     does, so `SELECT 1e5INTO t` is refused as `INTO`.
     Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
-    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so a filter on
-    the `sqlglot` logger drops its records in the parsing thread or task only (no global
-    switch). Python's last-resort stderr handler doesn't see them either.
+    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so the guard
+    parses inside `aisquare.pipe.core.sql.quiet_sqlglot()` (the parsing thread or task only, no
+    global switch). Python's last-resort stderr handler doesn't see them either.
   - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
     (paged) inside one deadline: the host's time budget, else 60 s (the source's
     `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
@@ -224,7 +224,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and warehouse,
     which no tool argument or pull param can change.
   - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
-    tool call, at most 100 MiB for the source; partitions are read only while they fit), and the
+    tool call, at most 64 MiB for the source; a result is read a row at a time, up to the cap), and the
     statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
     `timeout`; polling stops there and the statement is cancelled. Snowflake's error codes pick the
     canonical code (`002003` not_found, `003001`/`000606` forbidden, `000630` timeout, ...).
@@ -236,6 +236,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `next_start_index`.
   - Not built: stage file listing and reading (GoodRx hasn't said policies live in stages).
   Setup, the registration checklist and the exact secret: `connectors/snowflake/README.md`.
+- `aisquare.pipe.core.sql.quiet_sqlglot()`: the one helper every connector's SQL guard parses inside.
+  sqlglot logs pieces of the SQL while it parses ("Invalid JSON path syntax ... <path>" at WARNING for a
+  JSON key with a dash, in statements the guards admit); a ContextVar-gated filter on the `sqlglot`
+  logger drops them in that context only, before any handler, so `logging.lastResort` never prints
+  them either. Nothing is disabled globally. `sqlglot_at_least()` lets a guard refuse every statement
+  below its extra's floor (BigQuery, Snowflake and Redshift do, at 26.25).
+- `aisquare.pipe.testing.host.host_answer(exc)`: the HTTP status pipe-as-service answers a source's
+  exception with, for connector tests.
 
 ### Fixed
 
@@ -346,6 +354,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `limit`) and whether one is streamed.
   - Dropbox's `server_modified` keeps its format: the SDK's naive UTC datetime
     in ISO form, `2026-11-17T10:01:00` for Dropbox's `2026-11-17T10:01:00Z`.
+- `PipelineError` takes an optional `retry_after` (seconds). It is what a source raises for an upstream
+  or transient failure: pipe-as-service answers it 502 `upstream_error`, by its exact type.
+- The BigQuery, Cloud Storage, Glean, Snowflake, S3, Bedrock AgentCore and Redshift sources no longer
+  raise their connector's API error (a bare `Exception` or `PipeError` subclass, which pipe-as-service
+  answered 500 with the provider's text in its log). An upstream or transient failure is a
+  `PipelineError` (502, `retry_after` from the provider's `Retry-After`); what the caller can fix is a
+  `ValueError` subclass (422: `BigQueryRequestError`, `GcsRequestError`, `GleanRequestError`,
+  `SnowflakeRequestError`, `AwsRequestError`, `RedshiftRequestError`). Redshift's `StatementTimeout` is
+  a `PipelineError`, and a `StatementFailed` is a `RedshiftRequestError` (its SQL, a missing relation)
+  or a `PipelineError` (a grant, an abort). Neither carries the provider's own error text (a database
+  error can echo the caller's values); the toolkits still show it. `AwsNotConfiguredError` is a
+  `ValueError` first (422). Non-mapping pull params are a `ValueError`.
+- BigQuery, Snowflake and Redshift sources fit a 512 MiB pod: pages and partitions are let go before the next is
+  read (BigQuery pages hold at most 50,000 cells), rows convert one at a time and are kept as their
+  canonical JSON (the envelopes and hashes are unchanged, byte for byte), and a batch's rows are let go
+  once its envelope is built. `max_result_bytes` is at most 64 MiB (was 100 MiB). Peaks (tracemalloc,
+  every envelope kept): BigQuery 21 MiB at the defaults (was 149) and 103 MiB at the caps; Snowflake
+  47 MiB (was 65) and 93-104 MiB (was 367 MiB at 100 MiB); Redshift 16 MiB (was 29) and 96 MiB
+  (was 277 MiB at 100 MiB, seq 13894). The READMEs' "Memory" sections have the numbers.
+- BigQuery: "Custom quota exceeded" is `forbidden` with when it resets, not `rate_limited`; a job error
+  inside a 200 maps by its reason (`accessDenied` is `forbidden`); `WWW-Authenticate` reaches
+  `error_code_for_status` (`insufficient_scope`); Drive-backed external tables are listed as not
+  supported.
+- `scripts/dep_floor.py --connectors` exits 1 when no connector suite matches, and validate.yml's floor
+  step fails when it ran none (it used to pass having tested nothing).
+- S3: an object that grew past `max_object_bytes` between the listing and the read is skipped, not
+  raised mid-pull.
+- BigQuery, Snowflake and Redshift sources cut a batch at `batch_size` rows or `max_batch_bytes` bytes of
+  envelope data, whichever comes first (`aisquare.pipe.core.batches.batch_bounds`). The default, 256 KiB, is
+  what pipe-as-service returns inline in a sync pull: before, a default 500-row batch of 1 KiB rows was about
+  500 KiB, and a sync pull without a blob store answered 400 at the first envelope (all three, measured through
+  the host's `from_envelope`); now the same pull is 200, 8 envelopes of at most 261,816 bytes.
+- Source errors leave out the token endpoint's text too: BigQuery's and GCS's token errors keep Google's
+  `error`/`error_description` as `detail` (the toolkits still show it), so a refused key, a throttled or failing
+  endpoint reads "Google did not issue a token for <service account>" and the like, nothing of Google's (#46
+  reopen seq 13961). An S3 object body that breaks off mid-read (botocore's ReadTimeoutError,
+  ConnectionClosedError, ResponseStreamingError, IncompleteReadError, whose messages name the bucket and key) is a
+  502 naming the error type only (it was a 500). A GCS listing whose `generation` isn't a string is a 502, not a
+  422.
+- BigQuery: a `REPEATED` column's elements count as cells: the first page guesses 1,000 a column, and each next
+  page is sized from the most cells a row held so far. Rows of 100 elements: 277 -> 21 MiB at the defaults and
+  342 -> 81 MiB at the caps.
+- BigQuery: every row page, a query's first one in jobs.query's answer included, is read within a cap: its body is
+  streamed, and its bytes and cells (`"v":` keys, a `REPEATED` column's every element included) are counted before
+  any of it is parsed. A page over 8 MiB or 100,000 cells is dropped and asked for again with at most half the rows
+  (fewer when what was read says fewer fit), down to one; a single row over either is `RowTooLarge` (422; tools:
+  `invalid_arguments`) with its index and size, none of its values. Rows with `ARRAY_AGG` arrays of 20,000-34,000
+  elements: 266-344 -> 37-38 MiB at the defaults and the same 266-344 -> 74-77 MiB at the caps, on the first page
+  or after short ones (#46 reopen seq 14031).
+- BigQuery: each page is sized from the LAST page's widest row, not the pull's: one row of 60,000 elements held every
+  later page to one row (the default 10,000 rows came back as 5,048 in 5,001 requests, labelled `max_rows`); now
+  pages double back up and all 10,000 come back in 15 requests. A pull that reads `MAX_PAGES` (5,000) pages with
+  rows left says `truncated` `max_pages`. A dropped page is asked for again from its first row (`startIndex`), not
+  with its page token and a smaller `maxResults` (undocumented). The README's worst case is measured: 160 MiB at
+  the caps, an emoji in every cell of rows right under both read caps (#46 review seq 14088 M1, n1, n2).
+- Snowflake: a result is read a row at a time, never a partition whole (`aisquare_pipe_snowflake.stream`).
+  Snowflake sizes the partitions (its docs show 76 MB), and partition 0 came inside the status answer unchecked:
+  one 100,000-row partition of 50 `NUMBER` columns peaked at 380 MiB at the caps. Now every result body is
+  streamed 64 KiB at a time and split into rows as it arrives, and reading stops at the cap, inside a partition
+  when that is where it falls (a partition is no longer skipped whole because its `uncompressedSize` would not
+  fit). The same pull peaks at 74 MiB, whatever the partitions; the worst measured, rows of 8 MiB with an emoji in
+  each cell, 177 MiB. A row over 8 MiB of JSON is `RowTooLarge` (422; tools: `invalid_arguments`), with its
+  index and none of its values; a result body that isn't the SQL API's JSON, or breaks off, is a 502 (#46 review
+  seq 14088 M2).
+- Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
+  document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
+  `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
+- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor)` is how every SQL guard parses (BigQuery,
+  Snowflake, Redshift): the sqlglot floor check, a quiet tokenize and parse, and any exception a refusal, in one
+  place. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it differs from the floor
+  `scripts/dep_floor.py` reads from the pyproject, and when a connector module that imports sqlglot parses,
+  tokenizes or checks the floor itself, or keeps its own floor (#46 review seq 14088 m2).
+- `scripts/dep_floor.py --connectors` also exits 1 when an extra that names the dependency has no
+  `connectors/<extra>` directory (it was skipped silently while another suite matched); an aggregate extra (one
+  that names the project itself, as `[full]` does) needs none (#46 review seq 14088 n3).
+- `max_result_bytes` (BigQuery, Snowflake, Redshift) counts what the envelopes hold, each one's columns header
+  included (`aisquare.pipe.core.batches.BatchPlan` plans the cuts while the rows are read): 200 columns in 1 KiB
+  envelopes made 256 MiB of envelopes under a 64 MiB cap.
+- GCS source memory: a download accumulates in one buffer (no chunk list and join), the source drops each
+  object before the next download, and it holds an envelope back for a truncated pull's marker only when
+  every object after it could still be skipped at download (unknown size, or stored gzip). `max_bytes`
+  for the source is at most 64 MiB (was 100 MiB; tools keep 100 MiB). Peak (tracemalloc, three objects):
+  25 MiB objects 50 MiB (was 100), 64 MiB objects 129 MiB (was 192 truncated), and 400 MiB at the old
+  100 MiB cap before.
 
 ## [0.5.0] - 2026-11-04
 

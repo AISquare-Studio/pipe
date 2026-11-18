@@ -22,7 +22,8 @@ key into short-lived tokens. Without the extra, `gcs` and `gcs-source` count as 
   this name is included.
 - `modified_after` (RFC 3339).
 - `max_objects` (default 100, at most 1000).
-- `max_bytes` per object. A larger object is skipped and counted in one log line.
+- `max_bytes` per object (default 25 MiB, at most 64 MiB for the source, sized for a 512 MiB pod; see Memory
+  below). A larger object is skipped and counted in one log line.
 
 Each envelope carries the object's bytes and `metadata`: `bucket`, `object_name`, `filename`, `size`,
 `content_type`, `generation`, `md5_hash`, `updated`, `etag`, `crc32c`, `time_created`, and `content_encoding`
@@ -53,6 +54,31 @@ pull first, or it misses changes.
 
 Read-only by construction: the token's scope is `devstorage.read_only`, the service account only needs
 `roles/storage.objectViewer`, and no tool writes.
+
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Cloud Storage's own
+error text, which names objects, nor the token endpoint's `error` and `error_description`, because hosts log these;
+the toolkit, which answers the caller, still shows both. A listed object whose `generation` isn't a string is
+Cloud Storage's answer gone wrong: a 502):
+- **422**, a `ValueError`: the secret is missing or malformed (`GcsNotConfigured`); a bad param or a name outside
+  the prefix; `GcsPullTruncated`; and what Cloud Storage refused that the caller can fix, as `GcsRequestError` (with
+  its `status`): a named object that does not exist (404), a request it calls invalid (400).
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when Cloud Storage sent `Retry-After` (a 429 or
+  503): a key Google refused, a missing role, VPC Service Controls, throttling, a timeout, a 5xx or the network.
+
+**Memory.** A pull holds about two objects at a time: the one being read, and the one the consumer still holds
+while the next downloads (pipe-as-service's pull loop does; it keeps no inline copy of an object over 256 KiB, but a
+blob-store reference, or a sync 400). A download goes into one buffer that hands its bytes
+over without a copy, and an envelope is held back (for a truncated pull's marker) only when every object after it
+could still be skipped at download, which only an object of unknown size or one stored gzip can be. Measured with
+`tracemalloc` (`tests/test_memory.py`, three objects, the consumer dropping each envelope):
+
+| Objects | Peak before | Peak now |
+|---|---|---|
+| 25 MiB (the default `max_bytes`) | 100 MiB | 50 MiB |
+| 64 MiB (the source's cap now), a truncated listing | 192 MiB | 129 MiB |
+| 100 MiB (the cap before) | 400 MiB | over the cap: skipped |
+
+Tools still read up to 100 MiB (`GCS_GET_OBJECT`), one object per call.
 
 ## Security
 

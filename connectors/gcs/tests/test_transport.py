@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
-from aisquare_pipe_gcs import GcsAPIError, GcsSource, GcsToolkit
+from aisquare_pipe_gcs import GcsSource, GcsToolkit
 from tests.fakes import FakeGoogle, StoredObject, blob, real_session
 
 BODY = b"0123456789" * 1000
@@ -56,9 +58,10 @@ def test_a_read_timeout_mid_download_is_a_timeout():
     google_.media_break = TimeoutError("timed out")
     result = _get(google_)
     assert not result.successful and result.error_code == "timeout", result.error
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.timed_out
+    assert host_answer(raised.value).status == 502
+    assert "in time" in str(raised.value)
 
 
 def test_a_connection_reset_mid_download_is_an_upstream_error():
@@ -71,9 +74,10 @@ def test_a_connection_reset_mid_download_is_an_upstream_error():
     assert "could not read the object from Cloud Storage (ChunkedEncodingError)" in (
         result.error or ""
     )
-    with pytest.raises(GcsAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert not raised.value.timed_out and raised.value.status is None
+    assert host_answer(raised.value).status == 502
+    assert "in time" not in str(raised.value)
 
 
 def test_a_token_answer_that_times_out_midway_is_a_timeout():

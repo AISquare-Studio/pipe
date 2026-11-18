@@ -71,9 +71,14 @@ SESSION_SECONDS = 3600
 CONFIG_KEYS = ("role_arn", "external_id", "regions", "s3")
 
 
-class AwsNotConfiguredError(ConfigValidationError):
+class AwsNotConfiguredError(ValueError, ConfigValidationError):
     """The AWS credential blob is missing or malformed, or this host has no
-    AWS principal to assume the role from. Names the problem, never a value."""
+    AWS principal to assume the role from. Names the problem, never a value.
+
+    A ``ValueError`` first: pipe-as-service finds its handler along the MRO
+    (``ValueError``: 422) and maps a ``PipeError`` by its EXACT type, so a
+    ``ConfigValidationError`` subclass alone would be answered 500. It is a
+    ``ConfigValidationError`` too, for callers that catch that."""
 
 
 class AwsAccessError(PipeError):

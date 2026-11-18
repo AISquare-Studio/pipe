@@ -1,5 +1,7 @@
 """Custom exceptions for aisquare.pipe."""
 
+import math
+
 
 class PipeError(Exception):
     """Base exception for all aisquare.pipe errors."""
@@ -22,7 +24,34 @@ class EnvelopeValidationError(PipeError):
 
 
 class PipelineError(PipeError):
-    """Raised for general pipeline execution errors."""
+    """Raised for general pipeline execution errors, and by a source for an
+    upstream or transient failure: the provider failed, refused the
+    credential, throttled or did not answer in time.
+
+    pipe-as-service answers it 502 ``upstream_error``. Its router looks the
+    class up by its exact type, so a source raises ``PipelineError`` itself,
+    never a subclass (a subclass answers 500 there; a newer host that looks
+    along the MRO answers it 502, and :mod:`aisquare.pipe.testing.host`
+    mirrors the strictest). What the caller can fix (a bad param,
+    a cap, an invalid query, a missing table) is a ``ValueError`` instead,
+    answered 422.
+
+    ``retry_after`` (seconds) is set when the provider said when to retry,
+    for a host to send as ``Retry-After``. The message is the connector's
+    own words, never the provider's error text, SQL, names or values: hosts
+    log it at ERROR, with the traceback.
+    """
+
+    def __init__(self, *args: object, retry_after: float | None = None) -> None:
+        super().__init__(*args)
+        self.retry_after: float | None = (
+            float(retry_after)
+            if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            and math.isfinite(retry_after)
+            and retry_after >= 0
+            else None
+        )
 
 
 class ConverterError(PipeError):

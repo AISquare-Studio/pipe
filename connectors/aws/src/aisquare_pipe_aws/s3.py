@@ -21,6 +21,12 @@ from typing import Any
 from aisquare_pipe_aws.agentcore import iso
 from aisquare_pipe_aws.credentials import AwsAccessError, S3Location, call, pages
 
+
+class S3ObjectTooLarge(AwsAccessError):
+    """An object over the read limit (``invalid_arguments``): the source
+    skips it, as it skips one the listing already shows too large."""
+
+
 PAGE_SIZE = 1000
 #: Largest object read into memory by default (25 MiB); larger ones are
 #: listed but not downloaded.
@@ -131,7 +137,8 @@ def get_object(
     max_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
 ) -> tuple[bytes, dict[str, Any]]:
     """``(body, metadata)``. An object over ``max_bytes`` is refused with an
-    :class:`AwsAccessError` (code ``invalid_arguments``) before any byte is read."""
+    :class:`S3ObjectTooLarge` (an :class:`AwsAccessError`, code
+    ``invalid_arguments``) before more than ``max_bytes + 1`` bytes are read."""
     kwargs: dict[str, Any] = {"Bucket": location.bucket, "Key": key}
     if version_id:
         kwargs["VersionId"] = version_id
@@ -140,19 +147,42 @@ def get_object(
     try:
         size = response.get("ContentLength")
         if isinstance(size, int) and size > max_bytes:
-            raise AwsAccessError(
+            raise S3ObjectTooLarge(
                 f"object is {size} bytes, over the {max_bytes}-byte read limit",
                 code="invalid_arguments",
             )
-        data = body.read(max_bytes + 1)
+        data = _read(body, max_bytes + 1)
         if len(data) > max_bytes:
-            raise AwsAccessError(
+            raise S3ObjectTooLarge(
                 f"object is over the {max_bytes}-byte read limit",
                 code="invalid_arguments",
             )
     finally:
         body.close()
     return data, object_metadata(location, key, response)
+
+
+def _read(body: Any, amount: int) -> bytes:
+    """``body.read(amount)``. The body streams after GetObject has answered,
+    outside :func:`~aisquare_pipe_aws.credentials.call`, so a read that fails
+    there (a timeout, a dropped connection, a short body) is mapped here the
+    same way: an :class:`AwsAccessError` naming the error's type only (its
+    text names the bucket and key).
+
+    botocore's ``StreamingBody`` maps only urllib3's read timeout and protocol
+    errors to its own; the rest of urllib3's (an ``SSLError`` for a TLS record
+    that fails mid-body, a ``DecodeError``) and a bare ``OSError`` come
+    through as they are, so they are caught here too, as GCS's stream does."""
+    from botocore.exceptions import BotoCoreError
+    from urllib3.exceptions import HTTPError as Urllib3Error
+
+    try:
+        return bytes(body.read(amount))
+    except (BotoCoreError, Urllib3Error, OSError) as e:
+        raise AwsAccessError(
+            f"AWS s3:GetObject failed while reading the object ({type(e).__name__})",
+            code="upstream_error",
+        ) from None
 
 
 def object_metadata(

@@ -11,9 +11,10 @@ import google.auth.exceptions
 import pytest
 import requests
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
 from aisquare_pipe_bigquery import (
-    BigQueryAPIError,
     BigQueryNotConfigured,
     BigQueryQuerySource,
     BigQueryToolkit,
@@ -250,9 +251,11 @@ def test_a_token_endpoint_timeout_is_a_timeout_not_a_bad_key(error):
     assert not result.successful and result.error_code == "timeout", result.error
     assert _BAD_KEY_HINT not in (result.error or "")
     assert len(google_.token_requests) == 1 and google_.api_calls() == []
-    with pytest.raises(BigQueryAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.timed_out and raised.value.status != 401
+    assert host_answer(raised.value).status == 502
+    assert "did not answer in time" in str(raised.value)
+    assert _BAD_KEY_HINT not in str(raised.value)
 
 
 def test_an_unreachable_token_endpoint_is_an_upstream_error_not_a_bad_key():
@@ -314,9 +317,12 @@ def test_only_a_refused_key_is_unauthorized(status, body):
     assert not result.successful and result.error_code == "unauthorized"
     assert _BAD_KEY_HINT in (result.error or "")
     assert "PRIVATE KEY" not in (result.error or "")
-    with pytest.raises(BigQueryAPIError) as raised:
+    with pytest.raises(PipelineError) as raised:
         _pull(google_)
-    assert raised.value.status == 401 and raised.value.key_refused
+    # The tenant's key, not the caller: upstream (502), and it says so.
+    assert host_answer(raised.value).status == 502
+    assert _BAD_KEY_HINT in str(raised.value)
+    assert "PRIVATE KEY" not in str(raised.value)
 
 
 def test_our_clock_skew_is_not_blamed_on_the_key():

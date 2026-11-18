@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -67,20 +68,28 @@ def columns_of(row_type: Any) -> list[dict[str, Any]]:
 
 def convert_rows(columns: list[dict[str, Any]], rows: Any) -> list[dict[str, Any]]:
     """SQL API rows (lists of strings) as objects keyed by column name."""
+    return list(iter_rows(columns, rows))
+
+
+def iter_rows(columns: list[dict[str, Any]], rows: Any) -> Iterator[dict[str, Any]]:
+    """:func:`convert_rows`, one row at a time (a partition's rows are never
+    all objects at once)."""
     if not isinstance(rows, list):
-        return []
-    out = []
+        return
     for row in rows:
-        cells = row if isinstance(row, list) else []
-        out.append(
-            {
-                column["name"]: convert_value(
-                    column, cells[index] if index < len(cells) else None
-                )
-                for index, column in enumerate(columns)
-            }
+        yield convert_row(columns, row)
+
+
+def convert_row(columns: list[dict[str, Any]], row: Any) -> dict[str, Any]:
+    """One SQL API row (a list of strings and nulls; anything else is a row
+    of nulls) as an object keyed by column name."""
+    cells = row if isinstance(row, list) else []
+    return {
+        column["name"]: convert_value(
+            column, cells[index] if index < len(cells) else None
         )
-    return out
+        for index, column in enumerate(columns)
+    }
 
 
 def convert_value(column: dict[str, Any], value: Any) -> Any:
@@ -159,26 +168,52 @@ def row_size(row: dict[str, Any]) -> int:
 
 def rows_sha256(rows: list[dict[str, Any]]) -> str:
     """SHA-256 of ``rows`` in order (one batch's hash)."""
+    return encoded_rows_sha256(canonical(row) for row in rows)
+
+
+def encoded_rows_sha256(encoded: Iterable[bytes]) -> str:
+    """:func:`rows_sha256` of rows already in :func:`canonical` form."""
     digest = hashlib.sha256()
-    for row in rows:
-        digest.update(canonical(row))
+    for row in encoded:
+        digest.update(row)
         digest.update(b"\n")
     return digest.hexdigest()
 
 
 def result_sha256(columns: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str:
     """SHA-256 of the columns and the rows, whatever order the rows came in."""
+    return encoded_result_sha256(columns, (canonical(r) for r in rows))
+
+
+def encoded_result_sha256(
+    columns: list[dict[str, Any]], encoded: Iterable[bytes]
+) -> str:
+    """:func:`result_sha256` of rows already in :func:`canonical` form."""
     digest = hashlib.sha256(canonical(columns))
-    for row_digest in sorted(hashlib.sha256(canonical(r)).digest() for r in rows):
+    for row_digest in sorted(hashlib.sha256(row).digest() for row in encoded):
         digest.update(row_digest)
     return digest.hexdigest()
+
+
+def encoded_batch(columns: list[dict[str, Any]], encoded: Iterable[bytes]) -> bytes:
+    """``canonical({"columns": columns, "rows": rows})`` built from the
+    rows' :func:`canonical` forms, byte for byte (the keys sort as
+    ``columns``, ``rows``), without turning them back into objects."""
+    return (
+        b'{"columns":' + canonical(columns) + b',"rows":[' + b",".join(encoded) + b"]}"
+    )
 
 
 __all__ = [
     "canonical",
     "columns_of",
+    "convert_row",
     "convert_rows",
     "convert_value",
+    "encoded_batch",
+    "encoded_result_sha256",
+    "encoded_rows_sha256",
+    "iter_rows",
     "result_sha256",
     "row_size",
     "rows_sha256",

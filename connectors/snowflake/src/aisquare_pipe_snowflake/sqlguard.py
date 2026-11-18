@@ -60,11 +60,14 @@
    - a table function outside :data:`TABLE_FUNCTIONS`, including a
      qualified one, in ``TABLE(...)``, ``LATERAL`` or a bare ``FROM`` /
      ``JOIN``.
-   Text it can't parse is refused. sqlglot logs pieces of the SQL (its
-   "unsupported syntax" warning; "Invalid JSON path syntax" with the path,
-   for any JSON key with a dash), so nothing it logs while this module
-   parses gets out: a filter on the "sqlglot" logger drops those records,
-   in this context only. Nothing is disabled globally.
+   Text it can't parse is refused. It parses through
+   :func:`aisquare.pipe.core.sql.parse_statements`, as every guard does.
+   sqlglot logs pieces of the SQL (its "unsupported syntax" warning;
+   "Invalid JSON path syntax" with the path, for any JSON key with a dash),
+   so nothing it logs while that parses gets out (in this context only;
+   nothing is disabled globally), any exception refuses, and a sqlglot older
+   than core's :data:`~aisquare.pipe.core.sql.SQLGLOT_FLOOR` (the extras'
+   floor) refuses every statement.
 
 Either one refusing refuses the statement (:class:`NotReadOnly`, with a
 message naming why and never echoing the SQL). The two read the text
@@ -95,16 +98,17 @@ unqualified ``COMPLETE(...)`` is ``SNOWFLAKE.CORTEX.COMPLETE``.
 
 from __future__ import annotations
 
-import logging
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 
+from aisquare.pipe.core.sql import (
+    SQLGLOT_FLOOR,
+    SqlglotTooOld,
+    Unparsable,
+    parse_statements,
+)
 from sqlglot import exp
 from sqlglot.dialects.snowflake import Snowflake
-from sqlglot.errors import SqlglotError
 from sqlglot.tokens import Token, TokenType
 
 from aisquare_pipe_snowflake.refs import TableRef
@@ -359,49 +363,7 @@ def _qualifier_problem(name: str) -> str | None:
     return None
 
 
-class _QuietParser(Snowflake.Parser):
-    """sqlglot's Snowflake parser without its "contains unsupported syntax"
-    warning, which logs the SQL text. The statement is refused anyway: an
-    unsupported statement parses as a ``Command``."""
-
-    def _warn_unsupported(self) -> None:
-        return None
-
-
 _DIALECT = Snowflake()
-
-# sqlglot logs pieces of the SQL it parses: "Invalid JSON path syntax. ...
-# <the path>" for any JSON key with a dash (``GET_PATH(v, 'a-b')``,
-# ``v:'x-y'``), at WARNING, for statements this guard admits. Every sqlglot
-# module logs through the one "sqlglot" logger. This filter drops its records
-# while THIS module parses, in this context only (a ContextVar, so another
-# thread or task logging through sqlglot meanwhile is untouched). Nothing is
-# disabled globally.
-_SQLGLOT_LOGGER = logging.getLogger("sqlglot")
-_PARSING: ContextVar[bool] = ContextVar(
-    "aisquare_pipe_snowflake_sqlguard_parsing", default=False
-)
-
-
-class _DropWhileParsing(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _PARSING.get()
-
-
-_QUIET_WHILE_PARSING = _DropWhileParsing()
-
-
-@contextmanager
-def _sqlglot_silenced() -> Iterator[None]:
-    # Re-attached on every parse: a host that resets the logger's filters
-    # doesn't bring the leak back.
-    if _QUIET_WHILE_PARSING not in _SQLGLOT_LOGGER.filters:
-        _SQLGLOT_LOGGER.addFilter(_QUIET_WHILE_PARSING)
-    token = _PARSING.set(True)
-    try:
-        yield
-    finally:
-        _PARSING.reset(token)
 
 
 def check_select_only(sql: str) -> str:
@@ -701,11 +663,9 @@ def _blank(
 
 def _tokens_and_statements(sql: str) -> tuple[list[Token], list[exp.Expression]]:
     """sqlglot's tokens of ``sql`` and every statement in it (Snowflake
-    dialect, silently: nothing sqlglot logs while it parses gets out)."""
-    with _sqlglot_silenced():
-        tokens = _DIALECT.tokenize(sql)
-        parser = _QuietParser(dialect=_DIALECT)
-        return tokens, [s for s in parser.parse(tokens, sql) if s is not None]
+    dialect, through :func:`~aisquare.pipe.core.sql.parse_statements`)."""
+    parsed = parse_statements(sql, _DIALECT)
+    return parsed.tokens, parsed.statements
 
 
 def _parse(sql: str) -> list[exp.Expression]:
@@ -715,9 +675,11 @@ def _parse(sql: str) -> list[exp.Expression]:
 def _parsed_problem(sql: str) -> str | None:
     try:
         tokens, statements = _tokens_and_statements(sql)
-    except SqlglotError:
-        return "it does not parse as Snowflake SQL"
-    except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
+    except SqlglotTooOld as old:
+        raise NotReadOnly(
+            f"{old}; the host must install aisquare-pipe[snowflake] as declared"
+        ) from None
+    except Unparsable:
         return "it does not parse as Snowflake SQL"
     if len(statements) != 1:
         return "it is more than one statement" if statements else "it is empty"
@@ -887,6 +849,7 @@ def table_references(
 
 __all__ = [
     "MAX_SQL_CHARS",
+    "SQLGLOT_FLOOR",
     "TABLE_FUNCTIONS",
     "NotReadOnly",
     "check_context",

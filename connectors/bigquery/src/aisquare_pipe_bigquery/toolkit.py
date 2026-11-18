@@ -17,10 +17,13 @@ README): ``GOOGLEBIGQUERY_QUERY`` -> ``BIGQUERY_RUN_SELECT`` (SELECT only),
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
 from aisquare.pipe import (
+    ERROR_FORBIDDEN,
+    ERROR_INSUFFICIENT_SCOPE,
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_CONNECTED,
     ERROR_NOT_FOUND,
@@ -36,6 +39,7 @@ from aisquare.pipe import (
     error_code_for_status,
     time_budget,
 )
+from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_bigquery.client import BigQueryAPIError, BigQueryClient
 from aisquare_pipe_bigquery.credentials import (
@@ -51,6 +55,7 @@ from aisquare_pipe_bigquery.query import (
     CapExceeded,
     NotATable,
     Rows,
+    RowTooLarge,
     dry_run,
     read_table_rows,
     run_select,
@@ -313,65 +318,150 @@ _ARGUMENT_REASONS = frozenset(
 )
 
 
-def _describe(e: BigQueryAPIError, project: str) -> str:
-    """The failure, plus what to fix where the cause is known. Only a 401
-    (a key or token Google refused) blames the key."""
+#: A "Custom quota exceeded" 403: a quota the customer's administrator set
+#: (query usage per day, per project or per user). Retrying fails until it
+#: resets, so it is not a rate limit.
+_CUSTOM_QUOTA = "custom quota"
+#: Phrases in a 403 about a Google Drive-backed external table (a Sheet or a
+#: Drive file): its read needs a Drive scope, which no role grants.
+_DRIVE_PHRASES = ("drive credentials", "google drive")
+
+
+def _custom_quota(e: BigQueryAPIError) -> bool:
+    return e.reason == "quotaExceeded" and _CUSTOM_QUOTA in e.message.lower()
+
+
+def _hint(e: BigQueryAPIError, project: str) -> str | None:
+    """What to fix, where the cause is known (no BigQuery text in it). Only
+    a 401 (a key or token Google refused) blames the key."""
     text = e.message.lower()
     if e.status == 401:
         return (
-            f"{e.message} — Google rejected the service account key (deleted, disabled or "
-            "expired); the tenant's BigQuery credential must be fixed"
+            "Google rejected the service account key (deleted, disabled or expired); the "
+            "tenant's BigQuery credential must be fixed"
+        )
+    if _custom_quota(e):
+        return (
+            "a custom query quota the customer's administrator set (query usage per day, "
+            "for the project or per user) is used up; retries fail until it resets at "
+            "midnight Pacific time, or until the administrator raises it (see the "
+            "bigquery connector README)"
         )
     if e.reason == "bytesBilledLimitExceeded":
         return (
-            f"{e.message} — BigQuery stopped the query at max_bytes_processed (nothing was "
-            "billed); narrow it with a partition filter or fewer columns"
+            "BigQuery stopped the query at max_bytes_processed (nothing was billed); "
+            "narrow it with a partition filter or fewer columns"
         )
     if e.reason == "responseTooLarge":
-        return f"{e.message} — add a LIMIT or select fewer columns"
+        return "add a LIMIT or select fewer columns"
     if e.reason == "billingNotEnabled":
+        return f"billing is not enabled on project {project}, where the query jobs run"
+    if (
+        e.status == 403
+        and error_code_for_status(403, www_authenticate=e.www_authenticate)
+        == ERROR_INSUFFICIENT_SCOPE
+    ):
         return (
-            f"{e.message} — billing is not enabled on project {project}, where the query "
-            "jobs run"
+            "the token lacks a scope the call needs; this connector only ever asks for "
+            "bigquery.readonly"
         )
     if e.status == 403 and "vpc service controls" in text:
         return (
-            f"{e.message} — a VPC Service Controls perimeter blocks the request; the "
-            "customer must add an ingress rule for the service account (see the bigquery "
-            "connector README)"
+            "a VPC Service Controls perimeter blocks the request; the customer must add "
+            "an ingress rule for the service account (see the bigquery connector README)"
+        )
+    if e.status == 403 and any(phrase in text for phrase in _DRIVE_PHRASES):
+        return (
+            "the table is backed by Google Drive (a Sheet or a Drive file); reading it "
+            "needs a Drive scope this connector never asks for, so it is not supported "
+            "(see the bigquery connector README)"
         )
     if e.status == 403 and "bigquery.jobs.create" in text:
-        return (
-            f"{e.message} — the service account lacks roles/bigquery.jobUser on project "
-            f"{project}"
-        )
+        return f"the service account lacks roles/bigquery.jobUser on project {project}"
     if e.status == 403 and e.reason not in _RATE_LIMIT_REASONS:
         return (
-            f"{e.message} — the service account lacks roles/bigquery.dataViewer on that "
-            "dataset (or the table is outside what it was granted)"
+            "the service account lacks roles/bigquery.dataViewer on that dataset (or the "
+            "table is outside what it was granted)"
         )
-    return e.message
+    return None
+
+
+def _describe(e: BigQueryAPIError, project: str) -> str:
+    """The failure, BigQuery's own text included, plus what to fix where the
+    cause is known: what the toolkit answers the caller."""
+    hint = _hint(e, project)
+    return f"{e.message} — {hint}" if hint else e.message
+
+
+def error_code(e: BigQueryAPIError) -> str:
+    """The canonical ``error_code`` for a BigQuery failure. BigQuery answers
+    rate limits and quotas with 403, so its ``reason`` decides before the
+    status does; a custom quota is ``forbidden`` (a retry can't help until
+    it resets)."""
+    if e.timed_out or e.reason == "timeout":
+        return ERROR_TIMEOUT
+    if _custom_quota(e):
+        return ERROR_FORBIDDEN
+    if e.status == 429 or e.reason in _RATE_LIMIT_REASONS:
+        return ERROR_RATE_LIMITED
+    if e.reason in _UPSTREAM_REASONS:
+        return ERROR_UPSTREAM_ERROR
+    if e.reason in _ARGUMENT_REASONS:
+        return ERROR_INVALID_ARGUMENTS
+    if e.reason == "notFound":
+        return ERROR_NOT_FOUND
+    if e.status is None or 300 <= e.status < 400:
+        return ERROR_UPSTREAM_ERROR
+    return error_code_for_status(e.status, www_authenticate=e.www_authenticate)
 
 
 def failure(e: BigQueryAPIError, project: str) -> ToolResult:
-    """A BigQuery failure as a canonical ``ToolResult`` error. BigQuery
-    answers rate limits and quotas with 403, so its ``reason`` decides
-    before the status does."""
-    if e.timed_out or e.reason == "timeout":
-        code = ERROR_TIMEOUT
-    elif e.status == 429 or e.reason in _RATE_LIMIT_REASONS:
-        code = ERROR_RATE_LIMITED
-    elif e.reason in _UPSTREAM_REASONS:
-        code = ERROR_UPSTREAM_ERROR
-    elif e.reason in _ARGUMENT_REASONS:
-        code = ERROR_INVALID_ARGUMENTS
-    elif e.reason == "notFound":
-        code = ERROR_NOT_FOUND
-    elif e.status is None or 300 <= e.status < 400:
-        code = ERROR_UPSTREAM_ERROR
-    else:
-        code = error_code_for_status(e.status)
-    return ToolResult.fail(_describe(e, project), code=code, retry_after=e.retry_after)
+    """A BigQuery failure as a canonical ``ToolResult`` error."""
+    return ToolResult.fail(
+        _describe(e, project), code=error_code(e), retry_after=e.retry_after
+    )
+
+
+class BigQueryRequestError(ValueError):
+    """BigQuery refused what the caller asked for: an invalid query, a table
+    or dataset that does not exist, a result too large. A ``ValueError``, so
+    pipe-as-service answers it 422. ``status`` and ``reason`` are
+    BigQuery's."""
+
+    def __init__(
+        self, message: str, *, status: int | None = None, reason: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
+
+
+#: Where BigQuery points into the statement ("at [3:15]").
+_POSITION = re.compile(r"\bat \[(\d{1,6}):(\d{1,6})\]")
+
+
+def source_error(e: BigQueryAPIError, project: str) -> Exception:
+    """A BigQuery failure as the source raises it: what the caller can fix
+    (``invalid_arguments``, ``not_found``) is a :class:`BigQueryRequestError`
+    (422 in pipe-as-service); everything else (upstream, throttling, a
+    timeout, a refused key or permission) is a
+    :class:`~aisquare.pipe.errors.PipelineError` (502), with
+    ``retry_after`` when BigQuery gave one. The message is ``summary`` and
+    the hint, never BigQuery's own text (it can quote the SQL and name
+    tables, and hosts log these), but for a statement BigQuery calls invalid
+    it keeps where ("at [line:column]")."""
+    code = error_code(e)
+    hint = _hint(e, project)
+    text = e.summary
+    if code == ERROR_INVALID_ARGUMENTS:
+        where = _POSITION.search(e.detail)
+        if where is not None:
+            text += f" at [{where.group(1)}:{where.group(2)}]"
+    if hint:
+        text += f" — {hint}"
+    if code in (ERROR_INVALID_ARGUMENTS, ERROR_NOT_FOUND):
+        return BigQueryRequestError(text, status=e.status, reason=e.reason)
+    return PipelineError(text, retry_after=e.retry_after)
 
 
 def _bounded_int(arguments: Mapping[str, Any], name: str, low: int, high: int) -> int:
@@ -591,7 +681,7 @@ class BigQueryToolkit(Toolkit):
                 )
             except BigQueryAPIError as e:
                 return failure(e, creds.project_id)
-            except (NotReadOnly, CapExceeded, NotATable) as e:
+            except (NotReadOnly, CapExceeded, NotATable, RowTooLarge) as e:
                 return ToolResult.fail(str(e), code=ERROR_INVALID_ARGUMENTS)
 
     # Each handler checks its arguments and returns the call to make.

@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import math
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 
@@ -112,17 +113,19 @@ def value(field: Any) -> Any:
 
 def convert_page(cols: list[dict[str, Any]], records: Any) -> list[dict[str, Any]]:
     """A page's ``Records`` as objects keyed by column name."""
+    return list(iter_page(cols, records))
+
+
+def iter_page(cols: list[dict[str, Any]], records: Any) -> Iterator[dict[str, Any]]:
+    """:func:`convert_page`, one row at a time (a page's rows are never all
+    objects at once)."""
     names = [c["name"] for c in cols]
-    out: list[dict[str, Any]] = []
     for record in records if isinstance(records, list) else []:
         cells = record if isinstance(record, list) else []
-        out.append(
-            {
-                name: value(cells[index]) if index < len(cells) else None
-                for index, name in enumerate(names)
-            }
-        )
-    return out
+        yield {
+            name: value(cells[index]) if index < len(cells) else None
+            for index, name in enumerate(names)
+        }
 
 
 def canonical(obj: Any) -> bytes:
@@ -138,20 +141,49 @@ def row_digest(row: dict[str, Any]) -> str:
 
 def rows_sha256(rows: list[dict[str, Any]]) -> str:
     """The rows' hash in their order (one batch)."""
+    return digests_sha256(row_digest(row) for row in rows)
+
+
+def digests_sha256(digests: Iterable[str]) -> str:
+    """:func:`rows_sha256` from the rows' :func:`row_digest` values."""
     digest = hashlib.sha256()
-    for row in rows:
-        digest.update(row_digest(row).encode("ascii"))
+    for row_hash in digests:
+        digest.update(row_hash.encode("ascii"))
     return digest.hexdigest()
 
 
 def result_sha256(cols: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str:
     """The whole result's hash, whatever the rows' order: the columns'
     names and types, then every row's digest, sorted."""
+    return result_sha256_of_digests(cols, (row_digest(row) for row in rows))
+
+
+def result_sha256_of_digests(cols: list[dict[str, Any]], digests: Iterable[str]) -> str:
+    """:func:`result_sha256` from the rows' :func:`row_digest` values."""
     digest = hashlib.sha256()
     digest.update(canonical([[c["name"], c["type"]] for c in cols]))
-    for row_hash in sorted(row_digest(row) for row in rows):
+    for row_hash in sorted(digests):
         digest.update(row_hash.encode("ascii"))
     return digest.hexdigest()
+
+
+def envelope_json(obj: Any) -> bytes:
+    """``obj`` as the source's envelopes carry it: ``json.dumps``'s own
+    layout (keys in column order, ``", "`` and ``": "``), UTF-8."""
+    return json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+
+
+def envelope_batch(cols: list[dict[str, Any]], encoded: Iterable[bytes]) -> bytes:
+    """``envelope_json({"columns": cols, "rows": rows})`` built from each
+    row's :func:`envelope_json`, byte for byte, without turning the rows
+    back into objects."""
+    return (
+        b'{"columns": '
+        + envelope_json(cols)
+        + b', "rows": ['
+        + b", ".join(encoded)
+        + b"]}"
+    )
 
 
 def json_size(row: dict[str, Any]) -> int:

@@ -15,7 +15,8 @@ floor is raised once and holds for every connector that uses it.
 Reads the root pyproject only (no install, no import, stdlib only):
 
     python scripts/dep_floor.py sqlglot               # sqlglot==<floor>; exit 1 on a problem
-    python scripts/dep_floor.py sqlglot --connectors  # each connectors/<dir> whose extra names it
+    python scripts/dep_floor.py sqlglot --connectors  # each connectors/<dir> whose extra names it; exit 1 if
+                                                      # none, or if an extra naming it has no directory
     python scripts/dep_floor.py sqlglot --root R      # another checkout
 """
 
@@ -46,6 +47,9 @@ class Floor:
     version: str
     specifier: str
     extras: tuple[str, ...]  # the extras that name it, sorted
+    #: Of those, the aggregates: extras that name the project itself
+    #: (``aisquare-pipe[...]``, as [full] does), with no directory of their own.
+    aggregates: tuple[str, ...] = ()
 
     @property
     def pin(self) -> str:
@@ -63,13 +67,18 @@ def floor(root: Path, dist: str) -> Floor:
     bound."""
     pyproject = root / "pyproject.toml"
     with pyproject.open("rb") as f:
-        extras = tomllib.load(f).get("project", {}).get("optional-dependencies", {})
+        project = tomllib.load(f).get("project", {})
+    extras = project.get("optional-dependencies", {})
+    name = canonical(str(project.get("name") or ""))
     specs: dict[str, str] = {}
+    aggregates: set[str] = set()
     for extra, requirements in sorted(extras.items()):
         for requirement in requirements:
             match = _REQUIREMENT.match(requirement)
             if match and canonical(match["name"]) == canonical(dist):
                 specs[extra] = re.sub(r"\s+", "", match["spec"])
+            if match and name and canonical(match["name"]) == name:
+                aggregates.add(extra)
     if not specs:
         raise FloorError(f"{pyproject}: no extra names {dist}")
     if len(set(specs.values())) > 1:
@@ -84,18 +93,36 @@ def floor(root: Path, dist: str) -> Floor:
         raise FloorError(
             f"{pyproject}: {dist}{specifier} needs exactly one lower bound (>=, == or ~=)"
         )
-    return Floor(canonical(dist), lower[0], specifier, tuple(specs))
+    return Floor(
+        canonical(dist),
+        lower[0],
+        specifier,
+        tuple(specs),
+        tuple(sorted(e for e in specs if e in aggregates)),
+    )
 
 
 def connectors(root: Path, found: Floor) -> list[Path]:
     """The ``connectors/<dir>`` whose extra (named ``<dir>``) names the
-    dependency, sorted."""
+    dependency, sorted. :class:`FloorError` when an extra that names it, an
+    aggregate (:attr:`Floor.aggregates`) aside, has no such directory: its
+    suite would be skipped silently (review seq 14088 n3)."""
     named = {canonical(e) for e in found.extras}
-    return [
+    dirs = [
         d
         for d in sorted((root / "connectors").iterdir())
         if d.is_dir() and canonical(d.name) in named
     ]
+    have = {canonical(d.name) for d in dirs}
+    aggregates = {canonical(e) for e in found.aggregates}
+    missing = sorted(e for e in found.extras if canonical(e) not in have | aggregates)
+    if missing and dirs:
+        listed = ", ".join(f"[{e}] (no connectors/{canonical(e)})" for e in missing)
+        raise FloorError(
+            f"{root / 'pyproject.toml'}: extras name {found.dist} with no connector "
+            f"directory, so their suites would not run at the floor: {listed}"
+        )
+    return dirs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -120,7 +147,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"dep_floor: {problem}", file=sys.stderr)
         return 1
     if args.connectors:
-        for path in connectors(root, found):
+        try:
+            paths = connectors(root, found)
+        except FloorError as problem:
+            print(f"dep_floor: {problem}", file=sys.stderr)
+            return 1
+        if not paths:
+            # A floor step that finds no suite would pass having tested
+            # nothing (review #37 n1).
+            print(
+                f"dep_floor: no connectors/<dir> is named like an extra that names "
+                f"{found.dist} ({', '.join(sorted(found.extras))})",
+                file=sys.stderr,
+            )
+            return 1
+        for path in paths:
             print(path)
     else:
         print(found.pin)
