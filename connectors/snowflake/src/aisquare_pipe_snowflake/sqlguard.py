@@ -8,9 +8,11 @@
    and holds none of the Snowflake forms a read here never needs: ``$``
    (``$$`` strings, ``SYSTEM$`` functions, session variables, stage
    columns), ``@`` (stages), ``->`` / ``->>`` (the flow operator chains
-   statements), ``|>``, backticks and backslashes. A table function
-   (``TABLE(f(...))``, ``LATERAL f(...)``) must be one of the built-in
-   read-only ones (:data:`TABLE_FUNCTIONS`): a stored procedure can be
+   statements), ``|>``, backticks and backslashes. ``NEXTVAL`` is refused
+   even as a ``"..."`` name (``s."NEXTVAL"`` still takes a sequence's next
+   value). A table function (``TABLE(f(...))``, ``LATERAL f(...)``) must be
+   one of the built-in read-only ones (:data:`TABLE_FUNCTIONS`), unqualified
+   (``s.FLATTEN`` is a user-defined function): a stored procedure can be
    called that way, and it may write. A ``--`` or ``//`` comment ends at
    the first CR or LF, and one a bare CR ends (no LF after it) is refused;
    so is a ``/*`` inside a ``/* */`` comment. Readers disagree on both
@@ -20,9 +22,13 @@
    root is a query (``SELECT``, ``WITH ... SELECT``, ``UNION`` /
    ``INTERSECT`` / ``EXCEPT`` / ``MINUS``, or a parenthesised one), with no
    write, DDL, session, transaction or unparsed node anywhere in its tree,
-   and no table function outside :data:`TABLE_FUNCTIONS`. Text it can't
-   parse is refused. Its "unsupported syntax" warning, which would log the
-   SQL, is switched off.
+   no ``NEXTVAL`` name (quoted or not), and no table function outside
+   :data:`TABLE_FUNCTIONS` (a qualified one is outside it). Text it can't
+   parse is refused. sqlglot logs pieces of the SQL (its "unsupported
+   syntax" warning; "Invalid JSON path syntax" with the path, for any JSON
+   key with a dash), so nothing it logs while this module parses gets out:
+   a filter on the "sqlglot" logger drops those records, in this context
+   only. Nothing is disabled globally.
 
 Either one refusing refuses the statement (:class:`NotReadOnly`, with a
 message naming why and never echoing the SQL). The parser understands the
@@ -33,7 +39,11 @@ Snowflake does. Behind both, Snowflake is told to run ONE statement
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from sqlglot import exp
@@ -107,6 +117,13 @@ _WRITE_NODES: tuple[type[exp.Expression], ...] = tuple(
     )
     if isinstance(t, type)
 )
+# Nodes carrying a name the query uses: a column, table or alias (quoted or
+# not), a bare word, a function call.
+_NAMED_NODES: tuple[type[exp.Expression], ...] = (
+    exp.Identifier,
+    exp.Var,
+    exp.Anonymous,
+)
 # Where a FROM clause calls a function (``TABLE(f())``, ``LATERAL f()``).
 _TABLE_FUNCTION_NODES: tuple[type[exp.Expression], ...] = tuple(
     t for t in (getattr(exp, "TableFromRows", None), exp.Lateral) if isinstance(t, type)
@@ -153,6 +170,9 @@ _WRITE_KEYWORDS = frozenset(
         "USE",
     }
 )
+# Refused as a name even in double quotes (and by the parser, as any
+# identifier): ``s."NEXTVAL"`` still takes a sequence's next value.
+_NEVER_NAMED = frozenset({"NEXTVAL"})
 _FIRST_KEYWORDS = frozenset({"SELECT", "WITH"})
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _QUOTES = "'\""
@@ -192,6 +212,39 @@ class _QuietParser(Snowflake.Parser):
 
 _DIALECT = Snowflake()
 
+# sqlglot logs pieces of the SQL it parses: "Invalid JSON path syntax. ...
+# <the path>" for any JSON key with a dash (``GET_PATH(v, 'a-b')``,
+# ``v:'x-y'``), at WARNING, for statements this guard admits. Every sqlglot
+# module logs through the one "sqlglot" logger. This filter drops its records
+# while THIS module parses, in this context only (a ContextVar, so another
+# thread or task logging through sqlglot meanwhile is untouched). Nothing is
+# disabled globally.
+_SQLGLOT_LOGGER = logging.getLogger("sqlglot")
+_PARSING: ContextVar[bool] = ContextVar(
+    "aisquare_pipe_snowflake_sqlguard_parsing", default=False
+)
+
+
+class _DropWhileParsing(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _PARSING.get()
+
+
+_QUIET_WHILE_PARSING = _DropWhileParsing()
+
+
+@contextmanager
+def _sqlglot_silenced() -> Iterator[None]:
+    # Re-attached on every parse: a host that resets the logger's filters
+    # doesn't bring the leak back.
+    if _QUIET_WHILE_PARSING not in _SQLGLOT_LOGGER.filters:
+        _SQLGLOT_LOGGER.addFilter(_QUIET_WHILE_PARSING)
+    token = _PARSING.set(True)
+    try:
+        yield
+    finally:
+        _PARSING.reset(token)
+
 
 def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
@@ -224,11 +277,16 @@ def _lex(sql: str) -> _Lexed:
         return _Lexed(sql, "it holds a control character")
     statements: set[str] = set()
     for backslash in (True, False):
+        quoted_names: list[str] = []
         try:
-            blanked = _blank(sql, backslash_escapes=backslash)
+            blanked = _blank(
+                sql, backslash_escapes=backslash, quoted_names=quoted_names
+            )
         except _Unreadable as unreadable:
             return _Lexed(sql, str(unreadable))
         problem, cut = _read(blanked)
+        if problem is None:
+            problem = _quoted_name_problem(quoted_names)
         if problem is not None:
             return _Lexed(sql, problem)
         statements.add(sql[:cut].strip())
@@ -262,32 +320,50 @@ def _read(text: str) -> tuple[str | None, int]:
         return f"it names {written[0]}", cut
     for match in _TABLE_CALL.finditer(body):
         called = _CALLED.match(body, match.end())
-        if called is None or _last_name(called.group(1)) not in TABLE_FUNCTIONS:
+        if called is None or not _is_listed(called.group(1)):
             return _table_function_problem(), cut
     for match in _LATERAL.finditer(body):
         rest = body[match.end() :].lstrip()
         if rest.startswith("("):
             continue  # a lateral subquery
         called = _CALLED.match(body, match.end())
-        if called is None or _last_name(called.group(1)) not in TABLE_FUNCTIONS:
+        if called is None or not _is_listed(called.group(1)):
             return _table_function_problem(), cut
     return None, cut
 
 
-def _last_name(dotted: str) -> str:
-    return dotted.replace(" ", "").split(".")[-1].upper()
+def _is_listed(called: str) -> bool:
+    """Whether a called name is one of :data:`TABLE_FUNCTIONS`, UNQUALIFIED:
+    ``s.FLATTEN`` or ``db.s.GENERATOR`` names a user-defined function."""
+    return "." not in called and called.upper() in TABLE_FUNCTIONS
+
+
+def _quoted_name_problem(quoted_names: list[str]) -> str | None:
+    """A ``"..."`` identifier the word check can't see: ``s."NEXTVAL"``
+    takes a sequence's next value as surely as ``s.NEXTVAL`` does."""
+    for name in quoted_names:
+        if name.upper() in _NEVER_NAMED:
+            return f"it names {name.upper()}"
+    return None
 
 
 def _table_function_problem() -> str:
-    return "it calls a table function other than " + ", ".join(sorted(TABLE_FUNCTIONS))
+    return (
+        "it calls a table function other than "
+        + ", ".join(sorted(TABLE_FUNCTIONS))
+        + " (unqualified)"
+    )
 
 
-def _blank(sql: str, *, backslash_escapes: bool) -> str:
+def _blank(
+    sql: str, *, backslash_escapes: bool, quoted_names: list[str] | None = None
+) -> str:
     """``sql`` with quoted text and ``--`` / ``//`` / ``/* */`` comments
     turned into spaces, same length (so positions match). A line comment
-    ends at the first CR or LF. :class:`_Unreadable` when a quote or a block
-    comment never closes, a line comment ends at a bare CR, or a block
-    comment holds a ``/*``."""
+    ends at the first CR or LF. Each ``"..."`` identifier's name (``""``
+    read as ``"``) is appended to ``quoted_names``. :class:`_Unreadable` when
+    a quote or a block comment never closes, a line comment ends at a bare
+    CR, or a block comment holds a ``/*``."""
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -310,6 +386,8 @@ def _blank(sql: str, *, backslash_escapes: bool) -> str:
                     break
                 j += 1
             j = min(j, n)
+            if ch == '"' and quoted_names is not None:
+                quoted_names.append(sql[i + 1 : j - 1].replace('""', '"'))
             out.append(" " * (j - i))
             i = j
         elif sql.startswith("--", i) or sql.startswith("//", i):
@@ -347,10 +425,12 @@ def _blank(sql: str, *, backslash_escapes: bool) -> str:
 
 
 def _parse(sql: str) -> list[exp.Expression]:
-    """Every statement in ``sql`` (sqlglot, Snowflake dialect, silently)."""
-    tokens = _DIALECT.tokenize(sql)
-    parser = _QuietParser(dialect=_DIALECT)
-    return [s for s in parser.parse(tokens, sql) if s is not None]
+    """Every statement in ``sql`` (sqlglot, Snowflake dialect, silently:
+    nothing sqlglot logs while it parses gets out)."""
+    with _sqlglot_silenced():
+        tokens = _DIALECT.tokenize(sql)
+        parser = _QuietParser(dialect=_DIALECT)
+        return [s for s in parser.parse(tokens, sql) if s is not None]
 
 
 def _parsed_problem(sql: str) -> str | None:
@@ -368,6 +448,8 @@ def _parsed_problem(sql: str) -> str | None:
     for node in root.walk():
         if isinstance(node, _WRITE_NODES):
             return f"it contains {node.key.upper()}"
+        if isinstance(node, _NAMED_NODES) and node.name.upper() in _NEVER_NAMED:
+            return f"it names {node.name.upper()}"
         if isinstance(node, _TABLE_FUNCTION_NODES) and _calls_unlisted(node.this):
             return _table_function_problem()
         if (
@@ -381,7 +463,8 @@ def _parsed_problem(sql: str) -> str | None:
 
 def _calls_unlisted(called: object) -> bool:
     """Whether a ``TABLE(...)`` / ``LATERAL ...`` calls anything but a
-    function in :data:`TABLE_FUNCTIONS` (FLATTEN parses as ``Explode``)."""
+    function in :data:`TABLE_FUNCTIONS` (FLATTEN parses as ``Explode``). A
+    qualified call (``s.FLATTEN(...)``) parses as a ``Dot``: refused."""
     if isinstance(called, (exp.Subquery, exp.Select)):
         return False
     if isinstance(called, exp.Explode):

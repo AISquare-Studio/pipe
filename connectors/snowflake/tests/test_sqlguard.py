@@ -112,6 +112,15 @@ REFUSED = {
     "crlf_ends_the_comment": "SELECT 1 -- x\r\n; DROP TABLE t",
     "nested_block_comment": "SELECT 1 /* /* */ ; DROP TABLE t; /* */ */",
     "nested_by_shared_star": "SELECT 1 /* a /*/ FROM t",
+    # NEXTVAL, quoted or not: s."NEXTVAL" still takes a sequence's next value.
+    "quoted_nextval": 'SELECT s."NEXTVAL"',
+    "quoted_lowercase_nextval": 'SELECT s."nextval" FROM t',
+    # Only an UNQUALIFIED built-in: s.FLATTEN is a user-defined function.
+    "qualified_flatten": "SELECT * FROM TABLE(x.FLATTEN(input => PARSE_JSON('[1]')))",
+    "deep_qualified_flatten": "SELECT * FROM TABLE(evil.s.FLATTEN(input => t.v))",
+    "spaced_qualified_flatten": "SELECT * FROM TABLE(x /* c */ . FLATTEN(input => v))",
+    "lateral_qualified_flatten": "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
+    "qualified_generator": "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
 }
 
 
@@ -161,9 +170,15 @@ LEXER_CATCHES = [
     "SELECT * FROM TABLE(my_proc(1))",
     "SELECT * FROM t, LATERAL my_udtf(t.a)",
     "SELECT seq.NEXTVAL",
+    'SELECT s."NEXTVAL"',
+    'SELECT "NEXTVAL" FROM t',
     "SELECT 1; DROP TABLE t",
     "SELECT * FROM t FOR UPDATE",
     "SELECT 'a\\';DROP TABLE t;--'",
+    "SELECT * FROM TABLE(x.FLATTEN(input => v))",
+    "SELECT * FROM TABLE(evil.s.FLATTEN(input => v))",
+    "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
+    "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
 ]
 
 
@@ -183,6 +198,15 @@ PARSER_CATCHES = [
     "DESCRIBE TABLE t",
     "INSERT INTO t SELECT 1",
     "SELECT 1; SELECT 2",
+    "SELECT seq.NEXTVAL",
+    "SELECT seq.nextval FROM t",
+    'SELECT s."NEXTVAL"',
+    'SELECT "NEXTVAL" FROM t',
+    "SELECT NEXTVAL()",
+    "SELECT * FROM TABLE(x.FLATTEN(input => v))",
+    "SELECT * FROM TABLE(evil.s.FLATTEN(input => v))",
+    "SELECT * FROM t, LATERAL s.FLATTEN(input => t.v)",
+    "SELECT * FROM TABLE(x.GENERATOR(ROWCOUNT => 1))",
 ]
 
 
@@ -244,15 +268,81 @@ def test_the_message_never_echoes_the_sql():
     assert "secret_column_name" not in str(raised.value)
 
 
-def test_the_guard_never_logs_the_sql(caplog):
+# sqlglot logs a JSON path it can't read ("Invalid JSON path syntax. ...
+# <the path>") at WARNING, and any key with a dash is one: these statements
+# are valid Snowflake, and the guard ADMITS them.
+ADMITTED_WITH_DASHED_JSON_PATHS = [
+    "SELECT GET_PATH(record, 'member.ssn-123-45-6789') FROM claims",
+    "SELECT GET_PATH(v, 'a-private_1') FROM t",
+    "SELECT v:'patient-4111111111111111' FROM t",
+    "SELECT v:'x-private_2' AS x FROM t",
+    "SELECT JSON_EXTRACT_PATH_TEXT(v, 'dx-private_3') FROM t",
+]
+# The lexer passes these and the parser refuses them, after the JSON path.
+REFUSED_WITH_DASHED_JSON_PATHS = [
+    "SELECT GET_PATH(v, 'a-private_4') FROM t WHERE a = ?",
+    "SELECT v:'x-private_5' FROM t WHERE a = :1",
+]
+
+
+@pytest.fixture
+def sqlglot_records(caplog):
+    """Every record the "sqlglot" logger emits, at DEBUG and up: through
+    caplog's root handler and through a handler on the logger itself."""
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sqlglot_logger = logging.getLogger("sqlglot")
+    keep = Keep(level=logging.DEBUG)
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlglot")
+    sqlglot_logger.addHandler(keep)
+    try:
+        yield records
+    finally:
+        sqlglot_logger.removeHandler(keep)
+
+
+def test_the_guard_never_logs_the_sql(caplog, sqlglot_records):
     for sql in [
         "SELECT 1 FROM t WHERE a IN (SELECT x FROM private_t",
         "DROP TABLE private_t",
+        *REFUSED_WITH_DASHED_JSON_PATHS,
     ]:
         with pytest.raises(NotReadOnly):
             check_select_only(sql)
-    assert "private_t" not in caplog.text
+    for sql in ADMITTED_WITH_DASHED_JSON_PATHS:
+        assert check_select_only(sql) == sql
+        table_references(sql, database="POL", schema="PUBLIC")
+    for secret in ("private", "ssn", "123-45-6789", "4111111111111111"):
+        assert secret not in caplog.text
+    assert [r.getMessage() for r in sqlglot_records] == []
+
+
+def test_sqlglot_still_logs_outside_the_guard(sqlglot_records):
+    """The guard quiets sqlglot only while it parses: no global switch."""
+    import sqlglot
+
+    check_select_only(ADMITTED_WITH_DASHED_JSON_PATHS[0])
+    sqlglot.parse_one(
+        "SELECT GET_PATH(v, 'outside-the-guard') FROM t", read="snowflake"
+    )
+    logging.getLogger("sqlglot").warning("after the guard")
+    messages = [r.getMessage() for r in sqlglot_records]
+    assert any("outside-the-guard" in m for m in messages), messages
+    assert "after the guard" in messages
+    assert logging.root.manager.disable == logging.NOTSET
+
+
+def test_the_guard_stays_quiet_if_its_filter_was_removed(sqlglot_records):
+    """A host that resets the "sqlglot" logger's filters doesn't bring the
+    leak back: the guard re-attaches its own on the next parse."""
+    logging.getLogger("sqlglot").filters.clear()
+    assert check_select_only(ADMITTED_WITH_DASHED_JSON_PATHS[0])
+    assert sqlglot_records == []
 
 
 def test_a_statement_over_the_length_limit_is_refused():

@@ -114,15 +114,19 @@ statement before a token is even signed. Two independent checks must both pass:
      `UNDROP`, `RENAME`, `SWAP`, `CLONE`, `RESTORE`, `COPY`, `PUT`, `REMOVE`, `RM`, `LOAD`, `GRANT`, `REVOKE`,
      `USE`, `SET`, `UNSET`, `RESET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `DECLARE`, `CALL`, `EXEC`,
      `EXECUTE`, `IMMEDIATE`, `PROCEDURE`, `ANALYZE`, `INTO`, `NEXTVAL`. A column with one of those names must be in
-     double quotes.
+     double quotes, except `NEXTVAL`, which is refused quoted too (`s."NEXTVAL"` still takes a sequence's next value).
    - It may hold none of: `$` (`$$` strings, `SYSTEM$` functions, session variables, stage columns), `@` (stages),
      `->`/`->>` (the flow operator chains statements), `|>`, backticks, or a backslash outside a string.
    - A table function (`TABLE(f(...))`, `LATERAL f(...)`) must be `FLATTEN`, `SPLIT_TO_TABLE`,
-     `STRTOK_SPLIT_TO_TABLE` or `GENERATOR`: Snowflake can call a stored procedure from `FROM TABLE(...)`, and a
-     procedure may write.
+     `STRTOK_SPLIT_TO_TABLE` or `GENERATOR`, unqualified (`s.FLATTEN(...)` is a user-defined function): Snowflake can
+     call a stored procedure from `FROM TABLE(...)`, and a procedure may write.
 2. **A parser** (sqlglot, Snowflake dialect): exactly one statement whose root is a query, with no write, DDL,
-   session, transaction, bind-variable or unparsed node anywhere in its tree, and no table function outside that
-   list. Text it can't parse is refused. Its "unsupported syntax" warning, which would log the SQL, is switched off.
+   session, transaction, bind-variable or unparsed node anywhere in its tree, no `NEXTVAL` name (quoted or not), and
+   no table function outside that list (a qualified one is outside it). Text it can't parse is refused. sqlglot logs
+   pieces of the SQL it parses (its "unsupported syntax" warning, and "Invalid JSON path syntax" with the path for any
+   JSON key with a dash, as in `GET_PATH(v, 'a-b')` or `v:'x-y'`), so a filter on the `sqlglot` logger drops every
+   record it emits while the guard parses, in that context only. Nothing is disabled globally, and sqlglot logs
+   as usual everywhere else.
 
 So DML, DDL, DCL, `COPY`, `CALL`, Snowflake Scripting blocks, `EXECUTE IMMEDIATE` and several statements are
 refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake adds its own layers behind these:
