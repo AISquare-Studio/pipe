@@ -158,13 +158,29 @@ it installs the shim. They are the same paths `aisquare-pipe` 0.5.0 has just
 installed, so in an environment that had, say, `aisquare-pipe-onedrive`
 0.1.0, `pip install -U aisquare-pipe-onedrive aisquare-pipe` leaves
 `aisquare_pipe_onedrive` broken. So does a later `pip uninstall
-aisquare-pipe-onedrive` after `aisquare-pipe[onedrive]` was installed over
-0.1.0. Uninstall the old package first; if it's too late, run `pip install
---force-reinstall --no-deps aisquare-pipe`, or use a fresh environment.
-Discovery logs the breakage as a warning (`Failed to load toolkit onedrive:
-No module named 'aisquare_pipe_onedrive.constants'`), while `pip check` sees
-nothing wrong. Fresh installs (Docker image builds, CI) are not affected. The
-shim's README on PyPI says the same.
+aisquare-pipe-onedrive` after `aisquare-pipe` 0.5.0, with any extras, was
+installed over 0.1.0. The most common case: `pip install -U
+"aisquare-pipe[popular]"` over 0.1.1's `[popular]` keeps the old `-local`,
+`-dropbox` and `-onedrive` installed, each one breaking its connector when it
+is uninstalled. Uninstall every old package first. If it's too late,
+reinstall the installed version, pinned, or use a fresh environment:
+
+```bash
+pip install --force-reinstall --no-deps "aisquare-pipe==$(python -c 'from importlib.metadata import version; print(version("aisquare-pipe"))')"
+```
+
+Unpinned, `--force-reinstall` takes the newest release on the index, and
+`--no-deps` skips that release's new dependencies without a warning (only
+`pip check` shows them missing).
+
+Discovery logs the breakage as a warning, while `pip check` sees nothing
+wrong. For github and onedrive, 0.5.0 adds files the old release didn't have,
+so the directory stays: `Failed to load connector onedrive-source: No module
+named 'aisquare_pipe_onedrive.connector'`, and `import aisquare_pipe_onedrive`
+still works. For the other eight, pip removes the whole directory: `Failed to
+load connector dropbox-source: No module named 'aisquare_pipe_dropbox'`.
+Fresh installs (Docker image builds, CI) are not affected. The shim's README on PyPI says
+the same.
 
 ## The 0.5.0 release
 

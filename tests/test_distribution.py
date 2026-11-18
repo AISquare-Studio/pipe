@@ -137,6 +137,13 @@ def test_core_dependencies_never_name_another_aisquare_pipe_distribution():
     ]
 
 
+def test_the_license_is_an_spdx_expression():
+    """PEP 639: a license table and License classifiers are deprecated
+    (setuptools warns, and drops them after 2027-02-18)."""
+    assert PROJECT["license"] == "Apache-2.0"
+    assert not [c for c in PROJECT["classifiers"] if c.startswith("License ::")]
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("aisquare_pipe_github") is None,
     reason="needs the editable install",

@@ -105,6 +105,13 @@ SHIM_PROJECTS = (
 #: highest being aisquare-pipe-n8n 0.2.1) and the aisquare-pipe it requires.
 SHIM_VERSION = "0.5.0"
 SHIM_FLOOR = "0.5.0"
+#: The repair for an in-place upgrade (README.md and every shim README). It
+#: pins the installed version: unpinned, ``--force-reinstall`` takes the newest
+#: release, and ``--no-deps`` skips that release's new dependencies.
+_INSTALLED_VERSION = f"python -c 'from importlib.metadata import version; print(version(\"{FRAMEWORK}\"))'"
+REPAIR_COMMAND = (
+    f'pip install --force-reinstall --no-deps "{FRAMEWORK}==$({_INSTALLED_VERSION})"'
+)
 
 # A pip-compile lock line: ``name==version \``. Comments and hash lines are
 # indented and never match.
@@ -564,12 +571,28 @@ def shim_files(name: str) -> dict[str, str]:
         f"`{module}`.\n\n"
         f"## Upgrading from an older {project}\n\n"
         f"The old release and {FRAMEWORK} install the same files, and removing the old "
-        f"release removes them. Uninstall it first, then install the extra:\n\n"
+        f"release removes them. The old `{FRAMEWORK}[popular]` and `[full]` installed "
+        f"several old packages. **Uninstall every old package first** "
+        f"(`pip list` shows them), then install the extras:\n\n"
         f'```bash\npip uninstall -y {project}\npip install "{FRAMEWORK}[{name}]>={SHIM_FLOOR}"\n```\n\n'
-        f"If you already upgraded in place, never `pip uninstall {project}` without running "
-        f"`pip install --force-reinstall --no-deps {FRAMEWORK}` afterwards. The same command "
-        f"repairs an environment where `{module}` fails to import. A fresh environment is "
-        f"never affected.\n"
+        # The same text as README.md's, for this connector (a test checks it).
+        f"**If you already upgraded in place**, this command restores the files of the "
+        f"`{FRAMEWORK}` version you have:\n\n"
+        f"```bash\n{REPAIR_COMMAND}\n```\n\n"
+        f"Keep the pin (without a POSIX shell, put the version `pip show {FRAMEWORK}` "
+        f"prints after `==`): unpinned, pip would install the newest release, and "
+        f"`--no-deps` would skip its new dependencies.\n\n"
+        f"- `pip install -U {project}` over an old release breaks the connector at once. "
+        f"Run the command right after.\n"
+        f"- If you installed or upgraded `{FRAMEWORK}` to {SHIM_FLOOR} or later (with any "
+        f'extras, e.g. `pip install -U "{FRAMEWORK}[popular]"`) while the old package was '
+        f"installed, never `pip uninstall {project}` without running the command "
+        f"afterwards.\n\n"
+        f"The command repairs an environment broken this way. The symptom is a warning "
+        f"such as `Failed to load connector …: No module named '{module}'` (or "
+        f"`'{module}.connector'`), while `pip check` reports nothing wrong. Don't rely "
+        f"on `import {module}`: for some connectors it still succeeds. A fresh "
+        f"environment (a Docker build, CI) is never affected.\n"
     )
     pyproject = f'''[build-system]
 requires = ["setuptools>=77.0"]

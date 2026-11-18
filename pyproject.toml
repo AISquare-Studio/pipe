@@ -7,14 +7,13 @@ name = "aisquare-pipe"
 version = "0.5.0"
 description = "Universal anything-to-anything connector framework"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [{name = "AISquare Studio"}]
 keywords = ["connectors", "data-pipeline", "etl", "integration"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
