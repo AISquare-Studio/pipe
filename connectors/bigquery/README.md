@@ -265,26 +265,36 @@ Revoking the grants stops every read, a token AISquare already holds included, o
 ### AISquare devops
 
 **What has to be true first:**
-1. pipe-as-service runs credential-driven routing (task #30), with `bigquery-query` → `bigquery` in its
+1. pipe-as-service runs credential-driven routing (task #30), which maps `bigquery-query` → `bigquery` in its
    `TENANT_BLOBS` (`credentials/catalog.py`), so the source reads the same secret as the toolkit. Without that row,
    `bigquery-query-source` looks for a secret named `bigquery-query`.
 2. Its image has a pipe release that contains `bigquery` (`aisquare-pipe[toolkits]`, from the first release with this
    connector).
 
-**Where pipe-service runs today.** Production is on ECS only: aisquare-releases has no prod pipe-service
-(`environments/prod/services/` holds explainability-gateway and praxis), so GoodRx production follows the ECS path.
-`stg` and `dev` run on EKS, and also on ECS (`stg`) until the cutover. Use one customer key per environment (step 5).
+**Where pipe-service runs today.** Production runs on ECS only. aisquare-releases has no prod pipe-service
+(`environments/prod/services/` holds only explainability-gateway and praxis), and aisquare-infra has no
+`prod/prod/pipe-service/*` secret. So GoodRx production follows the ECS path. `stg` runs on ECS and on EKS until the
+cutover, and `dev` runs on EKS only.
+
+**One customer key per environment** (step 5): never put the production key in `stg` or `dev`. On EKS the value also
+sits in a GitHub environment secret of aisquare-infra (below), which more people and workflows can reach than an ECS
+secret.
 
 **Turning BigQuery on for a tenant is a deploy, today.** Every environment runs the env secrets backend
-(`PIPE_SERVICE_SECRETS_BACKEND=env`). The blob reaches the service only as the env var
-`PIPE_SECRET__<TENANT>__BIGQUERY__JSON`. Fill the secret first, then add the entry that reads it:
+(`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS task definitions in pipe-as-service). The
+blob reaches the service only as the env var `PIPE_SECRET__<TENANT>__BIGQUERY__JSON`. Store the value first ("The
+secret's value" below, saved as a local `blob.json`), then add the entry that reads it. A pod or task reads the value
+when it starts.
+
+`<TENANT>` is the tenant id in upper case. Every run of characters other than A-Z and 0-9 becomes one `_`, and any `_`
+at either end is dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__BIGQUERY__JSON`).
 
 - **ECS** (production, and `stg` until the cutover):
-  1. Create the secret `ais-pipe-service/<env>/bigquery-<tenant>` in the task definition's region (prod
-     `us-east-2`, stg `us-east-1`), holding the JSON below. The task execution role reads only
-     `ais-pipe-service/<env>/*` in its own region, so a secret anywhere else stops the task from starting.
-  2. Add to the task definition's `secrets:` (`deploy/ecs/<env>/task-definition-pipe-service.json` in
-     pipe-as-service), in the same ARN form as the entries already there:
+  1. Create the secret in the task definition's region: prod `us-east-2`, stg `us-east-1`. The task execution role
+     reads only `ais-pipe-service/<env>/*` in its own region, so a secret anywhere else stops the task from starting:
+     `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/bigquery-<tenant> --secret-string file://blob.json`
+  2. Add an entry to the task definition's `secrets:` (`deploy/ecs/<env>/task-definition-pipe-service.json` in
+     pipe-as-service). Use the same ARN form as the entries already there:
 
      ```json
      {
@@ -293,17 +303,20 @@ Revoking the grants stops every read, a token AISquare already holds included, o
      }
      ```
 
-     The new task-definition revision (the pipe-as-service Deploy workflow) is the deploy. Terraform ignores
-     `container_definitions`, so the workflow owns them.
-- **EKS** (`stg`, `dev`): the value never goes into Secrets Manager by hand. aisquare-infra creates the secret from
-  `supplied-secrets.json` and its `secrets-nonprod` workflow fills it from the GitHub environment `nonprod-secrets`
-  (and runs again after every `apply-nonprod`). A value edited in Secrets Manager is overwritten with the GitHub one
-  at the next sync, and a listed secret whose GitHub value is missing stops the sync for EVERY secret.
-  1. Store the value: `gh secret set BIGQUERY_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`
-     (the JSON below, from a file that is deleted afterwards). Each environment gets its own key, so its own GitHub
-     secret: `BIGQUERY_<TENANT>_JSON` for `stg`, `DEV_BIGQUERY_<TENANT>_JSON` for `dev` (as
-     `DEV_INTERNAL_AUTH_TOKEN` is).
-  2. In aisquare-infra, add to `live/nonprod/data/supplied-secrets.json`:
+  3. Merge it, then run pipe-as-service's `deploy` workflow for that environment and region:
+     `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`. The
+     new task-definition revision is the deploy. Terraform ignores `container_definitions`, so this workflow owns
+     them.
+- **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand. aisquare-infra creates the secret from
+  `live/nonprod/data/supplied-secrets.json`. Its `secrets-nonprod` workflow fills the secret from the GitHub environment
+  `nonprod-secrets`, when run by hand and after every `apply-nonprod`. So a value edited in Secrets Manager is
+  overwritten with the GitHub one at the next sync. And if a listed secret's GitHub value is missing, the sync stops
+  for EVERY secret.
+  1. Store the value in GitHub:
+     `gh secret set BIGQUERY_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+     Each environment has its own key, so each gets its own GitHub secret: `BIGQUERY_<TENANT>_JSON` for `stg`, and
+     `DEV_BIGQUERY_<TENANT>_JSON` for `dev` (like `DEV_INTERNAL_AUTH_TOKEN`).
+  2. In aisquare-infra, open one PR that adds the entry to `live/nonprod/data/supplied-secrets.json`:
 
      ```json
      {
@@ -314,32 +327,33 @@ Revoking the grants stops every read, a token AISquare already holds included, o
      }
      ```
 
-     and its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
-     `BIGQUERY_<TENANT>_JSON: ${{ secrets.BIGQUERY_<TENANT>_JSON }}`. Merge (the GitHub secret is already set, so the
-     sync can't fail on it), let `apply-nonprod` create the secret, and check that `secrets-nonprod` ran green.
-  3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml` (written by people; never
-     `values.yaml`, which the pipe-as-service build workflow overwrites):
+     The same PR adds its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
+     `BIGQUERY_<TENANT>_JSON: ${{ secrets.BIGQUERY_<TENANT>_JSON }}`. Merge only after step 1, so the sync can't fail
+     on it. The merge runs `apply-nonprod`, which creates the secret and then runs `secrets-nonprod` to fill it.
+     Check that both ran green.
+  3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml`. That file is written by
+     people. Never edit `values.yaml`, which the pipe-as-service build workflow overwrites:
 
      ```yaml
      secretEnv:
        PIPE_SECRET__<TENANT>__BIGQUERY__JSON: { from: pipe-service/bigquery-<tenant> }
      ```
 
-     Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging that PR is the deploy; Argo CD syncs
-     the ExternalSecret (key `<secrets.prefix>/pipe-service/bigquery-<tenant>`) before the Deployment, so a secret
-     that has no value yet holds the release.
+     Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging that PR is the deploy. Argo CD syncs
+     the ExternalSecret `pipe` (key `<secrets.prefix>/pipe-service/bigquery-<tenant>`) before the Deployment. One
+     ExternalSecret carries every `secretEnv` entry, so a secret with no value yet fails that ExternalSecret and holds
+     the release.
 
-`<TENANT>` is the tenant id upper-cased, with every run of characters other than A-Z and 0-9 written as one `_` and
-any `_` at either end dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__BIGQUERY__JSON`). The value is read
-when the pod or task starts.
+After storing the value, delete `blob.json`, the vault item and any local copy of key.json. Then remove the
+customer's guest access and the handoff vault.
 
 **Never switch the secrets backend for BigQuery.** `PIPE_SERVICE_SECRETS_BACKEND=aws` moves EVERY secret the service
-reads, the shared Composio key included, and a missing secret reads as no key: flipping it "for BigQuery" takes
-Composio down for every connector in that environment. Moving to the aws backend is a whole-service migration
+reads, the shared Composio key included, and a missing secret reads as no key. Flipping the backend "for BigQuery"
+takes Composio down for every connector in that environment. Moving to the aws backend is a whole-service migration
 (pipe-as-service `DEPLOYMENT.md`). After that migration, the tenant's secret is
 `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/bigquery`, picked up within about 60 s with no deploy.
 
-**The secret's value**, one JSON object, read for both `bigquery` and `bigquery-query-source`:
+**The secret's value** is one JSON object, read for both `bigquery` and `bigquery-query-source`:
 
 ```json
 {
@@ -360,30 +374,45 @@ Composio down for every connector in that environment. Moving to the aws backend
 ```
 
 `service_account_json` is key.json as it was downloaded (an object, or the same JSON as a string). `project_id` is
-required: the project jobs run in. `location` (`US`, `EU`, a region) and `max_bytes_billed` (bytes, 10 MiB to
-1 TiB, default 10 GiB) are optional. After filling it, delete the vault item and any local copy, then remove the
-customer's guest access and the handoff vault. Until the secret is read, pipe-as-service answers 422
-`connector_unavailable` / `not_configured`, naming "credentials for bigquery".
+required: the project jobs run in. `location` (`US`, `EU`, a region) and `max_bytes_billed` (bytes, 10 MiB to 1 TiB,
+default 10 GiB) are optional. Until the secret is read, pipe-as-service answers 422 `connector_unavailable` /
+`not_configured`, naming "credentials for bigquery".
 
 **Rotation**, at least before any key expiry:
 1. The customer creates a new key for the same service account (step 5) and hands it over (step 6).
-2. Replace `service_account_json` in the value:
-   - ECS: put the new value into `ais-pipe-service/<env>/bigquery-<tenant>`, then start new tasks (force a new
-     deployment of the service) and wait until the old tasks are gone.
-   - EKS: `gh secret set BIGQUERY_<TENANT>_JSON --env nonprod-secrets ...` and run `secrets-nonprod`, never an edit
-     in Secrets Manager. Then wait for External Secrets (refresh interval 1 h) or refresh it now
-     (`kubectl annotate externalsecret <name> -n <namespace> force-sync=$(date +%s) --overwrite`), and restart the
-     Deployment (`kubectl rollout restart`): the chart has no checksum or reloader, so pods keep the old value until
-     they restart.
+2. Replace `service_account_json` in the value. Then restart the service, which reads the value only when a pod or
+   task starts:
+   - ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/bigquery-<tenant> --secret-string file://blob.json`,
+     then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+     Wait until the old tasks are gone.
+   - EKS: `gh secret set BIGQUERY_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`,
+     then run `secrets-nonprod` (`gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra`). Never
+     edit the value in Secrets Manager: the next sync puts the GitHub value back, and a pod that starts after that
+     reads the old key. Next, wait for External Secrets to copy the value: the refresh interval is 1 h, the chart
+     default, which pipe-service doesn't override. Or refresh it now with
+     `kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`, and wait until
+     `kubectl -n <env> get externalsecret pipe` shows `SecretSynced`. Then restart the Deployment:
+     `kubectl -n <env> rollout restart deployment/pipe-service`, then
+     `kubectl -n <env> rollout status deployment/pipe-service`. The chart has no checksum annotation or reloader, so
+     pods keep the old value until they restart.
 3. Only when every pod or task runs with the new key does the customer delete the old one. Deleting it earlier breaks
    calls on pods that still hold it.
 
-**Offboarding:**
-- ECS: remove the task definition's `secrets:` entry (a deploy), then delete the secret.
-- EKS: remove the `secretEnv` entry from `release.yaml` (a deploy), then remove the `supplied-secrets.json` entry
-  and the `secrets-nonprod.yml` env line (one PR), and `gh secret delete BIGQUERY_<TENANT>_JSON --env nonprod-secrets
-  --repo AISquare-Studio/aisquare-infra`. Deleting the Secrets Manager secret by hand while the entry is listed does
-  nothing lasting: the next apply re-creates it and the sync refills it.
+**Offboarding** (AISquare's copy):
+- ECS: remove the task definition's `secrets:` entry and deploy (as above). Then delete the secret:
+  `aws secretsmanager delete-secret --region <region> --secret-id ais-pipe-service/<env>/bigquery-<tenant>`. Keep that
+  order, because a task whose secret is gone does not start.
+- EKS:
+  1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry is listed, a deleted
+     secret fails the ExternalSecret.
+  2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the `secrets-nonprod.yml` env
+     line. Its `apply-nonprod` deletes the Secrets Manager secret, with a 7-day recovery window.
+  3. After that merge, run
+     `gh secret delete BIGQUERY_<TENANT>_JSON --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`. If you
+     delete it earlier, while the entry is still listed, every sync stops.
+
+  Deleting the Secrets Manager secret by hand while the entry is listed does nothing lasting: the next apply
+  re-creates it and the sync refills it.
 - Tell the customer to do their offboarding (above) as well: deleting our copy does not revoke the key.
 
 ## Tests

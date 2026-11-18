@@ -50,16 +50,20 @@ server-side only: callers can never send a role, region, bucket, external ID or 
   - `prefix` (default `""`, the whole bucket);
   - `region` (default: the first of `regions`).
 
-**Where aisquare-pipe-service reads it** (a first-party connector's blob is keyed by its service slug):
+**Where aisquare-pipe-service reads it.** Each blob is a tenant secret named after the source
+connector's service slug, and its toolkit shares it (see below the table):
 
-| Connector | `SECRETS_BACKEND=env` | `SECRETS_BACKEND=aws` (Secrets Manager) |
-|---|---|---|
-| `bedrock-agentcore-policies-source` | `PIPE_SECRET__<TENANT>__BEDROCK_AGENTCORE_POLICIES__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/bedrock-agentcore-policies` |
-| `s3-source` | `PIPE_SECRET__<TENANT>__S3__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/s3` |
+| Connector and toolkit | Tenant secret | `SECRETS_BACKEND=env` | `SECRETS_BACKEND=aws` (Secrets Manager) |
+|---|---|---|---|
+| `bedrock-agentcore-policies-source`, toolkit `bedrock_agentcore` | `bedrock-agentcore-policies` | `PIPE_SECRET__<TENANT>__BEDROCK_AGENTCORE_POLICIES__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/bedrock-agentcore-policies` |
+| `s3-source`, toolkit `s3` | `s3` | `PIPE_SECRET__<TENANT>__S3__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/s3` |
 
-The same JSON can be stored under both names. The service does not yet serve a toolkit
-without an OAuth app. How it will find the `bedrock_agentcore` and `s3` toolkits' blob is
-that service change's decision.
+The same JSON can be stored under both names. Today pipe-as-service serves only the two sources:
+it doesn't yet serve a toolkit without an OAuth app. With credential-driven routing
+(pipe-as-service #30), each toolkit reads its source's secret (`TENANT_BLOBS` in
+`credentials/catalog.py`): `bedrock_agentcore` reads `bedrock-agentcore-policies`, and `s3` reads
+`s3`. How the secret reaches the service:
+[AISquare stores the blob](#aisquare-stores-the-blob).
 
 ## Pull params (narrowing only)
 
@@ -144,12 +148,20 @@ AISquare then adds the customer's role ARN and stores the blob
      data. As of 2026-11-17 prod's pipe-service still runs on ECS (no EKS release there yet),
      so prod has two principals: see step 2.
    - stg or dev: cluster `aisquare-nonprod`, us-east-1, namespace `stg` or `dev`. Use one of
-     them for a trial only.
+     them for a trial only. stg also runs on ECS until its cutover (Cloud-Infra's stg sets
+     `enable_pipe_service`). A trial through stg's ECS service has the principal
+     `ais-studio-pipe-task-role-stg`, set up as for prod's ECS role in step 2.
 
    Every environment has its own role with its own ARN; dev and stg don't share one. To let
    several read, the customer lists each one's ARN in `Principal.AWS`, and each environment's
    secret carries the same external ID. The cluster's region doesn't limit what is read: the
    blob's `regions` do.
+
+   **Keep production apart from trials.** Never add a stg or dev principal to the role that
+   reads production data. A trial gets a customer role of its own, with its own external ID
+   and, for S3, its own bucket or prefix. This is the AWS form of one customer key per
+   environment. A nonprod blob also sits in a GitHub environment secret of aisquare-infra
+   (see [AISquare stores the blob](#aisquare-stores-the-blob)).
 2. **Create that environment's pipe-service role now**, before the customer starts. Its
    permissions policy (below) names the customer's role, so it is attached later, when that
    ARN arrives.
@@ -362,10 +374,150 @@ target-role example that uses an external ID splits the two statements the same 
    AISquare role they trust: for prod, both. Without it, the first `AssumeRole` fails with
    `forbidden`.
 2. **Build the [credential blob](#the-credential-blob)** from what the customer sent and the
-   external ID. Store it in the environment from step 1, under the
-   [secret names above](#the-credential-blob): `bedrock-agentcore-policies` for AgentCore and
-   `s3` for S3. When both read the same account, the same JSON can go under both names. For
-   prod, store it again in prod's EKS environment when pipe-service moves there.
+   external ID, and save it as a local `blob.json`. When both connectors read the same account,
+   the same JSON can go under both secrets.
+3. **Store it in the environment from step 1**, once per secret the tenant uses:
+
+   | `<secret>` | Env var `<ENV_VAR>` | GitHub secret `<GH_SECRET>` (EKS) |
+   |---|---|---|
+   | `bedrock-agentcore-policies` | `PIPE_SECRET__<TENANT>__BEDROCK_AGENTCORE_POLICIES__JSON` | `BEDROCK_AGENTCORE_POLICIES_<TENANT>_JSON` |
+   | `s3` | `PIPE_SECRET__<TENANT>__S3__JSON` | `S3_<TENANT>_JSON` |
+
+   `<TENANT>` is the tenant id in upper case. Every run of characters other than A-Z and 0-9
+   becomes one `_`, and any `_` at either end is dropped (`acme-corp.eu` gives `ACME_CORP_EU`).
+   On EKS, `dev` gets its own GitHub secret, `DEV_<GH_SECRET>` (like `DEV_INTERNAL_AUTH_TOKEN`).
+
+   **Where pipe-service runs today.** Production runs on ECS only. aisquare-releases has no prod
+   pipe-service (`environments/prod/services/` holds only explainability-gateway and praxis),
+   and aisquare-infra has no `prod/prod/pipe-service/*` secret. So a customer's production
+   account follows the ECS path. `stg` runs on ECS and on EKS until the cutover, and `dev` runs
+   on EKS only.
+
+   **Turning a connector on for a tenant is a deploy, today.** Every environment runs the env
+   secrets backend (`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS
+   task definitions in pipe-as-service). The blob reaches the service only as `<ENV_VAR>`, read
+   when a pod or task starts. Store the value first, then add the entry that reads it.
+
+   - **ECS** (production, and `stg` until the cutover):
+     1. Create the secret in the task definition's region: prod `us-east-2`, stg `us-east-1`.
+        The task execution role reads only `ais-pipe-service/<env>/*` in its own region, so a
+        secret anywhere else stops the task from starting:
+        `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/<secret>-<tenant> --secret-string file://blob.json`
+     2. Add an entry to the task definition's `secrets:`
+        (`deploy/ecs/<env>/task-definition-pipe-service.json` in pipe-as-service). Use the same
+        ARN form as the entries already there:
+
+        ```json
+        {
+          "name": "<ENV_VAR>",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/<secret>-<tenant>"
+        }
+        ```
+
+     3. Merge it, then run pipe-as-service's `deploy` workflow for that environment and region:
+        `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`.
+        The new task-definition revision is the deploy. Terraform ignores
+        `container_definitions`, so this workflow owns them.
+   - **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand. aisquare-infra
+     creates the secret from `live/nonprod/data/supplied-secrets.json`. Its `secrets-nonprod`
+     workflow fills the secret from the GitHub environment `nonprod-secrets`, when run by hand
+     and after every `apply-nonprod`. So a value edited in Secrets Manager is overwritten with
+     the GitHub one at the next sync. And if a listed secret's GitHub value is missing, the sync
+     stops for EVERY secret.
+     1. Store the value in GitHub:
+        `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+     2. In aisquare-infra, open one PR that adds the entry to
+        `live/nonprod/data/supplied-secrets.json`:
+
+        ```json
+        {
+          "nonprod/<env>/pipe-service/<secret>-<tenant>": {
+            "github_secret": "<GH_SECRET>",
+            "description": "<ENV_VAR> of the <env> pipe service: the AWS role blob of <tenant>"
+          }
+        }
+        ```
+
+        The same PR adds its line to the `env` of the sync step in
+        `.github/workflows/secrets-nonprod.yml`: `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}`. Merge
+        only after step 1, so the sync can't fail on it. The merge runs `apply-nonprod`, which
+        creates the secret and then runs `secrets-nonprod` to fill it. Check that both ran green.
+     3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml`.
+        That file is written by people. Never edit `values.yaml`, which the pipe-as-service
+        build workflow overwrites:
+
+        ```yaml
+        secretEnv:
+          <ENV_VAR>: { from: pipe-service/<secret>-<tenant> }
+        ```
+
+        Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging that PR is the
+        deploy. Argo CD syncs the ExternalSecret `pipe` (key
+        `<secrets.prefix>/pipe-service/<secret>-<tenant>`) before the Deployment. One
+        ExternalSecret carries every `secretEnv` entry, so a secret with no value yet fails that
+        ExternalSecret and holds the release.
+
+   Then delete `blob.json`. When pipe-service moves to EKS in prod, the same EKS steps apply to
+   prod, with aisquare-infra's `live/prod/data/supplied-secrets.json`, `secrets-prod.yml` and the
+   GitHub environment `prod-secrets`. Store the blob there before prod's cutover.
+
+   **Never switch the secrets backend for AWS.** `PIPE_SERVICE_SECRETS_BACKEND=aws` moves EVERY
+   secret the service reads, the shared Composio key included, and a missing secret reads as no
+   key. Flipping the backend "for AWS" takes Composio down for every connector in that
+   environment. Moving to the aws backend is a whole-service migration (pipe-as-service
+   `DEPLOYMENT.md`). After it, the secret is `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/<secret>`
+   and needs no deploy.
+
+### Changing the blob
+
+A new external ID, role ARN, region or bucket means a new value. The service reads the value only
+when a pod or task starts, so store the new value and then restart:
+
+- ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/<secret>-<tenant> --secret-string file://blob.json`,
+  then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+  Wait until the old tasks are gone.
+- EKS: `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`,
+  then run `secrets-nonprod` (`gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra`).
+  Never edit the value in Secrets Manager: the next sync puts the GitHub value back. Next, wait
+  for External Secrets to copy the value: the refresh interval is 1 h, the chart default, which
+  pipe-service doesn't override. Or refresh it now with
+  `kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`, and wait until
+  `kubectl -n <env> get externalsecret pipe` shows `SecretSynced`. Then restart the Deployment:
+  `kubectl -n <env> rollout restart deployment/pipe-service`, then
+  `kubectl -n <env> rollout status deployment/pipe-service`. The chart has no checksum
+  annotation or reloader, so pods keep the old value until they restart.
+
+To rotate the external ID without a gap:
+1. The customer adds the new ID next to the old one in the trust policy
+   (`"sts:ExternalId": ["<OLD>", "<NEW>"]`).
+2. AISquare stores and rolls out the new blob (above).
+3. Once every pod or task runs with it, the customer removes the old ID.
+
+### Offboarding
+
+AISquare's copy, per secret:
+- ECS: remove the task definition's `secrets:` entry and deploy (as above). Then delete the
+  secret: `aws secretsmanager delete-secret --region <region> --secret-id ais-pipe-service/<env>/<secret>-<tenant>`.
+  Keep that order, because a task whose secret is gone does not start.
+- EKS:
+  1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry
+     is listed, a deleted secret fails the ExternalSecret.
+  2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the
+     `secrets-nonprod.yml` env line. Its `apply-nonprod` deletes the Secrets Manager secret,
+     with a 7-day recovery window.
+  3. After that merge, run
+     `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`.
+     If you delete it earlier, while the entry is still listed, every sync stops.
+
+  Deleting the Secrets Manager secret by hand while the entry is listed does nothing lasting: the
+  next apply re-creates it and the sync refills it.
+- Remove the customer's role ARN from our role's policy (step 2's `Resource`).
+
+The customer deletes the role, or removes AISquare's principal ARNs from its trust policy. Either
+one stops new sessions. After a trust-policy change, a session AISquare already holds keeps
+working until it expires (at most 1 hour). To end it at once, the customer revokes the role's
+active sessions (IAM console: *Revoke active sessions*) or deletes the role. Deleting our copy
+alone does not stop the customer's role from trusting us.
 
 ### If it fails
 
