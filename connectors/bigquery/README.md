@@ -8,7 +8,7 @@ stop-gap (GoodRx Smart Connectors, item 3c).
 
 Ships inside the `aisquare-pipe` distribution: `pip install "aisquare-pipe[bigquery]"` (or `[full]`, or
 `[toolkits]`). The extra adds two dependencies: `google-auth>=2.20,<3`, which signs the service account's key into
-short-lived tokens, and `sqlglot>=25,<28`, which parses SQL for the SELECT-only guard. HTTP goes through `requests`
+short-lived tokens, and `sqlglot>=26.25,<28`, which parses SQL for the SELECT-only guard. HTTP goes through `requests`
 (core). Without the extra, `bigquery` and `bigquery-query-source` count as not installed.
 
 ## Native name and the Composio mapping
@@ -92,10 +92,13 @@ statement before a token is even minted. Two independent checks must both pass:
    `DELETE`, `MERGE`, `TRUNCATE`, `CREATE`, `DROP`, `ALTER`, `UNDROP`, `GRANT`, `REVOKE`, `EXPORT`, `LOAD`,
    `DECLARE`, `SET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `CALL`, `EXECUTE`, `IMMEDIATE`, `ASSERT`,
    `RAISE`, `RETURN`, `LOOP`, `WHILE`, `LEAVE`, `ITERATE`, `BREAK`, `CONTINUE`, `INTO`. A column with one of those
-   names must be quoted in backticks.
-2. **A parser** (sqlglot, BigQuery dialect): exactly one statement whose root is a query, with no write, DDL,
-   scripting or transaction node anywhere in its tree. Text it can't parse is refused. Its "unsupported syntax"
-   warning, which would log the SQL, is switched off.
+   names must be quoted in backticks. As in BigQuery's tokenizer, a line ends at a CR or an LF, a bare CR
+   included: `--` and `#` comments end at either, and a one-line string or backtick identifier holding either is
+   refused. GoogleSQL `/* */` comments don't nest (the first `*/` ends one), so a `/*` inside one is refused.
+2. **A parser** (sqlglot `>=26.25`, BigQuery dialect; 25.3 to 26.24 read `/* */` comments as nested): exactly
+   one statement whose root is a query, with no write, DDL, scripting or transaction node anywhere in its tree.
+   Text it can't parse is refused. Its "unsupported syntax" warning, which would log the SQL, is switched off. CI
+   runs this suite a second time at the sqlglot floor (`scripts/dep_floor.py`), not only at the newest sqlglot.
 
 So DML, DDL, DCL, scripts (`DECLARE`, `BEGIN ... END`, `EXECUTE IMMEDIATE`, `CALL`, `ASSERT`...) and several
 statements are refused (`invalid_arguments`), and the message never echoes the SQL. Google adds its own layers

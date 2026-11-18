@@ -1,14 +1,20 @@
 """SELECT-only SQL: two independent checks, both before any API call.
 
-1. **The lexer** (no parser), read as BigQuery reads GoogleSQL: with string
-   literals (``'...'``, ``"..."``, ``'''...'''``, ``\"\"\"...\"\"\"``, backslash
-   escapes always on), quoted identifiers (`````...`````) and comments
-   (``--``, ``#``, ``/* */``) blanked, the text is ONE statement (a single
-   trailing ``;`` is allowed and dropped) that starts with ``SELECT`` or
-   ``WITH`` and names none of the write, DDL or scripting keywords
-   (``INSERT``, ``UPDATE``, ``DELETE``, ``MERGE``, ``CREATE``, ``DROP``,
-   ``ALTER``, ``TRUNCATE``, ``DECLARE``, ``SET``, ``BEGIN``, ``CALL``,
-   ``EXECUTE``, ``EXPORT``, ``LOAD``, ``ASSERT``, ``GRANT``, ...).
+1. **The lexer** (no parser), read as BigQuery reads GoogleSQL (ZetaSQL's
+   tokenizer): with string literals (``'...'``, ``"..."``, ``'''...'''``,
+   ``\"\"\"...\"\"\"``, backslash escapes always on), quoted identifiers
+   (`````...`````) and comments (``--``, ``#``, ``/* */``) blanked, the text
+   is ONE statement (a single trailing ``;`` is allowed and dropped) that
+   starts with ``SELECT`` or ``WITH`` and names none of the write, DDL or
+   scripting keywords (``INSERT``, ``UPDATE``, ``DELETE``, ``MERGE``,
+   ``CREATE``, ``DROP``, ``ALTER``, ``TRUNCATE``, ``DECLARE``, ``SET``,
+   ``BEGIN``, ``CALL``, ``EXECUTE``, ``EXPORT``, ``LOAD``, ``ASSERT``,
+   ``GRANT``, ...). As in ZetaSQL, a line ends at a CR or an LF (a bare CR
+   too): a ``--`` or ``#`` comment ends at either, and a one-line string or
+   a backtick identifier holding either is refused (BigQuery reads no token
+   there). GoogleSQL ``/* */`` comments don't nest, so the first ``*/`` ends
+   one; a ``/*`` inside one is refused, because a reader that nests them
+   (sqlglot 25.3 to 26.24 did) hides text BigQuery runs.
 2. **The parser** (sqlglot, BigQuery dialect): the text parses into exactly
    ONE statement whose root is a query (``SELECT``, ``WITH ... SELECT``, a
    ``UNION``/``INTERSECT``/``EXCEPT`` of queries, or a parenthesised one),
@@ -187,11 +193,16 @@ class _Lexed:
     problem: str | None
 
 
+class _Unreadable(Exception):
+    """Text the lexer won't vouch for: BigQuery reads it some other way, or
+    not at all. The message says why and never echoes the SQL."""
+
+
 def _lex(sql: str) -> _Lexed:
-    blanked = _blank(sql)
-    if blanked is None:
-        return _Lexed(sql, "it has an unterminated string, identifier or comment")
-    text, separators = blanked
+    try:
+        text, separators = _blank(sql)
+    except _Unreadable as unreadable:
+        return _Lexed(sql, str(unreadable))
     statement = sql
     if separators:
         last = separators[-1]
@@ -216,17 +227,26 @@ def _lex(sql: str) -> _Lexed:
     return _Lexed(statement, None)
 
 
-def _blank(sql: str) -> tuple[str, list[int]] | None:
+#: GoogleSQL's line ends, a bare CR included. ZetaSQL's tokenizer has
+#: ``dash_comment = --[^\r\n]*(\r|\n|\r\n)?`` (``#`` comments the same), and
+#: its one-line strings and backtick identifiers exclude both (``[^'\\\n\r]``).
+_LINE_ENDS = "\r\n"
+_LINE_END = re.compile(r"[\r\n]")
+
+
+def _blank(sql: str) -> tuple[str, list[int]]:
     """``sql`` with quoted text and comments replaced by spaces (same
     length, so positions line up), and the positions of the ``;`` outside
-    them; None when a quote or block comment never closes."""
+    them. :class:`_Unreadable` when a quote or block comment never closes,
+    a one-line string or backtick identifier holds a CR or LF, or a block
+    comment holds a ``/*``."""
     out = list(sql)
     separators: list[int] = []
     i, n = 0, len(sql)
 
     def blank(start: int, end: int) -> None:
         for k in range(start, end):
-            if out[k] != "\n":
+            if out[k] not in _LINE_ENDS:
                 out[k] = " "
 
     while i < n:
@@ -237,27 +257,40 @@ def _blank(sql: str) -> tuple[str, list[int]] | None:
             j = i + len(closer)
             while True:
                 if j >= n:
-                    return None
+                    raise _Unreadable(
+                        "it has an unterminated string or quoted identifier"
+                    )
                 if sql[j] == "\\":
-                    j += 2  # GoogleSQL escapes are on in every quoted form
+                    # GoogleSQL escapes are on in every quoted form; one takes
+                    # the next character, or a CR LF pair.
+                    j += 3 if sql.startswith("\r\n", j + 1) else 2
                     continue
                 if sql.startswith(closer, j):
                     j += len(closer)
                     break
-                if not triple and sql[j] == "\n" and ch != "`":
-                    return None  # a one-line string can't span lines
+                if not triple and sql[j] in _LINE_ENDS:
+                    raise _Unreadable(
+                        "it has a string or quoted identifier that runs past a line end"
+                    )
                 j += 1
             blank(i, j)
             i = j
         elif sql.startswith("--", i) or ch == "#":
-            end = sql.find("\n", i)
-            end = n if end < 0 else end
+            # To the line's end: the first CR or LF.
+            line_end = _LINE_END.search(sql, i)
+            end = n if line_end is None else line_end.start()
             blank(i, end)
             i = end
         elif sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
             if end < 0:
-                return None
+                raise _Unreadable("it has an unterminated /* */ comment")
+            # Up to the closer's '*' included: in '/* a /*/', a nesting reader
+            # takes '/*' first and the comment runs on.
+            if "/*" in sql[i + 2 : end + 1]:
+                raise _Unreadable(
+                    "it has a /* inside a /* */ comment (GoogleSQL comments don't nest)"
+                )
             blank(i, end + 2)
             i = end + 2
         else:

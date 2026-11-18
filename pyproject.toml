@@ -69,9 +69,12 @@ aws = [
 # BigQuery: google-auth signs the service account key into tokens (explicit
 # credentials only, never Application Default Credentials); sqlglot parses
 # SQL so only one SELECT is ever sent. HTTP via requests (core).
+# sqlglot from 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested,
+# and GoogleSQL doesn't nest them. Every extra naming sqlglot gives it this
+# same specifier; CI runs their suites at its floor (scripts/dep_floor.py).
 bigquery = [
     "google-auth>=2.20,<3",
-    "sqlglot>=25,<28",
+    "sqlglot>=26.25,<28",
 ]
 composio = [
     "composio>=0.13.1,<2.0",

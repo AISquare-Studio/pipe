@@ -36,6 +36,10 @@ ALLOWED = [
     # GoogleSQL escapes are always on: \' does not close the string, so this
     # is ONE string literal, as BigQuery reads it.
     "SELECT 'a\\'; DROP TABLE policies.documents; --'",
+    # Windows (CR LF) and old Mac (bare CR) line ends end a comment as LF does.
+    "SELECT id,\r\n  title -- the name\r\nFROM policies.documents\r\n",
+    "SELECT 1 # a bare CR ends me\r, 2",
+    "SELECT '''multi\r\nline''' AS s",
 ]
 
 
@@ -48,6 +52,12 @@ def test_one_trailing_semicolon_is_dropped():
     assert check_select_only("SELECT 1;") == "SELECT 1"
     assert check_select_only("SELECT 1 ;  -- done\n") == "SELECT 1"
 
+
+# The bypass #37 was reopened for (tester seq 13647), and its two halves.
+CR_DASH = "SELECT 1 --\r; DROP TABLE ds.t"
+CR_POUND = "SELECT 1 #\r; DROP TABLE ds.t"
+NESTED = "SELECT 1 /* /* */ ; DELETE FROM t WHERE TRUE /* */"
+CHAINED = "SELECT 1 --\r/* /* */; DROP TABLE ds.t; SELECT 1 /* */ -- */"
 
 REFUSED = {
     # DML
@@ -86,6 +96,19 @@ REFUSED = {
     # second statement.
     "escaped_quote_smuggle": "SELECT 'a\\\\'; DELETE FROM t WHERE TRUE; --'",
     "comment_hides_nothing": "SELECT 1 /* ; */ ; DELETE FROM t WHERE TRUE",
+    # BigQuery ends -- and # comments at a bare CR, so DROP is a second statement.
+    "cr_ends_dash_comment": CR_DASH,
+    "cr_ends_pound_comment": CR_POUND,
+    # GoogleSQL comments don't nest: '/* /* */' is one comment, and DELETE runs.
+    "nested_comment": NESTED,
+    "nested_comment_overlapping_closer": "SELECT 1 /* a /*/ ; DELETE FROM t WHERE TRUE /* */",
+    # Both chained: BigQuery reads SELECT 1; DROP TABLE ds.t; SELECT 1.
+    "cr_then_nested_comment": CHAINED,
+    # A one-line string or backtick identifier can't hold a CR (or LF).
+    "cr_in_string": "SELECT 'a\r'; DELETE FROM t WHERE TRUE; --'",
+    "cr_in_double_quoted_string": 'SELECT "a\r"; DELETE FROM t WHERE TRUE; --"',
+    "cr_in_backtick_identifier": "SELECT `a\r` FROM t",
+    "lf_in_backtick_identifier": "SELECT `a\n` FROM t",
     # a write inside a read
     "select_into": "SELECT 1 INTO x",
     # not SQL a query can be
@@ -120,6 +143,10 @@ def test_the_toolkit_refuses_them_before_any_request(sql):
         REFUSED["select_then_delete"],
         REFUSED["execute_immediate"],
         REFUSED["create"],
+        CR_DASH,
+        CR_POUND,
+        NESTED,
+        CHAINED,
     ],
 )
 def test_the_source_refuses_them_before_any_request(sql):
@@ -138,6 +165,10 @@ LAYER_CASES = [
     REFUSED["execute_immediate"],
     REFUSED["assert"],
     REFUSED["escaped_quote_smuggle"],
+    CR_DASH,
+    CR_POUND,
+    NESTED,
+    CHAINED,
 ]
 
 
@@ -161,6 +192,42 @@ def test_the_parser_alone_refuses_what_the_lexer_might_admit(monkeypatch):
         with pytest.raises(NotReadOnly):
             check_select_only(sql)
     assert check_select_only("SELECT 1") == "SELECT 1"
+
+
+def test_the_lexer_reads_line_ends_and_comments_as_bigquery_does(monkeypatch):
+    """ZetaSQL ends -- and # comments at a CR or an LF, a bare CR included;
+    its one-line strings and backtick identifiers hold neither; its /* */
+    comments don't nest. The lexer alone (the parser off) refuses each way of
+    hiding text there, and says why."""
+    monkeypatch.setattr(sqlguard, "_parsed_problem", lambda sql: None)
+    for sql in (CR_DASH, CR_POUND):
+        with pytest.raises(NotReadOnly, match="more than one statement"):
+            check_select_only(sql)
+    for sql in (NESTED, CHAINED, REFUSED["nested_comment_overlapping_closer"]):
+        with pytest.raises(NotReadOnly, match="don't nest"):
+            check_select_only(sql)
+    for key in (
+        "cr_in_string",
+        "cr_in_double_quoted_string",
+        "cr_in_backtick_identifier",
+        "lf_in_backtick_identifier",
+    ):
+        with pytest.raises(NotReadOnly, match="runs past a line end"):
+            check_select_only(REFUSED[key])
+    # A bare CR is a line end like LF: what follows is SQL again.
+    assert check_select_only("SELECT 1 --\r, 2") == "SELECT 1 --\r, 2"
+    # A backslash escapes a CR LF pair as one (still one string).
+    assert check_select_only("SELECT 'a\\\r\nb'") == "SELECT 'a\\\r\nb'"
+    assert check_select_only("SELECT 1 /* a */ /**/") == "SELECT 1 /* a */ /**/"
+
+
+def test_the_installed_sqlglot_reads_bigquery_comments_flat():
+    """sqlglot 25.3 to 26.24 read BigQuery's /* */ comments as nested, so its
+    parse alone admitted CHAINED. The [bigquery] extra's floor is 26.25, and
+    CI runs this suite at that floor as well as at the newest
+    (scripts/dep_floor.py in validate.yml)."""
+    tokens = sqlguard._DIALECT.tokenize("SELECT 1 /* /* */ AS x")
+    assert [t.text for t in tokens] == ["SELECT", "1", "AS", "x"]
 
 
 def test_a_column_named_like_a_write_keyword_needs_backticks():

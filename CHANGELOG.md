@@ -109,8 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the service account key (scope `bigquery.readonly`; `google-auth>=2.20,<3`) and never from Application
   Default Credentials; a missing or malformed blob fails closed ("BigQuery is not configured", no request).
   - SQL is SELECT-only, refused before any request otherwise: a lexer that reads GoogleSQL's quoting and
-    comments and a sqlglot parse (`sqlglot>=25,<28`, BigQuery dialect) must both find ONE `SELECT`/`WITH`
+    comments and a sqlglot parse (`sqlglot>=26.25,<28`, BigQuery dialect) must both find ONE `SELECT`/`WITH`
     statement with no write, DDL or scripting keyword or node. The dry run's `statementType` must be `SELECT`.
+    The lexer ends `--` and `#` comments at a CR or an LF (a bare CR too, as BigQuery does), refuses a CR or LF
+    inside a one-line string or backtick identifier, and refuses a `/*` inside a `/* */` comment. The floor is
+    sqlglot 26.25 because 25.3 to 26.24 read BigQuery comments as nested, and CI runs every suite whose extra names
+    sqlglot at that floor too (`scripts/dep_floor.py`).
   - Caps: a dry run refuses a query over `max_bytes_processed` (default 1 GiB, never above the tenant's
     `max_bytes_billed` ceiling, default 10 GiB) before it runs, and the job carries the same cap as
     `maximumBytesBilled`; `max_rows` and a JSON byte cap on the rows returned (`truncated` says which); the job
