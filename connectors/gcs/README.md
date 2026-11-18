@@ -35,7 +35,9 @@ names), for example when a `modified_after` matches little in a big prefix. Then
 - if no envelope came out (every name listed was older than `modified_after`, or too large), the pull raises
   `GcsPullTruncated` (a `ValueError`) with `reason` and `next_start_offset`. Its message names the
   `start_offset` to continue with, and pipe-as-service passes it on (422 `bad_request`);
-- a warning is logged either way. Logs never carry object names.
+- a warning is logged either way. This connector's own logs never carry object names. The host may log the
+  error's message, which names the `start_offset` (an object name): pipe-as-service's async worker logs a
+  failed job's error text (`async_/worker.py`).
 
 Pass `next_start_offset` as `start_offset` to continue, and repeat until a pull is not truncated. Nothing is
 skipped and nothing is repeated. A caller that keeps `max(updated)` as its watermark must finish a truncated
@@ -75,12 +77,14 @@ Read-only by construction: the token's scope is `devstorage.read_only`, the serv
   - Tokens are cached in memory per key until five minutes before they expire.
   - A token Cloud Storage rejects (401) is dropped from the cache. A call whose cached token was rejected
     retries once with a new token.
-- **Time budget.** A tool call fits inside the host's `timeout_seconds`, all of its requests together.
-  `GCS_GET_OBJECT` makes up to three requests (token, metadata, download), or four after a rejected cached
-  token (the rejected one, a new token, then the retry and the download). Each one, the token POST included, gets the time remaining (at most 30 s), and a call with no time
-  left fails `timeout` before it sends anything more. requests' timeout bounds each connect and each socket
-  read, not a whole body, so a download also checks the deadline between 64 KiB chunks. `gcs-source` has no
-  budget: each request gets 30 s.
+- **Time budget.** A tool call shares the host's `timeout_seconds` across all of its requests: every request
+  starts inside the budget and gets at most the time left (and at most 30 s). `GCS_GET_OBJECT` makes up to
+  three requests (token, metadata, download), or four after a rejected cached token (the rejected one, a new
+  token, then the retry and the download). The token POST counts too. A call with no time left fails
+  `timeout` before it sends anything more. requests' timeout bounds each connect and each socket read, not a
+  whole body, so a download also checks the deadline between 64 KiB chunks. A request already in flight can
+  still end after the deadline, by up to its own timeout (a body trickling in within one chunk is not cut
+  until that chunk ends). `gcs-source` has no budget: each request gets 30 s.
 
 | Failure | `error_code` | Meaning |
 |---|---|---|
@@ -182,6 +186,8 @@ Check these organization settings first:
    - Requester-pays buckets are not supported.
 4. **Create a JSON key**:
    `gcloud iam service-accounts keys create key.json --iam-account=aisquare-reader@<project>.iam.gserviceaccount.com`.
+   Make one key per AISquare environment (one for production, one for staging), and never use the production
+   key in staging.
 5. **Hand AISquare devops** key.json, the bucket name and, if the documents live under one folder, its prefix
    (it must end with `/`, for example `policies/`). Leaving the prefix out allows everything the grant
    covers.
@@ -190,10 +196,12 @@ Check these organization settings first:
      ticket.
    - Delete your local copy of key.json afterwards.
 
-**Offboarding** (when AISquare should stop reading): remove the role binding from step 3
-(`gcloud storage buckets remove-iam-policy-binding gs://<bucket> --member=serviceAccount:aisquare-reader@<project>.iam.gserviceaccount.com --role=roles/storage.objectViewer`,
-or `gcloud storage managed-folders remove-iam-policy-binding` with the same flags for 3b), then delete the
-key (`gcloud iam service-accounts keys delete <key-id> --iam-account=aisquare-reader@<project>.iam.gserviceaccount.com`)
+**Offboarding** (when AISquare should stop reading): remove the role binding from step 3, then delete the
+key or the service account.
+- 3a: `gcloud storage buckets remove-iam-policy-binding gs://<bucket> --member=serviceAccount:aisquare-reader@<project>.iam.gserviceaccount.com --role=roles/storage.objectViewer`
+- 3b: `gcloud storage managed-folders remove-iam-policy-binding gs://<bucket>/policies/ --member=serviceAccount:aisquare-reader@<project>.iam.gserviceaccount.com --role=roles/storage.objectViewer`
+
+Then delete the key (`gcloud iam service-accounts keys delete <key-id> --iam-account=aisquare-reader@<project>.iam.gserviceaccount.com`)
 or the whole service account (`gcloud iam service-accounts delete aisquare-reader@<project>.iam.gserviceaccount.com`).
 Removing the binding stops every read, a token AISquare already holds included, once the IAM change takes
 effect (usually within a few minutes).
@@ -201,63 +209,104 @@ effect (usually within a few minutes).
 ### AISquare devops
 
 **What has to be true first** (both):
-1. pipe-as-service runs credential-driven routing (task #30).
+1. pipe-as-service runs credential-driven routing (task #30), which reads one `gcs` secret for both `gcs` and
+   `gcs-source` (`TENANT_BLOBS` in `credentials/catalog.py`).
 2. Its image has a pipe release that contains `gcs` (`aisquare-pipe[toolkits]`, from the first release with
    this connector).
 
+**Where pipe-service runs today.** Production runs on ECS only. aisquare-releases has no prod pipe-service
+(`environments/prod/services/` holds only explainability-gateway and praxis), and aisquare-infra has no
+`prod/prod/pipe-service/*` secret. So GoodRx production follows the ECS path. `stg` runs on ECS and on EKS until
+the cutover, and `dev` runs on EKS only. While both `stg`s run, turn the tenant on in both (at the least, in the one
+the tenant's caller uses): the other one answers 422 `not_configured` for it.
+
+**One customer key per environment.** Ask the customer for a separate key for each environment that reads the
+bucket (step 4), and never put the production key in `stg` or `dev`. On EKS the value also sits in a GitHub
+environment secret of aisquare-infra (below), which more people and workflows can reach than an ECS secret.
+
 **Turning GCS on for a tenant is a deploy, today.** Every environment runs the env secrets backend
 (`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS task definitions in
-pipe-as-service). The blob reaches the pod only as the env var `PIPE_SECRET__<TENANT>__GCS__JSON`, from a
-secret that devops creates. Create the secret and fill it first ("Fill the secret" below), then add the
-entry:
+pipe-as-service). The blob reaches the service only as the env var `PIPE_SECRET__<TENANT>__GCS__JSON`. Store
+the value first ("The secret's value" below, saved as a local `blob.json`), then add the entry that reads
+it. A pod or task reads the value when it starts.
 
-- **EKS:** Secrets Manager `<secrets.prefix>/pipe-service/gcs-<tenant>` (for example
-  `nonprod/stg/pipe-service/gcs-<tenant>`), created empty by aisquare-infra and filled by its secrets
-  workflow, like pipe-service's other secrets (values never go in git). Then add to aisquare-releases
-  `environments/<env>/services/pipe-service/release.yaml`:
+`<TENANT>` is the tenant id in upper case. Every run of characters other than A-Z and 0-9 becomes one `_`, and
+any `_` at either end is dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__GCS__JSON`).
 
-  ```yaml
-  secretEnv:
-    PIPE_SECRET__<TENANT>__GCS__JSON: { from: pipe-service/gcs-<tenant> }
-  ```
+- **ECS** (production, and `stg` until the cutover):
+  1. Create the secret in the task definition's region: prod `us-east-2`, stg `us-east-1`. The task
+     execution role reads only `ais-pipe-service/<env>/*` in its own region, so a secret anywhere else stops
+     the task from starting:
+     `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/gcs-<tenant> --secret-string file://blob.json`
+  2. Add an entry to the task definition's `secrets:` (`deploy/ecs/<env>/task-definition-pipe-service.json`
+     in pipe-as-service). Use the same ARN form as the entries already there:
 
-  A code owner merging that PR is the deploy; Argo CD applies it.
-- **ECS:** Secrets Manager `ais-pipe-service/<env>/gcs-<tenant>` (the execution role already reads
-  `ais-pipe-service/<env>/*`). Then add to the task definition's `secrets:`
-  (`deploy/ecs/<env>/task-definition-pipe-service.json` in pipe-as-service), in the same ARN form as the
-  entries already there:
+     ```json
+     {
+       "name": "PIPE_SECRET__<TENANT>__GCS__JSON",
+       "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/gcs-<tenant>"
+     }
+     ```
 
-  ```json
-  {
-    "name": "PIPE_SECRET__<TENANT>__GCS__JSON",
-    "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/gcs-<tenant>"
-  }
-  ```
+  3. Merge it, then run pipe-as-service's `deploy` workflow for that environment and region:
+     `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`.
+     The new task-definition revision is the deploy. Terraform ignores `container_definitions`, so this
+     workflow owns them. The workflow builds and pushes the image from the head of the branch it runs on
+     (`main`), so this deploy also ships everything else merged to pipe-as-service `main` since the last one.
+     Check what that is first, above all in production.
+- **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand. aisquare-infra creates the secret
+  from `live/nonprod/data/supplied-secrets.json`. Its `secrets-nonprod` workflow fills the secret from the
+  GitHub environment `nonprod-secrets`, when run by hand and after every `apply-nonprod`. So a value edited in
+  Secrets Manager is overwritten with the GitHub one at the next sync. And if a listed secret's GitHub value
+  is missing, the sync stops for EVERY secret.
 
-  The new task-definition revision (the Deploy workflow) is the deploy.
+  `<GH_SECRET>` below is the environment's own GitHub secret, because each environment has its own key:
+  `GCS_<TENANT>_JSON` for `stg`, and `DEV_GCS_<TENANT>_JSON` for `dev` (like `DEV_INTERNAL_AUTH_TOKEN`). Use
+  that one name in every step and command for the environment, so `dev` never reads or writes stg's secret.
+  1. Store the value in GitHub:
+     `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+  2. In aisquare-infra, open one PR that adds the entry to `live/nonprod/data/supplied-secrets.json`:
 
-`<TENANT>` is the tenant id upper-cased, with every run of characters other than A-Z and 0-9 written as one
-`_` and any `_` at either end dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__GCS__JSON`). Add the
-entry only once its secret has a value: on EKS, Argo CD waits for the ExternalSecret before the Deployment,
-so a missing secret holds the release; on ECS, a task whose secret doesn't exist does not start. The new
-value is read when the pod or task starts.
+     ```json
+     {
+       "nonprod/<env>/pipe-service/gcs-<tenant>": {
+         "github_secret": "<GH_SECRET>",
+         "description": "PIPE_SECRET__<TENANT>__GCS__JSON of the <env> pipe service: the GCS service account blob of <tenant>"
+       }
+     }
+     ```
+
+     The same PR adds its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
+     `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}`. Merge only after step 1, so the sync can't fail on it. The merge runs `apply-nonprod`, which creates the secret and then runs `secrets-nonprod` to fill
+     it. Check that both ran green.
+  3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml`. That file is
+     written by people. Never edit `values.yaml`, which the pipe-as-service build workflow overwrites:
+
+     ```yaml
+     secretEnv:
+       PIPE_SECRET__<TENANT>__GCS__JSON: { from: pipe-service/gcs-<tenant> }
+     ```
+
+     Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging that PR is the deploy. Argo CD
+     syncs the ExternalSecret `pipe` (key `<secrets.prefix>/pipe-service/gcs-<tenant>`, for example
+     `nonprod/stg/pipe-service/gcs-<tenant>`) before the Deployment. One ExternalSecret carries every
+     `secretEnv` entry, so a secret with no value yet fails that ExternalSecret and holds the release.
+
+After storing the value, delete `blob.json`, the vault item and any local copy of key.json. Then remove the
+customer's guest access and the handoff vault.
 
 **Never switch the secrets backend for GCS.** `PIPE_SERVICE_SECRETS_BACKEND=aws` moves EVERY secret the
-service reads, the shared Composio key included: under it, that key is read from
+service reads, the shared Composio key included. Under that backend, that key is read from
 `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/_shared/composio/api_key`, and a missing or denied secret reads as no
-key. Flipping it "for GCS" takes Composio down for every connector in that environment. Moving to the aws
-backend is a whole-service migration (pipe-as-service `DEPLOYMENT.md`, go-live checklist: the Composio key
+key. Flipping the backend "for GCS" takes Composio down for every connector in that environment. Moving to the
+aws backend is a whole-service migration (pipe-as-service `DEPLOYMENT.md`, go-live checklist: the Composio key
 and the OAuth apps first), never a GCS step. After that migration, the tenant's secret is
-`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/gcs` and needs no deploy: a new secret is picked up within
+`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/gcs` and needs no deploy. A new secret is picked up within
 about 60 s (a missing secret is not cached, so only the 60 s routing TTL applies), and a changed one within
 300 s (the secret cache).
 
-**Fill the secret.** pipe-as-service reads it as the tenant's credential blob for both `gcs` and
-`gcs-source`:
-1. Copy key.json from the vault into the secret.
-2. Delete the vault item and any local copy. Then remove the customer's guest access and the handoff vault.
-
-The secret's value, one JSON object:
+**The secret's value.** pipe-as-service reads it as the tenant's credential blob for both `gcs` and
+`gcs-source`. It is one JSON object:
 
 ```json
 {
@@ -282,15 +331,90 @@ is optional and must end with `/`. Until the secret is read, pipe-as-service ans
 
 **Rotation**, at least before any key expiry:
 1. The customer creates a new key for the same service account (step 4) and hands it over as in step 5.
-2. Devops replaces `service_account_json` in the secret.
-3. Wait until every pod reads the new key. On the env backend (today) the value is read when a pod or task
-   starts: redeploy the service after the secret changes (on EKS, once External Secrets has synced it) and
-   wait until the rollout has finished. After a migration to the aws backend, wait at least 300 s.
-4. Only then does the customer delete the old key. Deleting it earlier breaks calls on pods that still hold it.
+2. Replace `service_account_json` in the value. Then restart the service, which reads the value only when a
+   pod or task starts:
+   - ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/gcs-<tenant> --secret-string file://blob.json`,
+     then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+     Wait until the old tasks are gone.
+   - EKS, in this order (`<GH_SECRET>` as in "Turning GCS on", per environment):
+     1. `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+        Never edit the value in Secrets Manager: the next sync puts the GitHub value back, and a pod that
+        starts after that reads the old key.
+     2. Run the sync and wait for it to finish. `gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra`
+        returns as soon as the run is queued. Find the run with
+        `gh run list --workflow secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra --limit 1 --json databaseId,createdAt`
+        (its `createdAt` must be after your dispatch; a new run can take a few seconds to appear), then
+        `gh run watch <run-id> --repo AISquare-Studio/aisquare-infra --exit-status`. It must end green, and
+        `gh run view <run-id> --repo AISquare-Studio/aisquare-infra --log | grep pipe-service/gcs-<tenant>`
+        must show `nonprod/<env>/pipe-service/gcs-<tenant>: updated`.
+     3. Only then refresh the ExternalSecret. Its refresh interval is 1 h, the chart default, which
+        pipe-service doesn't override. Or force it now with
+        `kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`. Then check that
+        `kubectl -n <env> get externalsecret pipe -o jsonpath='{.status.refreshTime}'` is later than the run's
+        end (`gh run view <run-id> --repo AISquare-Studio/aisquare-infra --json updatedAt`) and that
+        `kubectl -n <env> get externalsecret pipe` shows `SecretSynced`. A refresh that ran before the sync
+        finished copied the old key, and it still shows `SecretSynced`.
+     4. Restart the Deployment: `kubectl -n <env> rollout restart deployment/pipe-service`, then
+        `kubectl -n <env> rollout status deployment/pipe-service`. The chart has no checksum annotation or
+        reloader, so pods keep the old value until they restart.
+   - After a migration to the aws backend: no restart, but wait at least 300 s.
+3. Only when every pod or task runs with the new key does the customer delete the old one. Deleting it
+   earlier breaks calls on pods that still hold it.
 
-**Offboarding:** remove the `secretEnv` entry or the task definition's `secrets:` entry (a deploy), then
-delete the secret. Tell the customer to do their offboarding (above) as well: deleting our copy does not
-revoke the key.
+**Offboarding** (AISquare's copy):
+- ECS: remove the task definition's `secrets:` entry and deploy (as above). Then delete the secret:
+  `aws secretsmanager delete-secret --region <region> --secret-id ais-pipe-service/<env>/gcs-<tenant>`.
+  Keep that order, because a task whose secret is gone does not start. The name stays taken for the recovery
+  window (30 days by default), so to turn the tenant back on within it, restore the secret
+  (`aws secretsmanager restore-secret --region <region> --secret-id ais-pipe-service/<env>/gcs-<tenant>`) and
+  `put-secret-value` the new blob instead of `create-secret`.
+- EKS:
+  1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry is listed, a
+     deleted secret fails the ExternalSecret.
+  2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the
+     `secrets-nonprod.yml` env line, and the tenant's import block in `live/nonprod/data/imports.tf` if one
+     is still there (below). Its `apply-nonprod` deletes the Secrets Manager secret, with a 7-day recovery
+     window.
+  3. After that merge, run
+     `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`.
+     If you delete it earlier, while the entry is still listed, every sync stops.
+
+  **Never delete the Secrets Manager secret by hand.** `delete-secret` keeps the name for its recovery window
+  (30 days by default), and Terraform's AWS provider reads a secret that is pending deletion as gone. Until the
+  window ends, while the entry is listed:
+  - the next `apply-nonprod` of `live/nonprod/data` plans to create the secret, and `CreateSecret` fails
+    ("already scheduled for deletion"). The apply fails, and its `secrets-nonprod` job is skipped;
+  - `secrets-nonprod` fails on the secret and stops there, so no secret listed after it is written, other
+    services' included;
+  - the ExternalSecret `pipe` fails, which holds every later pipe-service release in that environment.
+
+  To undo it: `aws secretsmanager restore-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/gcs-<tenant>`.
+  The value comes back with it. If an `apply-nonprod` ran on `live/nonprod/data` in between, its failure also
+  dropped the secret from Terraform's state, so import it (below) as well. Then run `secrets-nonprod`, wait for
+  it and refresh the ExternalSecret, as the EKS rotation above does.
+
+  **Turning the tenant back on within 7 days** of the offboarding apply fails the same way: the name is still
+  pending deletion. Wait out the window, or restore the secret (above) first. Only then open the PR that re-adds
+  the entry: the provider cannot import a secret that is still pending deletion, so a PR opened before the
+  restore fails. In that PR, add an import block to `live/nonprod/data/imports.tf` like the ones already there:
+
+  ```hcl
+  import {
+    to = aws_secretsmanager_secret.supplied["nonprod/<env>/pipe-service/gcs-<tenant>"]
+    id = "<ARN>"
+  }
+  ```
+
+  `<ARN>` comes from
+  `aws secretsmanager describe-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/gcs-<tenant> --query ARN --output text`.
+  The restored secret holds the old value until the sync writes the GitHub one.
+
+  **Remove the import block once the `apply-nonprod` that imported it is green**, in a follow-up PR (the
+  secret stays in Terraform's state). A block left behind outlives the entry: after the next offboarding
+  removes the entry, every plan of `live/nonprod/data` fails ("Configuration for import target does not
+  exist"), so its `apply-nonprod` fails and the sync is skipped. The two blocks already there are safe only
+  while their entries stay listed.
+- Tell the customer to do their offboarding (above) as well: deleting our copy does not revoke the key.
 
 **Later (not built):** Workload Identity Federation from our AWS principal to the customer's service
 account. It avoids a long-lived key, and needs setup on both sides.

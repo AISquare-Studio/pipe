@@ -37,14 +37,16 @@ Glean issues the token. There is no OAuth here: the toolkit declares no
 tenant's server-side secret only. Callers cannot set the host, the token or
 the user Glean reads as.
 
-**What pipe-as-service runs today.** Only `glean-source` runs through
-pipe-as-service: its credential resolver classifies `glean-source` as a
-per-tenant credential (FIRST_PARTY) and reads the tenant's `glean` blob below.
-pipe-as-service does not serve the `GLEAN_SEARCH` and `GLEAN_GET_DOCUMENT`
-tools yet: its catalogue marks a toolkit that has no registry card and no
-`OAuthSpec` as unsupported. The tools work in any host that loads the toolkit
-directly with the blob as its config. Serving them from pipe-as-service waits
-on its native-toolkit routing work.
+**What pipe-as-service runs.** Only `glean-source` runs through
+pipe-as-service today (its `main`): its credential resolver classifies
+`glean-source` as a per-tenant credential (FIRST_PARTY) and reads the tenant's
+`glean` blob below. pipe-as-service does not serve the `GLEAN_SEARCH` and
+`GLEAN_GET_DOCUMENT` tools yet: its catalogue marks a toolkit that has no
+registry card and no `OAuthSpec` as unsupported. With credential-driven
+routing (pipe-as-service #30), the `glean` toolkit is served too, and it reads
+the same `glean` secret as `glean-source` (`TENANT_BLOBS` in
+`credentials/catalog.py`). So a tenant stores the blob once. The tools also
+work in any host that loads the toolkit directly with the blob as its config.
 
 ### 1. Find the host
 
@@ -85,19 +87,21 @@ example `169.254.169.254`, `127.1` or `0xa9.0xfe.0xa9.0xfe`).
    - **Expires**: optional. Put the expiry date in the runbook.
 4. Copy the token secret. Glean shows it only once, and its permissions and
    scopes cannot be changed later.
+5. Make one token per AISquare environment (one for production, one for
+   staging), and never use the production token in staging. Hand each token to
+   AISquare devops only through AISquare's team vault (1Password), never by
+   email, chat or a ticket.
 
 A Client API token cannot be used for Glean's Indexing API, and the reverse is
 also true.
 
-### 3. Store the secret (operator)
+### 3. The secret's value
 
 The secret is one JSON object, read by pipe-as-service as the `glean` blob for
-the tenant:
-
-| Secrets backend | Name |
-|---|---|
-| AWS Secrets Manager | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/glean` |
-| env (local) | `PIPE_SECRET__<TENANT>__GLEAN__JSON` |
+the tenant. On the env secrets backend, which every environment runs today,
+it is the env var `PIPE_SECRET__<TENANT>__GLEAN__JSON`. On the aws backend, it
+is `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/glean`. How it gets there:
+[4. Deliver the secret](#4-deliver-the-secret-aisquare-devops).
 
 USER token:
 
@@ -132,6 +136,233 @@ value that is not is refused as not configured.
 If the secret is missing or malformed, every tool fails with `not_connected`
 ("Glean is not configured: …") and the source raises `GleanNotConfigured`, both
 before any request. The reason never contains the token.
+
+### 4. Deliver the secret (AISquare devops)
+
+**What has to be true first:** pipe-as-service's image has a pipe release
+that contains `glean` (`aisquare-pipe[toolkits]`). The toolkit also needs
+pipe-as-service #30 (above).
+
+**Where pipe-service runs today.** Production runs on ECS only.
+aisquare-releases has no prod pipe-service (`environments/prod/services/`
+holds only explainability-gateway and praxis), and aisquare-infra has no
+`prod/prod/pipe-service/*` secret. So a customer's production tenant follows
+the ECS path. `stg` runs on ECS and on EKS until the cutover, and `dev` runs on
+EKS only. While both `stg`s run, turn the tenant on in both (at the least, in
+the one the tenant's caller uses): the other one fails the tenant's calls as
+not configured. Use one Glean token per environment (section 2, step 5). On
+EKS the value also sits in a GitHub environment secret of aisquare-infra
+(below), which more people and workflows can reach than an ECS secret.
+
+**Turning Glean on for a tenant is a deploy, today.** Every environment runs
+the env secrets backend (`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS
+`deploy/values.yaml` and both ECS task definitions in pipe-as-service). The
+blob reaches the service only as the env var
+`PIPE_SECRET__<TENANT>__GLEAN__JSON`, read when a pod or task starts. Store
+the value first (step 3, saved as a local `blob.json`), then add the entry
+that reads it.
+
+`<TENANT>` is the tenant id in upper case. Every run of characters other than
+A-Z and 0-9 becomes one `_`, and any `_` at either end is dropped
+(`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__GLEAN__JSON`).
+
+- **ECS** (production, and `stg` until the cutover):
+  1. Create the secret in the task definition's region: prod `us-east-2`, stg
+     `us-east-1`. The task execution role reads only `ais-pipe-service/<env>/*`
+     in its own region, so a secret anywhere else stops the task from
+     starting:
+     `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/glean-<tenant> --secret-string file://blob.json`
+  2. Add an entry to the task definition's `secrets:`
+     (`deploy/ecs/<env>/task-definition-pipe-service.json` in pipe-as-service).
+     Use the same ARN form as the entries already there:
+
+     ```json
+     {
+       "name": "PIPE_SECRET__<TENANT>__GLEAN__JSON",
+       "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/glean-<tenant>"
+     }
+     ```
+
+  3. Merge it, then run pipe-as-service's `deploy` workflow for that
+     environment and region:
+     `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`.
+     The new task-definition revision is the deploy. Terraform ignores
+     `container_definitions`, so this workflow owns them. The workflow builds
+     and pushes the image from the head of the branch it runs on (`main`), so
+     this deploy also ships everything else merged to pipe-as-service `main`
+     since the last one. Check what that is first, above all in production.
+- **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand.
+  aisquare-infra creates the secret from
+  `live/nonprod/data/supplied-secrets.json`. Its `secrets-nonprod` workflow
+  fills the secret from the GitHub environment `nonprod-secrets`, when run by
+  hand and after every `apply-nonprod`. So a value edited in Secrets Manager is
+  overwritten with the GitHub one at the next sync. And if a listed secret's
+  GitHub value is missing, the sync stops for EVERY secret.
+
+  `<GH_SECRET>` below is the environment's own GitHub secret, because each
+  environment has its own token: `GLEAN_<TENANT>_JSON` for `stg`, and
+  `DEV_GLEAN_<TENANT>_JSON` for `dev` (like `DEV_INTERNAL_AUTH_TOKEN`). Use that
+  one name in every step and command for the environment, so `dev` never reads
+  or writes stg's secret.
+  1. Store the value in GitHub:
+     `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+  2. In aisquare-infra, open one PR that adds the entry to
+     `live/nonprod/data/supplied-secrets.json`:
+
+     ```json
+     {
+       "nonprod/<env>/pipe-service/glean-<tenant>": {
+         "github_secret": "<GH_SECRET>",
+         "description": "PIPE_SECRET__<TENANT>__GLEAN__JSON of the <env> pipe service: the Glean token blob of <tenant>"
+       }
+     }
+     ```
+
+     The same PR adds its line to the `env` of the sync step in
+     `.github/workflows/secrets-nonprod.yml`:
+     `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}`. Merge only after
+     step 1, so the sync can't fail on it. The merge runs `apply-nonprod`,
+     which creates the secret and then runs `secrets-nonprod` to fill it. Check
+     that both ran green.
+  3. In aisquare-releases, add to
+     `environments/<env>/services/pipe-service/release.yaml`. That file is
+     written by people. Never edit `values.yaml`, which the pipe-as-service
+     build workflow overwrites:
+
+     ```yaml
+     secretEnv:
+       PIPE_SECRET__<TENANT>__GLEAN__JSON: { from: pipe-service/glean-<tenant> }
+     ```
+
+     Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging
+     that PR is the deploy. Argo CD syncs the ExternalSecret `pipe` (key
+     `<secrets.prefix>/pipe-service/glean-<tenant>`) before the Deployment. One
+     ExternalSecret carries every `secretEnv` entry, so a secret with no value
+     yet fails that ExternalSecret and holds the release.
+
+After storing the value, delete `blob.json` and the vault item.
+
+**Never switch the secrets backend for Glean.** `PIPE_SERVICE_SECRETS_BACKEND=aws`
+moves EVERY secret the service reads, the shared Composio key included, and a
+missing secret reads as no key. Flipping the backend "for Glean" takes Composio
+down for every connector in that environment. Moving to the aws backend is a
+whole-service migration (pipe-as-service `DEPLOYMENT.md`).
+
+**Rotation**, at least before the token expires:
+1. The Glean admin creates a new token (step 2) and hands it over. A token's
+   permissions and scopes can't be changed, so a new scope also means a new
+   token.
+2. Replace `token` in the value. Then restart the service, which reads the
+   value only when a pod or task starts:
+   - ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/glean-<tenant> --secret-string file://blob.json`,
+     then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+     Wait until the old tasks are gone.
+   - EKS, in this order (`<GH_SECRET>` as in "Deliver the secret", per
+     environment):
+     1. `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+        Never edit the value in Secrets Manager: the next sync puts the
+        GitHub value back, and a pod that starts after that reads the old
+        token.
+     2. Run the sync and wait for it to finish.
+        `gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra`
+        returns as soon as the run is queued. Find the run with
+        `gh run list --workflow secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra --limit 1 --json databaseId,createdAt`
+        (its `createdAt` must be after your dispatch; a new run can take a
+        few seconds to appear), then
+        `gh run watch <run-id> --repo AISquare-Studio/aisquare-infra --exit-status`.
+        It must end green, and
+        `gh run view <run-id> --repo AISquare-Studio/aisquare-infra --log | grep pipe-service/glean-<tenant>`
+        must show `nonprod/<env>/pipe-service/glean-<tenant>: updated`.
+     3. Only then refresh the ExternalSecret. Its refresh interval is 1 h, the
+        chart default, which pipe-service doesn't override. Or force it now
+        with
+        `kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`.
+        Then check that
+        `kubectl -n <env> get externalsecret pipe -o jsonpath='{.status.refreshTime}'`
+        is later than the run's end
+        (`gh run view <run-id> --repo AISquare-Studio/aisquare-infra --json updatedAt`)
+        and that `kubectl -n <env> get externalsecret pipe` shows
+        `SecretSynced`. A refresh that ran before the sync finished copied the
+        old token, and it still shows `SecretSynced`.
+     4. Restart the Deployment:
+        `kubectl -n <env> rollout restart deployment/pipe-service`, then
+        `kubectl -n <env> rollout status deployment/pipe-service`. The chart
+        has no checksum annotation or reloader, so pods keep the old value
+        until they restart.
+3. Only when every pod or task runs with the new token does the Glean admin
+   revoke the old one. Revoking it earlier breaks calls on pods that still
+   hold it.
+
+**Offboarding** (AISquare's copy):
+- ECS: remove the task definition's `secrets:` entry and deploy (as above).
+  Then delete the secret:
+  `aws secretsmanager delete-secret --region <region> --secret-id ais-pipe-service/<env>/glean-<tenant>`.
+  Keep that order, because a task whose secret is gone does not start. The
+  name stays taken for the recovery window (30 days by default), so to turn
+  the tenant back on within it, restore the secret
+  (`aws secretsmanager restore-secret --region <region> --secret-id ais-pipe-service/<env>/glean-<tenant>`)
+  and `put-secret-value` the new blob instead of `create-secret`.
+- EKS:
+  1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this
+     first: while the entry is listed, a deleted secret fails the
+     ExternalSecret.
+  2. In aisquare-infra, open one PR that removes the `supplied-secrets.json`
+     entry and the `secrets-nonprod.yml` env line, and the tenant's import
+     block in `live/nonprod/data/imports.tf` if one is still there (below).
+     Its `apply-nonprod` deletes the Secrets Manager secret, with a 7-day
+     recovery window.
+  3. After that merge, run
+     `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`.
+     If you delete it earlier, while the entry is still listed, every sync
+     stops.
+
+  **Never delete the Secrets Manager secret by hand.** `delete-secret` keeps
+  the name for its recovery window (30 days by default), and Terraform's AWS
+  provider reads a secret that is pending deletion as gone. Until the window
+  ends, while the entry is listed:
+  - the next `apply-nonprod` of `live/nonprod/data` plans to create the
+    secret, and `CreateSecret` fails ("already scheduled for deletion"). The
+    apply fails, and its `secrets-nonprod` job is skipped;
+  - `secrets-nonprod` fails on the secret and stops there, so no secret
+    listed after it is written, other services' included;
+  - the ExternalSecret `pipe` fails, which holds every later pipe-service
+    release in that environment.
+
+  To undo it:
+  `aws secretsmanager restore-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/glean-<tenant>`.
+  The value comes back with it. If an `apply-nonprod` ran on
+  `live/nonprod/data` in between, its failure also dropped the secret from
+  Terraform's state, so import it (below) as well. Then run `secrets-nonprod`,
+  wait for it and refresh the ExternalSecret, as the EKS rotation above does.
+
+  **Turning the tenant back on within 7 days** of the offboarding apply fails
+  the same way: the name is still pending deletion. Wait out the window, or
+  restore the secret (above) first. Only then open the PR that re-adds the
+  entry: the provider cannot import a secret that is still pending deletion,
+  so a PR opened before the restore fails. In that PR, add an import block to
+  `live/nonprod/data/imports.tf` like the ones already there:
+
+  ```hcl
+  import {
+    to = aws_secretsmanager_secret.supplied["nonprod/<env>/pipe-service/glean-<tenant>"]
+    id = "<ARN>"
+  }
+  ```
+
+  `<ARN>` comes from
+  `aws secretsmanager describe-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/glean-<tenant> --query ARN --output text`.
+  The restored secret holds the old value until the sync writes the GitHub
+  one.
+
+  **Remove the import block once the `apply-nonprod` that imported it is
+  green**, in a follow-up PR (the secret stays in Terraform's state). A block
+  left behind outlives the entry: after the next offboarding removes the
+  entry, every plan of `live/nonprod/data` fails ("Configuration for import
+  target does not exist"), so its `apply-nonprod` fails and the sync is
+  skipped. The two blocks already there are safe only while their entries
+  stay listed.
+- The Glean admin revokes the token (Token management, Client tab). Deleting
+  our copy does not revoke it.
 
 ## Toolkit
 
