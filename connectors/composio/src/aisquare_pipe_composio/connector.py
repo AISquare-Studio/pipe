@@ -25,7 +25,7 @@ from aisquare.pipe.core.envelope import (
     Resource,
 )
 
-from aisquare_pipe_composio.client import ComposioClient
+from aisquare_pipe_composio.client import ComposioClient, log_call_failure
 from aisquare_pipe_composio.constants import (
     DEFAULT_USER_ID,
     JSON_CONTENT_TYPE,
@@ -179,8 +179,8 @@ def _toolkit_resources(client: ComposioClient, config: dict) -> list[Resource]:
             slug = (toolkit.get("slug") if isinstance(toolkit, dict) else toolkit) or ""
             if slug:
                 accounts[str(slug).lower()] = account
-    except Exception:
-        logger.exception("composio: listing connected accounts failed")
+    except Exception as e:
+        log_call_failure(logger, "composio: listing connected accounts failed", e)
 
     toolkit_filter = {t.lower() for t in (config.get("toolkit_filter") or [])}
     resources: list[Resource] = []

@@ -746,3 +746,136 @@ def test_a_failed_resumed_page_keeps_its_cursor_only_if_transient(
     assert all(
         json.loads(r.content)["cursor"] == "cur_11" for r in composio_http.requests
     )
+
+
+# -- a Composio error is logged without its answer (#49 review seq 14129 n3) --
+
+# A 500's body text: Composio's answer can echo request data. No log line of
+# this connector may repeat it, a traceback's included.
+ANSWER_TEXT = "alice@example.com wrote: quarterly numbers"
+
+
+def _logged(caplog) -> str:
+    """This connector's log records as a handler formats them, tracebacks
+    included."""
+    formatter = logging.Formatter("%(levelname)s %(message)s")
+    return "\n".join(
+        formatter.format(r)
+        for r in caplog.records
+        if r.name == "aisquare.pipe.composio"
+    )
+
+
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+def test_a_failed_poll_cycle_logs_no_composio_answer(composio_http, tmp_path, caplog):
+    """The real SDK's error for a 500 (after its retries) whose body carries
+    ``ANSWER_TEXT``. Before: ``logger.exception`` printed the PipelineError's
+    message and its chained InternalServerError's, both with the body text,
+    once per failed cycle. Now one ERROR line names the types and the HTTP
+    status, with no traceback; the host still gets the error itself."""
+    from aisquare_pipe_composio.triggers import ComposioTriggersSource
+
+    composio_http.respond = lambda _request, _body: (
+        500,
+        {"error": {"message": ANSWER_TEXT}},
+    )
+    heard: list[Exception] = []
+    params = PullParams(
+        params={
+            "max_polls": 1,
+            "sleep": lambda _s: None,
+            "on_cycle_error": heard.append,
+        }
+    )
+    config = {**OFFLINE_CONFIG, "cursor_path": str(tmp_path / "cursor.json")}
+    with caplog.at_level(logging.DEBUG, logger="aisquare.pipe.composio"):
+        assert list(ComposioTriggersSource().pull(config, params)) == []
+
+    [logged] = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert logged.exc_info is None
+    assert logged.getMessage() == (
+        "composio: trigger poll cycle failed: "
+        "PipelineError from InternalServerError (HTTP 500)"
+    )
+    assert ANSWER_TEXT not in _logged(caplog)
+    [error] = heard
+    assert ANSWER_TEXT in str(error)  # the host's to log (or not)
+
+
+def _mapped_500() -> PipelineError:
+    """What ``_map_composio_errors`` raises for the real SDK's 500 error
+    whose body carries ``ANSWER_TEXT``."""
+    from aisquare_pipe_composio.client import _map_composio_errors
+    from composio_client import InternalServerError
+
+    request = httpx.Request("POST", "https://composio.invalid/api/v3/anything")
+    response = httpx.Response(
+        500, json={"error": {"message": ANSWER_TEXT}}, request=request
+    )
+    sdk_error = InternalServerError(
+        f"Error code: 500 - {response.json()}", response=response, body=response.json()
+    )
+
+    @_map_composio_errors
+    def call() -> None:
+        raise sdk_error
+
+    with pytest.raises(PipelineError) as raised:
+        call()
+    assert ANSWER_TEXT in str(raised.value)
+    return raised.value
+
+
+@pytest.mark.parametrize("listing", ["trigger instances", "connected accounts"])
+def test_a_failed_listing_logs_no_composio_answer(
+    sockets, monkeypatch, caplog, listing
+):
+    """The two other ``logger.exception`` lines: a trigger source's
+    ``list_resources`` (trigger instances) and a source's toolkit resources
+    (connected accounts) go on without the failed listing, and the ERROR
+    line names the types and the HTTP status only."""
+    from aisquare_pipe_composio.connector import ComposioSource
+    from aisquare_pipe_composio.triggers import ComposioTriggersSource
+
+    error = _mapped_500()
+
+    def fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise error
+
+    if listing == "trigger instances":
+        monkeypatch.setattr(ComposioClient, "list_trigger_types", lambda *a, **k: [])
+        monkeypatch.setattr(ComposioClient, "list_trigger_instances", fail)
+        list_resources = ComposioTriggersSource().list_resources
+    else:
+        monkeypatch.setattr(ComposioClient, "list_toolkits", lambda *a, **k: [])
+        monkeypatch.setattr(ComposioClient, "list_connected_accounts", fail)
+        list_resources = ComposioSource().list_resources
+
+    with caplog.at_level(logging.DEBUG, logger="aisquare.pipe.composio"):
+        assert list_resources(dict(OFFLINE_CONFIG)) == []
+
+    [logged] = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert logged.exc_info is None
+    assert logged.getMessage() == (
+        f"composio: listing {listing} failed: "
+        "PipelineError from InternalServerError (HTTP 500)"
+    )
+    assert ANSWER_TEXT not in _logged(caplog)
+    assert sockets == []
+
+
+def test_an_error_of_the_connectors_own_keeps_its_traceback(caplog):
+    """Not from Composio (a bug here, say): logged with its traceback, as
+    ``logger.exception`` did."""
+    from aisquare_pipe_composio.client import log_call_failure
+
+    log = logging.getLogger("aisquare.pipe.composio")
+    try:
+        raise KeyError("trigger_slug")
+    except KeyError as e:
+        with caplog.at_level(logging.DEBUG, logger="aisquare.pipe.composio"):
+            log_call_failure(log, "composio: trigger poll cycle failed", e)
+    [logged] = caplog.records
+    assert logged.levelno == logging.ERROR
+    assert logged.exc_info is not None and logged.exc_info[0] is KeyError
+    assert logged.getMessage() == "composio: trigger poll cycle failed"
