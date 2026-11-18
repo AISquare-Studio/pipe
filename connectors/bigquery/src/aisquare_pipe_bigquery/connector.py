@@ -16,13 +16,14 @@ ceiling. Exactly one of:
   ``job_timeout_seconds`` (default 120, at most 600) as ``jobTimeoutMs``.
   Optional ``default_dataset``.
 
-And for both: ``batch_size`` rows per envelope (default 500, at most
-10,000) and ``max_batch_bytes`` bytes of envelope data (default 256 KiB,
-what pipe-as-service returns inline in a synchronous pull; at least 1 KiB,
-at most 64 MiB; a single larger row still gets an envelope of its own),
+And for both: ``batch_size`` rows per envelope (default 500, at most 10,000)
+and ``max_batch_bytes`` bytes of envelope data (default 256 KiB, what
+pipe-as-service returns inline in a synchronous pull; at least 1 KiB, at
+most 64 MiB; a single larger row still gets an envelope of its own),
 whichever comes first, ``max_rows`` (default 10,000, at most 100,000) and
-``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 64 MiB:
-sized for a 512 MiB pod, see the README's "Memory").
+``max_result_bytes`` (bytes of the envelopes' data in all, each one's
+columns header included; default 25 MiB, at most 64 MiB: sized for a 512 MiB
+pod, see the README's "Memory").
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``; ``schema`` carries the columns
@@ -401,6 +402,7 @@ class BigQueryQuerySource(SourceConnector):
             start_index=start,
             selected_fields=selected,
             encoded=True,
+            batching=batch_size,
         )
         name = ref.qualified(creds.project_id)
         common: dict[str, Any] = {"kind": "table", "table": name}
@@ -437,6 +439,7 @@ class BigQueryQuerySource(SourceConnector):
             default_dataset=default_dataset,
             estimate=estimate,
             encoded=True,
+            batching=batch_size,
         )
         digest = hashlib.sha256(sql.encode()).hexdigest()
         common: dict[str, Any] = {"kind": "query", "query_sha256": digest, **markers}
@@ -535,13 +538,17 @@ def _batches(
             kind,
             result.truncated,
         )
-    bounds = batch_bounds(
-        [len(r) if r is not None else 0 for r in rows],
-        max_rows=batch_size[0],
-        max_bytes=batch_size[1],
-        header=len(encoded_batch(result.fields, [])) - 2,
-        separator=1,
-        closing=2,
+    bounds = (
+        result.plan.bounds()
+        if result.plan is not None
+        else batch_bounds(
+            [len(r) if r is not None else 0 for r in rows],
+            max_rows=batch_size[0],
+            max_bytes=batch_size[1],
+            header=len(encoded_batch(result.fields, [])) - 2,
+            separator=1,
+            closing=2,
+        )
     )
     columns = {"fields": result.fields}
     for index, (offset, end) in enumerate(bounds):

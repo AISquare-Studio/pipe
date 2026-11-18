@@ -9,14 +9,16 @@ secret (a param naming one is refused). Exactly one of:
 * ``table``: ``schema.table`` (plain names: letters, digits, ``_``, ``$``),
   read as ``SELECT * FROM "schema"."table"``, which passes the same check.
 
-And for both: ``batch_size`` rows per envelope (default 500, at most
-10,000) and ``max_batch_bytes`` bytes of envelope data (default 256 KiB,
-what pipe-as-service returns inline in a synchronous pull; at least 1 KiB,
-at most 64 MiB; a single larger row still gets an envelope of its own),
+And for both: ``batch_size`` rows per envelope (default 500, at most 10,000)
+and ``max_batch_bytes`` bytes of envelope data (default 256 KiB, what
+pipe-as-service returns inline in a synchronous pull; at least 1 KiB, at
+most 64 MiB; a single larger row still gets an envelope of its own),
 whichever comes first, ``max_rows`` (default 10,000, at most 100,000),
-``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 64 MiB,
-sized for a 512 MiB pod: see the README's "Memory") and ``timeout_seconds`` (default 120, at most 600; never more than the
-host's time budget): the statement is cancelled if it runs past it.
+``max_result_bytes`` (bytes of the envelopes' data in all, each one's
+columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB
+pod: see the README's "Memory") and ``timeout_seconds`` (default 120, at
+most 600; never more than the host's time budget): the statement is
+cancelled if it runs past it.
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``), and ``metadata`` carries the
@@ -305,6 +307,7 @@ class RedshiftQuerySource(_AwsSource):
             max_rows=max_rows,
             max_result_bytes=max_bytes,
             encoded=True,
+            batching=(batch_size, batch_bytes),
         )
         yield from _envelopes(result, cfg.target, what, (batch_size, batch_bytes))
 
@@ -325,13 +328,17 @@ def _envelopes(
     digests = result.digests or []
     result.encoded = result.digests = None
     count = len(encoded)
-    bounds = batch_bounds(
-        [len(r) if r is not None else 0 for r in encoded],
-        max_rows=batch_size[0],
-        max_bytes=batch_size[1],
-        header=len(rows.envelope_batch(result.columns, [])) - 2,
-        separator=2,
-        closing=2,
+    bounds = (
+        result.plan.bounds()
+        if result.plan is not None
+        else batch_bounds(
+            [len(r) if r is not None else 0 for r in encoded],
+            max_rows=batch_size[0],
+            max_bytes=batch_size[1],
+            header=len(rows.envelope_batch(result.columns, [])) - 2,
+            separator=2,
+            closing=2,
+        )
     )
     where = target.cluster_identifier or target.workgroup_name
     label = what.get("table") or f"query:{what['query_sha256'][:16]}"

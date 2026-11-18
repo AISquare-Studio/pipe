@@ -56,8 +56,8 @@ rest as the strings BigQuery sends.
 For both: `batch_size` rows per envelope (default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data
 (default 256 KiB, what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
 without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
-comes first, `max_rows` (default 10,000, at most 100,000)
-and `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see
+comes first, `max_rows` (default 10,000, at most 100,000) and `max_result_bytes` (bytes of the envelopes' data in
+all, each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see
 [Memory](#memory)).
 
 Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
@@ -87,7 +87,8 @@ until a pull is not truncated. Nothing is skipped or repeated while the table do
 can't be continued: narrow the query or raise the caps. `result_sha256` then covers the rows read only.
 
 **How a pull fails** (pipe-as-service answers by the exception's type; neither message carries BigQuery's own error
-text, which can quote the SQL and name tables, because hosts log these):
+text, which can quote the SQL and name tables, nor the token endpoint's `error` and `error_description`, because
+hosts log these; the toolkit, which answers the caller, still shows both):
 - **422**, a `ValueError`: the secret is missing or malformed (`BigQueryNotConfigured`); a bad param; SQL that is
   not one SELECT (`NotReadOnly`); the dry run over `max_bytes_processed` (`CapExceeded`); and what BigQuery refused
   that the caller can fix, as `BigQueryRequestError` (with BigQuery's `status` and `reason`): `invalidQuery` (with
@@ -100,7 +101,8 @@ text, which can quote the SQL and name tables, because hosts log these):
 ### Memory
 
 A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each REST page as fresh
-JSON bytes, and every envelope is kept, as pipe-as-service keeps a pull's envelopes for its response):
+JSON bytes, and every envelope is kept: one inline copy each, as pipe-as-service keeps a pull's converted envelopes
+(inline up to 256 KiB; each test's docstring has the model)):
 
 | Pull | Rows | JSON of the rows | Peak |
 |---|---|---|---|
@@ -117,8 +119,13 @@ converted one at a time, and the source keeps each row as its canonical JSON (ab
 object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once its
 envelope is built. So a pull peaks at about 1.35 times the rows' JSON plus 20-40 MiB, and at most about 105 MiB at
 the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
-response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod. A `REPEATED` column counts as
-one cell per row, so rows with long arrays make larger pages.
+response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod.
+
+A `REPEATED` column's elements are cells too, and its schema can't say how many a row holds: the first page guesses
+1,000 elements a column (50 rows for one `REPEATED INT64` column), and each next page is sized from the most cells a
+row has held so far. Rows of 100 elements peak at 22 MiB at the defaults (277 MiB before, with 10,000-row pages) and
+82 MiB at the caps (342 MiB); rows of 1,000 elements at 79 MiB. A first page whose arrays are far over the guess is
+bounded only by BigQuery's own 10 MB page.
 
 ## Security
 

@@ -71,6 +71,38 @@ def iter_rows(fields: list[dict[str, Any]], rows: Any) -> Iterator[dict[str, Any
         yield _record(fields, row)
 
 
+def rest_cells(row: Any) -> int:
+    """The ``{"v": ...}`` cells one REST row holds, a ``REPEATED`` column's
+    every element and a ``RECORD``'s every field included: what parsing it
+    costs (about 250 bytes of Python objects a cell)."""
+    count = 0
+    stack = [row]
+    while stack:
+        item = stack.pop()
+        cells = item.get("f") if isinstance(item, dict) else None
+        for cell in cells if isinstance(cells, list) else []:
+            count += 1
+            value = cell.get("v") if isinstance(cell, dict) else None
+            if isinstance(value, list):
+                count += len(value)
+                for element in value:
+                    inner = element.get("v") if isinstance(element, dict) else None
+                    if isinstance(inner, dict):
+                        stack.append(inner)
+            elif isinstance(value, dict):
+                stack.append(value)
+    return count
+
+
+def most_cells(rows: Any) -> int:
+    """The most :func:`rest_cells` of any row in a REST page (0 without rows)."""
+    return (
+        max((rest_cells(row) for row in rows), default=0)
+        if isinstance(rows, list)
+        else 0
+    )
+
+
 def _record(fields: list[dict[str, Any]], row: Any) -> dict[str, Any]:
     cells = row.get("f") if isinstance(row, dict) else None
     cells = cells if isinstance(cells, list) else []
@@ -194,6 +226,8 @@ __all__ = [
     "encoded_rows_sha256",
     "iter_rows",
     "millis_rfc3339",
+    "most_cells",
+    "rest_cells",
     "result_sha256",
     "row_size",
     "rows_sha256",

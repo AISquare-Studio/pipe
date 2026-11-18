@@ -3,9 +3,18 @@ maxima, so a pull fits a 512 MiB pod (review #37 m1).
 
 The fake serves each REST page as fresh JSON bytes, as the network would:
 what is measured is the source's own work (each page parsed, its rows
-converted and kept, the envelopes built) while the consumer keeps every
-envelope, as pipe-as-service does for a pull's response. The README's
-"Memory" table has the numbers.
+converted and kept, the envelopes built). The README's "Memory" table has
+the numbers.
+
+What the consumer holds, the same model in every source's memory test: as
+pipe-as-service's pull loop does, it converts each envelope as it arrives
+and keeps the converted one (at most 1,000 in a sync pull, 10,000 async):
+inline (base64) up to 256 KiB, else a blob-store reference (an async pull;
+a sync pull refuses it). Its loop variable also holds the last envelope
+while the next one is pulled. So the row sources' tests (BigQuery,
+Snowflake, Redshift), whose envelopes are at most 256 KiB, KEEP every
+envelope: one inline copy each. The GCS test, whose objects are far larger
+than that, DROPS each one but holds the previous while the next downloads.
 """
 
 from __future__ import annotations
@@ -238,3 +247,101 @@ def test_max_batch_bytes_is_checked(bad):
                 blob(), PullParams({"table": "sales.big", "max_batch_bytes": bad})
             )
         )
+
+
+# -- REPEATED columns (#46 reopen seq 13961, FAIL 3) -------------------------------
+
+
+def _array_cell(elements: int):
+    def cell(field: dict[str, Any], i: int) -> Any:
+        return [{"v": str(1_000_000 + j)} for j in range(elements)]
+
+    return cell
+
+
+@pytest.mark.parametrize(
+    ("elements", "params", "bound"),
+    [
+        # Measured 22 MiB (277 MiB before: 10,000-row pages of 100 elements).
+        (100, {}, 48 * MIB),
+        # Arrays ten times the first guess's. What's bounded is each page, so a
+        # smaller byte cap keeps the test quick; at the full caps (64 MiB) it
+        # measured 79 MiB, and 100-element rows 82 MiB (342 MiB before).
+        (1000, {"max_rows": MAX_ROWS, "max_result_bytes": 16 * MIB}, 64 * MIB),
+    ],
+)
+def test_a_repeated_column_is_paged_by_its_elements(elements, params, bound):
+    fields = [field_("tags", "INT64", "REPEATED")]
+    google = PagedGoogle(fields, 2 * MAX_ROWS, _array_cell(elements))
+    peak, rows, _data = _peak(
+        google, {"table": "sales.big", "batch_size": MAX_BATCH_SIZE, **params}
+    )
+    assert rows > 0
+    assert peak < bound, peak / MIB
+
+
+def test_page_sizes_follow_the_cells_rows_actually_hold():
+    """The first page is sized from the schema's guess (a REPEATED column as
+    REPEATED_CELLS elements); each next one from the most cells a row held."""
+    from aisquare_pipe_bigquery import query
+
+    fields = [field_("tags", "INT64", "REPEATED"), field_("id", "INT64")]
+    # Rows of 3 elements: much smaller than the guess, so pages grow.
+    google = PagedGoogle(
+        fields, 30_000, lambda f, i: [{"v": "1"}] * 3 if f["name"] == "tags" else "1"
+    )
+    from tests.fakes import blob
+
+    list(
+        BigQueryQuerySource(session=google).pull(
+            blob(), PullParams({"table": "sales.big", "max_rows": 30_000})
+        )
+    )
+    asked = [
+        int(r["params"]["maxResults"])
+        for r in google.requests
+        if r["url"].endswith("/data")
+    ]
+    guess = query.PAGE_CELLS // ((1 * query.REPEATED_CELLS) + 1)
+    assert asked[0] == guess
+    # 5 cells a row seen (tags, its 3 elements, id): PAGE_CELLS // 5, capped.
+    assert asked[1] == min(query.PAGE_ROWS, query.PAGE_CELLS // 5)
+    # Arrays that grow shrink the next page.
+    google = PagedGoogle(
+        fields, 3_000, lambda f, i: [{"v": "1"}] * 499 if f["name"] == "tags" else "1"
+    )
+    list(
+        BigQueryQuerySource(session=google).pull(
+            blob(), PullParams({"table": "sales.big", "max_rows": 3_000})
+        )
+    )
+    asked = [
+        int(r["params"]["maxResults"])
+        for r in google.requests
+        if r["url"].endswith("/data")
+    ]
+    assert asked[1] == query.PAGE_CELLS // 501
+
+
+def test_max_result_bytes_counts_every_envelope_s_columns_header():
+    """Each envelope repeats the columns header: with 200 columns and 1 KiB
+    envelopes the headers were most of the output, uncounted (256 MiB of
+    envelopes under a 64 MiB cap; #46 reopen seq 13961). Now the envelopes'
+    bytes in all, headers included, stay within max_result_bytes."""
+    from tests.fakes import blob
+
+    fields = [field_(f"c{i:03d}", "STRING") for i in range(200)]
+    google = PagedGoogle(fields, 5000, lambda f, i: "v")
+    cap = 256 * 1024
+    envelopes = list(
+        BigQueryQuerySource(session=google).pull(
+            blob(),
+            PullParams(
+                {"table": "sales.big", "max_batch_bytes": 1024, "max_result_bytes": cap}
+            ),
+        )
+    )
+    assert sum(len(e.data) for e in envelopes) <= cap
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
+    rows = sum(e.metadata["row_count"] for e in envelopes)
+    assert envelopes[-1].metadata["next_start_index"] == rows

@@ -47,6 +47,7 @@ from typing import Any, Self
 from urllib.parse import quote
 
 import requests
+from aisquare.pipe.core.batches import BatchPlan
 
 from aisquare_pipe_snowflake._http import retry_after_seconds, timed_out
 from aisquare_pipe_snowflake.credentials import (
@@ -58,7 +59,7 @@ from aisquare_pipe_snowflake.credentials import (
     bearer_token,
     forget_token,
 )
-from aisquare_pipe_snowflake.rows import canonical, columns_of, iter_rows
+from aisquare_pipe_snowflake.rows import canonical, columns_of, encoded_batch, iter_rows
 
 STATEMENTS_PATH = "/api/v2/statements"
 DEFAULT_TIMEOUT = 30.0
@@ -133,6 +134,10 @@ class StatementResult:
     #: ``rows`` (as the source's envelopes carry them; about a fifth of the
     #: memory objects take).
     encoded: list[bytes] | None = None
+    #: Read with ``batching``: the envelopes the rows are cut into, planned
+    #: as they are read; ``result_bytes`` is then every envelope's bytes,
+    #: each one's columns header included.
+    plan: BatchPlan | None = None
 
     @property
     def count(self) -> int:
@@ -246,6 +251,7 @@ class SnowflakeClient:
         schema: str | None = None,
         bindings: Mapping[str, Mapping[str, str]] | None = None,
         encoded: bool = False,
+        batching: tuple[int, int] | None = None,
     ) -> StatementResult:
         """Run ONE statement (a caller's, already checked SELECT-only, or one
         of the connector's own fixed SHOW / INFORMATION_SCHEMA forms) and
@@ -310,7 +316,11 @@ class SnowflakeClient:
                 "GET", f"{STATEMENTS_PATH}/{quote(handle, safe='')}", {}, polling=True
             )
         return self._collect(
-            answer, row_limit=row_limit, byte_limit=byte_limit, encoded=encoded
+            answer,
+            row_limit=row_limit,
+            byte_limit=byte_limit,
+            encoded=encoded,
+            batching=batching,
         )
 
     def _collect(
@@ -320,6 +330,7 @@ class SnowflakeClient:
         row_limit: int,
         byte_limit: int,
         encoded: bool = False,
+        batching: tuple[int, int] | None = None,
     ) -> StatementResult:
         meta = answer.get("resultSetMetaData")
         meta = meta if isinstance(meta, dict) else {}
@@ -333,6 +344,16 @@ class SnowflakeClient:
             num_rows=num_rows if isinstance(num_rows, int) and num_rows >= 0 else None,
             encoded=[] if encoded else None,
         )
+        if batching is not None:
+            # max_result_bytes counts every envelope's columns header too.
+            result.plan = BatchPlan(
+                max_rows=batching[0],
+                max_bytes=batching[1],
+                header=len(encoded_batch(columns, [])) - 2,
+                separator=1,
+                closing=2,
+            )
+            result.result_bytes = result.plan.total
         partitions = [p for p in meta.get("partitionInfo") or [] if isinstance(p, dict)]
         # Taken out of the answer (its caller still holds it), so each parsed
         # partition goes before the next one is read.
@@ -372,15 +393,20 @@ class SnowflakeClient:
                 result.truncated = TRUNCATED_MAX_ROWS
                 return True
             encoded = canonical(row)
-            size = len(encoded) + 1
-            if result.result_bytes + size > byte_limit:
+            if result.plan is not None:
+                cost = result.plan.cost(len(encoded))
+            else:
+                cost = len(encoded) + 1
+            if result.result_bytes + cost > byte_limit:
                 result.truncated = TRUNCATED_MAX_RESULT_BYTES
                 return True
             if result.encoded is None:
                 result.rows.append(row)
             else:
                 result.encoded.append(encoded)
-            result.result_bytes += size
+            if result.plan is not None:
+                result.plan.add(len(encoded))
+            result.result_bytes += cost
         return False
 
     def _cancel(self, handle: str) -> None:

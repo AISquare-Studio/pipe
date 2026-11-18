@@ -3,10 +3,19 @@ maxima, so a pull fits a 512 MiB pod (the #37 review's m1, checked here too).
 
 The fake serves each result partition as fresh JSON bytes, as the network
 would: what is measured is the source's own work (each partition parsed,
-its rows converted and kept, the envelopes built) while the consumer keeps
-every envelope, as pipe-as-service does for a pull's response. Snowflake,
-not the connector, sizes the partitions; these use 10,000 rows. The README's
+its rows converted and kept, the envelopes built). Snowflake, not the
+connector, sizes the partitions; these use 10,000 rows. The README's
 "Memory" table has the numbers.
+
+What the consumer holds, the same model in every source's memory test: as
+pipe-as-service's pull loop does, it converts each envelope as it arrives
+and keeps the converted one (at most 1,000 in a sync pull, 10,000 async):
+inline (base64) up to 256 KiB, else a blob-store reference (an async pull;
+a sync pull refuses it). Its loop variable also holds the last envelope
+while the next one is pulled. So the row sources' tests (BigQuery,
+Snowflake, Redshift), whose envelopes are at most 256 KiB, KEEP every
+envelope: one inline copy each. The GCS test, whose objects are far larger
+than that, DROPS each one but holds the previous while the next downloads.
 """
 
 from __future__ import annotations
@@ -229,3 +238,21 @@ def test_max_batch_bytes_is_checked(bad):
                 blob(), PullParams({"sql": SQL, "max_batch_bytes": bad})
             )
         )
+
+
+def test_max_result_bytes_counts_every_envelope_s_columns_header():
+    """Each envelope repeats the columns header: with 200 columns and 1 KiB
+    envelopes the headers were most of the output, uncounted (250 MiB of
+    envelopes under a 64 MiB cap; #46 reopen seq 13961). Now the envelopes'
+    bytes in all, headers included, stay within max_result_bytes."""
+    columns = [col(f"C{i:03d}", "text") for i in range(200)]
+    fake = PartitionedSnowflake(columns, 5000, lambda c, i: "v")
+    cap = 256 * 1024
+    envelopes = list(
+        SnowflakeQuerySource(session=fake).pull(
+            blob(),
+            PullParams({"sql": SQL, "max_batch_bytes": 1024, "max_result_bytes": cap}),
+        )
+    )
+    assert sum(len(e.data) for e in envelopes) <= cap
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}

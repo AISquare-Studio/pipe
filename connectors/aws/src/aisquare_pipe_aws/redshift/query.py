@@ -13,6 +13,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from aisquare.pipe.core.batches import BatchPlan
+
 from aisquare_pipe_aws.redshift import dataapi, rows
 from aisquare_pipe_aws.redshift.config import RedshiftTarget
 from aisquare_pipe_aws.redshift.sqlguard import check_select_only
@@ -39,6 +41,10 @@ class Result:
     #: ``rows`` (about a fifth of the memory row objects take).
     encoded: list[bytes] | None = None
     digests: list[str] | None = None
+    #: Read with ``batching``: the envelopes the rows are cut into, planned
+    #: as they are read; ``result_bytes`` is then every envelope's bytes,
+    #: each one's columns header included.
+    plan: BatchPlan | None = None
 
     @property
     def count(self) -> int:
@@ -61,6 +67,7 @@ def run_select(
     max_rows: int,
     max_result_bytes: int,
     encoded: bool = False,
+    batching: tuple[int, int] | None = None,
 ) -> Result:
     """Check ``sql``, then run it and read at most ``max_rows`` rows and
     ``max_result_bytes`` bytes of JSON rows (``encoded``: kept as JSON
@@ -80,11 +87,22 @@ def run_select(
     digests: list[str] | None = [] if encoded else None
     count = 0
     size = 0
+    plan: BatchPlan | None = None
     total = statement.result_rows
     truncated: str | None = None
     for page in dataapi.result_pages(api, statement):
         if not cols:
             cols = rows.columns(page.get("ColumnMetadata"))
+        if plan is None and batching is not None and encoded:
+            # max_result_bytes counts every envelope's columns header too.
+            plan = BatchPlan(
+                max_rows=batching[0],
+                max_bytes=batching[1],
+                header=len(rows.envelope_batch(cols, [])) - 2,
+                separator=2,
+                closing=2,
+            )
+            size = plan.total
         if total is None and isinstance(page.get("TotalNumRows"), int):
             total = page["TotalNumRows"]
         for row in rows.iter_page(cols, page.get("Records")):
@@ -93,16 +111,24 @@ def run_select(
                 break
             stable = rows.canonical(row)
             row_bytes = len(stable)  # rows.json_size, without a second dump
-            if size + row_bytes > max_result_bytes:
+            if as_json is None or digests is None or plan is None:
+                carried = b""
+                cost = row_bytes
+            else:
+                carried = rows.envelope_json(row)
+                cost = plan.cost(len(carried))
+            if size + cost > max_result_bytes:
                 truncated = TRUNCATED_BYTES
                 break
             if as_json is None or digests is None:
                 out.append(row)
             else:
-                as_json.append(rows.envelope_json(row))
+                as_json.append(carried or rows.envelope_json(row))
                 digests.append(hashlib.sha256(stable).hexdigest())
+                if plan is not None:
+                    plan.add(len(carried))
             count += 1
-            size += row_bytes
+            size += cost
         if truncated is not None:
             break
         if count >= max_rows and page.get("NextToken"):
@@ -120,4 +146,5 @@ def run_select(
         duration_ms=duration // 1_000_000 if duration is not None else None,
         encoded=as_json,
         digests=digests,
+        plan=plan,
     )

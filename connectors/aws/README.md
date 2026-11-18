@@ -133,7 +133,9 @@ type, so the AWS error classes themselves would be a 500):
   and `upstream_error`.
 
 The message is the table's: the operation and AWS's error code. An S3 object that grew past `max_object_bytes`
-between the listing and the read is skipped, as one the listing already shows too large is.
+between the listing and the read is skipped, as one the listing already shows too large is. An object body that
+breaks off while it is read (a read timeout, a dropped connection, a body shorter than its `Content-Length`) is a
+502 naming only the error's type: botocore's own message names the bucket and key.
 
 ## Customer setup (registration checklist)
 
@@ -548,10 +550,9 @@ Pull params, exactly one of:
 And `batch_size` (default 500, at most 10,000 rows per envelope) and `max_batch_bytes` (bytes of envelope data,
 default 256 KiB: what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
 without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
-comes first, `max_rows` (default 10,000,
-at most 100,000), `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 64 MiB, sized
-for a 512 MiB pod: see [Memory](#memory)), `timeout_seconds`. Any other param is refused, and so
-is one naming a key of the secret.
+comes first, `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (bytes of the envelopes' data in all,
+each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)),
+`timeout_seconds`. Any other param is refused, and so is one naming a key of the secret.
 
 Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
 (`application/json`). Its metadata:
@@ -608,9 +609,10 @@ database's error text, which can echo the caller's values (`invalid input syntax
 
 ### Memory
 
-A pull's peak memory, measured with `tracemalloc` (`tests/test_redshift_memory.py`; the fake
-client parses each `GetStatementResult` page from fresh JSON bytes, 1,000 rows a page, and every
-envelope is kept, as pipe-as-service keeps a pull's envelopes for its response):
+A pull's peak memory, measured with `tracemalloc` (`tests/test_redshift_memory.py`; the fake client parses each
+`GetStatementResult` page from fresh JSON bytes, 1,000 rows a page, and every envelope is kept: one inline copy
+each, as pipe-as-service keeps a pull's converted envelopes (inline up to 256 KiB; each test's docstring has the
+model)):
 
 | Pull | Rows | JSON of the rows | Peak |
 |---|---|---|---|

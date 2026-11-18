@@ -76,9 +76,10 @@ name gets a unique key (`A`, `A_2`) and its `source_name`.
 For both: `database` and `schema` (the defaults for names written without them), `batch_size` rows per envelope
 (default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data (default 256 KiB, what pipe-as-service
 returns inline in a synchronous pull, which answers 400 for a larger envelope without a blob store; at least 1 KiB,
-at most 64 MiB; a single larger row still gets its own envelope), whichever comes first, `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (JSON bytes of
-rows, default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)) and `timeout_seconds` (the
-statement deadline, default 120, at most 600).
+at most 64 MiB; a single larger row still gets its own envelope), whichever comes first, `max_rows` (default 10,000,
+at most 100,000), `max_result_bytes` (bytes of the envelopes' data in all, each one's columns header included;
+default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)) and `timeout_seconds` (the statement
+deadline, default 120, at most 600).
 
 Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
 `schema` holds the columns too). A result with no rows is one envelope with no rows, so its markers still come out.
@@ -121,8 +122,8 @@ text, which can quote the SQL and name objects, because hosts log these):
 ### Memory
 
 A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each result partition as
-fresh JSON bytes, 10,000 rows a partition, and every envelope is kept, as pipe-as-service keeps a pull's envelopes for
-its response):
+fresh JSON bytes, 10,000 rows a partition, and every envelope is kept: one inline copy each, as pipe-as-service keeps a
+pull's converted envelopes (inline up to 256 KiB; each test's docstring has the model)):
 
 | Pull | Rows | JSON of the rows | Peak |
 |---|---|---|---|

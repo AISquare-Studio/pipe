@@ -263,6 +263,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what pipe-as-service returns inline in a sync pull: before, a default 500-row batch of 1 KiB rows was about
   500 KiB, and a sync pull without a blob store answered 400 at the first envelope (all three, measured through
   the host's `from_envelope`); now the same pull is 200, 8 envelopes of at most 261,816 bytes.
+- Source errors leave out the token endpoint's text too: BigQuery's and GCS's token errors keep Google's
+  `error`/`error_description` as `detail` (the toolkits still show it), so a refused key, a throttled or failing
+  endpoint reads "Google did not issue a token for <service account>" and the like, nothing of Google's (#46
+  reopen seq 13961). An S3 object body that breaks off mid-read (botocore's ReadTimeoutError,
+  ConnectionClosedError, ResponseStreamingError, IncompleteReadError, whose messages name the bucket and key) is a
+  502 naming the error type only (it was a 500). A GCS listing whose `generation` isn't a string is a 502, not a
+  422.
+- BigQuery: a `REPEATED` column's elements count as cells: the first page guesses 1,000 a column, and each next
+  page is sized from the most cells a row held so far. Rows of 100 elements: 277 -> 22 MiB at the defaults and
+  342 -> 82 MiB at the caps.
+- `max_result_bytes` (BigQuery, Snowflake, Redshift) counts what the envelopes hold, each one's columns header
+  included (`aisquare.pipe.core.batches.BatchPlan` plans the cuts while the rows are read): 200 columns in 1 KiB
+  envelopes made 256 MiB of envelopes under a 64 MiB cap.
 - GCS source memory: a download accumulates in one buffer (no chunk list and join), the source drops each
   object before the next download, and it holds an envelope back for a truncated pull's marker only when
   every object after it could still be skipped at download (unknown size, or stored gzip). `max_bytes`

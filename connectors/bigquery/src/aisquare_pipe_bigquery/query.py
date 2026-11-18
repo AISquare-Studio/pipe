@@ -27,6 +27,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from aisquare.pipe.core.batches import BatchPlan
+
 from aisquare_pipe_bigquery.client import (
     POLL_PAUSE_SECONDS,
     BigQueryAPIError,
@@ -34,7 +36,13 @@ from aisquare_pipe_bigquery.client import (
     error_detail,
 )
 from aisquare_pipe_bigquery.refs import TableRef
-from aisquare_pipe_bigquery.rows import canonical, iter_rows, schema_fields
+from aisquare_pipe_bigquery.rows import (
+    canonical,
+    encoded_batch,
+    iter_rows,
+    most_cells,
+    schema_fields,
+)
 from aisquare_pipe_bigquery.sqlguard import NotReadOnly
 
 TRUNCATED_MAX_ROWS = "max_rows"
@@ -48,6 +56,11 @@ PAGE_ROWS = 10_000
 PAGE_CELLS = 50_000
 #: Rows per page while the schema is unknown (a dry run that gave none).
 UNKNOWN_SCHEMA_PAGE_ROWS = 1_000
+#: What a ``REPEATED`` column is first guessed to hold (its elements, each a
+#: cell): until a page has come back, a schema can't say how long its
+#: arrays are. After that, each next page is sized from the most cells a
+#: row has held so far (:func:`page_rows`'s ``seen``).
+REPEATED_CELLS = 1_000
 #: Pages followed at most for one result, whatever the page token says.
 MAX_PAGES = 1000
 #: Table types tabledata.list reads. Views, materialized views and external
@@ -81,21 +94,28 @@ def _int(value: Any) -> int | None:
 
 
 def cells_per_row(fields: list[dict[str, Any]]) -> int:
-    """The cells one REST row of ``fields`` carries: one per column, plus
-    a record's own sub-fields (a ``REPEATED`` column counts once; it may
-    carry more)."""
+    """The cells one REST row of ``fields`` is guessed to carry from its
+    schema: one per column, plus a record's own sub-fields, and a
+    ``REPEATED`` column's :data:`REPEATED_CELLS` elements."""
     count = 0
     for f in fields:
         sub = f.get("fields")
-        count += 1 + (cells_per_row(sub) if isinstance(sub, list) and sub else 0)
+        one = 1 + (cells_per_row(sub) if isinstance(sub, list) and sub else 0)
+        count += one * REPEATED_CELLS if f.get("mode") == "REPEATED" else one
     return max(1, count)
 
 
-def page_rows(fields: list[dict[str, Any]] | None, wanted: int) -> int:
+def page_rows(
+    fields: list[dict[str, Any]] | None, wanted: int, *, seen: int = 0
+) -> int:
     """Rows to ask for in one page: at most ``wanted``, :data:`PAGE_ROWS`
-    and :data:`PAGE_CELLS` cells (:data:`UNKNOWN_SCHEMA_PAGE_ROWS` without a
-    schema)."""
-    if fields:
+    and :data:`PAGE_CELLS` cells. A row's cells are ``seen``, the most any
+    row of an earlier page held, once a page has come back; before that,
+    the schema's guess (:func:`cells_per_row`), or
+    :data:`UNKNOWN_SCHEMA_PAGE_ROWS` rows without a schema."""
+    if seen > 0:
+        by_cells = PAGE_CELLS // seen
+    elif fields:
         by_cells = PAGE_CELLS // cells_per_row(fields)
     else:
         by_cells = UNKNOWN_SCHEMA_PAGE_ROWS
@@ -156,6 +176,10 @@ class Rows:
     location: str | None = None
     cache_hit: bool | None = None
     encoded: list[bytes] | None = None
+    #: Read with ``batching``: the envelopes the rows are cut into, planned
+    #: as they are read; ``result_bytes`` is then every envelope's bytes,
+    #: each one's columns header included.
+    plan: BatchPlan | None = None
 
     @property
     def count(self) -> int:
@@ -176,15 +200,34 @@ def _take(
             return True
         encoded = canonical(row)
         size = len(encoded)
-        if result.result_bytes + size > max_result_bytes:
+        cost = result.plan.cost(size) if result.plan is not None else size
+        if result.result_bytes + cost > max_result_bytes:
             result.truncated = TRUNCATED_MAX_RESULT_BYTES
             return True
         if result.encoded is None:
             result.rows.append(row)
         else:
             result.encoded.append(encoded)
-        result.result_bytes += size
+        if result.plan is not None:
+            result.plan.add(size)
+        result.result_bytes += cost
     return False
+
+
+def _plan(result: Rows, batching: tuple[int, int] | None) -> None:
+    """With ``batching`` (rows, bytes per envelope), plan the envelopes as
+    the rows are read, so ``max_result_bytes`` counts every envelope's
+    columns header too (:class:`~aisquare.pipe.core.batches.BatchPlan`)."""
+    if batching is None:
+        return
+    result.plan = BatchPlan(
+        max_rows=batching[0],
+        max_bytes=batching[1],
+        header=len(encoded_batch(result.fields, [])) - 2,
+        separator=1,
+        closing=2,
+    )
+    result.result_bytes = result.plan.total
 
 
 #: The HTTP status a job-level error stands for, by its reason (the answer
@@ -226,6 +269,7 @@ def run_select(
     default_dataset: tuple[str | None, str] | None = None,
     estimate: Estimate | None = None,
     encoded: bool = False,
+    batching: tuple[int, int] | None = None,
 ) -> Rows:
     """Steps 2-4 for a CHECKED statement. Pass ``estimate`` when the dry run
     already ran (the source runs it before reading markers), and
@@ -291,7 +335,10 @@ def run_select(
         else None,
         encoded=[] if encoded else None,
     )
+    _plan(result, batching)
+    seen = 0
     for _ in range(MAX_PAGES):
+        seen = max(seen, most_cells(answer.get("rows")))
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(result.fields, answer.get("rows"))
@@ -307,7 +354,7 @@ def run_select(
         del page
         answer = client.query_results(
             job,
-            page_size=page_rows(result.fields, max_rows - result.count),
+            page_size=page_rows(result.fields, max_rows - result.count, seen=seen),
             page_token=token,
         )
     result.truncated = result.truncated or TRUNCATED_MAX_ROWS
@@ -336,6 +383,7 @@ def read_table_rows(
     start_index: int = 0,
     selected_fields: list[str] | None = None,
     encoded: bool = False,
+    batching: tuple[int, int] | None = None,
 ) -> Rows:
     """Up to ``max_rows`` rows of ``ref`` (described by ``table``, its
     tables.get) from row ``start_index`` on, within ``max_result_bytes``.
@@ -357,11 +405,13 @@ def read_table_rows(
         total_rows=_int(table.get("numRows")),
         encoded=[] if encoded else None,
     )
+    _plan(result, batching)
     token: str | None = None
+    seen = 0
     for page_number in range(MAX_PAGES):
         answer = client.list_rows(
             ref,
-            page_size=page_rows(fields, max_rows - result.count),
+            page_size=page_rows(fields, max_rows - result.count, seen=seen),
             page_token=token,
             start_index=start_index if page_number == 0 else None,
             selected_fields=[f["name"] for f in fields] if selected_fields else None,
@@ -369,6 +419,7 @@ def read_table_rows(
         total = _int(answer.get("totalRows"))
         if total is not None:
             result.total_rows = total
+        seen = max(seen, most_cells(answer.get("rows")))
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(fields, answer.get("rows"))
