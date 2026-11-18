@@ -40,8 +40,10 @@ CALLER = [
             422,
             "001003",
             "42000",
-            (f"SQL compilation error: syntax error line 1 at "
-            f"position 7 unexpected '{LEAK}'."),
+            (
+                f"SQL compilation error: syntax error line 1 at "
+                f"position 7 unexpected '{LEAK}'."
+            ),
         ),
         "at line 1, position 7",
     ),
