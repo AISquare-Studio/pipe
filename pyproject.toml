@@ -7,14 +7,13 @@ name = "aisquare-pipe"
 version = "0.5.0"
 description = "Universal anything-to-anything connector framework"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [{name = "AISquare Studio"}]
 keywords = ["connectors", "data-pipeline", "etl", "integration"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -66,9 +65,13 @@ aws = [
     "boto3>=1.43.32,<2",
     "botocore>=1.43.32,<2",
 ]
+# Composio: every composio release pins composio-client exactly, so the
+# client range picks the SDK. 1.x and 2.x are both supported (2.x moved the
+# trigger log to client._internal; aisquare_pipe_composio.client handles
+# both, and its tests/test_sdk_compat.py runs on the installed real SDK).
 composio = [
     "composio>=0.13.1,<2.0",
-    "composio-client>=1.39,<2.0",
+    "composio-client>=1.39,<3.0",
 ]
 docusign = [
     "docusign-esign>=4.0",

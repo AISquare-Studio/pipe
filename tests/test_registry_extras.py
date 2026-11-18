@@ -30,7 +30,11 @@ def _requires(extra: str, reqs: list[str]) -> str:
     lines = []
     for r in reqs:
         req, _, marker = r.partition(";")
-        cond = f'({marker.strip()}) and extra == "{extra}"' if marker else f'extra == "{extra}"'
+        cond = (
+            f'({marker.strip()}) and extra == "{extra}"'
+            if marker
+            else f'extra == "{extra}"'
+        )
         lines.append(f"Requires-Dist: {req.strip()}; {cond}\n")
     return f"Provides-Extra: {extra}\n" + "".join(lines)
 
@@ -188,7 +192,10 @@ def test_a_missing_requirement_of_another_extra_does_not_count(probe, caplog):
             "import aisquare_pipe_probe.constants\n",
             "No module named 'aisquare_pipe_probe.constants'",
         ),
-        ("import aisquare.pipe.no_such_module\n", "No module named 'aisquare.pipe.no_such_module'"),
+        (
+            "import aisquare.pipe.no_such_module\n",
+            "No module named 'aisquare.pipe.no_such_module'",
+        ),
         # A name missing from a module that is there: never "not installed".
         ("from pytest import no_such_name\n", "cannot import name 'no_such_name'"),
     ],
@@ -205,21 +212,42 @@ def test_a_broken_install_is_a_warning_even_without_the_extra(
     assert warning.startswith(f"Failed to load connector probe-source: {error}")
 
 
-def test_an_import_error_raised_from_a_missing_third_party_module_is_not_installed(
-    probe, caplog
-):
-    """graphify's engine guard re-raises a ModuleNotFoundError with a
-    remediation message and no module name, from the original one."""
-    _install(
-        probe,
-        ["probe-sdk-not-installed>=1"],
-        """\
+#: Guards that re-raise a missing third-party module as an error with a
+#: remediation message and no module name. Python chains the original the way
+#: a traceback prints it.
+GUARDS = {
+    # graphify's engine guard: an explicit __cause__.
+    "raise from": """\
         try:
             import probe_sdk_not_installed
         except ImportError as exc:
             raise ModuleNotFoundError("install the engine extra") from exc
         """,
-    )
+    # Raised while handling it: an implicit __context__.
+    "raised in except": """\
+        try:
+            import probe_sdk_not_installed
+        except ImportError:
+            raise ImportError("install the engine extra")
+        """,
+    # A __cause__ whose own __context__ is the missing module.
+    "raise from a guard raised in except": """\
+        try:
+            try:
+                import probe_sdk_not_installed
+            except ImportError:
+                raise ImportError("the probe SDK is missing")
+        except ImportError as exc:
+            raise ImportError("install the engine extra") from exc
+        """,
+}
+
+
+@pytest.mark.parametrize("guard", list(GUARDS))
+def test_an_import_error_raised_from_a_missing_third_party_module_is_not_installed(
+    probe, caplog, guard
+):
+    _install(probe, ["probe-sdk-not-installed>=1"], GUARDS[guard])
     caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
 
     assert registry.discover_connectors() == {}
@@ -232,21 +260,54 @@ def test_an_import_error_raised_from_a_missing_third_party_module_is_not_install
     ]
 
 
+def test_a_guard_raised_from_none_is_a_warning(probe, caplog):
+    """``from None`` suppresses the context: the traceback doesn't print it,
+    and the registry doesn't follow it. The guard's own message is the
+    warning, so it still says what to install."""
+    _install(
+        probe,
+        ["probe-sdk-not-installed>=1"],
+        """\
+        try:
+            import probe_sdk_not_installed
+        except ImportError:
+            raise ImportError("install the engine extra") from None
+        """,
+    )
+    caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
+
+    assert registry.discover_connectors() == {}
+    assert _records(caplog, logging.INFO) == []
+    assert _records(caplog, logging.WARNING) == [
+        "Failed to load connector probe-source: install the engine extra"
+    ]
+
+
+def test_a_cycle_in_the_chain_ends_the_walk():
+    first, second = ImportError("first"), ImportError("second")
+    first.__context__, second.__context__ = second, first
+
+    assert registry._missing_module(first) is None
+
+
 @pytest.mark.parametrize(
-    ("body", "not_installed"),
+    ("body", "error", "not_installed"),
     [
-        ("import probe_sdk_not_installed\n", True),
-        ("import aisquare_pipe_probe.constants\n", False),
+        ("import probe_sdk_not_installed\n", "ModuleNotFoundError: ", True),
+        (GUARDS["raised in except"], "ImportError: install the engine extra", True),
+        ("import aisquare_pipe_probe.constants\n", "ModuleNotFoundError: ", False),
     ],
 )
-def test_pipe_validate_reads_load_failures_the_same_way(probe, body, not_installed):
+def test_pipe_validate_reads_load_failures_the_same_way(
+    probe, body, error, not_installed
+):
     """`pipe validate` reports a broken install as a load failure, not as an
     extra that isn't installed."""
     _install(probe, ["probe-sdk-not-installed>=1"], body)
 
     (found,) = validation.discover_connector_entry_points()
 
-    assert found.cls is None and found.load_error.startswith("ModuleNotFoundError: ")
+    assert found.cls is None and found.load_error.startswith(error)
     assert found.missing_requirements == (
         ("probe-sdk-not-installed",) if not_installed else ()
     )

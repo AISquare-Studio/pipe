@@ -47,14 +47,37 @@ from aisquare_pipe_composio.constants import (
 
 logger = logging.getLogger("aisquare.pipe.composio")
 
+# Where each supported composio-client keeps the trigger-log resource, newest
+# first: 2.x moved ``client.logs.triggers`` to ``client._internal.logs.triggers``
+# (x-internal, "no compatibility promise"; its MIGRATION.md, 2.0.0-rc.22).
+_TRIGGER_LOG_PATHS: tuple[tuple[str, ...], ...] = (
+    ("_internal", "logs", "triggers"),
+    ("logs", "triggers"),
+)
+
+
+class ComposioSDKShapeError(PipelineError):
+    """The installed composio SDK lacks something this connector calls, or
+    calls it differently: an SDK version this connector doesn't support. Not
+    transient (retrying can't fix it), so the triggers source raises it
+    instead of polling on."""
+
 
 def _map_composio_errors(func):  # type: ignore[no-untyped-def]
-    """Translate Composio SDK exceptions to framework errors."""
+    """Translate Composio SDK exceptions to framework errors. An
+    AttributeError (SDK drift: a resource moved or gone) is a
+    ``ComposioSDKShapeError``, never a bare AttributeError."""
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return func(*args, **kwargs)
+        except ComposioSDKShapeError:
+            raise
+        except AttributeError as e:
+            raise ComposioSDKShapeError(
+                f"unexpected composio SDK shape in {func.__name__}: {e}"
+            ) from e
         except (AuthenticationError, PermissionDeniedError) as e:
             raise ConfigValidationError(f"Composio auth failed: {e}") from e
         except RateLimitError as e:
@@ -387,11 +410,35 @@ class ComposioClient:
             kwargs["from_"] = from_ms
         if cursor:
             kwargs["cursor"] = cursor
-        response = self._sdk.client.logs.triggers.list(**kwargs)
+        list_logs = self._trigger_logs().list
+        try:
+            response = list_logs(**kwargs)
+        except TypeError as e:
+            # The SDK's method no longer takes these arguments.
+            raise ComposioSDKShapeError(
+                f"composio SDK trigger-log list() rejected its arguments: {e}"
+            ) from e
         events = [self._normalize_trigger_event(item) for item in _items(response)]
         events.sort(key=lambda e: e.get("timestamp_ms") or 0)
         next_cursor = getattr(response, "next_cursor", None)
         return events, next_cursor
+
+    def _trigger_logs(self) -> Any:
+        """The installed SDK's trigger-log resource (``_TRIGGER_LOG_PATHS``),
+        or ``ComposioSDKShapeError`` naming where it looked."""
+        for path in _TRIGGER_LOG_PATHS:
+            node: Any = self._sdk.client
+            for part in path:
+                node = getattr(node, part, None)
+                if node is None:
+                    break
+            if node is not None and callable(getattr(node, "list", None)):
+                return node
+        looked = " or ".join("client." + ".".join(p) for p in _TRIGGER_LOG_PATHS)
+        raise ComposioSDKShapeError(
+            f"the installed composio SDK has no trigger-log resource ({looked}); "
+            "this composio-client version is not supported"
+        )
 
     @staticmethod
     def _normalize_trigger_event(item: dict[str, Any]) -> dict[str, Any]:

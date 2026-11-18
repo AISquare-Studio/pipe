@@ -157,8 +157,16 @@ AISquare then adds the customer's role ARN and stores the blob
      Identity role from pipe-service's cutover runbook (pipe-as-service `DEPLOYMENT.md`,
      "Cutover runbook" > "EKS", item 2; aisquare-infra creates it). The chart runs every
      component under the one service account `pipe`, so add this policy to that role, not to a
-     second one. As of 2026-11-17 no environment has it yet. If it doesn't exist, create it now,
-     and the runbook's item 2 later adds its DynamoDB and KMS grants to the same role:
+     second one. As of 2026-11-17 no environment has it yet. If it doesn't exist, create it now
+     in aisquare-infra's Terraform, never by hand, as the role item 2 will use: item 2 later adds
+     its DynamoDB and KMS grants to that same role. aisquare-infra makes its Pod Identity roles
+     with the `terraform-aws-modules/eks-pod-identity` module (`modules/eks-cluster/addon_roles.tf`,
+     `main` d975dcf). A role made by hand clashes with Terraform later: aisquare-infra's apply
+     fails on its name (`EntityAlreadyExists`), and a second role is a principal the customer
+     never trusted. Never delete and recreate it either: IAM saves the role in the customer's
+     trust policy as the role's unique ID, not its ARN, so a recreated role, even under the same
+     ARN, is refused until the customer puts the ARN back and saves the policy again. The role
+     needs:
      - one role per environment;
      - its trust policy, EKS's Pod Identity one:
 
@@ -186,10 +194,11 @@ AISquare then adds the customer's role ARN and stores the blob
    - **Prod: have the customer trust both prod roles from day one.** At prod's ECS → EKS
      cutover the principal changes from the ECS task role to prod's Pod Identity role. A trust
      policy that names only the ECS role then refuses every `AssumeRole` until the customer
-     edits it. So create prod's Pod Identity role now as well (IAM rejects a trust policy that
-     names a role that doesn't exist yet), and send the customer both ARNs. If it can't be
-     created first, send the ECS role alone. The customer must then add the EKS role's ARN
-     before cutover: tell them so, and don't cut prod over until they confirm it.
+     edits it. So create prod's Pod Identity role now as well, in aisquare-infra as above (IAM
+     rejects a trust policy that names a role that doesn't exist yet), and send the customer
+     both ARNs. If it can't be created first, send the ECS role alone. The customer must then
+     add the EKS role's ARN before cutover: tell them so, and don't cut prod over until they
+     confirm it.
 
    **When the customer sends their role ARN** (their step 3), attach this policy to every
    AISquare role they trust (for prod, both). List each customer role ARN rather than `*`:
@@ -371,7 +380,7 @@ target-role example that uses an external ID splits the two statements the same 
 
 | Error | Check |
 |---|---|
-| `AWS refused sts:AssumeRole: …` (`forbidden`) | In the trust policy: the principal ARN, the external ID and `sts:TagSession`. In our role's policy: `sts:AssumeRole` and `sts:TagSession` on that role ARN. If it began at prod's EKS cutover: the trust policy lacks prod's Pod Identity role. |
+| `AWS refused sts:AssumeRole: …` (`forbidden`) | In the trust policy: the principal ARN, the external ID and `sts:TagSession`. In our role's policy: `sts:AssumeRole` and `sts:TagSession` on that role ARN. If it began at prod's EKS cutover: the trust policy lacks prod's Pod Identity role. If it began after our role was recreated: the customer must put its ARN back in the trust policy and save it again. |
 | `AWS is not configured on this host: no service principal …` | The `pipe` Pod Identity association, or the role, is missing in that environment. |
 | `refused: the role is in this service's own AWS account` (or "an AWS account this service is set to refuse") | The blob names an AISquare role, not the customer's. |
 | `AWS refused bedrock-agentcore:… (AccessDeniedException)` or `s3:… (AccessDenied)` / `(403)` | The permissions policy, the KMS grant, or the prefix. |

@@ -119,16 +119,24 @@ def missing_requirements(ep: EntryPoint) -> list[str]:
 
 def _missing_module(error: BaseException) -> str | None:
     """The module a failed import couldn't find: ``error``'s own when it is a
-    ModuleNotFoundError, else that of the ModuleNotFoundError it was raised
-    from (graphify's engine guard re-raises one without a name). None for any
-    other failure, e.g. ``cannot import name``."""
+    ModuleNotFoundError, else that of the first one in its chain. A guard
+    re-raises one as an error with a remediation message and no module name
+    (graphify's engine guard does). The chain is the one a traceback prints:
+    each error's ``__cause__`` (``raise ... from exc``), else its
+    ``__context__`` (raised while handling it) unless ``from None`` suppressed
+    it. None for any other failure, e.g. ``cannot import name``."""
     seen: set[int] = set()
     current: BaseException | None = error
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, ModuleNotFoundError) and current.name:
             return current.name
-        current = current.__cause__
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
     return None
 
 
