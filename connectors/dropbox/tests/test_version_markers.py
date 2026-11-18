@@ -217,3 +217,17 @@ def test_the_markers_are_the_downloaded_bytes_not_the_listings(fake):
     assert envelope.metadata["content_hash"] == content_hash(envelope.data)
     assert envelope.metadata["server_modified"] == current["server_modified"].removesuffix("Z")
     assert fake.calls == ["files/list_folder", "files/download"]
+
+
+def test_the_size_is_the_delivered_bytes_not_the_listings(fake):
+    """Like the markers, the size comes from the download's own metadata, so
+    an edit after the listing still gives size == len(data)."""
+    fake.add("/Policy.pdf", b"%PDF-1 policy")
+    listed = fake.entry("/Policy.pdf")
+    fake.after_listing = lambda: fake.edit("/Policy.pdf", b"%PDF-1 policy, revised and longer")
+
+    envelope = pull()["Policy.pdf"]
+
+    assert envelope.metadata["size"] == len(envelope.data) != listed["size"]
+    assert envelope.metadata["dropbox_id"] == listed["id"]
+    assert envelope.metadata["path"] == "/policy.pdf"

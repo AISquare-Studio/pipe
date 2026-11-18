@@ -17,13 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     come from the item as Graph returned it just before the download, so they
     are never newer than the bytes (the listing's values are used only if that
     response has none).
-  - `dropbox-source` adds `content_hash` beside `rev`. `rev`,
-    `server_modified` and `content_hash` now come from the download's own
-    metadata, so they match the bytes delivered even when the file was edited
-    after the listing.
+  - `dropbox-source` adds `content_hash` (Dropbox's hash of the bytes) beside
+    `rev`. Compare `rev` or `content_hash` with Dropbox's own values, not
+    `server_modified` (see Changed).
   - A marker the provider does not send is left out, not set to `""`.
   - `googledrive-source` already carried `modified_time` and `md5_checksum`,
-    so it is unchanged.
+    so it is unchanged. Drive has no MD5 for a Google-native Doc, Sheet or
+    Slides deck, so those envelopes have no `md5_checksum`. A re-check keys on
+    `modified_time` there, which also moves on a rename.
 - **AWS connectors** (`connectors/aws`, module `aisquare_pipe_aws`, extra
   `aisquare-pipe[aws]`, in `[full]` and `[toolkits]`): read-only access to a
   customer's AWS account through one cross-account IAM role.
@@ -115,6 +116,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before any envelope came out raises `GcsPullTruncated` (a `ValueError`) with
     `next_start_offset`, so a `modified_after` sync over a big prefix still advances.
   Setup and the exact secret: `connectors/gcs/README.md`.
+
+### Changed
+
+- **OneDrive and Dropbox pull envelopes describe the version delivered**, not
+  the folder listing's. Before, a file edited after the listing got an
+  envelope whose `size` was not `len(data)` and whose Dropbox `rev` was older
+  than the bytes.
+  - `onedrive-source` takes `filename`, `path`, `size`, `last_modified`,
+    `web_url`, `mime_type` and the content type from the item as Graph
+    returned it just before the bytes, field by field, else the listing's.
+  - `dropbox-source` takes `filename`, `path`, `size`, `dropbox_id`, `rev` and
+    `server_modified` from the download's own metadata (the same response as
+    the bytes), else the listing's.
+  - The listing still decides which files are pulled (extension filter,
+    `limit`) and whether one is streamed.
+  - Dropbox's `server_modified` keeps its format: the SDK's naive UTC datetime
+    in ISO form, `2026-11-17T10:01:00` for Dropbox's `2026-11-17T10:01:00Z`.
 
 ## [0.5.0] - 2026-11-04
 

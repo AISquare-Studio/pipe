@@ -48,6 +48,8 @@ class FakeGraph:
         self.files: dict[str, _File] = {}
         self.calls: list[str] = []
         self.after_listing: Callable[[], None] | None = None
+        self.after_item: Callable[[], None] | None = None  # once, after the next item GET
+        self.item_markers = True  # False: the item GET sends no cTag or eTag
 
     def add(self, item_id: str, name: str, content: bytes, *, markers: bool = True) -> None:
         guid = f"{{{len(self.files) + 1:08X}-1D2C-4B3A-9F8E-7D6C5B4A3F2E}}"
@@ -93,7 +95,14 @@ class FakeGraph:
         if m := _CONTENT.fullmatch(path):
             return response(200, content=self.files[m.group(1)].content, content_type="application/pdf")
         if m := _ITEM.fullmatch(path):
-            return response(200, self.item(m.group(1)))
+            body = self.item(m.group(1))
+            if not self.item_markers:
+                body.pop("cTag", None)
+                body.pop("eTag", None)
+            if self.after_item is not None:
+                hook, self.after_item = self.after_item, None
+                hook()
+            return response(200, body)
         raise AssertionError(f"unexpected Graph call: {method} {url}")
 
 
@@ -193,3 +202,60 @@ def test_the_markers_are_read_with_the_bytes_not_from_the_listing(graph):
     assert markers(envelope) == (current["cTag"], current["eTag"])
     assert envelope.metadata["ctag"] != listed["cTag"]
     assert graph.calls == ["/me/drive/root/children", "/me/drive/items/01A", "/me/drive/items/01A/content"]
+
+
+def test_the_whole_envelope_describes_the_item_fetched_with_the_bytes(graph):
+    """An edit and a rename after the folder listing: the name, size,
+    timestamp and URL are the item's as Graph gave it with the bytes, like
+    the markers, so the envelope describes one version (its size is
+    len(data)). The listing only picks what to pull."""
+    graph.add("01A", "policy.pdf", b"%PDF-1 policy")
+    listed = graph.item("01A")
+
+    def edit_and_rename() -> None:
+        graph.edit("01A", b"%PDF-1 policy, revised and longer")
+        graph.rename("01A", "policy-2026.pdf")
+
+    graph.after_listing = edit_and_rename
+
+    (envelope,) = pull().values()
+
+    current = graph.item("01A")
+    meta = envelope.metadata
+    assert envelope.data == b"%PDF-1 policy, revised and longer"
+    assert meta["size"] == len(envelope.data) == current["size"] != listed["size"]
+    assert meta["filename"] == "policy-2026.pdf"
+    assert meta["path"] == "/drive/root:/policy-2026.pdf"
+    assert meta["last_modified"] == current["lastModifiedDateTime"] != listed["lastModifiedDateTime"]
+    assert meta["web_url"] == current["webUrl"]
+    assert markers(envelope) == (current["cTag"], current["eTag"])
+
+
+def test_the_listings_markers_fill_in_when_the_item_get_has_none(graph):
+    graph.add("01A", "policy.pdf", b"%PDF-1 policy")
+    graph.item_markers = False
+
+    envelope = pull()["policy.pdf"]
+
+    listed = graph.item("01A")
+    assert markers(envelope) == (listed["cTag"], listed["eTag"])
+
+
+def test_an_edit_between_the_item_get_and_the_bytes_is_caught_by_the_next_recheck(graph):
+    """The markers are never newer than the bytes. An edit between the item
+    GET and /content leaves the envelope with the newer bytes and the older
+    markers, so the next re-check sees a moved cTag and reads the file again
+    (once too often), rather than keeping a marker that would hide a later
+    edit."""
+    graph.add("01A", "policy.pdf", b"%PDF-1 policy")
+    before_edit = graph.item("01A")
+    graph.after_item = lambda: graph.edit("01A", b"%PDF-1 policy, revised")
+
+    first = pull()["policy.pdf"]
+
+    assert first.data == b"%PDF-1 policy, revised"
+    assert markers(first) == (before_edit["cTag"], before_edit["eTag"])
+    second = pull()["policy.pdf"]
+    assert second.metadata["ctag"] != first.metadata["ctag"]  # the re-check reads it again
+    assert markers(second) == (graph.item("01A")["cTag"], graph.item("01A")["eTag"])
+    assert second.data == first.data
