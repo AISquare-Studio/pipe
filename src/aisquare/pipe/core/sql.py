@@ -1,5 +1,10 @@
 """Helpers every connector's SQL guard shares.
 
+A guard parses only through :func:`parse_statements` (tests/test_sql_guards.py
+checks every connector module that imports sqlglot): the floor check, a
+quiet tokenize and parse, and any exception a refusal, in one place, so a
+new guard can't forget one.
+
 sqlglot logs pieces of the SQL it parses: "Invalid JSON path syntax. ...
 <the path>" at WARNING for any JSON key with a dash (``GET_PATH(v, 'a-b')``,
 ``JSON_EXTRACT(p, 'member.ssn-123')``), for statements a guard admits, and
@@ -23,9 +28,20 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any
 
 #: The logger every sqlglot module logs through (at 26.25 and 27.x).
 SQLGLOT_LOGGER = "sqlglot"
+#: The oldest sqlglot a SQL guard runs on: the floor the root pyproject's
+#: extras give sqlglot (every extra that names it gives the same specifier:
+#: scripts/dep_floor.py). tests/test_sql_guards.py fails when the two
+#: differ, so a floor raised in the pyproject is raised here in the same
+#: change, and no guard keeps a copy. It is not read from the installed
+#: metadata at run time: which metadata Python finds depends on sys.path (a
+#: stale build's ``*.egg-info`` in the working directory wins over the
+#: installed ``*.dist-info``).
+SQLGLOT_FLOOR: tuple[int, ...] = (26, 25)
 
 _QUIET: ContextVar[int] = ContextVar("aisquare_pipe_quiet_sqlglot", default=0)
 _ATTACH_LOCK = threading.Lock()
@@ -108,8 +124,96 @@ def sqlglot_at_least(installed: str, floor: tuple[int, ...]) -> bool:
     return bool(parsed) and parsed >= floor
 
 
+class SqlglotTooOld(ValueError):
+    """The installed sqlglot is older than the floor: no statement may run
+    (a host can get an older one from another package; the registry checks
+    names, not versions). A guard adds which extra to install."""
+
+    def __init__(self, installed: str, floor: tuple[int, ...]) -> None:
+        self.installed = installed
+        self.floor = floor
+        super().__init__(
+            "the SQL guard needs sqlglot "
+            + ".".join(map(str, floor))
+            + " or later and this host has an older one, so no statement may run"
+        )
+
+
+class Unparsable(ValueError):
+    """sqlglot could not read the text: it raised, a parse error or a bug in
+    sqlglot alike (either refuses, never admits). Carries no SQL."""
+
+
+@dataclass(frozen=True)
+class ParsedSQL:
+    """sqlglot's reading of a text: its ``tokens`` and every statement in it
+    (``statements``, empty ones dropped)."""
+
+    tokens: list[Any]
+    statements: list[Any]
+
+
+_QUIET_PARSERS: dict[type, type] = {}
+
+
+def quiet_parser_class(dialect: Any) -> type:
+    """``dialect``'s parser class without its "contains unsupported syntax"
+    warning, which logs the SQL text (:func:`quiet_sqlglot` drops it too; a
+    statement sqlglot doesn't support parses as a ``Command``, which a guard
+    refuses anyway). One class per dialect, made once."""
+    base: type = type(dialect).Parser
+    quiet = _QUIET_PARSERS.get(base)
+    if quiet is None:
+        with _ATTACH_LOCK:
+            quiet = _QUIET_PARSERS.get(base)
+            if quiet is None:
+                quiet = type(
+                    f"Quiet{base.__qualname__.replace('.', '')}",
+                    (base,),
+                    {"_warn_unsupported": lambda self: None, "__module__": __name__},
+                )
+                _QUIET_PARSERS[base] = quiet
+    return quiet
+
+
+def parse_statements(
+    sql: str, dialect: Any, *, floor: tuple[int, ...] | None = None
+) -> ParsedSQL:
+    """``sql`` read by sqlglot in ``dialect`` (a sqlglot ``Dialect``), the
+    one way a guard parses:
+
+    1. the installed sqlglot must be at least ``floor`` (default
+       :data:`SQLGLOT_FLOOR`), else :class:`SqlglotTooOld`;
+    2. tokenize and parse inside :func:`quiet_sqlglot`, with
+       :func:`quiet_parser_class`'s parser;
+    3. any exception from either is :class:`Unparsable` (raised from None:
+       sqlglot's messages quote the SQL).
+
+    sqlglot is imported here, not at the top: core does not depend on it."""
+    import sqlglot
+
+    wanted = SQLGLOT_FLOOR if floor is None else floor
+    installed = str(getattr(sqlglot, "__version__", ""))
+    if not sqlglot_at_least(installed, wanted):
+        raise SqlglotTooOld(installed, wanted)
+    try:
+        with quiet_sqlglot():
+            tokens = dialect.tokenize(sql)
+            parser = quiet_parser_class(dialect)(dialect=dialect)
+            statements = [s for s in parser.parse(tokens, sql) if s is not None]
+    except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
+        raise Unparsable("sqlglot could not parse it") from None
+    return ParsedSQL(tokens=list(tokens), statements=statements)
+
+
 __all__ = [
+    "SQLGLOT_FLOOR",
     "SQLGLOT_LOGGER",
+    "ParsedSQL",
+    "SqlglotTooOld",
+    "Unparsable",
+    "parse_statements",
+    "quiet_parser_class",
     "quiet_sqlglot",
     "sqlglot_at_least",
     "sqlglot_version",
