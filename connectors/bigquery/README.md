@@ -275,7 +275,8 @@ Revoking the grants stops every read, a token AISquare already holds included, o
 (`environments/prod/services/` holds only explainability-gateway and praxis), and aisquare-infra has no
 `prod/prod/pipe-service/*` secret. So GoodRx production follows the ECS path. `stg` runs on ECS and on EKS until the
 cutover, and `dev` runs on EKS only. While both `stg`s run, turn the tenant on in both (at the least, in the one the
-tenant's caller uses): the other one answers 422 `not_configured` for it.
+tenant's caller uses): the other one sends the tenant's BigQuery calls to Composio's `googlebigquery` (read-only
+guard), on whatever Composio connection the person has, not to the customer's service account.
 
 **One customer key per environment** (step 5): never put the production key in `stg` or `dev`. On EKS the value also
 sits in a GitHub environment secret of aisquare-infra (below), which more people and workflows can reach than an ECS
@@ -381,8 +382,8 @@ secret cache).
 
 `service_account_json` is key.json as it was downloaded (an object, or the same JSON as a string). `project_id` is
 required: the project jobs run in. `location` (`US`, `EU`, a region) and `max_bytes_billed` (bytes, 10 MiB to 1 TiB,
-default 10 GiB) are optional. Until the secret is read, pipe-as-service answers 422 `connector_unavailable` /
-`not_configured`, naming "credentials for bigquery".
+default 10 GiB) are optional. Until the secret is read, the tenant's calls go to Composio's `googlebigquery`
+(routing rule d, read-only guard), not to the customer's service account.
 
 **Rotation**, at least before any key expiry:
 1. The customer creates a new key for the same service account (step 5) and hands it over (step 6).
@@ -427,7 +428,8 @@ default 10 GiB) are optional. Until the secret is read, pipe-as-service answers 
   1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry is listed, a deleted
      secret fails the ExternalSecret.
   2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the `secrets-nonprod.yml` env
-     line. Its `apply-nonprod` deletes the Secrets Manager secret, with a 7-day recovery window.
+     line, and the tenant's import block in `live/nonprod/data/imports.tf` if one is still there (below). Its
+     `apply-nonprod` deletes the Secrets Manager secret, with a 7-day recovery window.
   3. After that merge, run
      `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`. If you delete it
      earlier, while the entry is still listed, every sync stops.
@@ -447,8 +449,9 @@ default 10 GiB) are optional. Until the secret is read, pipe-as-service answers 
   the ExternalSecret, as the EKS rotation above does.
 
   **Turning the tenant back on within 7 days** of the offboarding apply fails the same way: the name is still pending
-  deletion. Wait out the window, or restore the secret (above) and, in the PR that re-adds the entry, add an import
-  block to `live/nonprod/data/imports.tf` like the ones already there:
+  deletion. Wait out the window, or restore the secret (above) first. Only then open the PR that re-adds the entry:
+  the provider cannot import a secret that is still pending deletion, so a PR opened before the restore fails. In
+  that PR, add an import block to `live/nonprod/data/imports.tf` like the ones already there:
 
   ```hcl
   import {
@@ -460,6 +463,11 @@ default 10 GiB) are optional. Until the secret is read, pipe-as-service answers 
   `<ARN>` comes from
   `aws secretsmanager describe-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/bigquery-<tenant> --query ARN --output text`.
   The restored secret holds the old value until the sync writes the GitHub one.
+
+  **Remove the import block once the `apply-nonprod` that imported it is green**, in a follow-up PR (the secret stays
+  in Terraform's state). A block left behind outlives the entry: after the next offboarding removes the entry, every
+  plan of `live/nonprod/data` fails ("Configuration for import target does not exist"), so its `apply-nonprod` fails
+  and the sync is skipped. The two blocks already there are safe only while their entries stay listed.
 - Tell the customer to do their offboarding (above) as well: deleting our copy does not revoke the key.
 
 ## Tests

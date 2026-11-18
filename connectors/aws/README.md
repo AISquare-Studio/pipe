@@ -526,8 +526,9 @@ AISquare's copy, per secret:
   1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry
      is listed, a deleted secret fails the ExternalSecret.
   2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the
-     `secrets-nonprod.yml` env line. Its `apply-nonprod` deletes the Secrets Manager secret,
-     with a 7-day recovery window.
+     `secrets-nonprod.yml` env line, and the tenant's import block in
+     `live/nonprod/data/imports.tf` if one is still there (below). Its `apply-nonprod` deletes
+     the Secrets Manager secret, with a 7-day recovery window.
   3. After that merge, run
      `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`.
      If you delete it earlier, while the entry is still listed, every sync stops.
@@ -551,9 +552,10 @@ AISquare's copy, per secret:
   the blob" do.
 
   **Turning the tenant back on within 7 days** of the offboarding apply fails the same way: the
-  name is still pending deletion. Wait out the window, or restore the secret (above) and, in the
-  PR that re-adds the entry, add an import block to `live/nonprod/data/imports.tf` like the ones
-  already there:
+  name is still pending deletion. Wait out the window, or restore the secret (above) first. Only
+  then open the PR that re-adds the entry: the provider cannot import a secret that is still
+  pending deletion, so a PR opened before the restore fails. In that PR, add an import block to
+  `live/nonprod/data/imports.tf` like the ones already there:
 
   ```hcl
   import {
@@ -565,6 +567,12 @@ AISquare's copy, per secret:
   `<ARN>` comes from
   `aws secretsmanager describe-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/<secret>-<tenant> --query ARN --output text`.
   The restored secret holds the old value until the sync writes the GitHub one.
+
+  **Remove the import block once the `apply-nonprod` that imported it is green**, in a
+  follow-up PR (the secret stays in Terraform's state). A block left behind outlives the entry:
+  after the next offboarding removes the entry, every plan of `live/nonprod/data` fails
+  ("Configuration for import target does not exist"), so its `apply-nonprod` fails and the sync
+  is skipped. The two blocks already there are safe only while their entries stay listed.
 - Remove the customer's role ARN from our role's policy (step 2's `Resource`).
 
 The customer deletes the role, or removes AISquare's principal ARNs from its trust policy. Either
