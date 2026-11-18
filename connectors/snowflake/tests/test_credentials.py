@@ -195,14 +195,25 @@ def test_ambient_snowflake_configuration_is_never_consulted(monkeypatch, tmp_pat
         "SNOWFLAKE_USER": "AMBIENT",
         "SNOWFLAKE_PASSWORD": "ambient-password",
         "SNOWFLAKE_PRIVATE_KEY_PATH": str(tmp_path / "key.p8"),
+        "SNOWFLAKE_PRIVATE_KEY": private_key_pem("ambient"),
+        "SNOWFLAKE_PRIVATE_KEY_PEM": private_key_pem("ambient"),
+        "SNOWFLAKE_AUTHENTICATOR": "SNOWFLAKE_JWT",
         "SNOWFLAKE_ROLE": "ACCOUNTADMIN",
         "SNOWFLAKE_WAREHOUSE": "AMBIENT_WH",
         "SNOWFLAKE_DEFAULT_CONNECTION_NAME": "default",
     }.items():
         monkeypatch.setenv(name, value)
-    with pytest.raises(SnowflakeNotConfigured):
-        load_credentials({})
+    for empty in (None, {}, {"account": ""}):
+        with pytest.raises(SnowflakeNotConfigured):
+            load_credentials(empty)
     fake = _fake()
+    assert (
+        SnowflakeToolkit(session=fake)
+        .call_tool("SNOWFLAKE_RUN_SELECT", {"statement": "SELECT 1 AS X"}, {})
+        .error_code
+        == "not_connected"
+    )
+    assert fake.requests == []
     result = _select(fake, blob())
     assert result.successful, result.error
     (submit,) = fake.submits()
