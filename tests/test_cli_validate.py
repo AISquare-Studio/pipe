@@ -277,6 +277,40 @@ class TestInstalledOnlyMode:
             "missing",
         )
 
+    @pytest.mark.parametrize(
+        ("dist_name", "label"),
+        [
+            ("aisquare-pipe", "aisquare-pipe[acme]"),
+            # A plugin in its own distribution, even one named aisquare-pipe-<x>
+            # (an old per-connector release, or a third party's), is that
+            # distribution: it has no aisquare-pipe extra.
+            ("aisquare-pipe-acme", "aisquare-pipe-acme"),
+        ],
+    )
+    def test_the_dist_label_names_the_extra_only_inside_aisquare_pipe(
+        self, monkeypatch, dist_name, label
+    ):
+        monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
+        monkeypatch.setattr(validate_mod, "discover_toolkit_entry_points", list)
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_connector_entry_points",
+            lambda: [
+                DiscoveredConnector(
+                    ep_name="mock-source",
+                    ep_value="aisquare_pipe_acme.connector:AcmeSource",
+                    dist_name=dist_name,
+                    dist_version="0.5.0",
+                    cls=MockSource,
+                    load_error=None,
+                )
+            ],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json"])
+        assert result.exit_code == 0, result.output
+        (report,) = json.loads(result.output)["connectors"]
+        assert (report["name"], report["dist"]) == ("acme", label)
+
     def test_named_target_without_repo_exit_two(self, monkeypatch):
         monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
         result = CliRunner().invoke(cli, ["validate", "composio"])

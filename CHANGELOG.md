@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AWS connectors** (`connectors/aws`, module `aisquare_pipe_aws`, extra
+  `aisquare-pipe[aws]`, in `[full]` and `[toolkits]`): read-only access to a
+  customer's AWS account through one cross-account IAM role.
+  - `aisquare_pipe_aws.credentials`: the shared credential. STS `AssumeRole`
+    runs with the server-issued `ExternalId`, and reads use the role's
+    refreshable temporary credentials. A role in the service's own account is
+    refused, as is one in an account listed in `PIPE_AWS_REFUSED_ACCOUNT_IDS`.
+    So are a role outside the commercial partition and an external ID
+    shorter than 32 characters. No customer client is built from ambient,
+    default or empty credentials. The blob is
+    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`. The
+    README's registration checklist covers `sts:TagSession` (EKS Pod
+    Identity's session tags are transitive), KMS `Decrypt` and
+    `DescribeKey` under `kms:ViaService`, and the order of the two sides'
+    steps. Prod's customer trusts both prod principals from day one: the ECS
+    task role `ais-studio-pipe-task-role-prod` and the EKS Pod Identity role
+    of pipe-service's cutover runbook.
+  - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
+    AgentCore policy, in every configured region (`ListPolicyEngines` →
+    `ListPolicies`, every page; `GetPolicy` only for a policy listed without
+    its definition). Each envelope carries the definition text, with the
+    name, ids, ARN, status, enforcement mode and timestamps as metadata, and
+    `version` = `updatedAt`.
+  - `s3-source`: one envelope per object under the configured bucket and
+    prefix (`ListObjectsV2`, every page; `GetObject`). Its `version` is the
+    `VersionId`, else the `ETag`. A `VersionId` of `"null"` (a bucket whose
+    versioning is suspended) counts as none, so the `ETag` is used.
+  - Toolkits `bedrock_agentcore` (`LIST_POLICY_ENGINES`, `LIST_POLICIES`,
+    `GET_POLICY`) and `s3` (`LIST_OBJECTS`, `GET_OBJECT`, `HEAD_OBJECT`). All
+    their tools are read-only, with strict schemas. Both AgentCore list
+    tools page with an opaque `next_token` (region, engine and AgentCore's
+    `nextToken`), so every engine and policy is reachable past `limit`.
+  - Pull params and tool arguments only narrow what the blob allows (a
+    prefix inside the configured one, one engine, a time filter). Neither
+    can name an account, role, region, bucket or credential.
+  - AWS's refusals map to tool error codes: a body-less S3 `403` is
+    `forbidden`; `ValidationException`, `InvalidArgument` and a body-less S3
+    `400` are `invalid_arguments`.
+  - The `[aws]` extra is `boto3`/`botocore` >= 1.43.32, < 2. The AgentCore
+    Policy GA model arrived in 1.42.60, but a policy's `enforcementMode` only
+    in 1.43.32. The tests' AWS fake, `moto[s3,sts]`, is in `[dev]`.
+- **Glean connector** (`connectors/glean`, module `aisquare_pipe_glean`, extra
+  `aisquare-pipe[glean]`, in `[full]` and `[toolkits]`). It is read-only over
+  Glean's Client API.
+  - **Toolkit `glean`**: `GLEAN_SEARCH` (`pipe:primary`) and `GLEAN_GET_DOCUMENT`.
+  - **Source `glean-source`**: a saved query or document ids, read as
+    `text/plain` envelopes. Each carries exactly one version marker: the
+    document's `update_time`, or `content_sha256` (the SHA-256 of the text)
+    when Glean sends no update time. Those documents are counted in one INFO
+    line, and a search that stops at the 50-page cap while Glean still has
+    results logs one WARNING (counts only).
+  - **Auth**: a Glean-issued token, held in a per-tenant credential blob
+    `{host, token, token_kind: user|global, act_as?, allowed_hosts?}`. No
+    OAuthSpec. pipe-as-service runs `glean-source` with this blob; it does not
+    serve the `GLEAN_*` tools yet.
+    - A global token always sends `X-Glean-ActAs`; a user token never does.
+    - `host` must match `<instance>-be.glean.com` or the blob's own
+      `allowed_hosts`. IP addresses are refused in both. Redirects are not
+      followed.
+    - `token` and `act_as` must be ASCII (they are sent as headers).
+    - Neither tool arguments nor pull params can set any credential key.
+    - Without a usable blob it fails closed (`not_connected` /
+      `GleanNotConfigured`) before any request.
+  - The extra is empty: HTTP goes through `requests`, which core already
+    requires.
 - **Google Cloud Storage connector** (`connectors/gcs`, module `aisquare_pipe_gcs`, extra
   `aisquare-pipe[gcs]`, in `[full]` and `[toolkits]`): the read-only toolkit `gcs`
   (`GCS_GET_OBJECT`, primary; `GCS_LIST_OBJECTS`) and the source `gcs-source`, over ONE bucket
@@ -41,6 +106,19 @@ published, so 0.5.0 also carries everything under 0.4.0 and 0.3.0 below.
 (pipe-as-service's `/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`.
 Publish steps: RELEASING.md, "The 0.5.0 release".
 
+### Upgrading from `aisquare-pipe-<x>`
+
+In an environment that has an old per-connector package (`aisquare-pipe-onedrive`
+0.1.0, say), **uninstall it first**, then install the extra:
+`pip uninstall -y aisquare-pipe-onedrive && pip install "aisquare-pipe[onedrive]>=0.5.0"`.
+The old package and `aisquare-pipe` 0.5.0 install the same files, so pip
+removing the old one (`pip install -U aisquare-pipe-<x>`, or a later `pip
+uninstall aisquare-pipe-<x>`) deletes the connector. If you already upgraded
+in place, never uninstall the old package without running `pip install
+--force-reinstall --no-deps aisquare-pipe` afterwards; the same command
+repairs a broken environment. Fresh environments are not affected. Details:
+README.md, "Upgrading from `aisquare-pipe-<x>`".
+
 ### Changed
 
 - **One distribution, every connector inside.** The `aisquare-pipe` wheel
@@ -56,8 +134,16 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
     graphify. `[toolkits]` is `aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]`.
   - **Not installed.** A connector whose extra isn't installed counts as not
     installed: discovery leaves it out with one info line naming the extra
-    (`registry.missing_requirements`, `registry.connector_extra`), instead of a
-    load-error warning.
+    (`registry.not_installed`, `registry.missing_requirements`,
+    `registry.connector_extra`), instead of a load-error warning. That takes
+    a missing third-party module (a `ModuleNotFoundError`, or an error raised
+    from one) and a missing requirement of the connector's own extra, counted
+    only where its env marker applies. Anything else stays a broken-plugin
+    warning, even with the extra missing: a missing `aisquare.*` or
+    `aisquare_pipe_*` module (a half-removed install), or `cannot import
+    name`. `pipe validate` reads load failures the same way, and labels a
+    plugin in its own `aisquare-pipe-<x>` distribution by that distribution,
+    not as an extra.
   - **Per-connector pyprojects.** `connectors/<name>/pyproject.toml` keeps only
     the suite's pytest/ruff settings. No connector builds on its own. The ten
     that were PyPI projects (composio, docusign, dropbox, gateway, github,
@@ -81,6 +167,14 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
     `pipe validate aisquare-pipe[<name>]` selects that connector.
   - **Development** is one editable install, `pip install -e ".[full,dev]"`.
     `scripts/dev_install_toolkits.sh` runs `pip install -e "<checkout>[toolkits]"`.
+  - **Dependency floors** that Dependabot raised in the old per-connector
+    pyprojects now live in the root: `requests>=2.34.2` (core),
+    `azure-identity>=1.27.0` (`[onedrive]`), `graphifyy==0.9.106`
+    (`[graphify-engine]`), `pytest>=9.2.0` (`[dev]`) and `setuptools>=84.2.1`
+    (build). Dependabot watches only the root `pyproject.toml`.
+  - **graphify** remediation messages name
+    `aisquare-pipe[graphify,graphify-engine]`, not
+    `aisquare-pipe-graphify[engine]`.
 - **Publishing** (`publish.yml`, new `scripts/release_packages.py`). A run can
   no longer pass without uploading.
   - A version already on PyPI is skipped by an explicit lookup and listed in
@@ -90,7 +184,8 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
   - A release tag must be `v<version>`, and nothing ever creates a PyPI project.
   - Every PR (and Run workflow, which defaults to a dry run) builds the
     distribution, checks that its wheel's RECORD holds every module of
-    `src/` and `connectors/*/src`, and runs `twine check --strict`.
+    `src/` and `connectors/*/src`, and runs `twine check --strict`. A PR
+    builds and checks the ten shims too.
   - Run workflow with target `shims` builds and checks the ten shims, and
     publishes them once `aisquare-pipe` 0.5.0 is on PyPI.
 

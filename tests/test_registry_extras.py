@@ -1,5 +1,7 @@
 """A connector whose ``aisquare-pipe[<name>]`` extra isn't installed counts as
-not installed: left out of discovery with one info line, never a warning.
+not installed: left out of discovery with one info line, never a warning. Any
+other load failure is a broken plugin, a warning, even where the extra is
+missing too.
 
 Builds a real (temporary) distribution on sys.path, so the metadata the
 registry reads is parsed exactly as an installed wheel's would be.
@@ -10,19 +12,39 @@ from __future__ import annotations
 import logging
 import sys
 import textwrap
+from collections.abc import Sequence
 from importlib.metadata import distributions
 from pathlib import Path
 
 import pytest
 
 from aisquare.pipe.core import registry
+from aisquare.pipe.testing import validation
 
 DIST = "aisquare-pipe-registry-probe"
 
 
-def _install(tmp_path: Path, extra_reqs: list[str], module_body: str) -> None:
+def _requires(extra: str, reqs: list[str]) -> str:
+    """Requires-Dist lines as a wheel writes them: ``req; extra == "x"``, or
+    ``req; (marker) and extra == "x"`` for a ``req; marker`` entry."""
+    lines = []
+    for r in reqs:
+        req, _, marker = r.partition(";")
+        cond = f'({marker.strip()}) and extra == "{extra}"' if marker else f'extra == "{extra}"'
+        lines.append(f"Requires-Dist: {req.strip()}; {cond}\n")
+    return f"Provides-Extra: {extra}\n" + "".join(lines)
+
+
+def _install(
+    tmp_path: Path,
+    extra_reqs: list[str],
+    module_body: str,
+    *,
+    other_reqs: Sequence[str] = (),
+) -> None:
     """A distribution named DIST with one connector module, aisquare_pipe_probe,
-    whose [probe] extra requires ``extra_reqs``."""
+    whose [probe] extra requires ``extra_reqs``. Its [other] extra (another
+    connector's) requires ``other_reqs``."""
     pkg = tmp_path / "aisquare_pipe_probe"
     pkg.mkdir()
     (pkg / "__init__.py").write_text("")
@@ -32,11 +54,11 @@ def _install(tmp_path: Path, extra_reqs: list[str], module_body: str) -> None:
     )
     info = tmp_path / "aisquare_pipe_registry_probe-0.5.0.dist-info"
     info.mkdir()
-    requires = "".join(f'Requires-Dist: {r}; extra == "probe"\n' for r in extra_reqs)
     (info / "METADATA").write_text(
         f"Metadata-Version: 2.1\nName: {DIST}\nVersion: 0.5.0\n"
-        f"Provides-Extra: probe\n{requires}"
-        f'Provides-Extra: bundle\nRequires-Dist: {DIST}[probe]; extra == "bundle"\n'
+        + _requires("probe", extra_reqs)
+        + _requires("other", list(other_reqs))
+        + _requires("bundle", [f"{DIST}[probe]"])
     )
     (info / "entry_points.txt").write_text(
         "[aisquare_pipe.connectors]\nprobe-source = aisquare_pipe_probe.connector:ProbeSource\n\n"
@@ -62,6 +84,7 @@ def probe(tmp_path, monkeypatch):
         return [ep for ep in dist.entry_points if ep.group == group]
 
     monkeypatch.setattr(registry, "entry_points", entry_points)
+    monkeypatch.setattr(validation, "entry_points", entry_points)
     yield tmp_path
     _forget_probe_modules()
 
@@ -75,11 +98,7 @@ def _records(caplog, level):
 
 
 def test_a_connector_whose_extra_is_missing_is_not_installed(probe, caplog):
-    _install(
-        probe,
-        ["aisquare-pipe-probe-sdk-not-installed>=1"],
-        "import aisquare_pipe_probe_sdk_not_installed\n",
-    )
+    _install(probe, ["probe-sdk-not-installed>=1"], "import probe_sdk_not_installed\n")
     caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
 
     assert registry.discover_connectors() == {}
@@ -88,11 +107,11 @@ def test_a_connector_whose_extra_is_missing_is_not_installed(probe, caplog):
     assert _records(caplog, logging.INFO) == [
         (
             "Connector probe-source is not installed: it needs aisquare-pipe[probe] "
-            "(missing aisquare-pipe-probe-sdk-not-installed)"
+            "(missing probe-sdk-not-installed)"
         ),
         (
             "Toolkit probe is not installed: it needs aisquare-pipe[probe] "
-            "(missing aisquare-pipe-probe-sdk-not-installed)"
+            "(missing probe-sdk-not-installed)"
         ),
     ]
 
@@ -133,17 +152,123 @@ def test_a_connector_with_no_third_party_deps_that_fails_to_import_is_a_warning(
 
 
 def test_any_other_load_error_is_still_a_warning(probe, caplog):
-    _install(
-        probe,
-        ["aisquare-pipe-probe-sdk-not-installed>=1"],
-        "raise RuntimeError('boom')\n",
-    )
+    _install(probe, ["probe-sdk-not-installed>=1"], "raise RuntimeError('boom')\n")
     caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
 
     assert registry.discover_connectors() == {}
     assert _records(caplog, logging.WARNING) == [
         "Failed to load connector probe-source: boom"
     ]
+
+
+def test_a_missing_requirement_of_another_extra_does_not_count(probe, caplog):
+    """[probe] is fully installed; [other], another connector's extra, is not.
+    The probe's import of a module it never declared is its own bug."""
+    _install(
+        probe,
+        ["pytest>=7"],
+        "import probe_undeclared_sdk\n",
+        other_reqs=["probe-other-sdk-not-installed>=1"],
+    )
+    caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
+
+    assert registry.discover_connectors() == {}
+    assert _records(caplog, logging.INFO) == []
+    assert _records(caplog, logging.WARNING) == [
+        "Failed to load connector probe-source: No module named 'probe_undeclared_sdk'"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        # The upgrade trap: `pip uninstall aisquare-pipe-<x>` deleted a file
+        # that aisquare-pipe also ships.
+        (
+            "import aisquare_pipe_probe.constants\n",
+            "No module named 'aisquare_pipe_probe.constants'",
+        ),
+        ("import aisquare.pipe.no_such_module\n", "No module named 'aisquare.pipe.no_such_module'"),
+        # A name missing from a module that is there: never "not installed".
+        ("from pytest import no_such_name\n", "cannot import name 'no_such_name'"),
+    ],
+)
+def test_a_broken_install_is_a_warning_even_without_the_extra(
+    probe, caplog, body, error
+):
+    _install(probe, ["probe-sdk-not-installed>=1"], body)
+    caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
+
+    assert registry.discover_connectors() == {}
+    assert _records(caplog, logging.INFO) == []
+    (warning,) = _records(caplog, logging.WARNING)
+    assert warning.startswith(f"Failed to load connector probe-source: {error}")
+
+
+def test_an_import_error_raised_from_a_missing_third_party_module_is_not_installed(
+    probe, caplog
+):
+    """graphify's engine guard re-raises a ModuleNotFoundError with a
+    remediation message and no module name, from the original one."""
+    _install(
+        probe,
+        ["probe-sdk-not-installed>=1"],
+        """\
+        try:
+            import probe_sdk_not_installed
+        except ImportError as exc:
+            raise ModuleNotFoundError("install the engine extra") from exc
+        """,
+    )
+    caplog.set_level(logging.DEBUG, logger="aisquare.pipe")
+
+    assert registry.discover_connectors() == {}
+    assert _records(caplog, logging.WARNING) == []
+    assert _records(caplog, logging.INFO) == [
+        (
+            "Connector probe-source is not installed: it needs aisquare-pipe[probe] "
+            "(missing probe-sdk-not-installed)"
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "not_installed"),
+    [
+        ("import probe_sdk_not_installed\n", True),
+        ("import aisquare_pipe_probe.constants\n", False),
+    ],
+)
+def test_pipe_validate_reads_load_failures_the_same_way(probe, body, not_installed):
+    """`pipe validate` reports a broken install as a load failure, not as an
+    extra that isn't installed."""
+    _install(probe, ["probe-sdk-not-installed>=1"], body)
+
+    (found,) = validation.discover_connector_entry_points()
+
+    assert found.cls is None and found.load_error.startswith("ModuleNotFoundError: ")
+    assert found.missing_requirements == (
+        ("probe-sdk-not-installed",) if not_installed else ()
+    )
+
+
+@pytest.mark.parametrize(
+    ("marker", "counts"),
+    [('python_version < "3"', False), ('python_version >= "3"', True)],
+)
+def test_a_requirement_whose_marker_excludes_this_python_does_not_count(
+    probe, marker, counts
+):
+    _install(
+        probe,
+        ["pytest>=7", f"probe-sdk-not-installed>=1; {marker}"],
+        "import probe_sdk_not_installed\n",
+    )
+    (ep,) = registry.entry_points(group="aisquare_pipe.connectors")
+
+    assert registry.missing_requirements(ep) == (
+        ["probe-sdk-not-installed"] if counts else []
+    )
 
 
 @pytest.mark.parametrize(

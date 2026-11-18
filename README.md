@@ -54,8 +54,29 @@ Every connector lives under `connectors/<name>/` (code in `src/aisquare_pipe_<na
 | AISquare gateway | `aisquare_pipe_gateway` | `aisquare-pipe[gateway]` |   | ✓ |
 | n8n | `aisquare_pipe_n8n` | `aisquare-pipe[n8n]` |   | ✓ |
 | Graphify | `aisquare_pipe_graphify` | `aisquare-pipe[graphify]` (engine: `[graphify-engine]`) |   | ✓ |
+| AWS: Bedrock AgentCore policies, S3 (cross-account role) | `aisquare_pipe_aws` | `aisquare-pipe[aws]` |   | ✓ |
+| Google Cloud Storage (service account key, one bucket) | `aisquare_pipe_gcs` | `aisquare-pipe[gcs]` |   | ✓ |
 
-Before 0.5.0 some connectors were separate PyPI packages (`aisquare-pipe-dropbox`, …). Their last release, 0.5.0, has no code and only requires `aisquare-pipe[<name>]`, so old install lines keep working; new ones should use the extra.
+Before 0.5.0 some connectors were separate PyPI packages (`aisquare-pipe-dropbox`, …). Their last release, 0.5.0, has no code and only requires `aisquare-pipe[<name>]`, so old install lines still resolve in a fresh environment; new ones should use the extra. To upgrade an existing environment, see below.
+
+### Upgrading from `aisquare-pipe-<x>`
+
+This applies to an environment that has one of the old per-connector packages: `aisquare-pipe-composio`, `-docusign`, `-dropbox`, `-gateway`, `-github`, `-graphify`, `-local`, `-n8n`, `-onedrive` or `-salesforce` before 0.5.0. The old package and `aisquare-pipe` 0.5.0 install the same files (`aisquare_pipe_<x>/…`), so when pip removes the old package, it deletes the connector `aisquare-pipe` just installed.
+
+**Uninstall the old package first**, then install the extra:
+
+```bash
+pip uninstall -y aisquare-pipe-onedrive
+pip install "aisquare-pipe[onedrive]>=0.5.0"
+```
+
+**If you already upgraded in place** (`pip install -U aisquare-pipe-<x>`, or `aisquare-pipe[<x>]` installed over the old package), never `pip uninstall aisquare-pipe-<x>` without restoring the files afterwards:
+
+```bash
+pip install --force-reinstall --no-deps aisquare-pipe
+```
+
+The same command repairs a broken environment. The symptom is a warning such as `Failed to load toolkit onedrive: No module named 'aisquare_pipe_onedrive.constants'`, while `pip check` reports nothing wrong. A fresh environment (a Docker build, CI) is never affected.
 
 Third-party connectors in their own distribution (any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 

@@ -23,6 +23,11 @@ from importlib.metadata import (
 )
 from typing import Any, NamedTuple
 
+try:  # packaging isn't a dependency: without it, env markers aren't evaluated
+    from packaging.markers import InvalidMarker, Marker
+except ImportError:  # pragma: no cover — packaging ships with pip and pytest
+    Marker = None  # type: ignore[assignment,misc]
+
 from aisquare.pipe.core.search import (
     ConnectorIndex,
     ScoredTool,
@@ -71,11 +76,25 @@ def connector_extra(module: str) -> str | None:
     return top[len(CONNECTOR_MODULE_PREFIX) :]
 
 
+def _applies_here(line: str, extra: str) -> bool:
+    """Whether the ``extra == ...`` requirement ``line`` applies to this
+    interpreter: its whole env marker (``python_version``, ``sys_platform``
+    ...) holds for ``extra``. True when packaging isn't installed or the
+    marker can't be parsed: the requirement then counts."""
+    if Marker is None or ";" not in line:
+        return True
+    try:
+        return Marker(line.split(";", 1)[1]).evaluate({"extra": extra})
+    except InvalidMarker:
+        return True
+
+
 def missing_requirements(ep: EntryPoint) -> list[str]:
     """The requirements of ``ep``'s connector extra that aren't installed,
     sorted. Empty when ``ep`` isn't a connector entry point, its distribution
-    is unknown, or the extra is fully installed. Reads installed metadata only:
-    it imports nothing."""
+    is unknown, or the extra is fully installed. A requirement whose env
+    marker excludes this interpreter doesn't count. Reads installed metadata
+    only: it imports nothing."""
     extra = connector_extra(ep.module)
     dist = ep.dist
     if extra is None or dist is None:
@@ -89,6 +108,8 @@ def missing_requirements(ep: EntryPoint) -> list[str]:
             continue
         if _canonical(name.group(1)) == own:
             continue  # a bundle of our own extras, not a third-party dep
+        if not _applies_here(line, marker.group(1)):
+            continue
         try:
             distribution(name.group(1))
         except PackageNotFoundError:
@@ -96,22 +117,61 @@ def missing_requirements(ep: EntryPoint) -> list[str]:
     return sorted(missing)
 
 
+def _missing_module(error: BaseException) -> str | None:
+    """The module a failed import couldn't find: ``error``'s own when it is a
+    ModuleNotFoundError, else that of the ModuleNotFoundError it was raised
+    from (graphify's engine guard re-raises one without a name). None for any
+    other failure, e.g. ``cannot import name``."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ModuleNotFoundError) and current.name:
+            return current.name
+        current = current.__cause__
+    return None
+
+
+def _is_own_module(module: str) -> bool:
+    """Whether ``module`` is aisquare-pipe's own: the framework
+    (``aisquare.*``) or a connector (``aisquare_pipe_*``)."""
+    top = module.split(".", 1)[0]
+    return top == "aisquare" or top.startswith(CONNECTOR_MODULE_PREFIX)
+
+
+def not_installed(ep: EntryPoint, error: BaseException) -> list[str]:
+    """When ``error``, raised loading ``ep``, means that ``ep``'s connector
+    extra isn't installed: that extra's missing requirements, sorted. Empty
+    when it means a broken plugin instead:
+
+    - the failure isn't a missing module (``cannot import name``, any
+      other exception);
+    - the missing module is aisquare-pipe's own (``aisquare.*``,
+      ``aisquare_pipe_*``): a broken or half-removed install, e.g. after
+      ``pip uninstall aisquare-pipe-<x>`` deleted files ``aisquare-pipe``
+      also ships;
+    - or the extra is fully installed.
+    """
+    module = _missing_module(error)
+    if module is None or _is_own_module(module):
+        return []
+    return missing_requirements(ep)
+
+
 def _load_failed(kind: str, ep: EntryPoint, error: Exception) -> None:
     """Log why ``ep`` didn't load. A connector whose extra isn't installed is
     not installed, which is fine: one info line saying what to install. Any
-    other failure is a broken plugin: a warning."""
-    if isinstance(error, ImportError):
-        missing = missing_requirements(ep)
-        if missing:
-            extra = connector_extra(ep.module)
-            logger.info(
-                "%s %s is not installed: it needs aisquare-pipe[%s] (missing %s)",
-                kind.capitalize(),
-                ep.name,
-                extra,
-                ", ".join(missing),
-            )
-            return
+    other failure (:func:`not_installed`) is a broken plugin: a warning."""
+    missing = not_installed(ep, error)
+    if missing:
+        logger.info(
+            "%s %s is not installed: it needs aisquare-pipe[%s] (missing %s)",
+            kind.capitalize(),
+            ep.name,
+            connector_extra(ep.module),
+            ", ".join(missing),
+        )
+        return
     logger.warning(f"Failed to load {kind} {ep.name}: {error}")
 
 
