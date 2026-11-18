@@ -36,6 +36,34 @@ def test_every_databricks_cloud_host_loads(url):
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        "https://accounts.cloud.databricks.com",
+        "https://ACCOUNTS.cloud.databricks.com/",
+        "https://accounts.azuredatabricks.net",
+        "https://accounts.gcp.databricks.com",
+    ],
+)
+def test_an_account_console_is_not_a_workspace(url):
+    """Databricks's account consoles match the cloud suffixes but serve no
+    workspace API: refused like any other host (seq 13990 n1)."""
+    with pytest.raises(DatabricksNotConfigured, match="workspace_url must be"):
+        load_credentials(pat_blob(workspace_url=url))
+    assert (
+        load_credentials(
+            pat_blob(workspace_url="https://accounts-team.cloud.databricks.com")
+        ).host
+        == "accounts-team.cloud.databricks.com"
+    )
+
+
+def test_dbfs_is_off_unless_the_blob_says_true():
+    assert load_credentials(pat_blob()).dbfs is False
+    assert load_credentials(pat_blob(dbfs=False)).dbfs is False
+    assert load_credentials(m2m_blob(dbfs=True)).dbfs is True
+
+
+@pytest.mark.parametrize(
     ("config", "reason"),
     [
         (None, "no Databricks credentials"),
@@ -67,6 +95,7 @@ def test_every_databricks_cloud_host_loads(url):
         (m2m_blob(client_secret=None), "client_secret is missing"),
         (m2m_blob(client_id=""), "client_id is missing"),
         (pat_blob(warehouse_id="../x"), "warehouse_id must be"),
+        (pat_blob(dbfs="true"), "dbfs must be true or false"),
     ],
 )
 def test_a_missing_or_malformed_blob_is_not_configured(config, reason):

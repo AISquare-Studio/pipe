@@ -222,27 +222,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `aisquare-pipe[databricks]`, in `[full]` and `[toolkits]`): the read-only toolkit `databricks`
   (`DATABRICKS_READ_FILE`, primary; `DATABRICKS_LIST_FILES`; `DATABRICKS_RUN_SELECT`;
   `DATABRICKS_LIST_CATALOGS`/`_SCHEMAS`/`_TABLES`) and the source `databricks-files-source`, over
-  Unity Catalog volumes (Files API) and DBFS, on the tenant's blob
-  `{workspace_url, auth: pat|oauth_m2m, token | client_id+client_secret, warehouse_id?}`.
-  `workspace_url` must be a Databricks host (cloud.databricks.com, azuredatabricks.net,
-  gcp.databricks.com). Files carry version markers `modified_time`, `etag`, `sha256`. A missing or
-  malformed blob fails closed ("Databricks is not configured", no request). Setup and the exact secret:
-  `connectors/databricks/README.md`.
+  Unity Catalog volumes (Files API) and, when the blob says `"dbfs": true`, DBFS, on the tenant's blob
+  `{workspace_url, auth: pat|oauth_m2m, token | client_id+client_secret, warehouse_id?, dbfs?}`.
+  `workspace_url` must be a Databricks workspace host (cloud.databricks.com, azuredatabricks.net,
+  gcp.databricks.com; not the `accounts.` consoles). Files carry version markers `modified_time`, `etag`,
+  `sha256`. A missing or malformed blob fails closed ("Databricks is not configured", no request). DBFS
+  has no Unity Catalog grants (its root and mounts are readable by every workspace user), so a `dbfs:/`
+  path is refused (`forbidden`; 422 in the source) before any request unless the blob enables it. Setup,
+  the exact secret and how it reaches the service on ECS and EKS: `connectors/databricks/README.md`.
   - SQL runs only if a lexer and a parser (sqlglot, `sqlglot>=26.25,<28`, the extra's only dependency,
     the specifier every sqlglot extra shares; CI runs the suite at the floor) both accept ONE SELECT/WITH,
-    before any HTTP call. The lexer reads the text as Spark does and refuses where readers disagree: a
-    backslash before a `--` comment's line break (Spark continues the comment there), a bare CR ending one,
-    a `/*` inside a block comment (Spark nests them), a quoted token whose end depends on backslash escapes
-    (Spark takes them in `'...'` and `"..."`, never in backticks), `${`, and non-ASCII outside quotes.
-    Hint contents are read as tokens. Both layers refuse calls of `http_request`, `remote_query`,
-    `reflect`/`java_method`, `secret`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`. Tests pin
-    what only one layer catches, so dropping either fails the suite. The parser runs inside core's
+    before any HTTP call. Each refuses every write on its own: a fuzz runs each layer alone against a
+    reference reading of Spark's lexer. The lexer reads the text as Spark does and refuses where readers
+    disagree: a comment ending in a backslash (Spark continues a `--` comment past one at its line break),
+    a bare CR ending one, a `/*` inside a block comment (Spark nests them), a quoted token whose end
+    depends on backslash escapes (Spark takes them in `'...'` and `"..."`, never in backticks), `${`, `$`
+    outside quotes (Databricks reads `$$...$$` as text in places), and non-ASCII outside quotes. Hint
+    contents are read as tokens. The parser first refuses where sqlglot's tokens read unlike Spark's: a
+    comment ending in a backslash, a `/*+` that is not a plain hint right after SELECT (sqlglot reads
+    one elsewhere as a comment, and nests one inside a comment), `{#` (a Jinja comment to sqlglot), `*`
+    right before `/` (one token in Spark), a `"..."` string whose end depends on escapes, `${`, non-ASCII
+    outside quotes. Both layers refuse calls of `http_request`, `remote_query`, `reflect`/`java_method`,
+    `secret`, `list_secrets`, `vector_search`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`,
+    naming the function by its canonical name only. Tests pin what only one layer catches (none of it a
+    write in Spark's reading), so dropping either fails the suite. The parser runs inside core's
     `quiet_sqlglot()`, so no SQL reaches a log, and below sqlglot 26.25 nothing runs.
   - The statement deadline (`timeout_seconds` up to 120, or the host's budget) bounds every request. Up to
-    55 s left, one synchronous call with `wait_timeout` 5 s under what is left, a read timeout 5 s over it,
-    and `on_wait_timeout: CANCEL`, so the warehouse cancels it even when its answer is lost. Beyond that, an
-    asynchronous submit (`0s`) returns the `statement_id` at once, and polling cancels at the deadline,
-    a failed poll included. A row cap and an 8 MiB byte cap.
+    55 s left, one synchronous call with `on_wait_timeout: CANCEL`, so the warehouse cancels it even when
+    its answer is lost: `wait_timeout` 5 s under what is left and a read timeout 5 s over it, or, under
+    10 s, `wait_timeout` 5 s and a read timeout of what is left (a host budget under 6 s included, so a
+    lost answer still ends 5 s after the submit). Beyond 55 s, an asynchronous submit (`0s`) returns the
+    `statement_id` at once, and polling cancels at the deadline, a failed poll included. A row cap and an
+    8 MiB byte cap.
+  - The host's budget bounds file reads too: every request (the OAuth token's, each 1 MB DBFS read)
+    gets at most the time left and none is sent once it is spent, and a volume download is read one
+    socket read at a time (urllib3 2's `read1`), each with the time left as its socket timeout (between
+    64 KiB chunks on urllib3 1.26).
   - The source raises `PipelineError` (502) for upstream and transient failures and
     `DatabricksRequestError` (a `ValueError`, 422) for a missing path or a 400, without Databricks's text.
     It holds about two files at a time (one buffer per download), with `max_bytes` at most 64 MiB:

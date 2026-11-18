@@ -20,6 +20,12 @@ The blob is one JSON object (see the README for the Secrets Manager name)::
   memory until five minutes before it expires).
 * ``warehouse_id`` (optional) is the SQL warehouse SQL runs on; without it
   ``DATABRICKS_RUN_SELECT`` is "not configured".
+* ``dbfs`` (optional, default false): true lets the tools and the source read
+  ``dbfs:/`` paths. DBFS has no Unity Catalog grants: its root and every mount
+  are readable by every workspace user (a mount with its own credentials)
+  unless a workspace admin has disabled them, so the grants a volume-only
+  tenant gave the principal don't bound it. Off, a ``dbfs:/`` path is refused
+  before any request.
 
 Anything missing or malformed raises :class:`DatabricksNotConfigured` with a
 reason that never contains a secret, and no request is made. Ambient
@@ -40,9 +46,11 @@ from urllib.parse import urlsplit
 
 import requests
 
-#: The workspace hosts Databricks serves: AWS, Azure and GCP.
+#: The workspace hosts Databricks serves: AWS, Azure and GCP. Not the
+#: account consoles (``accounts.cloud.databricks.com`` and its Azure and GCP
+#: twins): they are Databricks's, but no workspace.
 WORKSPACE_HOST = re.compile(
-    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"^(?!accounts\.)(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
     r"\.(?:cloud\.databricks\.com|azuredatabricks\.net|gcp\.databricks\.com)$"
 )
@@ -52,7 +60,15 @@ _REFRESH_SKEW_SECONDS = 300.0
 
 #: The blob's keys. They are server-controlled: a caller may set none of them.
 SERVER_KEYS = frozenset(
-    {"workspace_url", "auth", "token", "client_id", "client_secret", "warehouse_id"}
+    {
+        "workspace_url",
+        "auth",
+        "token",
+        "client_id",
+        "client_secret",
+        "warehouse_id",
+        "dbfs",
+    }
 )
 
 
@@ -82,6 +98,8 @@ class DatabricksCredentials:
     client_id: str | None = None
     client_secret: str | None = field(default=None, repr=False)
     warehouse_id: str | None = None
+    #: Whether ``dbfs:/`` paths may be read (the blob's ``dbfs``).
+    dbfs: bool = False
 
     @property
     def base_url(self) -> str:
@@ -151,9 +169,16 @@ def load_credentials(config: Any) -> DatabricksCredentials:
         warehouse = None
     elif not isinstance(warehouse, str) or not _WAREHOUSE_ID.match(warehouse):
         raise DatabricksNotConfigured("warehouse_id must be a SQL warehouse id")
+    dbfs = config.get("dbfs", False)
+    if not isinstance(dbfs, bool):
+        raise DatabricksNotConfigured("dbfs must be true or false")
     if auth == "pat":
         return DatabricksCredentials(
-            host=host, auth=auth, token=_secret(config, "token"), warehouse_id=warehouse
+            host=host,
+            auth=auth,
+            token=_secret(config, "token"),
+            warehouse_id=warehouse,
+            dbfs=dbfs,
         )
     return DatabricksCredentials(
         host=host,
@@ -161,6 +186,7 @@ def load_credentials(config: Any) -> DatabricksCredentials:
         client_id=_secret(config, "client_id"),
         client_secret=_secret(config, "client_secret"),
         warehouse_id=warehouse,
+        dbfs=dbfs,
     )
 
 

@@ -3,8 +3,8 @@
 ``config`` is the tenant's credential blob (:mod:`.credentials`). Pull params
 pick the files, never the credential, the host or the warehouse:
 
-* ``path`` (required): a directory (``/Volumes/<catalog>/<schema>/<volume>/...``
-  or ``dbfs:/...``) or one file;
+* ``path`` (required): a directory (``/Volumes/<catalog>/<schema>/<volume>/...``,
+  or ``dbfs:/...`` when the credential says ``"dbfs": true``) or one file;
 * ``recursive`` (default false): walk sub-directories too (at most
   ``MAX_DEPTH`` levels);
 * ``modified_after`` (optional, RFC 3339): only files modified after it;
@@ -157,6 +157,12 @@ class DatabricksFilesSource(SourceConnector):
         "warehouse_id": MetaField(
             type=str, required=False, description="SQL warehouse id (toolkit SQL only)"
         ),
+        "dbfs": MetaField(
+            type=bool,
+            required=False,
+            default=False,
+            description="true: dbfs:/ paths may be read (server-side only)",
+        ),
     }
 
     metadata_spec = {  # noqa: RUF012
@@ -220,7 +226,7 @@ class DatabricksFilesSource(SourceConnector):
     ) -> Iterator[DataEnvelope]:
         options = _options(params)
         try:
-            root = parse_path(options.get("path"), directory=True)
+            root = parse_path(options.get("path"), directory=True, dbfs=creds.dbfs)
         except BadPath as e:
             raise ValueError(str(e)) from None
         recursive = options.get("recursive", False)

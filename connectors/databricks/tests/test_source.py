@@ -86,7 +86,7 @@ def test_pull_recursive_dbfs_modified_after_and_limits():
     small = _pull(fake, {"path": VOL, "max_bytes": 16})
     assert f"{VOL}/big.bin" not in [e.metadata["path"] for e in small]
     assert len(_pull(fake, {"path": VOL, "max_files": 1})) == 1
-    dbfs = _pull(fake, {"path": "dbfs:/mnt/policies"}, m2m_blob())
+    dbfs = _pull(fake, {"path": "dbfs:/mnt/policies"}, m2m_blob(dbfs=True))
     assert [(e.metadata["path"], e.data) for e in dbfs] == [
         ("dbfs:/mnt/policies/e.txt", b"dbfs e")
     ]
@@ -100,6 +100,7 @@ def test_pull_recursive_dbfs_modified_after_and_limits():
         {"path": VOL, "workspace_url": "https://evil.example"},
         {"path": VOL, "token": "dapi-mine"},
         {"path": VOL, "warehouse_id": "x"},
+        {"path": "dbfs:/mnt/policies", "dbfs": True},
         {"path": "/Workspace/Users/someone"},
         {"path": "dbfs:/mnt/../etc"},
         {},
@@ -112,7 +113,22 @@ def test_pull_recursive_dbfs_modified_after_and_limits():
 def test_params_cannot_override_server_keys_or_leave_volumes_and_dbfs(params):
     fake = _fake()
     with pytest.raises(ValueError):
-        _pull(fake, params)
+        _pull(fake, params, pat_blob(dbfs=True))
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("config", [pat_blob(), pat_blob(dbfs=False)])
+@pytest.mark.parametrize(
+    "path", ["dbfs:/", "dbfs:/mnt/policies", "dbfs:/mnt/policies/e.txt"]
+)
+def test_dbfs_is_refused_unless_the_credential_enables_it(config, path):
+    """DBFS has no Unity Catalog grants (its root and mounts are readable by
+    every workspace user), so a volume-only tenant's blob can't be read
+    through it: a 422 before any request (seq 13990 m4)."""
+    fake = _fake()
+    with pytest.raises(ValueError, match='no "dbfs": true') as caught:
+        _pull(fake, {"path": path}, config)
+    assert host_answer(caught.value).status == 422
     assert fake.requests == []
 
 

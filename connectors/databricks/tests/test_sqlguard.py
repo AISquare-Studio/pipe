@@ -131,12 +131,18 @@ def test_the_lexer_alone_refuses_the_reopen_payloads(sql):
         check_select_only(sql)
 
 
+@pytest.mark.parametrize("sql", REOPEN_PAYLOADS.values(), ids=REOPEN_PAYLOADS)
+def test_the_parser_alone_refuses_the_reopen_payloads(sql):
+    """FAIL 1 included: at 810abb2 only the lexer refused it (seq 13990 m1)."""
+    assert sqlguard._parsed(sql) is not None
+
+
 @pytest.mark.parametrize(
     ("sql", "why"),
     [
-        ("SELECT 1 -- \\\nFROM t", "backslash before its line break"),
-        ("SELECT 1 -- \\\r\nFROM t", "backslash before its line break"),
-        ("SELECT 1 --\\\n, 2", "backslash before its line break"),
+        ("SELECT 1 -- \\\nFROM t", "ends in a backslash"),
+        ("SELECT 1 -- \\\r\nFROM t", "ends in a backslash"),
+        ("SELECT 1 --\\\n, 2", "ends in a backslash"),
         ("SELECT 1 -- x\r, 2", "bare CR"),
         ("SELECT 1 /* a /* b */ c */", r"/\* inside a /\* \*/"),
         ("SELECT 1 /* a /*/ FROM t", r"/\* inside a /\* \*/"),
@@ -157,7 +163,26 @@ def test_line_comments_end_at_cr_lf_and_hide_nothing():
         check_select_only("SELECT 1 -- note\r\nFROM t") == "SELECT 1 -- note\r\nFROM t"
     )
     assert check_select_only("SELECT 1 -- a \\ in a comment\nFROM t")
-    assert check_select_only("SELECT 1 -- ends the text \\")
+    assert check_select_only("SELECT 1 -- a backslash, then a space \\ \nFROM t")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT 1 -- \\\nFROM t",
+        "SELECT 1 -- \\\r\nFROM t",
+        "SELECT 1 -- ends the text \\",
+        "SELECT 1 /* a \\*/ FROM t",
+        "SELECT 1 /* a\nb \\*/",
+    ],
+)
+def test_no_comment_may_end_in_a_backslash_in_either_layer(sql):
+    """Spark carries a -- comment on past a backslash right before its LF.
+    sqlglot's reading of a comment doesn't say where it ended, so the parser
+    refuses any comment that ends in a backslash, and the lexer the same,
+    either kind, at a line break or at the end of the text."""
+    assert "ends in a backslash" in (sqlguard._lexical(sql) or "")
+    assert "ends in a backslash" in (sqlguard._parsed(sql) or "")
 
 
 def test_quotes_read_one_way_whatever_the_reader():
@@ -169,18 +194,67 @@ def test_quotes_read_one_way_whatever_the_reader():
         assert check_select_only(sql) == sql
 
 
+#: Where sqlglot's reading and Spark's differ, the parser refuses on its own
+#: (seq 13990 m1: at 810abb2 the lexer alone refused the first two).
+THE_PARSER_ALONE_REFUSES = [
+    (REOPEN_PAYLOADS["backslash_lf_continues_the_comment"], "ends in a backslash"),
+    ("SELECT `a` -- \\\n, `b` FROM t", "ends in a backslash"),
+    ("SELECT '${env:HOME}'", r"\$\{"),
+    ("SELECT 1 -- ${x}", r"\$\{"),
+    # Spark reads a hint's insides as tokens wherever it stands: here ';' and
+    # DROP. sqlglot reads a /*+ that is not right after SELECT as a comment.
+    ("SELECT 1 /*+ ; DROP x */", "not right after SELECT"),
+    ("SELECT 1 /*+ DELETE */", "not right after SELECT"),
+    # sqlglot nests a /*+ inside a comment, Spark doesn't: Spark's comment ends
+    # at the first */, then ; DROP TABLE t.
+    ("SELECT 1 /* a /*+ */ ; DROP TABLE t -- */", "not right after SELECT"),
+    # A hint's insides beyond names and numbers: Spark reads the string first,
+    # so its */ doesn't end the hint (then ; DROP TABLE t); sqlglot ends it there.
+    ("SELECT /*+ x('*/' ; DROP TABLE t ; --') 1", "holds more than names"),
+    # sqlglot reads {# #} as a (Jinja) comment in every dialect.
+    ("SELECT 1 {# ; DROP TABLE t; #}", r"\{#"),
+    # Spark reads */ as one token, so */* opens no comment: ; DROP TABLE t.
+    ("SELECT 2 */* ; DROP TABLE t */ 3", r"\*/ outside a comment"),
+    # Under spark.sql.ansi.doubleQuotedIdentifiers, "..." takes no escapes:
+    # the identifier "\" ends at its second quote.
+    ('SELECT "\\" ; DROP TABLE t ; --"', "backslash in a"),
+    ("SELECT ınsert FROM t", "non-ASCII"),
+]
+
+
+@pytest.mark.parametrize(("sql", "why"), THE_PARSER_ALONE_REFUSES)
+def test_the_parser_alone_refuses_where_sqlglot_reads_unlike_spark(sql, why):
+    assert re.search(why, sqlguard._parsed(sql) or ""), sqlguard._parsed(sql)
+    assert sqlguard._lexical(sql) is not None  # and so does the lexer
+
+
+def test_a_hint_right_after_select_reads_alike_and_passes():
+    for sql in (
+        "SELECT /*+ BROADCAST(t) */ * FROM t",
+        "SELECT /*+ REPARTITION(8, c), COALESCE(2) */ c FROM t",
+        "SELECT * FROM (SELECT /*+ BROADCAST(t) */ * FROM t)",
+        "SELECT '/*+ not a hint */', `{#x#}` FROM t",
+    ):
+        assert check_select_only(sql) == sql
+
+
 # The two layers are composed: each catches what the other admits. A
-# check_select_only that dropped either one fails here.
+# check_select_only that dropped either one fails here. None of these is a
+# write in Spark's reading: each layer refuses every write on its own (the
+# fuzzes below run each layer alone).
 ONLY_THE_LEXER_REFUSES = [
-    REOPEN_PAYLOADS["backslash_lf_continues_the_comment"],
-    "SELECT 1 /*+ DELETE */",  # sqlglot reads a hint here as a comment
-    "SELECT '${env:HOME}'",
-    "SELECT `a` -- \\\n, `b` FROM t",
+    "SELECT $1",  # sqlglot reads $ as a parameter; Databricks $$...$$ as text
+    "SELECT a$b FROM t",
+    "SELECT 1 /* a /* b */ c */",  # Spark and sqlglot nest; other readers don't
+    "SELECT 1 -- x\r, 2",  # Spark and sqlglot end it at the bare CR
+    "SELECT 'a\\'b' FROM t",  # Spark and sqlglot take the \' escape
+    "SELECT 'a\u2028b'",  # an LS, in a string
 ]
 ONLY_THE_PARSER_REFUSES = [
     "SELECT * FROM t FOR SHARE",  # a row lock: no write word to see
     "SELECT (",
     "SELECT * FROM t WHERE",
+    "SELECT /*+ SKEW('t') */ * FROM t",  # a hint with a string in it
 ]
 
 
@@ -190,6 +264,11 @@ def test_what_only_the_lexer_refuses_is_refused(sql):
     assert sqlguard._lexical(sql) is not None
     with pytest.raises(NotReadOnly):
         check_select_only(sql)
+
+
+@pytest.mark.parametrize("sql", ONLY_THE_LEXER_REFUSES + ONLY_THE_PARSER_REFUSES)
+def test_what_only_one_layer_refuses_is_no_write_in_sparks_reading(sql):
+    assert not _spark_sees_a_write(sql)
 
 
 @pytest.mark.parametrize("sql", ONLY_THE_PARSER_REFUSES)
@@ -222,6 +301,9 @@ def test_check_select_only_runs_both_layers(monkeypatch):
 
 
 SIDE_EFFECTS = [
+    "SELECT * FROM list_secrets()",
+    "SELECT * FROM `list_secrets`()",
+    "SELECT * FROM vector_search(index => 'main.p.idx', query_text => 'x', num_results => 5)",
     "SELECT http_request(conn => 'c', method => 'POST', path => '/x')",
     "SELECT * FROM remote_query('c', query => 'DELETE FROM x')",
     "SELECT reflect('java.lang.Thread', 'sleep', 1000L)",
@@ -247,6 +329,22 @@ def test_side_effect_calls_are_refused_by_each_layer(sql):
     assert sqlguard._parsed(sql) is not None
 
 
+@pytest.mark.parametrize(
+    ("sql", "label"),
+    [
+        ("SELECT ai_member_ssn_123456789(x) FROM t", "AI_* function"),
+        ("SELECT `ai_member_ssn_123456789`(x) FROM t", "AI_* function"),
+        ("SELECT `system`.`builtin`.`ReFlect`('a', 'b')", "REFLECT"),
+        ("SELECT * FROM List_Secrets()", "LIST_SECRETS"),
+    ],
+)
+def test_a_refused_call_is_named_by_its_canonical_name_only(sql, label):
+    """The caller's spelling is caller text (seq 13990 n2)."""
+    for message in (sqlguard._lexical(sql), sqlguard._parsed(sql)):
+        assert message is not None and message.endswith(label), message
+        assert "SSN" not in message.upper() and "ReFlect" not in message
+
+
 def test_names_like_side_effect_functions_are_fine_when_not_called():
     sql = "SELECT secret, ai_score, identifier, transform(a, x -> x + 1) FROM t"
     assert check_select_only(sql) == sql
@@ -263,11 +361,20 @@ def test_names_like_side_effect_functions_are_fine_when_not_called():
         ("SELECT 1\x00", "control character"),
         ("SELECT 'a\u2028b'", "NEL, LS, PS"),
         ("SELECT 1 \\ 2", "backslash outside quotes"),
+        ("SELECT $1", r"a \$ outside quotes"),
+        ("SELECT $$x$$", r"a \$ outside quotes"),
+        ("SELECT x FROM t WHERE y = $p", r"a \$ outside quotes"),
+        ("SELECT /*+ $x */ 1", r"a \$ outside quotes"),
         ("SELECT /*+ x */* ; DROP TABLE t; */ 1", "more than one statement"),
     ],
 )
 def test_the_lexer_refuses_what_spark_reads_another_way(sql, why):
     assert re.search(why, sqlguard._lexical(sql) or "")
+
+
+def test_a_dollar_in_strings_and_comments_is_fine():
+    sql = "SELECT '$5' AS price, `cost$` FROM t -- costs $5"
+    assert check_select_only(sql) == sql
 
 
 def test_non_ascii_text_in_strings_and_comments_is_fine():
@@ -511,3 +618,38 @@ def test_whatever_the_lexer_admits_spark_reads_as_one_statement_without_a_write(
             admitted += 1
             assert not _spark_sees_a_write(sql), repr(sql)
     assert checked > 430_000 and admitted > 10_000
+
+
+#: The parser's alphabet: the lexer's, plus what only sqlglot reads apart
+#: (``{#``, a bare ``*`` before ``/``) and CRLF, a hint that passes, and a
+#: string holding ``*/``.
+PARSER_PIECES = [*PIECES, "*", "{#", "#}", "\r\n", "'*/'", "/*+ x */"]
+PARSER_LONG_PIECES = [*LONG_PIECES, "*", "{#", "/*+", "r", "\r"]
+
+
+def test_whatever_the_parser_admits_spark_reads_as_one_statement_without_a_write():
+    """The parser ALONE (the lexer is not consulted), on every "SELECT 1 " +
+    up to four pieces of its alphabet and 200,000 seeded random strings of
+    five to eight longer pieces: whatever Spark's reading finds a write in
+    (a DROP, or anything after a ';'), the parser refuses. At 810abb2 it
+    admitted the FAIL 1 shape, a /*+ hint not right after SELECT, a /*+
+    nested in a comment, {# #} and */* (seq 13990 m1)."""
+    checked = writes = 0
+    for count in range(1, 5):
+        for pieces in itertools.product(PARSER_PIECES, repeat=count):
+            sql = "SELECT 1 " + "".join(pieces)
+            checked += 1
+            if _spark_sees_a_write(sql):
+                writes += 1
+                assert sqlguard._parsed(sql) is not None, repr(sql)
+    rng = random.Random(1399)
+    for _ in range(200_000):
+        count = rng.randint(5, 8)
+        sql = "SELECT 1 " + "".join(
+            rng.choice(PARSER_LONG_PIECES) for _ in range(count)
+        )
+        checked += 1
+        if _spark_sees_a_write(sql):
+            writes += 1
+            assert sqlguard._parsed(sql) is not None, repr(sql)
+    assert checked > 300_000 and writes > 20_000

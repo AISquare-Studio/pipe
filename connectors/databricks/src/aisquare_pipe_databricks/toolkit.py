@@ -49,6 +49,7 @@ from aisquare_pipe_databricks.credentials import (
 )
 from aisquare_pipe_databricks.files import (
     BadPath,
+    DbfsNotEnabled,
     file_envelope,
     file_metadata,
     list_entries,
@@ -118,7 +119,8 @@ LIST_FILES = ToolSpec(
     slug="DATABRICKS_LIST_FILES",
     description=(
         "List the files and folders in a Databricks Unity Catalog volume directory "
-        "(/Volumes/<catalog>/<schema>/<volume>/...) or a DBFS directory (dbfs:/...). Returns "
+        "(/Volumes/<catalog>/<schema>/<volume>/...) or, where the workspace enables it, a DBFS "
+        "directory (dbfs:/...). Returns "
         "each entry's path, name, is_directory, size and modified_time (a version marker: it "
         "changes when the file is rewritten). Pass next_page_token back as page_token for "
         "more. Read a file with DATABRICKS_READ_FILE."
@@ -154,8 +156,8 @@ LIST_FILES = ToolSpec(
 READ_FILE = ToolSpec(
     slug="DATABRICKS_READ_FILE",
     description=(
-        "Read one file from a Databricks Unity Catalog volume (/Volumes/...) or DBFS "
-        "(dbfs:/...): its bytes (returned as a file; text up to 1 MiB also inline as content) "
+        "Read one file from a Databricks Unity Catalog volume (/Volumes/...) or, where the "
+        "workspace enables it, DBFS (dbfs:/...): its bytes (returned as a file; text up to 1 MiB also inline as content) "
         "plus size, content_type and the version markers modified_time, etag and sha256, "
         "which change when the file is edited. include_content=false reads the metadata only, "
         "e.g. to check whether a policy document changed."
@@ -530,9 +532,9 @@ class DatabricksToolkit(Toolkit):
         ) as client:
             try:
                 if tool.slug == READ_FILE.slug:
-                    return self._read(client, arguments)
+                    return self._read(client, creds, arguments)
                 if tool.slug == LIST_FILES.slug:
-                    return self._list(client, arguments)
+                    return self._list(client, creds, arguments)
                 if tool.slug == RUN_SELECT.slug:
                     return self._select(client, creds, arguments, budget)
                 if tool.slug == LIST_CATALOGS.slug:
@@ -546,14 +548,21 @@ class DatabricksToolkit(Toolkit):
                         "schema_name": _name(arguments, "schema_name"),
                     }
                     return self._catalog(client, "tables", scope, arguments)
+            except DbfsNotEnabled as e:
+                raise ToolError(str(e), code=ERROR_FORBIDDEN) from None
             except BadPath as e:
                 raise ToolError(str(e), code=ERROR_INVALID_ARGUMENTS) from None
             except DatabricksAPIError as e:
                 return failure(e)
         raise ToolError(f"{tool.slug} is not implemented")
 
-    def _read(self, client: DatabricksClient, arguments: dict[str, Any]) -> ToolResult:
-        where = parse_path(arguments["path"])
+    def _read(
+        self,
+        client: DatabricksClient,
+        creds: DatabricksCredentials,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        where = parse_path(arguments["path"], dbfs=creds.dbfs)
         max_bytes = _int(arguments, "max_bytes", 1, MAX_FILE_BYTES)
         if arguments.get("include_content") is False:
             return ToolResult.ok(file_metadata(client, where))
@@ -579,8 +588,13 @@ class DatabricksToolkit(Toolkit):
             ],
         )
 
-    def _list(self, client: DatabricksClient, arguments: dict[str, Any]) -> ToolResult:
-        where = parse_path(arguments["path"], directory=True)
+    def _list(
+        self,
+        client: DatabricksClient,
+        creds: DatabricksCredentials,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        where = parse_path(arguments["path"], directory=True, dbfs=creds.dbfs)
         page_size = _int(arguments, "page_size", 1, MAX_PAGE_SIZE)
         entries, token = list_entries(
             client,

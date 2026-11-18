@@ -19,6 +19,19 @@ token. Redirects are never followed. Downloads stop at ``max_bytes`` and
 accumulate in one buffer. Error messages never carry a secret; a
 :class:`DatabricksAPIError`'s ``summary`` carries none of Databricks's own
 text either.
+
+Time budget: with ``budget`` (seconds; the host's ``config["timeout_seconds"]``)
+the whole call fits inside it, from the client's creation on. Every request,
+the OAuth token's included, gets at most the time left as its timeout, and a
+request with no time left (under :data:`MIN_REQUEST_TIMEOUT`) fails
+``timed_out`` before it is sent. So a DBFS read, 1 MB a request, stops at the
+deadline. requests' timeout bounds each connect and each socket read, not a
+whole body, so a volume download also checks the deadline before every read:
+with urllib3 2 each read is ONE socket read (``read1``), sent with the time
+left as its socket timeout, so a body that trickles in still stops by the
+deadline; with urllib3 1.26 (no ``read1``), the deadline is checked between
+64 KiB chunks. A statement's own deadline (:meth:`DatabricksClient.run_statement`)
+is cut to the budget too.
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ import base64
 import binascii
 import io
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, Self
 from urllib.parse import quote
 
@@ -107,8 +120,10 @@ def files_path(path: str) -> str:
 class DatabricksClient:
     """One credential's view of its workspace. Use it as a context manager: a
     session it opened itself is closed on exit; a passed-in ``session`` (tests,
-    or a host that pools connections) is left open. ``clock`` and ``sleep``
-    drive statement polling (tests replace them)."""
+    or a host that pools connections) is left open. ``timeout`` bounds each
+    request; ``budget`` (None: unbounded) bounds the whole call, every request
+    together (the module docstring says how). ``clock`` (the budget's and
+    statement polling's) and ``sleep`` are replaced by tests."""
 
     def __init__(
         self,
@@ -123,9 +138,11 @@ class DatabricksClient:
         self._creds = credentials
         self._own_session = session is None
         self._session = session if session is not None else requests.Session()
-        self._timeout = timeout if budget is None else max(0.1, min(timeout, budget))
+        self._timeout = timeout
         self._clock = clock
         self._sleep = sleep
+        self.budget = budget if budget is not None and budget > 0 else None
+        self._deadline = None if self.budget is None else clock() + self.budget
         self._token: str | None = None
 
     def __enter__(self) -> Self:
@@ -134,6 +151,32 @@ class DatabricksClient:
     def __exit__(self, *exc: object) -> None:
         if self._own_session:
             self._session.close()
+
+    # -- the time budget -------------------------------------------------------------
+
+    def remaining(self) -> float | None:
+        """Seconds left in the budget (None: unbounded)."""
+        if self._deadline is None:
+            return None
+        return self._deadline - self._clock()
+
+    def _out_of_time(self) -> DatabricksAPIError:
+        return DatabricksAPIError(
+            f"the Databricks call ran out of its {self.budget:g}s time budget",
+            timed_out=True,
+        )
+
+    def _fitted(self, timeout: float | None) -> float:
+        """A request's timeout: ``timeout`` (None: the client's), cut to what is
+        left of the budget. With less than :data:`MIN_REQUEST_TIMEOUT` left,
+        a timed-out :class:`DatabricksAPIError` instead: nothing is sent."""
+        wanted = self._timeout if timeout is None else timeout
+        remaining = self.remaining()
+        if remaining is None:
+            return wanted
+        if remaining < MIN_REQUEST_TIMEOUT:
+            raise self._out_of_time()
+        return min(wanted, remaining)
 
     # -- Files API (Unity Catalog volumes) ------------------------------------------
 
@@ -163,7 +206,7 @@ class DatabricksClient:
         try:
             buffer = io.BytesIO()
             total = 0
-            for chunk in resp.iter_content(_STREAM_CHUNK):
+            for chunk in self._body(resp):
                 total += len(chunk)
                 if total > max_bytes:
                     raise FileTooLarge(f"{path} is larger than {max_bytes} bytes")
@@ -175,6 +218,28 @@ class DatabricksClient:
             raise _transport_error(e) from e
         finally:
             resp.close()
+
+    def _body(self, resp: Any) -> Iterator[bytes]:
+        """A streamed body, read by read, within the budget (the module
+        docstring says how). Without a budget, requests' chunks."""
+        raw = getattr(resp, "raw", None)
+        read1 = getattr(raw, "read1", None)
+        if self._deadline is None or not callable(read1):
+            for chunk in resp.iter_content(_STREAM_CHUNK):
+                if self._deadline is not None and self._clock() >= self._deadline:
+                    raise self._out_of_time()
+                yield chunk
+            return
+        sock = getattr(getattr(raw, "connection", None), "sock", None)
+        settimeout = getattr(sock, "settimeout", None)
+        while True:
+            timeout = self._fitted(None)
+            if callable(settimeout):
+                settimeout(timeout)
+            chunk = read1(_STREAM_CHUNK, decode_content=True)
+            if not chunk:
+                return
+            yield chunk
 
     # -- DBFS ----------------------------------------------------------------------------
 
@@ -224,24 +289,30 @@ class DatabricksClient:
         schema: str | None = None,
     ) -> dict[str, Any]:
         """Run one statement (already checked SELECT-only) and wait for it, at
-        most ``deadline_seconds`` from now, the OAuth token included. Every
-        request's timeout fits what is left; past the deadline the statement
-        is cancelled and a timed-out :class:`DatabricksAPIError` raised.
+        most ``deadline_seconds`` from now (never past the client's budget),
+        the OAuth token included. Every request's timeout fits what is left;
+        past the deadline the statement is cancelled and a timed-out
+        :class:`DatabricksAPIError` raised.
 
-        * With 6 to 55 s left (:data:`API_MIN_WAIT` + 1 to
-          :data:`API_MAX_WAIT` + :data:`ANSWER_SLACK`), one synchronous call:
-          ``wait_timeout`` is what is left less ``ANSWER_SLACK`` (5 to 50 s),
-          the HTTP read timeout is ``wait_timeout`` + ``ANSWER_SLACK`` (never
-          past what is left), and ``on_wait_timeout`` is ``CANCEL``. So the
+        * With up to 55 s left (:data:`API_MAX_WAIT` + :data:`ANSWER_SLACK`),
+          one synchronous call with ``on_wait_timeout`` ``CANCEL``, so the
           warehouse cancels the statement itself at ``wait_timeout``, even if
-          its answer never arrives (a client timeout).
-        * Otherwise (``timeout_seconds`` above 55, or a host budget under
-          6 s), asynchronously: ``wait_timeout`` ``0s`` answers at once with
-          the ``statement_id``, which is polled until the statement ends and
-          cancelled when the deadline comes (:data:`CANCEL_RESERVE` is kept
-          back for the cancel). A poll that fails or times out cancels it too.
+          its answer never arrives (a client timeout). ``wait_timeout`` is
+          what is left less ``ANSWER_SLACK`` (5 to 50 s) and the HTTP read
+          timeout ``wait_timeout`` + ``ANSWER_SLACK``, never past what is
+          left. Under 10 s left, ``wait_timeout`` is the API's least, 5 s,
+          and the read timeout is what is left: the client may give up
+          first, and the statement still ends 5 s after it was sent.
+        * With more (``timeout_seconds`` above 55), asynchronously:
+          ``wait_timeout`` ``0s`` answers at once with the ``statement_id``,
+          which is polled until the statement ends and cancelled when the
+          deadline comes (:data:`CANCEL_RESERVE` is kept back for the
+          cancel). A poll that fails or times out cancels it too.
         """
         started = self._clock()
+        budget_left = self.remaining()
+        if budget_left is not None:
+            deadline_seconds = min(deadline_seconds, budget_left)
 
         def left() -> float:
             return deadline_seconds - (self._clock() - started)
@@ -254,7 +325,11 @@ class DatabricksClient:
                 f"the statement could not start within {deadline_seconds:g}s",
                 timed_out=True,
             )
-        synchronous = API_MIN_WAIT + 1 <= remaining <= API_MAX_WAIT + ANSWER_SLACK
+        # Up to 55 s, synchronous: the warehouse cancels the statement itself
+        # at wait_timeout, answered or not. Under 10 s that is 5 s (the API's
+        # least) with a read timeout of what is left: the client may give up
+        # first, and the statement still ends 5 s after it was sent.
+        synchronous = remaining <= API_MAX_WAIT + ANSWER_SLACK
         body: dict[str, Any] = {
             "statement": statement,
             "warehouse_id": warehouse_id,
@@ -359,9 +434,7 @@ class DatabricksClient:
         if self._token is None:
             try:
                 self._token = bearer_token(
-                    self._creds,
-                    self._session,
-                    timeout=self._timeout if timeout is None else timeout,
+                    self._creds, self._session, timeout=self._fitted(timeout)
                 )
             except DatabricksTokenError as e:
                 raise DatabricksAPIError(
@@ -382,6 +455,7 @@ class DatabricksClient:
         timeout: float | None = None,
     ) -> Any:
         headers = {"Accept": "application/json", **self._auth(timeout=timeout)}
+        sent_with = self._fitted(timeout)
         try:
             resp = self._session.request(
                 method,
@@ -389,7 +463,7 @@ class DatabricksClient:
                 params=params,
                 json=body,
                 headers=headers,
-                timeout=self._timeout if timeout is None else timeout,
+                timeout=sent_with,
                 allow_redirects=False,
                 stream=stream,
             )

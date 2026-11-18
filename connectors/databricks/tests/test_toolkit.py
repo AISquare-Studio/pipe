@@ -69,7 +69,10 @@ def test_read_a_volume_file_with_its_version_markers():
 
 def test_read_a_dbfs_file_across_reads():
     result = _call(
-        _fake(), "DATABRICKS_READ_FILE", {"path": "dbfs:/mnt/policies/a.txt"}
+        _fake(),
+        "DATABRICKS_READ_FILE",
+        {"path": "dbfs:/mnt/policies/a.txt"},
+        pat_blob(dbfs=True),
     )
     assert result.successful, result.error
     assert result.files[0].data == b"dbfs text body"
@@ -112,7 +115,12 @@ def test_list_files_pages_and_marks_directories():
         "travel.txt": False,
     }
     assert all(e["modified_time"] for e in entries if not e["is_directory"])
-    dbfs = _call(fake, "DATABRICKS_LIST_FILES", {"path": "dbfs:/mnt/policies"}).data
+    dbfs = _call(
+        fake,
+        "DATABRICKS_LIST_FILES",
+        {"path": "dbfs:/mnt/policies"},
+        pat_blob(dbfs=True),
+    ).data
     assert [e["path"] for e in dbfs["entries"]] == ["dbfs:/mnt/policies/a.txt"]
 
 
@@ -128,9 +136,41 @@ def test_list_files_pages_and_marks_directories():
 )
 def test_paths_outside_volumes_and_dbfs_are_refused_without_a_request(path):
     fake = _fake()
-    result = _call(fake, "DATABRICKS_READ_FILE", {"path": path})
+    result = _call(fake, "DATABRICKS_READ_FILE", {"path": path}, pat_blob(dbfs=True))
     assert not result.successful and result.error_code == "invalid_arguments"
     assert fake.api_calls() == []
+
+
+@pytest.mark.parametrize("config", [pat_blob(), pat_blob(dbfs=False)])
+@pytest.mark.parametrize(
+    ("slug", "path"),
+    [
+        ("DATABRICKS_READ_FILE", "dbfs:/mnt/policies/a.txt"),
+        ("DATABRICKS_LIST_FILES", "dbfs:/"),
+        ("DATABRICKS_LIST_FILES", "dbfs:/mnt/policies"),
+    ],
+)
+def test_dbfs_is_forbidden_unless_the_credential_enables_it(config, slug, path):
+    """DBFS has no Unity Catalog grants: its root and every mount are
+    readable by every workspace user. So it is off unless the tenant's blob
+    says "dbfs": true, and a volume-only tenant can't be read through it
+    (seq 13990 m4)."""
+    fake = _fake()
+    result = _call(fake, slug, {"path": path}, config)
+    assert not result.successful and result.error_code == "forbidden"
+    assert 'no "dbfs": true' in (result.error or "")
+    assert fake.requests == []
+
+
+@pytest.mark.parametrize("flag", ["true", 1, "yes", None])
+def test_a_dbfs_flag_that_is_not_a_boolean_is_not_configured(flag):
+    fake = _fake()
+    result = _call(
+        fake, "DATABRICKS_READ_FILE", {"path": f"{VOL}/travel.txt"}, pat_blob(dbfs=flag)
+    )
+    assert not result.successful and result.error_code == "not_connected"
+    assert "dbfs must be true or false" in (result.error or "")
+    assert fake.requests == []
 
 
 @pytest.mark.parametrize(
@@ -142,6 +182,7 @@ def test_paths_outside_volumes_and_dbfs_are_refused_without_a_request(path):
         ),
         ("DATABRICKS_READ_FILE", {"path": f"{VOL}/travel.txt", "token": "dapi-mine"}),
         ("DATABRICKS_RUN_SELECT", {"statement": "SELECT 1", "warehouse_id": "other"}),
+        ("DATABRICKS_LIST_FILES", {"path": "dbfs:/mnt/policies", "dbfs": True}),
     ],
 )
 def test_a_caller_cannot_override_a_server_key(slug, arguments):

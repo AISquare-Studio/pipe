@@ -13,6 +13,11 @@ cancelled by the warehouse (CANCEL); and a hold longer than the request's
 ``timeout`` raises ``requests.ReadTimeout`` after ``timeout``, with the
 statement still running (or cancelled at ``wait_timeout``, under CANCEL), as
 a real client would see it. ``running()`` lists what is still running.
+
+With a :class:`Clock`, file reads take time too: each DBFS read takes
+``dbfs_read_seconds`` (a ``ReadTimeout`` after the request's ``timeout`` when
+that is shorter), and a volume download set to ``trickle`` sends its body a
+few bytes a read, each read taking that long (:class:`TrickleBody`).
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from typing import Any
 from urllib.parse import unquote
 
 import requests
+import urllib3
 
 HOST = "acme.cloud.databricks.com"
 BASE = f"https://{HOST}"
@@ -133,6 +139,11 @@ class FakeDatabricks:
         self.body_breaks: Exception | None = None
         #: The most a DBFS read returns.
         self.dbfs_read_size = 4
+        #: How long each DBFS read takes, on the clock.
+        self.dbfs_read_seconds = 0.0
+        #: A volume download's body, a read at a time: (bytes a read, seconds
+        #: a read, whether the response has urllib3 2's ``raw.read1``).
+        self.trickle: tuple[int, float, bool] | None = None
         self.volume: dict[str, StoredFile] = {}
         self.dbfs: dict[str, StoredFile] = {}
         self.catalog: dict[str, list[dict[str, Any]]] = {
@@ -174,13 +185,15 @@ class FakeDatabricks:
                 unquote(path[len("/api/2.0/fs/directories") :]), params
             )
         if path.startswith("/api/2.0/fs/files"):
-            return self._file(method, unquote(path[len("/api/2.0/fs/files") :]))
+            return self._file(
+                method, unquote(path[len("/api/2.0/fs/files") :]), kwargs.get("timeout")
+            )
         if path == "/api/2.0/dbfs/list":
             return self._dbfs_list(params["path"])
         if path == "/api/2.0/dbfs/get-status":
             return self._dbfs_status(params["path"])
         if path == "/api/2.0/dbfs/read":
-            return self._dbfs_read(params)
+            return self._dbfs_read(params, kwargs.get("timeout"))
         if path == "/api/2.0/sql/statements" and method == "POST":
             return self._submit(kwargs.get("json") or {}, kwargs.get("timeout"))
         if path.startswith("/api/2.0/sql/statements/"):
@@ -252,7 +265,7 @@ class FakeDatabricks:
             body["next_page_token"] = str(start + size)
         return FakeResponse(200, body)
 
-    def _file(self, method: str, path: str) -> FakeResponse:
+    def _file(self, method: str, path: str, timeout: Any = None) -> Any:
         stored = self.volume.get(path)
         if stored is None:
             return FakeResponse(
@@ -269,6 +282,11 @@ class FakeDatabricks:
         )
         if self.body_breaks is not None and method == "GET":
             return BrokenBody(response, self.body_breaks)
+        if self.trickle is not None and method == "GET" and self.clock is not None:
+            per_read, seconds, read1 = self.trickle
+            return TrickleBody(
+                response, self.clock, per_read, seconds, timeout, read1=read1
+            )
         return response
 
     def _dbfs_list(self, path: str) -> FakeResponse:
@@ -312,7 +330,12 @@ class FakeDatabricks:
             },
         )
 
-    def _dbfs_read(self, params: dict[str, Any]) -> FakeResponse:
+    def _dbfs_read(self, params: dict[str, Any], timeout: Any = None) -> FakeResponse:
+        if self.clock is not None and self.dbfs_read_seconds:
+            if not isinstance(timeout, int | float) or self.dbfs_read_seconds > timeout:
+                self.clock.now += timeout if isinstance(timeout, int | float) else 0
+                raise requests.ReadTimeout("fake DBFS: read timed out")
+            self.clock.now += self.dbfs_read_seconds
         stored = self.dbfs[params["path"]]
         offset, length = int(params["offset"]), int(params["length"])
         # Tiny reads by default: they exercise the loop.
@@ -417,6 +440,90 @@ class BrokenBody:
     def iter_content(self, size: int = 1024):
         yield self._response.content[:size]
         raise self._error
+
+    def close(self) -> None:
+        pass
+
+
+class FakeSocket:
+    """The socket under a streamed response: records each ``settimeout``
+    with the clock's time, as urllib3 2's ``raw.connection.sock``."""
+
+    def __init__(self, clock: Clock, timeout: float) -> None:
+        self._clock = clock
+        self.timeout = timeout
+        self.timeouts: list[tuple[float, float]] = []
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+        self.timeouts.append((self._clock.now, timeout))
+
+
+class _Connection:
+    def __init__(self, sock: FakeSocket) -> None:
+        self.sock = sock
+
+
+class _Raw:
+    """urllib3 2's response surface the client reads with: ``read1`` (one
+    socket read, bounded by the socket's timeout) and ``connection.sock``."""
+
+    def __init__(self, body: TrickleBody) -> None:
+        self._body = body
+        self.connection = _Connection(body.sock)
+
+    def read1(
+        self, amt: int | None = None, decode_content: bool | None = None
+    ) -> bytes:
+        return self._body.read(amt or self._body.per_read)
+
+
+class TrickleBody:
+    """A download whose body comes ``per_read`` bytes a read, each read taking
+    ``seconds`` on the clock. A read slower than the socket's timeout (the
+    request's ``timeout``, or what the client last set) raises urllib3's
+    ``ReadTimeoutError`` after that timeout, as a real socket read does. With
+    ``read1``, the response has urllib3 2's ``raw`` (one socket read a call);
+    without, only ``iter_content``, whose every chunk takes ``seconds``."""
+
+    def __init__(
+        self,
+        response: FakeResponse,
+        clock: Clock,
+        per_read: int,
+        seconds: float,
+        timeout: Any,
+        *,
+        read1: bool,
+    ) -> None:
+        self._response = response
+        self._clock = clock
+        self.per_read = per_read
+        self._seconds = seconds
+        self._at = 0
+        self.status_code = response.status_code
+        self.headers = response.headers
+        self.sock = FakeSocket(clock, float(timeout))
+        self.reads = 0
+        if read1:
+            self.raw = _Raw(self)
+
+    def read(self, amt: int) -> bytes:
+        data = self._response.content
+        if self._at >= len(data):
+            return b""
+        if self._seconds > self.sock.timeout:
+            self._clock.now += self.sock.timeout
+            raise urllib3.exceptions.ReadTimeoutError(None, None, "Read timed out.")  # type: ignore[arg-type]
+        self._clock.now += self._seconds
+        self.reads += 1
+        chunk = data[self._at : self._at + min(amt, self.per_read)]
+        self._at += len(chunk)
+        return chunk
+
+    def iter_content(self, size: int = 1024):
+        while chunk := self.read(size):
+            yield chunk
 
     def close(self) -> None:
         pass

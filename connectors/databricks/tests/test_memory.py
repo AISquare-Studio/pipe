@@ -52,7 +52,7 @@ def _peak(fake: FakeDatabricks, path: str, *, holds: bool = True, **params: Any)
         base = tracemalloc.get_traced_memory()[0]
         pulled = 0
         for envelope in source.pull(
-            pat_blob(), PullParams(params={"path": path, **params})
+            pat_blob(dbfs=True), PullParams(params={"path": path, **params})
         ):
             assert envelope.data  # the consumer reads it, then drops it
             pulled += 1

@@ -4,7 +4,9 @@ Two kinds of path, told apart by their form:
 
 * ``/Volumes/<catalog>/<schema>/<volume>/...``: a Unity Catalog volume,
   through the Files API;
-* ``dbfs:/...``: the workspace's DBFS, through the DBFS API.
+* ``dbfs:/...``: the workspace's DBFS, through the DBFS API, only when the
+  tenant's credential says ``"dbfs": true`` (:class:`DbfsNotEnabled`
+  otherwise: DBFS has no Unity Catalog grants, see :mod:`.credentials`).
 
 Nothing else is accepted (no workspace files, no ``..`` or ``.`` segments, no
 control characters, no empty segments).
@@ -36,6 +38,10 @@ class BadPath(ValueError):
     """A path that is not a volume or DBFS path this connector reads."""
 
 
+class DbfsNotEnabled(BadPath):
+    """A ``dbfs:/`` path, for a tenant whose credential doesn't enable DBFS."""
+
+
 @dataclass(frozen=True)
 class FilePath:
     kind: str  # VOLUME | DBFS
@@ -47,8 +53,10 @@ class FilePath:
         return self.path[len("dbfs:") :] if self.kind == DBFS else self.path
 
 
-def parse_path(value: Any, *, directory: bool = False) -> FilePath:
-    """``value`` as a :class:`FilePath`, or :class:`BadPath`."""
+def parse_path(value: Any, *, directory: bool = False, dbfs: bool = False) -> FilePath:
+    """``value`` as a :class:`FilePath`, or :class:`BadPath`; a ``dbfs:/``
+    path only with ``dbfs`` (the credential's flag), else
+    :class:`DbfsNotEnabled`."""
     if not isinstance(value, str) or not value.strip():
         raise BadPath("path is missing")
     path = value.strip()
@@ -59,6 +67,12 @@ def parse_path(value: Any, *, directory: bool = False) -> FilePath:
         if len([p for p in rest.split("/") if p]) < 3:
             raise BadPath("a volume path is /Volumes/<catalog>/<schema>/<volume>/...")
     elif path.startswith("dbfs:/"):
+        if not dbfs:
+            raise DbfsNotEnabled(
+                "dbfs:/ paths are not enabled for this workspace (its Databricks "
+                'credential has no "dbfs": true); read from a Unity Catalog volume, '
+                "/Volumes/<catalog>/<schema>/<volume>/..."
+            )
         kind, rest = DBFS, path[len("dbfs:/") :]
     else:
         raise BadPath(
@@ -232,6 +246,7 @@ __all__ = [
     "DBFS",
     "VOLUME",
     "BadPath",
+    "DbfsNotEnabled",
     "FilePath",
     "file_envelope",
     "file_metadata",
