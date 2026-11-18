@@ -34,6 +34,7 @@ from aisquare.pipe import (
 from aisquare.pipe.core.envelope import DataEnvelope
 
 from aisquare_pipe_gcs.client import (
+    INVALID_NAMES,
     GcsAPIError,
     GcsClient,
     ObjectTooLarge,
@@ -53,6 +54,8 @@ DEFAULT_MAX_BYTES = 25 * 1024 * 1024
 #: Text up to this size is also returned inline as ``content``.
 INLINE_TEXT_MAX = 1024 * 1024
 MAX_NAME_CHARS = 1024
+#: GCS page tokens are opaque but short (they encode a position).
+MAX_PAGE_TOKEN_CHARS = 4096
 _GENERATION = re.compile(r"^[0-9]{1,20}$")
 
 LIST_OBJECTS = ToolSpec(
@@ -88,6 +91,7 @@ LIST_OBJECTS = ToolSpec(
             },
             "page_token": {
                 "type": "string",
+                "maxLength": MAX_PAGE_TOKEN_CHARS,
                 "description": "next_page_token from a previous GCS_LIST_OBJECTS call.",
             },
         },
@@ -153,13 +157,32 @@ TOOL_SPECS = (LIST_OBJECTS, GET_OBJECT)
 
 
 def _describe(e: GcsAPIError) -> str:
+    """The failure, plus what to fix where the cause is known. Only a 401 (a
+    key or token Google refused) blames the key."""
+    text = e.message.lower()
     if e.status == 401:
         return (
             f"{e.message} — Google rejected the service account key (deleted, disabled or "
             "expired); the tenant's GCS credential must be fixed"
         )
+    if e.status == 403 and "vpcservicecontrols" in text:
+        return (
+            f"{e.message} — a VPC Service Controls perimeter around the bucket's project "
+            "blocks the request; the customer must add an ingress rule for the service "
+            "account (see the gcs connector README)"
+        )
     if e.status == 403:
-        return f"{e.message} — the service account lacks roles/storage.objectViewer on the bucket"
+        return (
+            f"{e.message} — the service account lacks roles/storage.objectViewer on the "
+            "bucket (or on the managed folder that holds the prefix)"
+        )
+    if e.status == 400 and "requester pays" in text:
+        return f"{e.message} — requester-pays buckets are not supported"
+    if e.status == 400 and "customer-supplied encryption key" in text:
+        return (
+            f"{e.message} — objects encrypted with a customer-supplied key (CSEK) can't "
+            "be read; CMEK (a Cloud KMS key on the bucket) needs nothing extra"
+        )
     return e.message
 
 
@@ -185,6 +208,20 @@ def _bounded_int(arguments: Mapping[str, Any], name: str, low: int, high: int) -
     ):
         raise ToolError(
             f"{name} must be an integer from {low} to {high}",
+            code=ERROR_INVALID_ARGUMENTS,
+        )
+    return value
+
+
+def _string(arguments: Mapping[str, Any], name: str, limit: int) -> str | None:
+    """A string argument up to ``limit`` characters (core checks types only),
+    or None when absent or empty."""
+    value = arguments.get(name)
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > limit:
+        raise ToolError(
+            f"{name} must be a string of at most {limit} characters",
             code=ERROR_INVALID_ARGUMENTS,
         )
     return value
@@ -229,6 +266,7 @@ def file_envelope(
         **{
             key: record[key]
             for key in (
+                "content_encoding",
                 "generation",
                 "md5_hash",
                 "crc32c",
@@ -339,17 +377,13 @@ class GcsToolkit(Toolkit):
     def _list(
         self, client: GcsClient, creds: GcsCredentials, arguments: dict[str, Any]
     ) -> ToolResult:
-        prefix = arguments.get("prefix")
-        prefix = (
-            creds.prefix
-            if prefix in (None, "")
-            else _inside(creds, str(prefix), "prefix")
-        )
+        prefix = _string(arguments, "prefix", MAX_NAME_CHARS)
+        prefix = creds.prefix if prefix is None else _inside(creds, prefix, "prefix")
         page_size = _bounded_int(arguments, "page_size", 1, MAX_PAGE_SIZE)
         response = client.list_objects(
             prefix=prefix,
             page_size=page_size,
-            page_token=arguments.get("page_token") or None,
+            page_token=_string(arguments, "page_token", MAX_PAGE_TOKEN_CHARS),
             delimiter=arguments.get("folders") is True,
         )
         items = response.get("items")
@@ -374,7 +408,12 @@ class GcsToolkit(Toolkit):
     def _get(
         self, client: GcsClient, creds: GcsCredentials, arguments: dict[str, Any]
     ) -> ToolResult:
-        name = _inside(creds, str(arguments["name"]), "name")
+        name = _string(arguments, "name", MAX_NAME_CHARS)
+        if name is None or name in INVALID_NAMES:
+            raise ToolError(
+                "name must be an object's full name", code=ERROR_INVALID_ARGUMENTS
+            )
+        name = _inside(creds, name, "name")
         generation = arguments.get("generation") or None
         if generation is not None and not _GENERATION.match(str(generation)):
             raise ToolError("generation must be digits", code=ERROR_INVALID_ARGUMENTS)

@@ -6,7 +6,7 @@ import pytest
 from aisquare.pipe import PRIMARY_TAG
 
 from aisquare_pipe_gcs import GcsToolkit
-from aisquare_pipe_gcs.toolkit import GET_OBJECT, LIST_OBJECTS
+from aisquare_pipe_gcs.toolkit import GET_OBJECT, LIST_OBJECTS, MAX_PAGE_TOKEN_CHARS
 from tests.fakes import FakeGoogle, StoredObject, blob
 
 PDF = b"%PDF-1.7 travel policy"
@@ -215,3 +215,115 @@ def test_the_toolkit_is_found_by_search_scored_and_search_connectors():
     assert hits[0].tool.slug == "GCS_GET_OBJECT"
     top = search_scored("download a file from google cloud storage", limit=5)
     assert any(h.connector == "gcs" for h in top)
+
+
+@pytest.mark.parametrize("name", [".", ".."])
+def test_dot_and_dotdot_are_refused_before_any_request(name):
+    """With no prefix they are 'inside' it, but urllib3 would collapse
+    /o/. and /o/.. into the listing and the bucket URLs."""
+    google_ = _google()
+    result = _call(google_, "GCS_GET_OBJECT", {"name": name}, blob(prefix=None))
+    assert not result.successful and result.error_code == "invalid_arguments"
+    assert google_.storage_calls() == []
+
+
+def test_string_arguments_are_bounded_before_any_request():
+    """Core checks types only, so the lengths the schemas declare are
+    checked here: a page_token over its maxLength is refused unsent."""
+    assert LIST_OBJECTS.input_schema["properties"]["page_token"]["maxLength"] == (
+        MAX_PAGE_TOKEN_CHARS
+    )
+    google_ = _google()
+    for slug, arguments in (
+        ("GCS_LIST_OBJECTS", {"page_token": "x" * (MAX_PAGE_TOKEN_CHARS + 1)}),
+        ("GCS_LIST_OBJECTS", {"prefix": "policies/" + "x" * 1024}),
+        ("GCS_GET_OBJECT", {"name": "policies/" + "x" * 1024}),
+    ):
+        result = _call(google_, slug, arguments)
+        assert not result.successful and result.error_code == "invalid_arguments", slug
+    assert google_.requests == []
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 500])
+def test_an_error_body_that_echoes_the_bearer_token_is_redacted(status):
+    google_ = _google()
+    google_.fail_with = (
+        status,
+        {"error": {"code": status, "message": "bad token {token} for this bucket"}},
+        {},
+    )
+    result = _call(google_, "GCS_LIST_OBJECTS", {})
+    assert not result.successful
+    assert "bad token [redacted] for this bucket" in (result.error or "")
+    (token,) = google_.tokens
+    assert token not in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "code", "hint", "not_hint"),
+    [
+        (
+            403,
+            (
+                "Request is prohibited by organization's policy. "
+                "vpcServiceControlsUniqueIdentifier: abc123"
+            ),
+            "forbidden",
+            "VPC Service Controls perimeter",
+            "roles/storage.objectViewer",
+        ),
+        (
+            403,
+            (
+                "reader@acme-proj.iam.gserviceaccount.com does not have "
+                "storage.objects.list access to the Google Cloud Storage bucket."
+            ),
+            "forbidden",
+            "roles/storage.objectViewer",
+            "VPC Service Controls",
+        ),
+        (
+            400,
+            "Bucket is a requester pays bucket but no user project provided.",
+            "invalid_arguments",
+            "requester-pays buckets are not supported",
+            "objectViewer",
+        ),
+        (
+            400,
+            "The target object is encrypted by a customer-supplied encryption key.",
+            "invalid_arguments",
+            "customer-supplied key (CSEK) can't be read",
+            "objectViewer",
+        ),
+    ],
+)
+def test_failures_say_what_to_fix(status, message, code, hint, not_hint):
+    google_ = _google()
+    google_.fail_with = (status, {"error": {"code": status, "message": message}}, {})
+    result = _call(google_, "GCS_LIST_OBJECTS", {})
+    assert not result.successful and result.error_code == code
+    assert hint in (result.error or "") and not_hint not in (result.error or "")
+    assert "service account key" not in (result.error or "")
+
+
+def test_a_gzip_stored_object_says_its_markers_describe_the_stored_bytes():
+    google_ = _google(
+        **{
+            "policies/log.txt": StoredObject(
+                b"inflated text", "text/plain", content_encoding="gzip"
+            )
+        }
+    )
+    listed = _call(google_, "GCS_LIST_OBJECTS", {}).data["objects"]
+    assert (
+        next(o for o in listed if o["name"] == "policies/log.txt")["content_encoding"]
+        == "gzip"
+    )
+    assert "contentEncoding" in google_.storage_calls()[0]["params"]["fields"]
+    result = _call(google_, "GCS_GET_OBJECT", {"name": "policies/log.txt"})
+    assert result.data["content_encoding"] == "gzip"
+    assert result.files[0].metadata["content_encoding"] == "gzip"
+    plain = _call(google_, "GCS_GET_OBJECT", {"name": "policies/handbook.txt"})
+    assert plain.data["content_encoding"] is None
+    assert "content_encoding" not in plain.files[0].metadata

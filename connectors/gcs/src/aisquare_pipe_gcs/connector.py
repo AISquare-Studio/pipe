@@ -4,7 +4,11 @@
 pick the files, never the credential, the bucket or the key:
 
 * ``prefix`` (optional): a narrower prefix inside the configured one (default:
-  the configured prefix), or ``object_names`` (a list of full names), not both;
+  the configured prefix), or ``object_names`` (a list of full names, at most
+  ``max_objects``), not both;
+* ``start_offset`` (optional, with a prefix): list from this object name on
+  (GCS ``startOffset``: names are listed in lexicographic order, this one
+  included). Pass a truncated pull's ``next_start_offset`` to continue it;
 * ``modified_after`` (optional, RFC 3339): only objects updated after it;
 * ``max_objects`` (default 100, at most 1000) and ``max_bytes`` per object
   (default 25 MiB, at most 100 MiB; a larger object is skipped and counted).
@@ -12,13 +16,21 @@ pick the files, never the credential, the bucket or the key:
 Each object becomes one envelope with its bytes and ``metadata`` ``bucket``,
 ``object_name``, ``filename``, ``size``, ``content_type`` and the version
 markers ``generation``, ``md5_hash``, ``updated`` (plus ``etag``,
-``crc32c``, ``time_created``). A caller keeps them and re-reads the object
-when ``generation`` (or ``md5_hash``) changes. "Folder" placeholders (names
-ending in ``/``) are skipped.
+``crc32c``, ``time_created``, and ``content_encoding`` when the stored bytes
+are gzip). A caller keeps them and re-reads the object when ``generation``
+(or ``md5_hash``) changes. "Folder" placeholders (names ending in ``/``) are
+skipped.
+
+A listing that stops before its end says so: on ``max_objects``, or after
+``MAX_LIST_PAGES`` pages (a ``modified_after`` that matches little in a big
+prefix), the LAST envelope's metadata carries ``truncated`` (``max_objects``
+or ``max_list_pages``) and ``next_start_offset``, and a warning is logged
+(also when no envelope came out). A caller that keeps ``max(updated)`` as a
+watermark must finish a truncated pull first, or it misses changes.
 
 A param naming a credential key (``service_account_json``, ``bucket``) is
 refused, and so is a prefix or name outside the configured prefix. Skipped
-objects are counted in one log line, with no names.
+objects are counted in one log line; logs carry no object names.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from aisquare.pipe.core.connector import AuthType, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
 
 from aisquare_pipe_gcs.client import (
+    INVALID_NAMES,
     GcsAPIError,
     GcsClient,
     ObjectTooLarge,
@@ -53,8 +66,17 @@ LIST_PAGE_SIZE = 1000
 #: Listing pages followed at most, whatever the page token says.
 MAX_LIST_PAGES = 100
 _PARAMS = frozenset(
-    {"prefix", "object_names", "modified_after", "max_objects", "max_bytes"}
+    {
+        "prefix",
+        "object_names",
+        "start_offset",
+        "modified_after",
+        "max_objects",
+        "max_bytes",
+    }
 )
+TRUNCATED_MAX_OBJECTS = "max_objects"
+TRUNCATED_MAX_LIST_PAGES = "max_list_pages"
 
 
 def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
@@ -94,7 +116,13 @@ def _timestamp(value: Any, what: str) -> datetime:
 
 
 def _inside(creds: GcsCredentials, name: Any, what: str) -> str:
-    if not isinstance(name, str) or not name or not name.isprintable():
+    if (
+        not isinstance(name, str)
+        or not name
+        or not name.isprintable()
+        or len(name.encode()) > 1024
+        or name in INVALID_NAMES
+    ):
         raise ValueError(f"{what} must be a non-empty object name")
     if not creds.contains(name):
         raise ValueError(f"{what} is outside the configured prefix {creds.prefix!r}")
@@ -163,6 +191,23 @@ class GcsSource(SourceConnector):
         "time_created": MetaField(
             type=str, required=False, description="RFC 3339 creation time"
         ),
+        "content_encoding": MetaField(
+            type=str,
+            required=False,
+            description="The stored encoding (gzip: size and md5_hash describe the "
+            "compressed bytes; data is inflated)",
+        ),
+        "truncated": MetaField(
+            type=str,
+            required=False,
+            description="On the last envelope of a pull that stopped early: "
+            "max_objects or max_list_pages",
+        ),
+        "next_start_offset": MetaField(
+            type=str,
+            required=False,
+            description="With truncated: the start_offset that continues the pull",
+        ),
     }
 
     def __init__(self, *, session: Any = None) -> None:
@@ -183,31 +228,46 @@ class GcsSource(SourceConnector):
         bad params, and :class:`GcsAPIError` when Cloud Storage fails."""
         creds = load_credentials(config)
         options = _options(params)
+        limit = _bounded(options, "max_objects", DEFAULT_MAX_OBJECTS, MAX_OBJECTS)
+        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES)
         names = options.get("object_names")
-        if names is not None and options.get("prefix") not in (None, ""):
-            raise ValueError("give prefix or object_names, not both")
+        if names is not None and (
+            options.get("prefix") not in (None, "")
+            or options.get("start_offset") not in (None, "")
+        ):
+            raise ValueError("give prefix/start_offset or object_names, not both")
         if names is not None:
             if not isinstance(names, list) or not names:
                 raise ValueError(
                     "object_names must be a non-empty list of object names"
                 )
             names = [_inside(creds, n, "object_names") for n in dict.fromkeys(names)]
+            if len(names) > limit:
+                raise ValueError(
+                    f"object_names has {len(names)} names, over max_objects ({limit})"
+                )
         prefix = options.get("prefix")
         prefix = (
             creds.prefix if prefix in (None, "") else _inside(creds, prefix, "prefix")
         )
+        start = options.get("start_offset")
+        if start in (None, ""):
+            start = None
+        else:
+            start = _inside(creds, start, "start_offset")
+            if not start.startswith(prefix):
+                raise ValueError(f"start_offset is outside the prefix {prefix!r}")
         after = options.get("modified_after")
         since = None if after is None else _timestamp(after, "modified_after")
-        limit = _bounded(options, "max_objects", DEFAULT_MAX_OBJECTS, MAX_OBJECTS)
-        max_bytes = _bounded(options, "max_bytes", DEFAULT_MAX_BYTES, MAX_OBJECT_BYTES)
 
         with GcsClient(creds, session=self._session) as client:
-            records = (
-                [object_record(client.get_metadata(n)) for n in names[:limit]]
-                if names is not None
-                else self._listed(client, prefix, since, limit)
-            )
+            truncation: tuple[str, str | None] | None = None
+            if names is not None:
+                records = [object_record(client.get_metadata(n)) for n in names]
+            else:
+                records, truncation = self._listed(client, prefix, start, since, limit)
             skipped = 0
+            last: DataEnvelope | None = None
             for record in records:
                 if since is not None and not _after(record.get("updated"), since):
                     continue
@@ -224,37 +284,94 @@ class GcsSource(SourceConnector):
                 except ObjectTooLarge:
                     skipped += 1
                     continue
-                yield file_envelope(record, content, bucket=creds.bucket)
+                # One envelope behind, so the last one can carry the
+                # truncation marker.
+                if last is not None:
+                    yield last
+                last = file_envelope(record, content, bucket=creds.bucket)
             if skipped:
                 logger.info(
                     "gcs-source: skipped %d object(s) larger than max_bytes", skipped
                 )
+            if truncation is not None:
+                reason, resume = truncation
+                logger.warning(
+                    "gcs-source: the listing stopped early (%s): more objects remain "
+                    "under the prefix; continue with the last envelope's "
+                    "next_start_offset as start_offset%s",
+                    reason,
+                    ""
+                    if last is not None
+                    else " (no envelope came out: narrow the "
+                    "prefix or the modified_after window)",
+                )
+                if last is not None:
+                    last.metadata["truncated"] = reason
+                    if resume is not None:
+                        last.metadata["next_start_offset"] = resume
+            if last is not None:
+                yield last
 
     def _listed(
-        self, client: GcsClient, prefix: str, since: datetime | None, limit: int
-    ) -> list[dict[str, Any]]:
+        self,
+        client: GcsClient,
+        prefix: str,
+        start: str | None,
+        since: datetime | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], tuple[str, str | None] | None]:
+        """Up to ``limit`` objects in name order, and why the listing stopped
+        early (with the name to resume at), or None when it reached its end."""
         found: list[dict[str, Any]] = []
         token: str | None = None
         for _ in range(MAX_LIST_PAGES):
             page = client.list_objects(
-                prefix=prefix, page_size=LIST_PAGE_SIZE, page_token=token
+                prefix=prefix,
+                page_size=LIST_PAGE_SIZE,
+                page_token=token,
+                start_offset=start,
             )
             items = page.get("items")
             for item in items if isinstance(items, list) else []:
                 record = object_record(item)
                 name = record.get("name")
-                if not isinstance(name, str) or not name or name.endswith("/"):
+                if not isinstance(name, str) or not name:
+                    continue
+                if len(found) >= limit:
+                    # A name after the last one kept: the pull is cut short.
+                    return found, (TRUNCATED_MAX_OBJECTS, name)
+                if name.endswith("/"):
                     continue  # a "folder" placeholder
                 if since is not None and not _after(record.get("updated"), since):
                     continue
                 found.append(record)
-                if len(found) >= limit:
-                    return found
             next_token = page.get("nextPageToken")
             if not isinstance(next_token, str) or not next_token:
-                break
+                return found, None
             token = next_token
-        return found
+        reason = (
+            TRUNCATED_MAX_OBJECTS if len(found) >= limit else TRUNCATED_MAX_LIST_PAGES
+        )
+        return found, (reason, self._first_name(client, prefix, start, token))
+
+    @staticmethod
+    def _first_name(
+        client: GcsClient, prefix: str, start: str | None, token: str | None
+    ) -> str | None:
+        """The first name on the page ``token`` points at: where a pull cut
+        short by the page cap resumes. None if it can't be read."""
+        try:
+            page = client.list_objects(
+                prefix=prefix, page_size=1, page_token=token, start_offset=start
+            )
+        except GcsAPIError:
+            return None
+        items = page.get("items")
+        for item in items if isinstance(items, list) else []:
+            name = object_record(item).get("name")
+            if isinstance(name, str) and name:
+                return name
+        return None
 
 
 def _after(updated: Any, since: datetime) -> bool:

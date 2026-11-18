@@ -46,6 +46,9 @@ dev = [
     "pyyaml",
     "types-requests",
     "responses",
+    # connectors/gcs tests make throwaway RSA/EC keys. google-auth only brings
+    # it in from 2.4x; [gcs] allows 2.20.
+    "cryptography>=38.0.3",
 ]
 # One extra per connector, named after its directory (connectors/<name>,
 # module aisquare_pipe_<name>): that connector's third-party deps beyond the
