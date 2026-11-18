@@ -80,6 +80,7 @@ from aisquare_pipe_bigquery.query import (
     CapExceeded,
     NotATable,
     Rows,
+    RowTooLarge,
     dry_run,
     read_table_rows,
     run_select,
@@ -298,7 +299,9 @@ class BigQueryQuerySource(SourceConnector):
           usable credential (before any request); bad params; SQL that is
           not one SELECT (:class:`~aisquare_pipe_bigquery.sqlguard.NotReadOnly`);
           a query over its byte cap
-          (:class:`~aisquare_pipe_bigquery.query.CapExceeded`); and what
+          (:class:`~aisquare_pipe_bigquery.query.CapExceeded`); a single
+          row larger than one page may hold
+          (:class:`~aisquare_pipe_bigquery.query.RowTooLarge`); and what
           BigQuery refused that the caller can fix, an invalid query or a
           missing table (:class:`~aisquare_pipe_bigquery.toolkit.BigQueryRequestError`);
         * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
@@ -580,4 +583,5 @@ __all__ = [
     "CapExceeded",
     "NotATable",
     "NotReadOnly",
+    "RowTooLarge",
 ]

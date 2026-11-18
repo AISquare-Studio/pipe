@@ -271,8 +271,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   502 naming the error type only (it was a 500). A GCS listing whose `generation` isn't a string is a 502, not a
   422.
 - BigQuery: a `REPEATED` column's elements count as cells: the first page guesses 1,000 a column, and each next
-  page is sized from the most cells a row held so far. Rows of 100 elements: 277 -> 22 MiB at the defaults and
-  342 -> 82 MiB at the caps.
+  page is sized from the most cells a row held so far. Rows of 100 elements: 277 -> 21 MiB at the defaults and
+  342 -> 81 MiB at the caps.
+- BigQuery: every row page, a query's first one in jobs.query's answer included, is read within a cap: its body is
+  streamed, and its bytes and cells (`"v":` keys, a `REPEATED` column's every element included) are counted before
+  any of it is parsed. A page over 8 MiB or 100,000 cells is dropped and asked for again with at most half the rows
+  (fewer when what was read says fewer fit), down to one; a single row over either is `RowTooLarge` (422; tools:
+  `invalid_arguments`) with its index and size, none of its values. Rows with `ARRAY_AGG` arrays of 20,000-34,000
+  elements: 266-344 -> 37-38 MiB at the defaults and the same 266-344 -> 74-77 MiB at the caps, on the first page
+  or after short ones (#46 reopen seq 14031).
 - `max_result_bytes` (BigQuery, Snowflake, Redshift) counts what the envelopes hold, each one's columns header
   included (`aisquare.pipe.core.batches.BatchPlan` plans the cuts while the rows are read): 200 columns in 1 KiB
   envelopes made 256 MiB of envelopes under a 64 MiB cap.

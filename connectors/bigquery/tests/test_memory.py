@@ -53,6 +53,9 @@ class PagedGoogle(FakeGoogle):
         super().__init__()
         self.fields, self.total, self.cell = fields, total, cell
         self._pages: dict[int, bytes] = {}
+        #: Each row page served: its rows, cells (-1: not counted), bytes, and
+        #: the bytes of it the client read before it closed it.
+        self.pages: list[dict[str, int]] = []
         self.add_dataset("acme-analytics.sales")
         self.add_table("acme-analytics.sales.big", FakeTable(schema=fields))
         self.add_query(SQL, CannedQuery(schema=fields))
@@ -74,6 +77,10 @@ class PagedGoogle(FakeGoogle):
         """The rows a page holds when ``n`` are asked for from ``start``."""
         return n
 
+    def cells(self, start: int, n: int) -> int:
+        """The cells of rows ``start`` to ``start + n`` (-1: not counted)."""
+        return -1
+
     def _serve(self, head: dict[str, Any], params: dict[str, Any]) -> FakeResponse:
         size = int(params.get("maxResults") or 100)
         start = int(params.get("pageToken") or params.get("startIndex") or 0)
@@ -84,7 +91,19 @@ class PagedGoogle(FakeGoogle):
         if start + n < self.total:
             parts.append(b',"pageToken":"' + str(start + n).encode() + b'"')
         parts.append(b"}")
-        return FakeResponse(200, None, content=b"".join(parts))
+        content = b"".join(parts)
+        page = {"rows": n, "cells": self.cells(start, n), "bytes": len(content)}
+        self.pages.append(page)
+
+        def closed(response: FakeResponse) -> None:
+            page["read"] = response.consumed
+
+        return FakeResponse(200, None, content=content, on_close=closed)
+
+    @property
+    def served(self) -> list[tuple[int, int]]:
+        """(rows, cells) of each row page served with rows."""
+        return [(p["rows"], p["cells"]) for p in self.pages if p["rows"]]
 
     def _rows(self, table, params):
         return self._serve({"totalRows": str(self.total)}, params)
@@ -271,11 +290,11 @@ def _array_cell(elements: int):
 @pytest.mark.parametrize(
     ("elements", "params", "bound"),
     [
-        # Measured 22 MiB (277 MiB before: 10,000-row pages of 100 elements).
+        # Measured 21 MiB (277 MiB before: 10,000-row pages of 100 elements).
         (100, {}, 48 * MIB),
         # Arrays ten times the first guess's. What's bounded is each page, so a
         # smaller byte cap keeps the test quick; at the full caps (64 MiB) it
-        # measured 79 MiB, and 100-element rows 82 MiB (342 MiB before).
+        # measured 78 MiB, and 100-element rows 81 MiB (342 MiB before).
         (1000, {"max_rows": MAX_ROWS, "max_result_bytes": 16 * MIB}, 64 * MIB),
     ],
 )
@@ -298,16 +317,17 @@ def _asked(google: PagedGoogle) -> list[int]:
     ]
 
 
-def test_the_schema_guess_is_a_floor_for_every_page():
-    """Every page is sized from the schema's guess (a REPEATED column as
-    REPEATED_CELLS elements), not only the first: rows that held fewer cells
-    say nothing about the next ones (#46 reopen seq 13987, FAIL 2). Rows that
-    held more make the next page shorter."""
+def test_the_schema_guess_sizes_the_first_page_and_rows_the_next():
+    """The schema's guess (a REPEATED column as REPEATED_CELLS elements)
+    sizes the first page only: no longer a floor (#46 reopen seq 14031), as
+    the read cap, not the guess, bounds every page. Rows that held fewer
+    cells let the next page grow, PAGE_GROWTH times at most; rows that held
+    more make it shorter."""
     from aisquare_pipe_bigquery import query
 
     fields = [field_("tags", "INT64", "REPEATED"), field_("id", "INT64")]
     guess = query.PAGE_CELLS // ((1 * query.REPEATED_CELLS) + 1)
-    # Rows of 3 elements: far under the guess, and the pages stay at it.
+    # Rows of 3 elements: far under the guess, and the pages grow from it.
     google = PagedGoogle(
         fields, 1_000, lambda f, i: [{"v": "1"}] * 3 if f["name"] == "tags" else "1"
     )
@@ -319,7 +339,8 @@ def test_the_schema_guess_is_a_floor_for_every_page():
         )
     )
     asked = _asked(google)
-    assert len(asked) > 2 and set(asked[:-1]) == {guess}
+    assert asked[:4] == [guess, 2 * guess, 4 * guess, 8 * guess]
+    assert sum(google.served[i][0] for i in range(len(asked))) == 1_000
     # Arrays over the guess shrink the next page.
     google = PagedGoogle(
         fields,
@@ -384,7 +405,6 @@ class SkewedGoogle(PagedGoogle):
         rows = [{"f": [{"v": v} for v in cells]} for cells in (before, after)]
         self.row_bytes = [json.dumps(row).encode() for row in rows]
         self.row_cells = [rest_cells(row) for row in rows]
-        self.served: list[tuple[int, int]] = []
         self._split: dict[tuple[int, int], bytes] = {}
 
     def _counts(self, start: int, n: int) -> tuple[int, int]:
@@ -401,9 +421,12 @@ class SkewedGoogle(PagedGoogle):
                 return max(1, i - start)
         return n
 
+    def cells(self, start: int, n: int) -> int:
+        low, high = self._counts(start, n)
+        return low * self.row_cells[0] + high * self.row_cells[1]
+
     def rows_json(self, start: int, n: int) -> bytes:
         low, high = self._counts(start, n)
-        self.served.append((n, low * self.row_cells[0] + high * self.row_cells[1]))
         key = (low, high)
         if key not in self._split:
             self._split[key] = b",".join(
@@ -412,13 +435,19 @@ class SkewedGoogle(PagedGoogle):
         return self._split[key]
 
 
-def _warm_peak(google: PagedGoogle, params: dict[str, Any]) -> tuple[int, int]:
+def _warm_peak(
+    google: PagedGoogle, params: dict[str, Any], *, warm_bytes: int | None = None
+) -> tuple[int, int]:
     """(peak bytes, rows) of a pull, every envelope kept, after the same pull
-    unmeasured (imports, the token, every page's bytes made)."""
+    unmeasured (imports, the token, every page's bytes made). ``warm_bytes``:
+    the unmeasured pull stops at that ``max_result_bytes``, past the pages
+    whose shape changes (a page it didn't make is made in the measured one,
+    and counted there: the peak can only come out higher)."""
     from tests.fakes import blob
 
     config = blob()
-    list(BigQueryQuerySource(session=google).pull(config, PullParams(params)))
+    warm = params if warm_bytes is None else {**params, "max_result_bytes": warm_bytes}
+    list(BigQueryQuerySource(session=google).pull(config, PullParams(warm)))
     gc.collect()
     tracemalloc.start()
     try:
@@ -456,15 +485,15 @@ _CAPS = {
 @pytest.mark.parametrize(
     ("params", "total", "bound"),
     [
-        # Measured 278, 224 and 378 MiB before (#46 reopen seq 13987, FAIL 2):
-        # the first page's [] sized the second at 9,951 rows (1M cells, a
-        # 17 MiB page, under BigQuery's 20 MB page limit). Now 9.7, 7.9 and
-        # 6.0 MiB.
+        # Measured 278, 224 and 378 MiB at 0b9e6e3 (#46 reopen seq 13987, FAIL
+        # 2): the first page's [] sized the second at 9,951 rows (1M cells, a
+        # 17 MiB page, under BigQuery's 20 MB page limit). Now 21, 20 and
+        # 14 MiB: pages grow PAGE_GROWTH times a step.
         pytest.param({}, DEFAULT_MAX_ROWS, POD_SHARE / 4, id="defaults"),
         # Two full pages after the skew, which made the second one 10,000
-        # rows; now 18, 15 and 10 MiB. With 200,000 rows the caps stop them at
-        # 82,051 (max_result_bytes), 100,000 and 100,000 rows: 75, 76 and
-        # 49 MiB (the README's numbers; 24-46 s each, so not run here).
+        # rows. With 200,000 rows the caps stop them at 82,051
+        # (max_result_bytes), 100,000 and 100,000 rows: 81, 80 and 51 MiB (the
+        # README's numbers; 23-45 s each, so not run here).
         pytest.param(_CAPS, 2 * PAGE_ROWS + 50, POD_SHARE / 2, id="caps"),
     ],
 )
@@ -473,16 +502,13 @@ def test_rows_that_grow_after_the_first_page_keep_each_page_bounded(
     skew, params, total, bound
 ):
     """A query whose first page's arrays are far shorter than the rest's."""
-    from aisquare_pipe_bigquery import query
 
     before, after = _SKEWS[skew]
     fields = [field_("tags", "INT64", "REPEATED"), field_("id", "INT64")]
     google = SkewedGoogle(fields, total, skew_at=50, before=before, after=after)
     peak, rows = _warm_peak(google, {"sql": SQL, **params})
     assert rows > 1_000
-    # Each page within PAGE_CELLS: the floor (REPEATED_CELLS elements a row)
-    # is over every row's arrays here.
-    assert max(cells for _, cells in google.served) <= query.PAGE_CELLS
+    _assert_read_within_the_cap(google)
     assert peak < bound, peak / MIB
 
 
@@ -502,12 +528,34 @@ def test_a_table_read_keeps_each_page_bounded_when_rows_grow():
             blob(), PullParams({"table": "sales.big"})
         )
     )
-    assert max(cells for _, cells in google.served) <= query.PAGE_CELLS
+    _assert_read_within_the_cap(google)
+    assert max(cells for _, cells in google.served) <= query.READ_CELLS
 
 
-def test_a_page_cut_short_by_bigquerys_page_limit_sizes_the_next_by_its_bytes():
+def _assert_read_within_the_cap(google: PagedGoogle) -> int:
+    """Every row page was read whole within READ_BYTES and READ_CELLS, or
+    dropped after at most READ_BYTES (and a chunk) of it was read. The pages
+    dropped."""
+    from aisquare_pipe_bigquery import client, query
+
+    dropped = 0
+    for page in google.pages:
+        if page["read"] == page["bytes"]:
+            assert page["bytes"] <= query.READ_BYTES, page
+            assert page["cells"] <= query.READ_CELLS, page
+        else:
+            assert page["read"] <= query.READ_BYTES + client.READ_CHUNK, page
+            assert page["bytes"] > query.READ_BYTES or page["cells"] > query.READ_CELLS
+            dropped += 1
+    return dropped
+
+
+def test_a_page_over_the_read_cap_is_asked_again_with_the_rows_that_fit():
     """Rows of 20 KB: BigQuery's 10 MB page holds about 500 of the 10,000
-    asked for, and the next page asks for what fits PAGE_BYTES."""
+    asked for, over READ_BYTES. It is dropped once its first READ_BYTES are
+    read, and asked for again with the rows that fit PAGE_BYTES at what was
+    read (not halved again and again against BigQuery's page limit); the
+    next pages are sized by their bytes."""
     from aisquare_pipe_bigquery import query
     from tests.fakes import blob
 
@@ -520,7 +568,7 @@ def test_a_page_cut_short_by_bigquerys_page_limit_sizes_the_next_by_its_bytes():
         after=wide,
         limit=10_000_000,
     )
-    list(
+    envelopes = list(
         BigQueryQuerySource(session=google).pull(
             blob(), PullParams({"table": "sales.big"})
         )
@@ -528,8 +576,17 @@ def test_a_page_cut_short_by_bigquerys_page_limit_sizes_the_next_by_its_bytes():
     asked = _asked(google)
     first_rows = google.served[0][0]
     assert asked[0] == query.PAGE_ROWS and first_rows < 600
+    assert _assert_read_within_the_cap(google) == 1
+    assert google.pages[0]["read"] < google.pages[0]["bytes"]
     assert 0 < asked[1] * len(google.row_bytes[1]) <= query.PAGE_BYTES
-    assert asked[1] < first_rows
+    assert all(
+        n * len(google.row_bytes[1]) <= query.PAGE_BYTES + len(google.row_bytes[1])
+        for n in asked[1:]
+    )
+    # Nothing skipped or repeated: the dropped page's rows came again.
+    firsts = [e.metadata["first_row"] for e in envelopes]
+    counts = [e.metadata["row_count"] for e in envelopes]
+    assert firsts == [sum(counts[:i]) for i in range(len(counts))]
 
 
 def test_max_result_bytes_counts_every_envelope_s_columns_header():
@@ -554,3 +611,91 @@ def test_max_result_bytes_counts_every_envelope_s_columns_header():
     assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
     rows = sum(e.metadata["row_count"] for e in envelopes)
     assert envelopes[-1].metadata["next_start_index"] == rows
+
+
+# -- long arrays: every page read within a cap (#46 reopen seq 14031) -------------
+
+#: BigQuery's own page limits (the most a page's JSON holds): jobs.query and
+#: jobs.getQueryResults about 20 MB, tabledata.list about 10 MB.
+QUERY_PAGE_LIMIT = 20_000_000
+TABLE_PAGE_LIMIT = 10_000_000
+_LONG_FIELDS = [field_("tags", "INT64", "REPEATED"), field_("id", "INT64")]
+
+_LONG = {
+    # SELECT customer_id, ARRAY_AGG(order_id) ... GROUP BY 1, ORDER BY
+    # ARRAY_LENGTH DESC: the first page's rows hold the longest arrays, far
+    # over the schema's guess (REPEATED_CELLS elements).
+    "20k": [_elements(20_000), "1"],
+    "22k": [_elements(22_000), "1"],
+    "34k-one-char": [_elements(34_000, lambda j: str(j % 10)), "1"],
+}
+#: Each well under the bar: e3d068b measured 266-344 MiB at both.
+_BOUND = {"defaults": POD_SHARE / 3, "caps": POD_SHARE / 2}
+
+
+def _long_peak(google: SkewedGoogle, params: dict[str, Any], which: str) -> None:
+    """The pull's peak under the bar for ``which`` (defaults or caps); then
+    every page parsed was within the cap, and at least one was dropped."""
+    extra = _CAPS if which == "caps" else {}
+    peak, rows = _warm_peak(google, {**params, **extra}, warm_bytes=4 * MIB)
+    assert rows > 50
+    assert peak < _BOUND[which], peak / MIB
+    assert _assert_read_within_the_cap(google) >= 1
+
+
+@pytest.mark.parametrize(
+    ("shape", "which", "total"),
+    [
+        # 292.9 MiB at e3d068b, at the defaults (148 rows, max_result_bytes) and
+        # at the caps (381) alike: the first page asked for 49 rows (the guess),
+        # 1.08M cells. Now 37.9 and 77.1 MiB (each in a process of its own;
+        # a little more after other tests).
+        ("22k", "defaults", 1_000),
+        ("22k", "caps", 1_000),
+        # 343.5 MiB at e3d068b (1.67M cells in the first page); now 38.2 at the
+        # defaults, 73.9 at the caps (986 rows, a page a row: 60 s, so not run
+        # here). 100 rows keep it quick: the first page is the same.
+        ("34k-one-char", "defaults", 100),
+    ],
+)
+def test_long_arrays_on_the_first_page_keep_a_query_under_the_pod_share(
+    shape, which, total
+):
+    """The first page (jobs.query's answer) held 49 rows of 20,000+
+    elements. Now its body is dropped once it is over READ_CELLS, and the
+    job gives the first page again with the rows that fit."""
+    from aisquare_pipe_bigquery import query
+
+    row = _LONG[shape]
+    google = SkewedGoogle(
+        _LONG_FIELDS, total, skew_at=0, before=row, after=row, limit=QUERY_PAGE_LIMIT
+    )
+    _long_peak(google, {"sql": SQL}, which)
+    assert google.pages[0]["cells"] > query.READ_CELLS  # jobs.query's page
+    assert google.pages[0]["read"] < google.pages[0]["bytes"]
+
+
+@pytest.mark.parametrize("which", ["defaults", "caps"])
+def test_long_arrays_after_short_ones_keep_a_query_under_the_pod_share(which):
+    """[] for the first 50 rows, then 22,000 elements: the page that reaches
+    the long rows held 49 of them at e3d068b (the floor), 286.9 MiB at the
+    defaults and at the caps. Now 37.9 and 77.2 MiB."""
+    google = SkewedGoogle(
+        _LONG_FIELDS,
+        1_000,
+        skew_at=50,
+        before=[[], "1"],
+        after=_LONG["22k"],
+        limit=QUERY_PAGE_LIMIT,
+    )
+    _long_peak(google, {"sql": SQL}, which)
+
+
+def test_long_arrays_keep_a_table_read_under_the_pod_share():
+    """tabledata.list's 10 MB page limit held it to 146.6 MiB at e3d068b, at
+    the defaults and at the caps; now 36.7 MiB (76.0 at the caps)."""
+    row = _LONG["20k"]
+    google = SkewedGoogle(
+        _LONG_FIELDS, 1_000, skew_at=0, before=row, after=row, limit=TABLE_PAGE_LIMIT
+    )
+    _long_peak(google, {"table": "sales.big"}, "defaults")

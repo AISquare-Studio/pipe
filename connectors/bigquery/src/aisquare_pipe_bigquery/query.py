@@ -18,13 +18,19 @@ A query (:func:`run_select`) goes:
 
 :func:`read_table_rows` reads one table's rows (tabledata.list, free: no
 job) within the same row and byte caps.
+
+Every page, the first one included, is read within :data:`READ_BYTES` and
+:data:`READ_CELLS` (counted on the body as it streams in, before it is
+parsed): a page over them is dropped and asked for again with at most half
+the rows, down to one; a single row over them is :class:`RowTooLarge`.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 from aisquare.pipe.core.batches import BatchPlan
@@ -33,6 +39,8 @@ from aisquare_pipe_bigquery.client import (
     POLL_PAUSE_SECONDS,
     BigQueryAPIError,
     BigQueryClient,
+    PageCap,
+    PageTooLarge,
     error_detail,
 )
 from aisquare_pipe_bigquery.refs import TableRef
@@ -56,13 +64,10 @@ PAGE_ROWS = 10_000
 PAGE_CELLS = 50_000
 #: Rows per page while the schema is unknown (a dry run that gave none).
 UNKNOWN_SCHEMA_PAGE_ROWS = 1_000
-#: What a ``REPEATED`` column is guessed to hold (its elements, each a cell):
-#: a schema can't say how long its arrays are. The guess is a floor for
-#: every page, not just the first: rows that held fewer elements so far say
-#: nothing about the next ones (a column added later leaves older rows
-#: ``[]``; an ``ORDER BY`` array length puts the long ones last), so they
-#: can't make a page longer. Rows that held more make it shorter
-#: (:func:`page_rows`'s ``seen``).
+#: What a ``REPEATED`` column is guessed to hold (its elements, each a cell)
+#: for the FIRST page: a schema can't say how long its arrays are. After it,
+#: pages are sized from the rows that came back (:func:`page_rows`'s
+#: ``seen``). Neither bounds a page: the read cap does (:data:`READ_CELLS`).
 REPEATED_CELLS = 1_000
 #: JSON bytes a page is sized to hold at most once one has come back: the next
 #: page asks for the rows that fit at the last page's bytes a row. A cell's
@@ -71,12 +76,23 @@ REPEATED_CELLS = 1_000
 #: page limit is about 10 MB (tabledata.list) and 20 MB (jobs.getQueryResults).
 PAGE_BYTES = 4 * 1024 * 1024
 #: A next page asks for at most this many times the rows the last page held,
-#: so a page that came back short (by its bytes, or BigQuery's page limit)
-#: grows back a step at a time.
+#: so a page that came back short (by its bytes, its cells, or BigQuery's page
+#: limit) grows back a step at a time.
 PAGE_GROWTH = 2
-#: Pages followed at most for one result, whatever the page token says. At
-#: the floor, rows with two ``REPEATED`` columns page 24 at a time, so the
-#: source's 100,000-row cap takes about 4,200 pages.
+#: The most one page's body may hold, counted as it is read and before it is
+#: parsed (:class:`~aisquare_pipe_bigquery.client.PageCap`): bytes of JSON,
+#: and cells (``{"v": ...}`` objects, a ``REPEATED`` column's every element
+#: included). A page is SIZED to half of each (:data:`PAGE_BYTES`,
+#: :data:`PAGE_CELLS`); one over either, whatever its arrays hold, is dropped
+#: unparsed and asked for again with half the rows, down to one row, and a
+#: single row over either is :class:`RowTooLarge`. So parsing a page costs at
+#: most about 25 MiB of cells on top of its 8 MiB of JSON.
+READ_BYTES = 2 * PAGE_BYTES
+READ_CELLS = 2 * PAGE_CELLS
+#: Pages followed at most for one result, whatever the page token says (a
+#: dropped page asked for again counts once). Rows of 50,000 cells or more page
+#: one at a time, and ``max_result_bytes`` stops those within about 700
+#: pages.
 MAX_PAGES = 5_000
 #: Table types tabledata.list reads. Views, materialized views and external
 #: tables are read with a query.
@@ -99,6 +115,40 @@ class CapExceeded(ValueError):
 
 class NotATable(ValueError):
     """tabledata.list can't read this table type (a view, ...)."""
+
+
+class RowTooLarge(ValueError):
+    """One row is more than a page may hold (:data:`READ_BYTES` bytes of
+    JSON or :data:`READ_CELLS` cells): nothing is returned. A ``ValueError``,
+    so pipe-as-service answers 422: the caller can select fewer or shorter
+    columns, or bound the arrays. ``row`` is its 0-based index (the table's
+    row for a table read), ``page_bytes`` and ``cells`` the size of the page
+    that held it alone (at least that, unless ``complete``). The message
+    carries no value of it."""
+
+    def __init__(
+        self, row: int, page_bytes: int, cells: int, *, complete: bool, table: bool
+    ) -> None:
+        self.row = row
+        self.page_bytes = page_bytes
+        self.cells = cells
+        self.complete = complete
+        over = "" if complete else "over "
+        where = "the table" if table else "the result"
+        fix = (
+            "read fewer columns (selected_fields), or read it with a SELECT that "
+            "bounds the arrays"
+            if table
+            else "select fewer or shorter columns, or bound the arrays "
+            "(ARRAY_AGG(... LIMIT n), ARRAY_LENGTH in a WHERE, or UNNEST them into "
+            "rows)"
+        )
+        super().__init__(
+            f"row {row} of {where} is too large to read: the page that holds it "
+            f"alone is {over}{page_bytes:,} bytes of JSON with {over}{cells:,} values, "
+            f"and a page may hold at most {READ_BYTES:,} bytes and {READ_CELLS:,} "
+            f"values; {fix}"
+        )
 
 
 def _int(value: Any) -> int | None:
@@ -131,16 +181,20 @@ def page_rows(
     """Rows to ask for in one page: at most ``wanted``, :data:`PAGE_ROWS`
     and :data:`PAGE_CELLS` cells.
 
-    A row's cells are the schema's guess (:func:`cells_per_row`, which counts
-    a ``REPEATED`` column as :data:`REPEATED_CELLS` elements), or ``seen``
-    (the most any row of an earlier page held) when that is more: the guess
-    is a floor. Without a schema, ``seen``, else
-    :data:`UNKNOWN_SCHEMA_PAGE_ROWS` rows.
+    A row's cells are ``seen`` (the most any row of an earlier page held)
+    once rows have come back; before that the schema's guess
+    (:func:`cells_per_row`, which counts a ``REPEATED`` column as
+    :data:`REPEATED_CELLS` elements), else :data:`UNKNOWN_SCHEMA_PAGE_ROWS`
+    rows.
 
     Once a page has come back (``last_rows`` rows in ``last_bytes`` bytes of
     JSON), also at most the rows that fit :data:`PAGE_BYTES` at its bytes a
-    row, and :data:`PAGE_GROWTH` times its rows."""
-    per_row = max(seen, cells_per_row(fields) if fields else 0)
+    row, and :data:`PAGE_GROWTH` times its rows.
+
+    This is what a page is SIZED to; what bounds it is the read cap
+    (:func:`_read_capped`): rows that held fewer cells say nothing about the
+    next ones."""
+    per_row = seen if seen > 0 else (cells_per_row(fields) if fields else 0)
     by_cells = PAGE_CELLS // per_row if per_row > 0 else UNKNOWN_SCHEMA_PAGE_ROWS
     size = min(PAGE_ROWS, by_cells, wanted)
     if last_rows > 0 and last_bytes > 0:
@@ -154,6 +208,68 @@ def _page_shape(answer: dict[str, Any], client: BigQueryClient) -> tuple[int, in
     rows = answer.get("rows")
     count = len(rows) if isinstance(rows, list) else 0
     return most_cells(rows), count, client.last_body_bytes
+
+
+def _cap(rows: int) -> PageCap:
+    """The read cap for a page of ``rows``: one row's page over it is read
+    through (discarded) to say how large it is."""
+    return PageCap(READ_BYTES, READ_CELLS, measure=rows <= 1)
+
+
+def _fewer(dropped: PageTooLarge, rows: int, first_row: int, *, table: bool) -> int:
+    """The rows to ask for after a page of ``rows`` from ``first_row`` came
+    back over the cap: half, or fewer when what was read of it says that
+    fewer fit :data:`PAGE_BYTES` and :data:`PAGE_CELLS` (so BigQuery's own
+    page limit, which a page of long rows always reaches, costs one dropped
+    read, not one per halving); :class:`RowTooLarge` for one row."""
+    if rows <= 1:
+        raise RowTooLarge(
+            first_row,
+            dropped.body_bytes,
+            dropped.cells,
+            complete=dropped.complete,
+            table=table,
+        ) from None
+    fewer = rows // 2
+    # The rows read whole: the cap fell inside the last one begun. A RECORD
+    # value's "f" counts too, so this may be more, never fewer: min() keeps
+    # the half.
+    whole = dropped.rows - (0 if dropped.complete else 1)
+    if whole > 0:
+        fewer = min(
+            fewer,
+            whole * PAGE_BYTES // max(1, dropped.body_bytes),
+            whole * PAGE_CELLS // max(1, dropped.cells),
+        )
+    return max(1, fewer)
+
+
+def _read_capped(
+    fetch: Callable[..., dict[str, Any]], rows: int, first_row: int, *, table: bool
+) -> dict[str, Any]:
+    """``fetch(page_size=, cap=)`` within the read cap: a page over it is
+    asked for again with fewer rows (:func:`_fewer`), down to one, and one
+    row over it is :class:`RowTooLarge`."""
+    while True:
+        try:
+            return fetch(page_size=rows, cap=_cap(rows))
+        except PageTooLarge as e:
+            rows = _fewer(e, rows, first_row, table=table)
+
+
+def _first_page_again(
+    client: BigQueryClient, job: dict[str, Any], dropped: PageTooLarge, rows: int
+) -> dict[str, Any]:
+    """A query's first page, asked for again from its ``job``
+    (getQueryResults with no page token) after the answer that brought it
+    (jobs.query's, or a poll's: the job is done) was over the cap with
+    ``rows`` rows."""
+    return _read_capped(
+        partial(client.query_results, job),
+        _fewer(dropped, rows, 0, table=False),
+        0,
+        table=False,
+    )
 
 
 @dataclass
@@ -318,17 +434,30 @@ def run_select(
     job_seconds = client.job_seconds(job_timeout)
     job_deadline = client.now() + job_seconds
     page_size = page_rows(estimate.fields, max_rows)
-    answer = client.start_query(
-        sql,
-        page_size=page_size,
-        max_bytes_billed=max_bytes_processed,
-        job_timeout_ms=int(job_seconds * 1000),
-        wait_ms=client.wait_ms(job_seconds),
-        request_id=str(uuid.uuid4()),
-        default_dataset=default_dataset,
-    )
-    job = answer.get("jobReference")
-    job = job if isinstance(job, dict) else {}
+    try:
+        answer = client.start_query(
+            sql,
+            page_size=page_size,
+            max_bytes_billed=max_bytes_processed,
+            job_timeout_ms=int(job_seconds * 1000),
+            wait_ms=client.wait_ms(job_seconds),
+            request_id=str(uuid.uuid4()),
+            default_dataset=default_dataset,
+            cap=_cap(page_size),
+        )
+        job = answer.get("jobReference")
+        job = job if isinstance(job, dict) else {}
+    except PageTooLarge as e:
+        # The job is done (its first page came back), but the page was over
+        # the cap: the job it named gives it again, with fewer rows.
+        job = e.job or {}
+        if page_size > 1 and not job:
+            raise BigQueryAPIError(
+                "BigQuery's first page of results was too large to read, and its "
+                "answer named no job to read it from"
+            ) from None
+        # Its traceback holds the dropped answer's frames: let them go first.
+        answer = _first_page_again(client, job, e.with_traceback(None), page_size)
     for _ in range(MAX_PAGES):
         if answer.get("jobComplete") is True:
             break
@@ -340,9 +469,16 @@ def run_select(
                 timed_out=True,
             )
         asked = client.now()
-        answer = client.query_results(
-            job, page_size=page_size, wait_ms=client.wait_ms(left)
-        )
+        try:
+            answer = client.query_results(
+                job,
+                page_size=page_size,
+                wait_ms=client.wait_ms(left),
+                cap=_cap(page_size),
+            )
+        except PageTooLarge as e:
+            answer = _first_page_again(client, job, e.with_traceback(None), page_size)
+            break
         if (
             answer.get("jobComplete") is not True
             and client.now() - asked < POLL_PAUSE_SECONDS
@@ -387,16 +523,17 @@ def run_select(
             result.truncated = TRUNCATED_MAX_ROWS
             return result
         del page
-        answer = client.query_results(
-            job,
-            page_size=page_rows(
+        answer = _read_capped(
+            partial(client.query_results, job, page_token=token),
+            page_rows(
                 result.fields,
                 max_rows - result.count,
                 seen=seen,
                 last_rows=last_rows,
                 last_bytes=last_bytes,
             ),
-            page_token=token,
+            result.count,
+            table=False,
         )
     result.truncated = result.truncated or TRUNCATED_MAX_ROWS
     return result
@@ -450,18 +587,25 @@ def read_table_rows(
     token: str | None = None
     seen = last_rows = last_bytes = 0
     for page_number in range(MAX_PAGES):
-        answer = client.list_rows(
-            ref,
-            page_size=page_rows(
+        answer = _read_capped(
+            partial(
+                client.list_rows,
+                ref,
+                page_token=token,
+                start_index=start_index if page_number == 0 else None,
+                selected_fields=[f["name"] for f in fields]
+                if selected_fields
+                else None,
+            ),
+            page_rows(
                 fields,
                 max_rows - result.count,
                 seen=seen,
                 last_rows=last_rows,
                 last_bytes=last_bytes,
             ),
-            page_token=token,
-            start_index=start_index if page_number == 0 else None,
-            selected_fields=[f["name"] for f in fields] if selected_fields else None,
+            start_index + result.count,
+            table=True,
         )
         total = _int(answer.get("totalRows"))
         if total is not None:
@@ -494,11 +638,14 @@ __all__ = [
     "PAGE_GROWTH",
     "PAGE_ROWS",
     "READABLE_TABLE_TYPES",
+    "READ_BYTES",
+    "READ_CELLS",
     "TRUNCATED_MAX_RESULT_BYTES",
     "TRUNCATED_MAX_ROWS",
     "CapExceeded",
     "Estimate",
     "NotATable",
+    "RowTooLarge",
     "Rows",
     "cells_per_row",
     "dry_run",

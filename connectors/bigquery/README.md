@@ -37,8 +37,9 @@ Composio's other ~58 BigQuery tools (job, table, dataset and routine writes) hav
 | `BIGQUERY_LIST_TABLES` | The tables and views in one dataset, with their types. |
 | `BIGQUERY_LIST_DATASETS` | The datasets the key can read, in the configured project or in another `project`. |
 
-A tool returns at most 4 MiB of JSON rows. Tables are written `dataset.table` or `project.dataset.table` (backticks
-allowed); datasets `dataset` or `project.dataset`. Without a project, the tenant's `project_id` is meant.
+A tool returns at most 4 MiB of JSON rows, and a single row larger than one page may hold (8 MiB of JSON or 100,000
+values, see [Memory](#memory)) is `invalid_arguments`. Tables are written `dataset.table` or `project.dataset.table`
+(backticks allowed); datasets `dataset` or `project.dataset`. Without a project, the tenant's `project_id` is meant.
 
 Values come back as JSON: `INT64` as numbers, `FLOAT64` as numbers (`NaN` and the infinities as strings), `BOOL` as
 booleans, `TIMESTAMP` as RFC 3339 UTC with microseconds, `NUMERIC`/`BIGNUMERIC` as exact strings, `RECORD` as
@@ -90,7 +91,9 @@ can't be continued: narrow the query or raise the caps. `result_sha256` then cov
 text, which can quote the SQL and name tables, nor the token endpoint's `error` and `error_description`, because
 hosts log these; the toolkit, which answers the caller, still shows both):
 - **422**, a `ValueError`: the secret is missing or malformed (`BigQueryNotConfigured`); a bad param; SQL that is
-  not one SELECT (`NotReadOnly`); the dry run over `max_bytes_processed` (`CapExceeded`); and what BigQuery refused
+  not one SELECT (`NotReadOnly`); the dry run over `max_bytes_processed` (`CapExceeded`); a single row larger than
+  one page may hold, 8 MiB of JSON or 100,000 values (`RowTooLarge`: its index and size, none of its values; see
+  [Memory](#memory)); and what BigQuery refused
   that the caller can fix, as `BigQueryRequestError` (with BigQuery's `status` and `reason`): `invalidQuery` (with
   BigQuery's "at [line:column]"), `invalid`, `notFound`, `responseTooLarge`, `resourcesExceeded`,
   `bytesBilledLimitExceeded`, `billingTierLimitExceeded`.
@@ -102,45 +105,67 @@ hosts log these; the toolkit, which answers the caller, still shows both):
 
 A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each REST page as fresh
 JSON bytes, and every envelope is kept: one inline copy each, as pipe-as-service keeps a pull's converted envelopes
-(inline up to 256 KiB; each test's docstring has the model)):
+(inline up to 256 KiB; each test's docstring has the model)). Each pull was measured in a process of its own:
 
 | Pull | Rows | JSON of the rows | Peak |
 |---|---|---|---|
-| defaults: 10,000 rows of 50 `INT64` columns | 10,000 | 6.8 MiB | 20 MiB (149 MiB before) |
-| defaults: 10,000 rows of 20 mixed columns | 10,000 | 3.7 MiB | 19 MiB |
-| defaults: 10,000 rows of 4 wide `STRING` columns (1 KB a row) | 10,000 | 9.9 MiB | 41 MiB |
+| defaults: 10,000 rows of 50 `INT64` columns | 10,000 | 6.8 MiB | 20 MiB (149 MiB before pages were bounded) |
+| defaults: 10,000 rows of 20 mixed columns (`INT64`, `FLOAT64`, `BOOL`, `TIMESTAMP`, `DATE`, `NUMERIC`, short `STRING`s) | 10,000 | 4.1 MiB | 18 MiB |
+| defaults: 10,000 rows of 4 wide `STRING` columns (1 KB a row) | 10,000 | 9.9 MiB | 21 MiB (41 MiB when the first 10 MB page was parsed whole) |
 | `max_result_bytes` 64 MiB, 50 `INT64` columns | 94,709 | 64 MiB | 81 MiB |
-| `max_rows` 100,000, 20 mixed columns | 100,000 | 37 MiB | 56 MiB |
-| `max_result_bytes` 64 MiB, wide rows (the most bytes held) | 64,849 | 64 MiB | 84 MiB (103 MiB with 10 MB pages, 241 MiB at the old 100 MiB) |
+| `max_rows` 100,000, 20 mixed columns | 100,000 | 41 MiB | 58 MiB |
+| `max_result_bytes` 64 MiB, wide rows (the most bytes held) | 64,849 | 64 MiB | 82 MiB (241 MiB at the old 100 MiB) |
 
-How: a page asks for at most 50,000 cells (`PAGE_CELLS`; each REST cell is a `{"v": "..."}` object, about 250 bytes
-once parsed), so 1,000 rows of 50 columns or 10,000 of 5. Once a page has come back, the next also asks for at most the
-rows that fit 4 MiB of JSON at its bytes a row (`PAGE_BYTES`; long values), and at most twice its rows (`PAGE_GROWTH`;
-a page that came back short grows back a step at a time). Each page is let go before the next is read, rows are
-converted one at a time, and the source keeps each row as its canonical JSON (about a fifth of the memory a row
-object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once its
-envelope is built. So a pull peaks at about 1.35 times the rows' JSON plus 20-40 MiB, and at most about 85 MiB at
+How a page is sized: it asks for at most 50,000 cells (`PAGE_CELLS`; each REST cell is a `{"v": "..."}` object, about
+250 bytes once parsed), so 1,000 rows of 50 columns or 10,000 of 5. Once a page has come back, the next also asks for
+at most the rows that fit 4 MiB of JSON at its bytes a row (`PAGE_BYTES`; long values), and at most twice its rows
+(`PAGE_GROWTH`; a page that came back short grows back a step at a time). Each page is let go before the next is
+read, rows are converted one at a time, and the source keeps each row as its canonical JSON (about a fifth of the
+memory a row object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once
+its envelope is built. So a pull peaks at about 1.35 times the rows' JSON plus 20-40 MiB, and at most about 85 MiB at
 the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
 response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod.
 
-A `REPEATED` column's elements are cells too, and its schema can't say how many a row holds: every page guesses 1,000
-elements a column (`REPEATED_CELLS`; 49 rows a page for one `REPEATED INT64` column). The guess is a floor: rows that
-held fewer elements so far say nothing about the next ones (a column added later leaves the older rows `[]`; an
-`ORDER BY` array length puts the long ones last), so they never make a page longer; rows that held more make the next
-page shorter. Rows of 100 elements peak at 9.7 MiB at the defaults (277 MiB with 10,000-row pages) and 75 MiB at the
-caps (342 MiB); rows of 1,000 elements at 79 MiB. A query whose first 50 rows hold short arrays and the rest long ones
-(`tests/test_memory.py`, on the `sql` path):
+**What bounds a page is the read cap, not its sizing.** A page's body (every one: tabledata.list's, a query's first
+page in jobs.query's answer, and getQueryResults') is streamed, and its bytes and its cells (its `"v":` keys: a
+`REPEATED` column's every element and a `RECORD`'s every field included) are counted as they arrive, before any of
+it is parsed. A page over 8 MiB of JSON (`READ_BYTES`) or 100,000 cells (`READ_CELLS`) is dropped, and asked for
+again with fewer rows: half, or fewer when what was read of it says fewer fit 4 MiB and 50,000 cells (BigQuery's own
+page limit answers a page of long rows with as many as fit, whatever was asked, so halving alone would drop page
+after page). A query's dropped first page is asked for again from the job jobs.query's answer named. Down to one
+row: a single row over either cap is **refused**, `RowTooLarge` (422), which says the row's index and the size of
+the page that holds it alone (its bytes and values) and nothing of its values. So parsing a page costs at most about
+25 MiB of objects on top of its 8 MiB of JSON, however long its arrays are. A dropped page costs a request and at
+most 8 MiB read.
 
-| First 50 rows, then the rest | Peak at the defaults | Peak at the caps (rows) | Before the floor |
-|---|---|---|---|
-| `[]`, then 100 elements | 9.7 MiB | 75 MiB (82,051, `max_result_bytes`) | 278 MiB |
-| 1 element, then 80 | 7.9 MiB | 76 MiB (100,000) | 224 MiB |
-| `[]`, then 180 one-character elements | 6.0 MiB | 49 MiB (100,000) | 378 MiB |
+A `REPEATED` column's schema can't say how many elements a row holds: the FIRST page guesses 1,000 a column
+(`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the most cells a row
+has held so far. Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
+elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
+and 10 MB for a table; 1,000 rows, so both stop at `max_result_bytes`):
 
-Before, the first page's short arrays sized the second at 9,951 rows (a million cells, a 17 MiB page, under BigQuery's
-20 MB page limit). The floor's cost is pages: 49 rows a page is 205 requests for the default 10,000 rows, and a pull
-follows at most 5,000 pages (`MAX_PAGES`). A row whose arrays are far over the guess is bounded by BigQuery's own page
-limit (10 MB for a table, 20 MB for a query) on the first page that holds it, and the next page by its bytes.
+| Rows | Pull | Peak at the defaults (rows) | Peak at the caps (rows) | At e3d068b, defaults / caps |
+|---|---|---|---|---|
+| 20,000 elements each | `sql` | 36.7 MiB (163) | 76.0 MiB (419) | 266.1 / 266.1 MiB |
+| 22,000 elements each | `sql` | 37.9 MiB (148) | 77.1 MiB (381) | 292.9 / 292.9 MiB |
+| 34,000 one-character elements each | `sql` | 38.2 MiB (385) | 73.9 MiB (986) | 343.5 / 343.5 MiB |
+| `[]` for 50 rows, then 22,000 elements | `sql` | 37.9 MiB (198) | 77.2 MiB (431) | 286.9 / 286.9 MiB |
+| 20,000 elements each | `table` | 36.7 MiB (163) | 76.0 MiB (419) | 146.6 / 146.6 MiB |
+
+At e3d068b the first page asked for 49 rows (the guess, then a floor for every page) whatever their arrays held: up
+to 1.67 million cells, a 20 MB page parsed whole. BigQuery's page limit bounds a page's bytes, not what parsing it
+costs. Now that page is dropped once 100,000 of its cells are read, and asked for again with the rows that fit (one
+or two), then pages of two (one for the one-character rows). Rows whose arrays are short and then long (a column added
+later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones last), on the `sql` path:
+
+| First 50 rows, then the rest | Peak at the defaults | Peak at the caps (rows) |
+|---|---|---|
+| `[]`, then 100 elements | 21 MiB | 81 MiB (82,051, `max_result_bytes`) |
+| 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
+| `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
+
+A pull follows at most 5,000 pages (`MAX_PAGES`); rows of 50,000 cells or more page one at a time, and
+`max_result_bytes` stops those within about 700.
 
 ## Security
 
