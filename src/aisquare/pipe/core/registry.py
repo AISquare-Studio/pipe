@@ -13,8 +13,14 @@ import functools
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Iterable, Mapping
-from importlib.metadata import entry_points
+from importlib.metadata import (
+    EntryPoint,
+    PackageNotFoundError,
+    distribution,
+    entry_points,
+)
 from typing import Any, NamedTuple
 
 from aisquare.pipe.core.search import (
@@ -42,28 +48,97 @@ from aisquare.pipe.errors import (
 
 logger = logging.getLogger("aisquare.pipe")
 
+#: Every connector ships inside the ``aisquare-pipe`` distribution as the
+#: top-level module ``aisquare_pipe_<name>``, and its third-party deps are the
+#: ``aisquare-pipe[<name>]`` extra.
+CONNECTOR_MODULE_PREFIX = "aisquare_pipe_"
+
+_REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
+_EXTRA_MARKER = re.compile(r"""\bextra\s*==\s*['"]([^'"]+)['"]""")
+
+
+def _canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def connector_extra(module: str) -> str | None:
+    """The extra that carries the deps of the connector module ``module``
+    (``aisquare_pipe_dropbox.connector`` → ``dropbox``), or None when it isn't
+    a connector module."""
+    top = module.split(".", 1)[0]
+    if not top.startswith(CONNECTOR_MODULE_PREFIX) or top == CONNECTOR_MODULE_PREFIX:
+        return None
+    return top[len(CONNECTOR_MODULE_PREFIX) :]
+
+
+def missing_requirements(ep: EntryPoint) -> list[str]:
+    """The requirements of ``ep``'s connector extra that aren't installed,
+    sorted. Empty when ``ep`` isn't a connector entry point, its distribution
+    is unknown, or the extra is fully installed. Reads installed metadata only:
+    it imports nothing."""
+    extra = connector_extra(ep.module)
+    dist = ep.dist
+    if extra is None or dist is None:
+        return []
+    own = _canonical(dist.metadata["Name"] or "")
+    missing = set()
+    for line in dist.requires or []:
+        marker = _EXTRA_MARKER.search(line)
+        name = _REQUIREMENT_NAME.match(line)
+        if not marker or not name or _canonical(marker.group(1)) != _canonical(extra):
+            continue
+        if _canonical(name.group(1)) == own:
+            continue  # a bundle of our own extras, not a third-party dep
+        try:
+            distribution(name.group(1))
+        except PackageNotFoundError:
+            missing.add(name.group(1))
+    return sorted(missing)
+
+
+def _load_failed(kind: str, ep: EntryPoint, error: Exception) -> None:
+    """Log why ``ep`` didn't load. A connector whose extra isn't installed is
+    not installed, which is fine: one info line saying what to install. Any
+    other failure is a broken plugin: a warning."""
+    if isinstance(error, ImportError):
+        missing = missing_requirements(ep)
+        if missing:
+            extra = connector_extra(ep.module)
+            logger.info(
+                "%s %s is not installed: it needs aisquare-pipe[%s] (missing %s)",
+                kind.capitalize(),
+                ep.name,
+                extra,
+                ", ".join(missing),
+            )
+            return
+    logger.warning(f"Failed to load {kind} {ep.name}: {error}")
+
 
 def discover_connectors() -> dict[str, type]:
-    """Auto-discover all installed connectors via entry_points."""
+    """Auto-discover all installed connectors via entry_points. A connector
+    whose ``aisquare-pipe[<name>]`` extra isn't installed is left out as not
+    installed (logged at info level)."""
     discovered: dict[str, type] = {}
     for ep in entry_points(group="aisquare_pipe.connectors"):
         try:
             cls = ep.load()
             discovered[ep.name] = cls
-        except Exception as e:
-            logger.warning(f"Failed to load connector {ep.name}: {e}")
+        except Exception as e:  # noqa: BLE001 — one broken plugin must not hide the rest
+            _load_failed("connector", ep, e)
     return discovered
 
 
 def discover_converters() -> dict[str, type]:
-    """Auto-discover all installed converters via entry_points."""
+    """Auto-discover all installed converters via entry_points (a missing
+    extra counts as not installed, as for connectors)."""
     discovered: dict[str, type] = {}
     for ep in entry_points(group="aisquare_pipe.converters"):
         try:
             cls = ep.load()
             discovered[ep.name] = cls
-        except Exception as e:
-            logger.warning(f"Failed to load converter {ep.name}: {e}")
+        except Exception as e:  # noqa: BLE001 — one broken plugin must not hide the rest
+            _load_failed("converter", ep, e)
     return discovered
 
 
@@ -97,14 +172,15 @@ def get_converter(name: str) -> type:
 
 def discover_toolkits() -> dict[str, type]:
     """Auto-discover all installed toolkits via the ``aisquare_pipe.toolkits``
-    entry-point group (entry-point name == toolkit name)."""
+    entry-point group (entry-point name == toolkit name). A toolkit whose
+    connector extra isn't installed is left out as not installed."""
     discovered: dict[str, type] = {}
     for ep in entry_points(group="aisquare_pipe.toolkits"):
         try:
             cls = ep.load()
             discovered[ep.name] = cls
         except Exception as e:  # noqa: BLE001 — one broken plugin must not hide the rest
-            logger.warning(f"Failed to load toolkit {ep.name}: {e}")
+            _load_failed("toolkit", ep, e)
     return discovered
 
 

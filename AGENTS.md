@@ -9,7 +9,7 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 - `src/aisquare/pipe/mcp/`: MCP server integration
 - `src/aisquare/pipe/testing/`: compliance helpers, fixtures, and mock connectors used by tests
 - `tests/`: framework-level test suite
-- `connectors/<name>/`: standalone connector plugin packages with their own `pyproject.toml`, source package, README, and tests
+- `connectors/<name>/`: one connector each: its module (`src/aisquare_pipe_<name>/`), README and tests, plus a `pyproject.toml` holding only that suite's pytest/ruff settings. Every connector ships inside the one `aisquare-pipe` distribution: the root `pyproject.toml` packages it, declares its entry points, and holds its third-party deps as the `[<name>]` extra
 - `examples/`: small runnable examples
 
 ## Development Environment
@@ -18,9 +18,9 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
   ```bash
   source .venv/bin/activate
   ```
-- Install editable package with dev tools:
+- Install editable package with dev tools and every connector's deps (one install covers the framework and all connectors):
   ```bash
-  pip install -e ".[dev]"
+  pip install -e ".[full,dev]"
   ```
 - Plugin discovery depends on editable/install-time entry points. If CLI discovery behaves unexpectedly, confirm the package has been installed with `pip install -e .`.
 
@@ -30,7 +30,7 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
   pipe validate                # contract + hygiene + every unit suite
   pipe validate --skip-tests   # contract + hygiene only (seconds)
   pipe validate composio       # one connector
-  pipe validate --install      # also pip install -e any missing/broken connector dirs
+  pipe validate --install      # first pip install -e ".[full,dev]" if a connector is missing or stale
   ```
   Exit 0 = clean (warnings allowed), 1 = failures. CI runs exactly this command.
 - Run framework tests:
@@ -54,12 +54,12 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
   ```bash
   mypy src
   ```
-- Toolkits extra — every package registering an `aisquare_pipe.toolkits` entry point is in the root
-  `[toolkits]` extra with a `>=` floor, and nothing else is (CI runs it; no install needed):
+- Toolkits extra — every connector registering an `aisquare_pipe.toolkits` entry point is in the root
+  `[toolkits]` extra (`aisquare-pipe[github,gmail,...]`), and nothing else is (CI runs it; no install needed):
   ```bash
   python scripts/check_toolkits_extra.py
   ```
-- Editable-install the framework and every toolkit into another venv (e.g. pipe-as-service's), from that venv:
+- Editable-install the framework with every toolkit's deps into another venv (e.g. pipe-as-service's), from that venv (one `pip install -e "<checkout>[toolkits]"`):
   ```bash
   <pipe-checkout>/scripts/dev_install_toolkits.sh
   ```
@@ -75,7 +75,8 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 - When adding connector behavior, update or add compliance-oriented tests alongside unit tests.
 - Prefer small, typed changes that follow existing patterns in the core package and connector packages.
 - Do not remove or rename entry points in `pyproject.toml` files unless the task explicitly requires it.
-- Each connector under `connectors/<name>/` is an independently published pip package. Its source MUST stay inside its own directory; framework code is not modified from a connector change.
+- Each connector under `connectors/<name>/` ships inside the one `aisquare-pipe` distribution (no connector is ever its own PyPI package). Its source MUST stay inside its own directory; framework code is not modified from a connector change.
+- Adding a connector: code in `connectors/<name>/src/aisquare_pipe_<name>/`, then in the root `pyproject.toml` add `connectors/<name>/src` to `[tool.setuptools.packages.find] where`, its entry points, an extra named `<name>` with its third-party deps (`[]` if none), and `<name>` to `[full]` (and `[toolkits]` if it registers a toolkit). Import its SDK at module top: without the extra, its entry points then count as not installed. `tests/test_distribution.py` and `pipe validate` hygiene fail until all of it is there.
 - If a connector needs additional folders (e.g., `migrations/`, `schemas/`, `fixtures/`), those go **inside** `connectors/<name>/` — never at the repo root.
 - **Credentials are never required by default.** All validation layers (contract, hygiene, unit suites) are hermetic — connector tests mock at the client boundary. Live tests are opt-in via `pipe validate --live` and must self-skip when their env vars are absent.
 
@@ -83,13 +84,13 @@ This repository contains `aisquare.pipe`, a Python 3.11+ connector framework for
 All connectors live in the same `connectors/<name>/` directory; the tier signal is encoded in `pyproject.toml` extras bundles, not in folder location.
 
 - **`[popular]`** — Super-popular, broadly useful connectors most users want. Currently: `local`, `dropbox`, `onedrive`, `googledrive`. Installed via `pip install "aisquare-pipe[popular]"`.
-- **`[full]`** — Everything in `[popular]` plus the long-tail / enterprise / client-specific connectors. Currently adds `salesforce`, `docusign`, `composio`, `github`, `slack`, `gmail`, `googlecalendar`. Installed via `pip install "aisquare-pipe[full]"`.
-- **Direct install** — `pip install aisquare-pipe-<name>` always works for any connector regardless of tier.
-- **`[toolkits]`** — not a tier: every package that registers an `aisquare_pipe.toolkits` entry point, each with a `>=` floor. Hosts (pipe-as-service) install it to get every toolkit. `scripts/check_toolkits_extra.py` fails CI when a toolkit package is missing from it or an entry has no toolkit.
+- **`[full]`** — Every connector's extra (`hygiene.tier-listed` fails a connector missing from it). Installed via `pip install "aisquare-pipe[full]"`.
+- **One connector** — `pip install "aisquare-pipe[<name>]"` works for any connector regardless of tier.
+- **`[toolkits]`** — not a tier: the extras of every connector that registers an `aisquare_pipe.toolkits` entry point. Hosts (pipe-as-service) install it to get every toolkit's deps. `scripts/check_toolkits_extra.py` fails CI when a toolkit connector is missing from it or an entry has no toolkit.
 
 **Where does a new connector belong?**
 - Super-popular and broadly useful (a typical AISquare user is likely to need it) → add to `[popular]` in `pyproject.toml`.
-- Niche / enterprise / client-specific / experimental → leave out of `[popular]` (it still ships via `[full]` and direct install).
+- Niche / enterprise / client-specific / experimental → leave out of `[popular]` (it still ships via `[full]` and `aisquare-pipe[<name>]`).
 - When in doubt, leave it out of `[popular]`. Promoting later is cheap; demoting feels worse to users.
 
 The repo is sized to scale to ~50 connectors in this layout. If the long-tail grows past that, the `[popular]` set may need to spin out into its own repo — but that's a future problem, not a current one.
@@ -97,7 +98,7 @@ The repo is sized to scale to ~50 connectors in this layout. If the long-tail gr
 ## Testing Expectations
 - Run `pipe validate` before pushing any connector change — it is the single gate (contract, hygiene, unit suites) and what CI runs, together with `python scripts/check_toolkits_extra.py`.
 - Any change to pipeline logic, type matching, envelope handling, registry behavior, or merge behavior should include or update tests under `tests/`.
-- Any connector package change should run that connector's test suite and keep compliance tests passing.
+- Any connector change should run that connector's test suite and keep compliance tests passing.
 - If a change affects CLI output or connector discovery, verify with the CLI where practical.
 
 ## Notes For Agents

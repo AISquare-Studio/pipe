@@ -1,9 +1,15 @@
-"""Repo-hygiene checks for connector packages (Layer B of ``pipe validate``).
+"""Repo-hygiene checks for connector directories (Layer B of ``pipe validate``).
 
 Operates on a repo checkout's ``connectors/<dir>/`` trees and codifies the
 connector-PR review rubric: packaging rules, scaffold completeness, code
 isolation, and install-state. Pure functions over paths + injected dist
 info, so tests can drive them against ``tmp_path`` fakes.
+
+Every connector ships inside the one ``aisquare-pipe`` distribution (D8):
+the root ``pyproject.toml`` packages ``connectors/<dir>/src``, declares the
+connector's entry points, and holds its third-party deps as the
+``aisquare-pipe[<dir>]`` extra. ``connectors/<dir>/pyproject.toml`` holds
+only the tool settings its test suite runs with (pytest, ruff).
 """
 
 from __future__ import annotations
@@ -27,10 +33,79 @@ from aisquare.pipe.testing.validation import (
 FRAMEWORK_DIST = "aisquare-pipe"
 ENTRY_POINT_GROUP = "aisquare_pipe.connectors"
 TOOLKIT_ENTRY_POINT_GROUP = "aisquare_pipe.toolkits"
+CONVERTER_ENTRY_POINT_GROUP = "aisquare_pipe.converters"
+ENTRY_POINT_GROUPS = (ENTRY_POINT_GROUP, TOOLKIT_ENTRY_POINT_GROUP, CONVERTER_ENTRY_POINT_GROUP)
+#: The bundle every connector's extra belongs to.
+FULL_EXTRA = "full"
+#: How the repo is installed for development (and by ``--install``).
+DEV_INSTALL = 'pip install -e ".[full,dev]"'
 
 INSTALL_OK = "ok"
 INSTALL_BROKEN = "broken"
 INSTALL_MISSING = "missing"
+
+_SELF_EXTRAS = re.compile(r"^\s*aisquare-pipe\s*\[([^\]]*)\]", re.IGNORECASE)
+
+
+def canonical(name: str) -> str:
+    """A distribution or extra name as pip compares them (PEP 503 / 685)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+@dataclass
+class RootProject:
+    """The packaging facts of the root ``pyproject.toml`` (``aisquare-pipe``)."""
+
+    data: dict
+    error: str | None = None
+
+    @classmethod
+    def load(cls, repo_root: Path) -> RootProject:
+        try:
+            with (repo_root / "pyproject.toml").open("rb") as f:
+                return cls(tomllib.load(f))
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            return cls({}, error=str(e))
+
+    @property
+    def project(self) -> dict:
+        return self.data.get("project", {})
+
+    @property
+    def version(self) -> str | None:
+        return self.project.get("version")
+
+    @property
+    def extras(self) -> dict[str, list[str]]:
+        """Extras by canonical name."""
+        raw = self.project.get("optional-dependencies", {}) or {}
+        return {canonical(k): list(v or []) for k, v in raw.items()}
+
+    @property
+    def package_dirs(self) -> list[str]:
+        """``[tool.setuptools.packages.find] where``, as written."""
+        find = self.data.get("tool", {}).get("setuptools", {}).get("packages", {})
+        where = find.get("find", {}).get("where", []) if isinstance(find, dict) else []
+        return [str(w).rstrip("/") for w in where]
+
+    def entry_points(self, group: str) -> dict[str, str]:
+        return dict(self.project.get("entry-points", {}).get(group, {}) or {})
+
+    def bundle(self, extra: str) -> set[str]:
+        """Every extra ``extra`` pulls in through ``aisquare-pipe[...]``
+        self-references, itself included (canonical names)."""
+        seen: set[str] = set()
+        todo = [canonical(extra)]
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for req in self.extras.get(name, []):
+                m = _SELF_EXTRAS.match(req)
+                if m:
+                    todo += [canonical(e) for e in m.group(1).split(",") if e.strip()]
+        return seen
 
 
 @dataclass
@@ -39,9 +114,10 @@ class ConnectorDir:
 
     dir_name: str
     path: Path
-    dist_name: str
+    #: ``connectors/<dir>/pyproject.toml``: tool settings only.
     pyproject: dict | None
     pyproject_error: str | None
+    root: RootProject = field(default_factory=lambda: RootProject({}))
 
     @property
     def safe_name(self) -> str:
@@ -51,9 +127,38 @@ class ConnectorDir:
     def module_name(self) -> str:
         return f"aisquare_pipe_{self.safe_name}"
 
-    def entry_points(self, group: str) -> dict:
-        project = (self.pyproject or {}).get("project", {})
-        return project.get("entry-points", {}).get(group, {}) or {}
+    @property
+    def extra(self) -> str:
+        """The extra carrying this connector's third-party deps."""
+        return canonical(self.dir_name)
+
+    @property
+    def requirement(self) -> str:
+        """How to install it: ``aisquare-pipe[<dir>]``."""
+        return f"{FRAMEWORK_DIST}[{self.dir_name}]"
+
+    @property
+    def dist_name(self) -> str:
+        """The distribution it ships in, with its extra (a report label)."""
+        return self.requirement
+
+    def entry_points(self, group: str) -> dict[str, str]:
+        """This connector's entry points in ``group``, as the root pyproject
+        declares them: those whose module is ``aisquare_pipe_<dir>``."""
+        return {
+            name: value
+            for name, value in self.root.entry_points(group).items()
+            if value.split(":", 1)[0].split(".", 1)[0] == self.module_name
+        }
+
+    def declared_entry_points(self) -> set[str]:
+        """Its connector and toolkit entry points (the groups ``pipe validate``
+        loads)."""
+        return {
+            name
+            for group in (ENTRY_POINT_GROUP, TOOLKIT_ENTRY_POINT_GROUP)
+            for name in self.entry_points(group)
+        }
 
     @property
     def registers_toolkit(self) -> bool:
@@ -62,18 +167,23 @@ class ConnectorDir:
     @property
     def registers_connector(self) -> bool:
         """True when connector entry points are registered — or when nothing
-        is, so a bare package is still held to the connector scaffold."""
+        is, so a bare directory is still held to the connector scaffold."""
         return bool(self.entry_points(ENTRY_POINT_GROUP)) or not self.registers_toolkit
 
 
 @dataclass
 class DistInfo:
-    """Installed-distribution facts for one connector (injectable in tests)."""
+    """Installed facts for one connector (injectable in tests): the framework
+    distribution it ships in, and how its own entry points loaded."""
 
     found: bool
     version: str | None = None
     editable_path: Path | None = None
     ep_load_errors: dict[str, str] = field(default_factory=dict)
+    #: Requirements of the connector's extra that aren't installed.
+    missing_requirements: list[str] = field(default_factory=list)
+    #: Its entry points the installed metadata lists (None: not looked up).
+    installed_entry_points: set[str] | None = None
 
 
 def find_repo_root(start: Path | None = None) -> Path | None:
@@ -96,8 +206,9 @@ def find_repo_root(start: Path | None = None) -> Path | None:
 
 
 def list_connector_dirs(repo_root: Path) -> list[ConnectorDir]:
-    """Every ``connectors/<dir>/`` containing (or expected to contain) a
-    connector package, sorted by name."""
+    """Every ``connectors/<dir>/`` (each is, or should be, a connector),
+    sorted by name."""
+    root = RootProject.load(repo_root)
     dirs: list[ConnectorDir] = []
     connectors = repo_root / "connectors"
     for path in sorted(connectors.iterdir()):
@@ -113,17 +224,22 @@ def list_connector_dirs(repo_root: Path) -> list[ConnectorDir]:
             except (OSError, tomllib.TOMLDecodeError) as e:
                 error = str(e)
         else:
-            error = "pyproject.toml not found"
+            error = "pyproject.toml not found (it holds the suite's pytest settings)"
         dirs.append(
             ConnectorDir(
                 dir_name=path.name,
                 path=path,
-                dist_name=f"aisquare-pipe-{path.name}",
                 pyproject=pyproject,
                 pyproject_error=error,
+                root=root,
             )
         )
     return dirs
+
+
+def owner_module(ep_value: str) -> str:
+    """The top-level module an entry point's value lives in."""
+    return ep_value.split(":", 1)[0].split(".", 1)[0]
 
 
 def _file_url_to_path(url: str) -> Path:
@@ -139,51 +255,71 @@ def _file_url_to_path(url: str) -> Path:
     return Path(url2pathname(urlparse(url).path))
 
 
-def load_dist_info(
-    dist_name: str, discovered: list[DiscoveredConnector]
-) -> DistInfo:
-    """Installed-dist facts: version, editable target (``direct_url.json``),
-    and any entry-point load errors attributed to this dist."""
+def _framework_dist_facts() -> tuple[bool, str | None, Path | None]:
+    """(installed, version, checkout path) of the installed ``aisquare-pipe``.
+    The checkout path comes from ``direct_url.json`` and is set only for an
+    install from a directory (``pip install [-e] <repo>``), not from a wheel
+    or an index."""
     from importlib.metadata import PackageNotFoundError, distribution
 
     try:
-        dist = distribution(dist_name)
+        dist = distribution(FRAMEWORK_DIST)
     except PackageNotFoundError:
-        return DistInfo(found=False)
-
+        return False, None, None
     editable_path: Path | None = None
     try:
         raw = dist.read_text("direct_url.json")
         if raw:
-            url = json.loads(raw).get("url", "")
-            if url.startswith("file://"):
+            info = json.loads(raw)
+            url = info.get("url", "")
+            if "dir_info" in info and url.startswith("file://"):
                 editable_path = _file_url_to_path(url)
     except Exception:  # noqa: BLE001 — absent/odd metadata is not an error
         editable_path = None
+    return True, dist.version, editable_path
 
+
+def load_dist_info(cdir: ConnectorDir, discovered: list[DiscoveredConnector]) -> DistInfo:
+    """Installed facts for one connector: the framework distribution's
+    version and checkout, and how this connector's entry points loaded. An
+    entry point that failed only because the connector's extra isn't
+    installed is a missing requirement, not a load error."""
+    found, version, editable_path = _framework_dist_facts()
+    if not found:
+        return DistInfo(found=False)
+    own = [d for d in discovered if owner_module(d.ep_value) == cdir.module_name]
+    missing = sorted({req for d in own for req in d.missing_requirements})
     ep_load_errors = {
-        d.ep_name: d.load_error
-        for d in discovered
-        if d.dist_name == dist_name and d.load_error
+        d.ep_name: d.load_error for d in own if d.load_error and not d.missing_requirements
     }
     return DistInfo(
         found=True,
-        version=dist.version,
+        version=version,
         editable_path=editable_path,
         ep_load_errors=ep_load_errors,
+        missing_requirements=missing,
+        installed_entry_points={d.ep_name for d in own},
     )
 
 
+def stale_entry_points(cdir: ConnectorDir, dist: DistInfo) -> list[str]:
+    """Entry points the root pyproject declares for this connector that the
+    installed metadata doesn't list: the install predates them."""
+    if dist.installed_entry_points is None:
+        return []
+    return sorted(cdir.declared_entry_points() - dist.installed_entry_points)
+
+
 def classify_install_state(cdir: ConnectorDir, dist: DistInfo) -> str:
-    if not dist.found:
+    if not dist.found or dist.missing_requirements:
         return INSTALL_MISSING
-    if dist.ep_load_errors:
+    if dist.ep_load_errors or stale_entry_points(cdir, dist):
         return INSTALL_BROKEN
     if dist.editable_path is not None:
         try:
-            if dist.editable_path.resolve() != cdir.path.resolve():
+            if dist.editable_path.resolve() != cdir.path.resolve().parents[1]:
                 return INSTALL_BROKEN
-        except OSError:
+        except (OSError, IndexError):
             return INSTALL_BROKEN
     return INSTALL_OK
 
@@ -203,40 +339,41 @@ def _iter_src_files(cdir: ConnectorDir) -> list[Path]:
 
 
 def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
+    """The connector's own pyproject holds tool settings only; the root
+    pyproject packages it, declares its entry points and its extra."""
+    rel = f"connectors/{cdir.dir_name}"
     results = [
         _result(
             "hygiene.pyproject-parses",
             cdir.pyproject is not None,
-            f"connectors/{cdir.dir_name}/pyproject.toml: {cdir.pyproject_error}",
+            f"{rel}/pyproject.toml: {cdir.pyproject_error}",
         )
     ]
-    if cdir.pyproject is None:
-        return results
-    project = cdir.pyproject.get("project", {})
-
+    if cdir.pyproject is not None:
+        tables = sorted(t for t in ("project", "build-system") if t in cdir.pyproject)
+        results.append(
+            _result(
+                "hygiene.not-a-package",
+                not tables,
+                f"{rel}/pyproject.toml has [{'], ['.join(tables)}]: connectors ship inside "
+                f"{FRAMEWORK_DIST}, packaged by the root pyproject.toml. Keep only [tool.*] here",
+            )
+        )
+    root = cdir.root
     results.append(
         _result(
-            "hygiene.package-name",
-            project.get("name") == cdir.dist_name,
-            f"[project].name is {project.get('name')!r}, must be {cdir.dist_name!r}",
+            "hygiene.packaged",
+            f"{rel}/src" in root.package_dirs,
+            f'root pyproject.toml: [tool.setuptools.packages.find] where lacks "{rel}/src", '
+            f"so {cdir.module_name} is not in the {FRAMEWORK_DIST} wheel",
         )
     )
     results.append(
         _result(
-            "hygiene.requires-python",
-            bool(project.get("requires-python")),
-            "[project].requires-python is not set (framework baseline: >=3.11)",
-        )
-    )
-    deps = project.get("dependencies", []) or []
-    has_framework_dep = any(
-        re.match(r"^aisquare-pipe\s*(\[[^]]*\])?\s*(>=|==|~=)", dep) for dep in deps
-    )
-    results.append(
-        _result(
-            "hygiene.framework-dep",
-            has_framework_dep,
-            "dependencies must include a versioned requirement on aisquare-pipe (e.g. aisquare-pipe>=0.1.0)",
+            "hygiene.extra-declared",
+            cdir.extra in root.extras,
+            f"root pyproject.toml: no [project.optional-dependencies] {cdir.dir_name} = [...] "
+            f"(its third-party deps; [] when it has none), so {cdir.requirement} does not exist",
         )
     )
     eps = cdir.entry_points(ENTRY_POINT_GROUP) or cdir.entry_points(TOOLKIT_ENTRY_POINT_GROUP)
@@ -244,8 +381,8 @@ def _check_pyproject_rules(cdir: ConnectorDir) -> list[CheckResult]:
         _result(
             "hygiene.entry-points-registered",
             bool(eps),
-            f'[project.entry-points."{ENTRY_POINT_GROUP}"] (or "{TOOLKIT_ENTRY_POINT_GROUP}") '
-            "is missing or empty",
+            f'root pyproject.toml: no [project.entry-points."{ENTRY_POINT_GROUP}"] (or '
+            f'"{TOOLKIT_ENTRY_POINT_GROUP}") entry pointing into {cdir.module_name}',
         )
     )
     return results
@@ -362,64 +499,37 @@ def _class_versions(cdir: ConnectorDir, loaded_classes: dict[str, type]) -> set[
 def _check_versions(
     cdir: ConnectorDir, dist: DistInfo, loaded_classes: dict[str, type]
 ) -> list[CheckResult]:
-    results: list[CheckResult] = []
-    pyproject_version = (
-        (cdir.pyproject or {}).get("project", {}).get("version")
-        if cdir.pyproject
-        else None
-    )
-    results.append(
+    """A connector's classes carry its own contract version (the toolkit card
+    and search index key on it), independent of the distribution's: they
+    must declare one, and all of one connector's classes the same one."""
+    class_versions = {v for v in _class_versions(cdir, loaded_classes) if v}
+    results = [
         _result(
             "hygiene.version-set",
-            bool(pyproject_version),
-            "[project].version is not set",
+            bool(class_versions),
+            f"no connector class in {cdir.module_name} declares a version",
             severity=Severity.WARNING,
         )
-    )
-    if pyproject_version:
-        class_versions = _class_versions(cdir, loaded_classes)
-        mismatched = {v for v in class_versions if v and v != pyproject_version}
-        if class_versions:
-            results.append(
-                _result(
-                    "hygiene.version-sync",
-                    not mismatched,
-                    f"connector class version(s) {sorted(mismatched)} != pyproject version {pyproject_version!r}",
-                )
+    ]
+    if class_versions:
+        results.append(
+            _result(
+                "hygiene.version-sync",
+                len(class_versions) == 1,
+                f"{cdir.module_name}'s classes declare different versions {sorted(class_versions)}: "
+                "one connector, one version",
             )
-        if dist.found and dist.version and dist.version != pyproject_version:
-            results.append(
-                CheckResult(
-                    "hygiene.dist-version-fresh",
-                    False,
-                    severity=Severity.WARNING,
-                    message=(
-                        f"installed dist {dist.version} != pyproject {pyproject_version} "
-                        f"(stale editable metadata — re-run pip install -e connectors/{cdir.dir_name})"
-                    ),
-                )
-            )
+        )
     return results
 
 
-def _check_tier(cdir: ConnectorDir, repo_root: Path) -> list[CheckResult]:
-    try:
-        with (repo_root / "pyproject.toml").open("rb") as f:
-            root = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
-        return []
-    extras = root.get("project", {}).get("optional-dependencies", {})
-    listed = any(
-        any(req.split("[")[0].strip() == cdir.dist_name for req in extras.get(tier, []))
-        for tier in ("popular", "full")
-    )
+def _check_tier(cdir: ConnectorDir) -> list[CheckResult]:
     return [
         _result(
             "hygiene.tier-listed",
-            listed,
-            f"{cdir.dist_name} is in neither [popular] nor [full] extras of the root pyproject "
-            "(fine for experimental connectors; add it when it should ship with the bundles)",
-            severity=Severity.WARNING,
+            cdir.extra in cdir.root.bundle(FULL_EXTRA),
+            f"[{cdir.dir_name}] is not in the root pyproject's [{FULL_EXTRA}] extra, which "
+            "must pull in every connector's deps",
         )
     ]
 
@@ -466,20 +576,27 @@ def _check_live_markers(cdir: ConnectorDir) -> list[CheckResult]:
 
 def check_install_state(cdir: ConnectorDir, dist: DistInfo) -> list[CheckResult]:
     state = classify_install_state(cdir, dist)
-    remediation = f"Fix: pip install -e connectors/{cdir.dir_name}  (or re-run with --install)"
+    remediation = f"Fix: {DEV_INSTALL}  (or re-run with --install)"
     if state == INSTALL_MISSING:
-        return [
-            _result(
-                "hygiene.install-state",
-                False,
-                f"{cdir.dist_name} is not installed. {remediation}",
+        if not dist.found:
+            detail = f"{FRAMEWORK_DIST} is not installed"
+        else:
+            detail = (
+                f"not installed: {cdir.requirement} is missing "
+                + ", ".join(dist.missing_requirements)
             )
-        ]
+        return [_result("hygiene.install-state", False, f"{detail}. {remediation}")]
     if state == INSTALL_BROKEN:
+        stale = stale_entry_points(cdir, dist)
         if dist.ep_load_errors:
             detail = "entry points fail to load"
+        elif stale:
+            detail = (
+                f"entry points {', '.join(stale)} are declared but not installed "
+                "(the install predates them)"
+            )
         else:
-            detail = f"editable install points at {dist.editable_path} (repo moved?)"
+            detail = f"{FRAMEWORK_DIST} is installed from {dist.editable_path}, not this checkout"
         return [_result("hygiene.install-state", False, f"{detail}. {remediation}")]
     return [_result("hygiene.install-state", True, "")]
 
@@ -493,7 +610,7 @@ def run_hygiene_checks(
     """All Layer B checks for one connector directory.
 
     ``loaded_classes`` maps entry-point name → class for successfully loaded
-    entry points (used for the version-sync check); pass ``{}``/None when
+    entry points (used for the version checks); pass ``{}``/None when
     nothing is importable — the check falls back to source scanning.
     """
     loaded_classes = loaded_classes or {}
@@ -502,20 +619,40 @@ def run_hygiene_checks(
     results += _check_scaffold_files(cdir)
     results += _check_source_code(cdir)
     results += _check_versions(cdir, dist, loaded_classes)
-    results += _check_tier(cdir, repo_root)
+    results += _check_tier(cdir)
     results += _check_entry_points_resolve(cdir, dist)
     results += _check_live_markers(cdir)
     return results
 
 
-def load_entry_point_classes_for_dist(
-    dist_name: str, discovered: list[DiscoveredConnector]
+def check_framework_install(repo_root: Path) -> list[CheckResult]:
+    """The installed ``aisquare-pipe`` matches this checkout's pyproject
+    version (stale install metadata otherwise)."""
+    root = RootProject.load(repo_root)
+    found, version, _ = _framework_dist_facts()
+    if not found or not root.version or version == root.version:
+        return []
+    return [
+        CheckResult(
+            "hygiene.dist-version-fresh",
+            False,
+            severity=Severity.WARNING,
+            message=(
+                f"installed {FRAMEWORK_DIST} {version} != pyproject {root.version} "
+                f"(stale install metadata — re-run {DEV_INSTALL})"
+            ),
+        )
+    ]
+
+
+def load_entry_point_classes(
+    cdir: ConnectorDir, discovered: list[DiscoveredConnector]
 ) -> dict[str, type]:
-    """Successfully loaded classes belonging to one dist, importable without
+    """Successfully loaded classes of one connector, importable without
     network (guard enforced here so hygiene callers get it for free)."""
     classes: dict[str, type] = {}
     for d in discovered:
-        if d.dist_name == dist_name and d.cls is not None:
+        if owner_module(d.ep_value) == cdir.module_name and d.cls is not None:
             with no_network():
                 classes[d.ep_name] = d.cls
     return classes
