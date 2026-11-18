@@ -111,9 +111,10 @@ statement before a token is even signed. Two checks must both pass. Each reads t
 below are refused by both, each by itself. The few that only one of them refuses are listed after the two.
 1. **A lexer.** It blanks `'...'` strings, `"..."` identifiers and `--`, `//` and `/* */` comments.
    - Backslashes: it reads them as Snowflake does, as an escape in a `'...'` string and never in a `"..."`
-     identifier. Then it reads the text the three other ways a reader could (escapes in both, in neither, in
-     `"..."` only). All four readings must agree on where every quote, every comment and the statement end, so
-     write a quote inside a string as `''`, not `\'`.
+     identifier, and that reading decides. Then it reads the text the three other ways a reader could (escapes in
+     both, in neither, in `"..."` only), and each must blank exactly the same spans: every string, quoted name and
+     comment starts and ends where it does in Snowflake's reading. So write a quote inside a string as `''`, not
+     `\'`.
    - Comments: a `--` or `//` comment ends at the first CR or LF. One that a bare CR (no LF after it) ends is
      refused, and so is a `/*` inside a `/* */` comment. Readers disagree on both (sqlglot ends a line at a CR, and
      some versions nest comments), and the disagreement could hide a statement from one check.
@@ -124,8 +125,13 @@ below are refused by both, each by itself. The few that only one of them refuses
      `USE`, `SET`, `UNSET`, `RESET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `DECLARE`, `CALL`, `EXEC`,
      `EXECUTE`, `IMMEDIATE`, `PROCEDURE`, `ANALYZE`, `INTO`, `NEXTVAL`. A column with one of those names must be in
      double quotes, except `NEXTVAL`, which is refused quoted too (`s."NEXTVAL"` still takes a sequence's next value).
+   - Numbers: a number is read before a word, as Snowflake does (`1e5AI_COMPLETE(` is `1e5`, then a call to
+     `AI_COMPLETE`). A number that runs straight into an `E`, or into a sign after its exponent (`1e5-1`, `1e-`),
+     is refused: sqlglot reads the sign into the number, and in `1e5-- ...` sees code where Snowflake sees a
+     comment. Write `1e5 - 1`.
    - It may hold none of: `$` (`$$` strings, `SYSTEM$` functions, session variables, stage columns), `@` (stages),
-     `->`/`->>` (the flow operator chains statements), `|>`, a `!` other than `!=` (a model's method,
+     `->`/`->>` (`->>` is the flow operator, which chains statements; `->` also starts a lambda, so
+     `FILTER(a, x -> x > 1)` is refused), `|>`, a `!` other than `!=` (a model's method,
      `m!PREDICT(...)`), backticks, or a backslash outside a string. No `"..."` name may hold a `$` either
      (`"SYSTEM$ABORT_SESSION"(...)`).
    - It may call no Cortex AI function: no `AI_*` call and no `CORTEX` qualifier (`SNOWFLAKE.CORTEX.COMPLETE`),
@@ -137,7 +143,11 @@ below are refused by both, each by itself. The few that only one of them refuses
 2. **A parser**: sqlglot's tokens and tree (Snowflake dialect; its tokenizer reads quotes as Snowflake does). The
    text must be exactly one statement whose root is a query, and nowhere in it may there be:
    - a write, DDL, session, transaction, bind-variable or unparsed node;
-   - a `$` or `@` token, a `$$` string, a name holding `$` (quoted or not, a function's too), or a table named `@...`;
+   - a `$` or `@` token, a `$$` string, a name holding `$` (quoted or not, a function's too), or a table named `@...`
+     (`FROM '@~/f.csv'` too);
+   - a `->` or `->>` token: sqlglot reads them as Postgres' JSON operators, so `SELECT 1 ->> DELETE FROM t` parses
+     as a read of `JSON_EXTRACT_PATH_TEXT(1, DELETE)`, where Snowflake runs the `DELETE`;
+   - a number token that isn't a well-formed number (`1e5-`);
    - a `NEXTVAL` name (quoted or not);
    - an `AI_*` call, a `CORTEX` qualifier, an `IDENTIFIER(...)` or a model's method;
    - a table function outside that list, including a qualified one in a bare `FROM` or `JOIN`
@@ -149,14 +159,18 @@ below are refused by both, each by itself. The few that only one of them refuses
    Nothing is disabled globally, and sqlglot logs as usual everywhere else.
 
 What only one check refuses:
-- Only the lexer: a write keyword as a bare word (`SELECT update FROM t`, where sqlglot reads a column), `|>`, a
-  control character, a second `;`, and the text readers are known to disagree on (a backslash before a quote, a
-  bare CR, a nested comment). The parser reads such text one way, as Snowflake does where they are known to agree.
-  The lexer refuses it because the parser is only as faithful as sqlglot's reading of Snowflake.
+- Only the lexer: a write keyword as a bare word (`SELECT update FROM t`, where sqlglot reads a column), a control
+  character, a second `;`, and the text readers are known to disagree on (a backslash before a quote, a bare CR, a
+  nested comment). The parser reads such text one way, as Snowflake does where they are known to agree. The lexer
+  refuses it because the parser is only as faithful as sqlglot's reading of Snowflake. The parser refuses `|>`, a
+  backtick and a bare backslash only because sqlglot can't parse them: no rule of its own does.
 - Only the parser: a table function in a bare `FROM` or `JOIN` under a name other than the built-ins'
-  (`FROM t, my_udtf(1)`), which the lexer can't tell from `EXTRACT(YEAR FROM TO_DATE(x))`, and the `?` and `:1`
-  binds. `test_what_the_lexer_leaves_to_the_parser` lists them.
-- Neither looks inside a string: what it holds is data.
+  (`FROM t, my_udtf(1)`), which the lexer can't tell from `EXTRACT(YEAR FROM TO_DATE(x))`, a stage named in a
+  string (`FROM '@~/f.csv'`), and the `?` and `:1` binds.
+- Neither looks inside a string otherwise: what it holds is data.
+
+The tests hold both lists (`ONLY_THE_LEXER_REFUSES`, `ONLY_THE_PARSER_REFUSES`) and fail when a refused form that one
+check alone admits is on neither.
 
 A default schema named `CORTEX` (the `schema_name` argument, a pull's `schema`, or the blob's `schema`) is refused as
 well: there, an unqualified `COMPLETE(...)` is `SNOWFLAKE.CORTEX.COMPLETE`.

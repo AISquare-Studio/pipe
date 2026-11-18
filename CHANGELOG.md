@@ -119,15 +119,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - SQL is SELECT-only, refused before any request otherwise. Two checks must both find ONE
     `SELECT`/`WITH`:
     - A lexer blanks strings, quoted identifiers and comments. It reads backslashes as Snowflake
-      does (an escape in `'...'` only), and the three other ways must agree. A `--`/`//` comment
-      ends at a CR or an LF, one ended by a bare CR is refused, and so is a `/*` inside a `/* */`
-      comment.
+      does (an escape in `'...'` only), and the three other ways must blank exactly the same
+      spans. A `--`/`//` comment ends at a CR or an LF, one ended by a bare CR is refused, and so
+      is a `/*` inside a `/* */` comment.
     - A sqlglot parse: `sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and
       CI runs this suite at that floor too (`scripts/dep_floor.py`); Snowflake dialect, tokens and
       tree.
 
     The lexer refuses every write, DDL, session or scripting keyword, and the parser every such
-    node. Both refuse `$` (in any name too, quoted or not), `@` stages, `$$` strings, `->>`, a
+    node. Both refuse `$` (in any name too, quoted or not), `@` stages, `$$` strings, `->` and
+    `->>` (sqlglot reads them as JSON operators), a number that runs into a sign (`1e5-`), a
     model's methods, `IDENTIFIER(...)` and Cortex AI calls (`SNOWFLAKE.CORTEX.*`, `AI_*`: AI
     credits no warehouse limit bounds), and a default schema `CORTEX` is refused too. The only
     table functions allowed are FLATTEN, SPLIT_TO_TABLE, STRTOK_SPLIT_TO_TABLE and GENERATOR,

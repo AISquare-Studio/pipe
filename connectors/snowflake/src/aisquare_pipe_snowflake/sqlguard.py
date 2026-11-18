@@ -3,18 +3,25 @@
 1. **The lexer** (no parser) blanks string literals, quoted identifiers and
    ``--`` / ``//`` / ``/* */`` comments. Snowflake reads a backslash as an
    escape in a ``'...'`` string and never in a ``"..."`` identifier, and the
-   lexer reads the text that way first (sqlglot's tokenizer agrees). It then
-   reads it the three other ways a reader could (escapes in both, in
-   neither, in ``"..."`` only), and all four must agree on where every
-   quote, comment and the statement end. Otherwise the text is refused, so a
-   quote inside a string is written ``''``, never ``\\'``. In Snowflake's
-   reading the text must be ONE statement (one trailing ``;`` is dropped)
-   that starts with ``SELECT`` or ``WITH``.
-   - It names none of the write, DDL, session or scripting keywords.
+   lexer reads the text that way first (sqlglot's tokenizer agrees), and
+   that reading decides. It then reads it the three other ways a reader
+   could (escapes in both, in neither, in ``"..."`` only), and each must
+   blank exactly the same spans: every string, quoted name and comment
+   starts and ends where it does in Snowflake's reading. Otherwise the text
+   is refused, so a quote inside a string is written ``''``, never
+   ``\\'``. In Snowflake's reading the text must be ONE statement (one
+   trailing ``;`` is dropped) that starts with ``SELECT`` or ``WITH``.
+   - It names none of the write, DDL, session or scripting keywords. A
+     number is read before a word, as Snowflake does: ``1e5AI_COMPLETE(``
+     is the number ``1e5``, then a call to ``AI_COMPLETE``. A number that
+     runs straight into an ``E`` or, after an exponent, a sign (``1e5-``,
+     ``1e-``) is refused: sqlglot reads the sign into the number, and in
+     ``1e5-- ...`` sees code where Snowflake sees a comment.
    - It holds none of the forms a read here never needs: ``$`` (``$$``
      strings, ``SYSTEM$`` functions, session variables, stage columns),
-     ``@`` (stages), ``->`` / ``->>`` (the flow operator chains
-     statements), ``|>``, a ``!`` other than ``!=`` (a model's method),
+     ``@`` (stages), ``->`` / ``->>`` (``->>`` is the flow operator, which
+     chains statements; ``->`` also starts a lambda, so ``FILTER(a, x -> x >
+     1)`` is refused), ``|>``, a ``!`` other than ``!=`` (a model's method),
      backticks and backslashes.
    - No ``"..."`` name holds a ``$`` or is ``NEXTVAL`` (``s."NEXTVAL"``
      still takes a sequence's next value).
@@ -41,7 +48,12 @@
    - a write, DDL, session, transaction, bind-variable or unparsed node;
    - a ``$`` or ``@`` token (variables, stage columns, stages), a ``$$``
      string, a name holding a ``$`` (identifiers quoted or not, words,
-     function names), or a table named ``@...``;
+     function names), or a table named ``@...`` (``FROM '@~/f.csv'`` too);
+   - a ``->`` or ``->>`` token. sqlglot reads them as Postgres' JSON
+     operators (``SELECT 1 ->> DELETE FROM t`` parses as a read of
+     ``JSON_EXTRACT_PATH_TEXT(1, DELETE)``), where Snowflake runs a
+     ``DELETE`` after the ``SELECT``;
+   - a number token that isn't a well-formed number (``1e5-``);
    - a ``NEXTVAL`` name (quoted or not);
    - a Cortex AI call (an ``AI_*`` function, a ``CORTEX`` qualifier), an
      ``IDENTIFIER(...)``, or a model's method (``m!PREDICT(...)``);
@@ -59,15 +71,21 @@ message naming why and never echoing the SQL). The two read the text
 separately, and most forms above are refused by both, each on its own. The
 few that only one of them refuses:
 - Only the lexer: a write keyword as a bare word (``SELECT update FROM t``,
-  where sqlglot reads a column), ``|>``, a control character, a second
-  ``;``, and the text readers are known to disagree on (a backslash before a
-  quote, a bare CR, nested comments). The parser is only as faithful as
-  sqlglot's reading of Snowflake, so the lexer refuses such text.
+  where sqlglot reads a column), a control character, a second ``;``, and
+  the text readers are known to disagree on (a backslash before a quote, a
+  bare CR, nested comments). The parser is only as faithful as sqlglot's
+  reading of Snowflake, so the lexer refuses such text. (The parser refuses
+  ``|>``, a backtick and a bare backslash only because sqlglot can't parse
+  them: no rule of its own does.)
 - Only the parser: a table function in a bare ``FROM`` or ``JOIN`` under a
   name other than the built-ins' (``FROM t, my_udtf(1)``), which the lexer
-  can't tell from ``EXTRACT(YEAR FROM TO_DATE(x))``, and the ``?`` and
-  ``:1`` binds.
-- Neither looks inside a string: what it holds is data.
+  can't tell from ``EXTRACT(YEAR FROM TO_DATE(x))``, a stage named in a
+  string (``FROM '@~/f.csv'``; the lexer doesn't look inside strings), and
+  the ``?`` and ``:1`` binds.
+- Neither looks inside a string otherwise: what it holds is data.
+The tests hold both lists (``ONLY_THE_LEXER_REFUSES``,
+``ONLY_THE_PARSER_REFUSES``) and fail when a refused form that one check
+alone admits is on neither.
 Behind both, Snowflake is told to run ONE statement
 (``MULTI_STATEMENT_COUNT`` 1), and the role holds read-only grants.
 
@@ -181,6 +199,13 @@ _DOLLAR_QUOTED_TOKENS = frozenset(
     )
     if t is not None
 )
+# ``->`` and ``->>``: sqlglot reads them as JSON operators, Snowflake's
+# ``->>`` chains statements (``SELECT 1 ->> DELETE FROM t``).
+_ARROW_TOKENS = frozenset(
+    t
+    for t in (getattr(TokenType, "ARROW", None), getattr(TokenType, "DARROW", None))
+    if t is not None
+)
 # A model's method (``m!PREDICT(...)``; sqlglot 26 can't parse it at all).
 _MODEL_METHOD_NODES: tuple[type[exp.Expression], ...] = tuple(
     t for t in (getattr(exp, "ModelAttribute", None),) if isinstance(t, type)
@@ -247,7 +272,12 @@ _WRITE_KEYWORDS = frozenset(
 # identifier): ``s."NEXTVAL"`` still takes a sequence's next value.
 _NEVER_NAMED = frozenset({"NEXTVAL"})
 _FIRST_KEYWORDS = frozenset({"SELECT", "WITH"})
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A number, and a scanner that tries a number before a word: a name starts
+# with a letter or an underscore, so Snowflake (and sqlglot) read ``1e5AI_C``
+# as the number 1e5, then the name AI_C.
+_NUMBER = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_NUMBER_OR_WORD = re.compile(rf"(?P<number>{_NUMBER})|(?P<word>[A-Za-z_][A-Za-z0-9_]*)")
+_WELL_FORMED_NUMBER = re.compile(_NUMBER)
 _QUOTES = "'\""
 _LINE_END = re.compile(r"[\r\n]")
 # How a backslash reads in quoted text: (in '...' strings, in "..."
@@ -259,6 +289,11 @@ _READINGS = ((True, False), (True, True), (False, False), (False, True))
 _MORE_THAN_ONE_WAY = (
     "its quoting reads more than one way (a backslash before a quote; write a "
     "quote inside a string as '')"
+)
+_FLOW = "it uses the -> / ->> operator (in Snowflake, ->> chains statements)"
+_NUMBER_SPLIT = (
+    "a number runs into an E or a sign (readers disagree where it ends; put a "
+    "space after it)"
 )
 _DOLLAR = "it uses $ ($$ strings, SYSTEM$ functions, variables or stage columns)"
 _DOLLAR_NAME = "it names something holding $ (SYSTEM$ functions, variables)"
@@ -275,7 +310,7 @@ _MODEL_METHOD = "it calls a model's method (!)"
 _FORBIDDEN = (
     ("$", _DOLLAR),
     ("@", _STAGE),
-    ("->", "it uses the -> / ->> operator"),
+    ("->", _FLOW),
     ("|>", "it uses the |> operator"),
     ("`", "it holds a backtick"),
     ("\\", "it holds a backslash outside a string"),
@@ -421,35 +456,47 @@ class _Quoted:
 
 def _lex(sql: str) -> _Lexed:
     """Snowflake's reading of ``sql`` (:data:`_READINGS`' first) decides,
-    and reports its own problem. Any other reading that finds a problem, or
-    ends the statement elsewhere, refuses the text as reading more than one
-    way."""
+    and reports its own problem. Every other reading must then blank exactly
+    the same spans (each string, quoted name and comment starting and ending
+    where it does in Snowflake's reading), or the text is refused as reading
+    more than one way. With the same spans, each reading sees the same text
+    outside them, the same names and the same statement end."""
     if any(not (ch.isprintable() or ch in " \t\r\n") for ch in sql):
         return _Lexed(sql, "it holds a control character")
-    statement = ""
-    for index, (in_strings, in_names) in enumerate(_READINGS):
-        quoted: list[_Quoted] = []
-        problem: str | None
+    (in_strings, in_names), *others = _READINGS
+    spans: list[tuple[int, int]] = []
+    quoted: list[_Quoted] = []
+    try:
+        blanked = _blank(
+            sql,
+            escapes_in_strings=in_strings,
+            escapes_in_names=in_names,
+            quoted=quoted,
+            spans=spans,
+        )
+    except _Unreadable as unreadable:
+        return _Lexed(sql, str(unreadable))
+    problem, cut = _read(blanked)
+    if problem is None and _number_runs_on(sql, blanked):
+        problem = _NUMBER_SPLIT
+    if problem is None:
+        problem = _quoted_name_problem(quoted, blanked)
+    if problem is not None:
+        return _Lexed(sql, problem)
+    for in_strings, in_names in others:
+        other: list[tuple[int, int]] = []
         try:
-            blanked = _blank(
+            _blank(
                 sql,
                 escapes_in_strings=in_strings,
                 escapes_in_names=in_names,
-                quoted=quoted,
+                spans=other,
             )
-        except _Unreadable as unreadable:
-            problem, cut = str(unreadable), len(sql)
-        else:
-            problem, cut = _read(blanked)
-            if problem is None:
-                problem = _quoted_name_problem(quoted, blanked)
-        if index == 0:
-            if problem is not None:
-                return _Lexed(sql, problem)
-            statement = sql[:cut].strip()
-        elif problem is not None or sql[:cut].strip() != statement:
+        except _Unreadable:
             return _Lexed(sql, _MORE_THAN_ONE_WAY)
-    return _Lexed(statement, None)
+        if other != spans:
+            return _Lexed(sql, _MORE_THAN_ONE_WAY)
+    return _Lexed(sql[:cut].strip(), None)
 
 
 def _read(text: str) -> tuple[str | None, int]:
@@ -470,7 +517,8 @@ def _read(text: str) -> tuple[str | None, int]:
     body = text[:cut]
     if not body.strip():
         return "it is empty", cut
-    words = [w.upper() for w in _WORD.findall(body)]
+    found = _words(body)
+    words = [w.group().upper() for w in found]
     if not words or words[0] not in _FIRST_KEYWORDS:
         return "it does not start with SELECT or WITH", cut
     written = sorted(set(words) & _WRITE_KEYWORDS)
@@ -478,10 +526,10 @@ def _read(text: str) -> tuple[str | None, int]:
         return f"it names {written[0]}", cut
     if _QUALIFIED_TABLE_FUNCTION.search(body):
         return _table_function_problem(), cut
-    # Word by word, as Snowflake splits them: a name starts with a letter or
-    # an underscore, so ``1AI_C(1)`` is the number 1, then a call to AI_C (a
-    # word boundary, ``\b``, would see one word there and miss the call).
-    for word in _WORD.finditer(body):
+    # Word by word, as Snowflake splits them: ``1AI_C(1)`` and ``1e5AI_C(1)``
+    # are a number, then a call to AI_C (a word boundary, ``\b``, would see
+    # one word there and miss the call).
+    for word in found:
         name = word.group()
         following = _NEXT.match(body, word.end())
         after = following.group(1) if following else ""
@@ -502,6 +550,29 @@ def _read(text: str) -> tuple[str | None, int]:
             if called is None or not _is_listed(called.group(1)):
                 return _table_function_problem(), cut
     return None, cut
+
+
+def _number_runs_on(sql: str, blanked: str) -> bool:
+    """Whether a number (found in ``blanked``) runs straight into an ``E``
+    (``1e--``, ``1eX``) or, after an exponent, into a sign (``1e5-``), in
+    ``sql`` itself: the sign may open a comment, which ``blanked`` has
+    blanked. sqlglot reads the E and the sign as part of the number, so in
+    ``1e5-- '...'`` it sees ``1e5-``, then ``-`` and a string, where Snowflake
+    sees ``1e5`` and a comment: each hides text the other reads as code."""
+    for found in _NUMBER_OR_WORD.finditer(blanked):
+        number = found.group("number")
+        if number is None:
+            continue
+        after = sql[found.end() : found.end() + 1]
+        if after in ("e", "E") or (after in ("+", "-") and "e" in number.lower()):
+            return True
+    return False
+
+
+def _words(text: str) -> list[re.Match[str]]:
+    """The words in blanked ``text``, left to right, numbers skipped
+    (:data:`_NUMBER_OR_WORD`)."""
+    return [m for m in _NUMBER_OR_WORD.finditer(text) if m.group("word") is not None]
 
 
 def _is_listed(called: str) -> bool:
@@ -551,13 +622,15 @@ def _blank(
     escapes_in_strings: bool,
     escapes_in_names: bool,
     quoted: list[_Quoted] | None = None,
+    spans: list[tuple[int, int]] | None = None,
 ) -> str:
     """``sql`` with quoted text and ``--`` / ``//`` / ``/* */`` comments
     turned into spaces, same length (so positions match). A backslash
     escapes the next character in a ``'...'`` string when
     ``escapes_in_strings``, in a ``"..."`` identifier when
     ``escapes_in_names`` (Snowflake: strings only). A line comment ends at
-    the first CR or LF. Each ``"..."`` identifier is appended to ``quoted``.
+    the first CR or LF. Each ``"..."`` identifier is appended to ``quoted``,
+    and where each blanked span starts and ends to ``spans``.
     :class:`_Unreadable` when a quote or a block comment never closes, a
     line comment ends at a bare CR, or a block comment holds a ``/*``."""
     out: list[str] = []
@@ -585,6 +658,8 @@ def _blank(
             if ch == '"' and quoted is not None:
                 quoted.append(_Quoted(sql[i + 1 : j - 1].replace('""', '"'), j))
             out.append(" " * (j - i))
+            if spans is not None:
+                spans.append((i, j))
             i = j
         elif sql.startswith("--", i) or sql.startswith("//", i):
             # To the line's end: the first CR or LF (a reader that stops only
@@ -597,6 +672,8 @@ def _blank(
                     "(readers disagree where it ends)"
                 )
             out.append(" " * (end - i))
+            if spans is not None:
+                spans.append((i, end))
             i = end
         elif sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
@@ -610,6 +687,8 @@ def _blank(
                     "comments nest)"
                 )
             out.append(" " * (end + 2 - i))
+            if spans is not None:
+                spans.append((i, end + 2))
             i = end + 2
         else:
             out.append(ch)
@@ -657,7 +736,8 @@ def _parsed_problem(sql: str) -> str | None:
 
 def _token_problem(tokens: list[Token]) -> str | None:
     """sqlglot's reading, token by token: no ``$`` or ``@`` token, no
-    ``$$`` string, no name (a word or a quoted identifier) holding ``$``,
+    ``->`` / ``->>``, no number it misread (``1e5-``), no ``$$`` string, no
+    name (a word or a quoted identifier) holding ``$``,
     no ``!`` method call, no ``AI_*`` or ``IDENTIFIER`` call, no ``CORTEX``
     qualifier. A string literal's text is data, and is not looked at."""
     for index, token in enumerate(tokens):
@@ -666,6 +746,10 @@ def _token_problem(tokens: list[Token]) -> str | None:
             return _DOLLAR_STRING
         if kind == TokenType.PARAMETER:
             return _PARAMETER
+        if kind in _ARROW_TOKENS:
+            return _FLOW
+        if kind == TokenType.NUMBER and not _WELL_FORMED_NUMBER.fullmatch(token.text):
+            return _NUMBER_SPLIT  # ``1e5-``: sqlglot took a sign into the number
         if kind in _STRING_TOKENS:
             continue
         if "$" in token.text:

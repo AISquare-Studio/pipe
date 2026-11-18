@@ -50,6 +50,8 @@ READ_ONLY = [
     # Named like an AI function or CORTEX, but neither called nor a qualifier.
     'SELECT "AI_SCORE", ai_score, cortex, "!" FROM t',
     "SELECT TRANSLATE(name, 'ab', 'xy') FROM t",
+    # Exponents, with a space before a sign that follows one.
+    "SELECT 1e5 - 1, 1.5E-3, 2e+2, .5e1 FROM t -- 1e5\n",
 ]
 
 # Reviewer seq 13859 M1. The lexer read a backslash as an escape in BOTH
@@ -94,6 +96,11 @@ CORTEX_CALLS = {
     # sqlglot) read 1AI_COMPLETE as the number 1, then AI_COMPLETE.
     "ai_after_a_digit": "SELECT 1AI_COMPLETE('m', body) FROM t",
     "cortex_after_a_digit": "SELECT 1CORTEX.COMPLETE('m', body) FROM t",
+    # Reviewer seq 13917 b2: the same after an exponent (1e5, then AI_COMPLETE).
+    "ai_after_an_exponent": "SELECT 1e5AI_COMPLETE('m', body) FROM t",
+    "ai_after_a_decimal_exponent": "SELECT 1.5E3AI_COMPLETE('m', body) FROM t",
+    "ai_after_a_signed_exponent": "SELECT 1e+5AI_COMPLETE('m', body) FROM t",
+    "cortex_after_an_exponent": "SELECT 1e5CORTEX.COMPLETE('m', body) FROM t",
     "model_method": "SELECT m!PREDICT(body) FROM t",
     "qualified_model_method": "SELECT db.s.m ! PREDICT(body, 1) FROM t",
 }
@@ -116,6 +123,33 @@ BARE_QUALIFIED_TABLE_FUNCTIONS = {
     "bare_from_qualified_generator": "SELECT * FROM s.GENERATOR(ROWCOUNT => 1)",
     # The same fuzz: TABLE( right after a digit.
     "table_call_after_a_digit": "SELECT * FROM t, 1TABLE(my_proc(1))",
+    "table_call_after_an_exponent": "SELECT * FROM t, 1e5TABLE(my_proc(1))",
+    "lateral_after_an_exponent": "SELECT * FROM t, 1e5LATERAL my_udtf(t.a)",
+}
+# Found by the quote fuzz once it had an exponent atom: sqlglot reads a sign
+# after an exponent's digits (and an E with no digits after it) into the
+# number. In 1e5-- '...' it sees 1e5-, then -, then a string, where Snowflake
+# sees 1e5, then a comment, then the rest as code. Both checks admitted the
+# first four at 8661c94.
+NUMBER_SPLITS = {
+    "exponent_sign_hides_a_udtf": "SELECT 1e5-- '\nFROM t, my_udtf(1) -- '",
+    "bare_e_hides_a_udtf": "SELECT 1e-- '\nFROM t, my_udtf(1) -- '",
+    "decimal_exponent_hides_a_udtf": "SELECT .5e5-- '\nFROM t, my_udtf(1) -- '",
+    "exponent_sign_hides_a_bind": "SELECT 1e5-- '\nFROM t WHERE a = ? -- '",
+    "exponent_minus_one": "SELECT 1e5-1",
+    "e_runs_into_a_name": "SELECT 1ex FROM t",
+}
+# Reviewer seq 13917 a1: sqlglot reads -> / ->> as Postgres' JSON operators
+# (SELECT 1 ->> DELETE FROM t parses as SELECT JSON_EXTRACT_PATH_TEXT(1,
+# DELETE) FROM t), and in Snowflake ->> is the flow operator: the DELETE runs.
+ARROW_OPERATORS = {
+    "flow_operator_delete": "SELECT 1 ->> DELETE FROM t",
+    "flow_operator_delete_where": "SELECT 1 ->> DELETE FROM t WHERE a = 1",
+    "flow_operator_truncate": "SELECT 1 ->> TRUNCATE t",
+    "flow_operator_spaced": "SELECT 1 /* c */ ->> /* c */ DELETE FROM t",
+    "arrow_delete": "SELECT 1 -> DELETE FROM t",
+    # -> also starts a Snowflake lambda: refused with it.
+    "lambda": "SELECT FILTER(a, x -> x > 1) FROM t",
 }
 
 REFUSED = {
@@ -201,6 +235,15 @@ REFUSED = {
     **CORTEX_CALLS,
     **DOLLAR_NAMES,
     **BARE_QUALIFIED_TABLE_FUNCTIONS,
+    **ARROW_OPERATORS,
+    **NUMBER_SPLITS,
+    # The lexer alone refuses these three (ONLY_THE_LEXER_REFUSES).
+    "bare_write_word": "SELECT update FROM t",
+    "backslash_quote_hidden_by_a_comment": "SELECT 'it\\'s' AS a -- '",
+    "comment_ended_by_a_bare_cr": "SELECT 1 -- c\rFROM t",
+    # The parser alone refuses these two (ONLY_THE_PARSER_REFUSES).
+    "stage_in_a_string": "SELECT * FROM '@~/f.csv'",
+    "named_stage_in_a_string": "SELECT * FROM '@st/f.csv' (FILE_FORMAT => 'ff')",
 }
 
 
@@ -266,6 +309,8 @@ LEXER_CATCHES = [
     # m5 in the lexer: a qualified call named like a built-in table function.
     # A bare FROM f(...) by any other name is the parser's alone (below).
     *BARE_QUALIFIED_TABLE_FUNCTIONS.values(),
+    *ARROW_OPERATORS.values(),
+    *NUMBER_SPLITS.values(),
 ]
 
 
@@ -280,12 +325,46 @@ def _unique(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+# What the README and the module docstring say only the lexer refuses: a
+# write keyword as a bare word (sqlglot reads a column), a control character,
+# a second ";", and text readers disagree on (a backslash before a quote, a
+# bare CR, nested comments).
+ONLY_THE_LEXER_REFUSES = [
+    "SELECT update FROM t",
+    "SELECT 1\x00",
+    "SELECT 1;;",
+    "SELECT 'a\\';DROP TABLE t;--'",
+    "SELECT 'it\\'s' AS a -- '",
+    "SELECT 1 -- c\rFROM t",
+    "SELECT 1 /* a /*/ FROM t",
+]
+
+
+@pytest.mark.parametrize("sql", ONLY_THE_LEXER_REFUSES)
+def test_what_the_parser_leaves_to_the_lexer(sql):
+    """If a parser rule starts catching one, drop it here and from both
+    texts."""
+    assert sqlguard._parsed_problem(sql) is None
+    assert sqlguard._lex(sql).problem is not None
+
+
+def test_every_form_only_the_lexer_refuses_is_listed():
+    """a1 (seq 13917) was a write only the lexer refused, missing from the
+    docs' list: a refused form the parser alone admits must be listed."""
+    for sql in _unique([*REFUSED.values(), *LEXER_CATCHES]):
+        if sqlguard._parsed_problem(sql) is None:
+            assert sql in ONLY_THE_LEXER_REFUSES, sql
+
+
 ONLY_THE_PARSER_REFUSES = [
     "SELECT * FROM t WHERE a = ?",
     "SELECT * FROM t WHERE a = :1",
     "SELECT * FROM my_udtf(1)",
     "SELECT * FROM t, my_udtf(t.a)",
     "SELECT * FROM t JOIN my_udtf(t.a) ON 1 = 1",
+    # Reviewer seq 13917 b3: a stage named in a string. The lexer blanks it.
+    "SELECT * FROM '@~/f.csv'",
+    "SELECT * FROM '@st/f.csv' (FILE_FORMAT => 'ff')",
 ]
 
 PARSER_CATCHES = _unique(
@@ -321,6 +400,8 @@ PARSER_CATCHES = _unique(
         *CORTEX_CALLS.values(),
         *DOLLAR_NAMES.values(),
         *BARE_QUALIFIED_TABLE_FUNCTIONS.values(),
+        *ARROW_OPERATORS.values(),
+        *NUMBER_SPLITS.values(),
         *ONLY_THE_PARSER_REFUSES,
     ]
 )
@@ -342,6 +423,12 @@ def test_what_the_lexer_leaves_to_the_parser(sql, monkeypatch):
     assert sqlguard._lex(sql).problem is None
     monkeypatch.setattr(sqlguard, "_parsed_problem", lambda statement: None)
     assert check_select_only(sql) == sql
+
+
+def test_every_form_only_the_parser_refuses_is_listed():
+    for sql in _unique([*REFUSED.values(), *PARSER_CATCHES]):
+        if sqlguard._lex(sql).problem is None:
+            assert sql in ONLY_THE_PARSER_REFUSES, sql
 
 
 # A bare CR ends a line for some readers (sqlglot) and not for others, and
@@ -379,6 +466,23 @@ def test_a_quote_escaped_with_a_backslash_reads_two_ways_and_is_refused():
     with pytest.raises(NotReadOnly, match="more than one way"):
         check_select_only("SELECT 'a\\'b' FROM t")
     assert check_select_only("SELECT 'a''b' FROM t")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Reviewer seq 13917 b1. Every reading found no problem and ended the
+        # statement in the same place, so these passed the lexer, though the
+        # readings put the quotes in different places.
+        "SELECT 'it\\'s' AS a -- '",
+        "SELECT X'\\'' AS h FROM t, my_udtf(1) -- '",
+        _wrapped("1"),  # the M1 wrapper around a harmless 1
+    ],
+)
+def test_every_reading_must_blank_the_same_spans(sql):
+    assert sqlguard._lex(sql).problem == sqlguard._MORE_THAN_ONE_WAY
+    with pytest.raises(NotReadOnly, match="more than one way"):
+        check_select_only(sql)
 
 
 @pytest.mark.parametrize(
@@ -589,7 +693,7 @@ def test_table_references_leave_ctes_out_and_flag_what_cant_be_read():
 _FUZZ_ATOMS = [
     *("'", '"', "\\", "''", '""'),
     *("--", "//", "/*", "*/", "\n", "\r"),
-    *(";", " ", ",", "(", ")", "x", "1", "!", "$", "@"),
+    *(";", " ", ",", "(", ")", "x", "1", "1e5", "!", "$", "@"),
     *("SYSTEM$X()", "DROP TABLE t", "AI_C(1)", "CORTEX.F(1)"),
 ]
 
