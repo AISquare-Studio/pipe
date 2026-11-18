@@ -58,7 +58,7 @@ from aisquare_pipe_snowflake.credentials import (
     bearer_token,
     forget_token,
 )
-from aisquare_pipe_snowflake.rows import columns_of, convert_rows, row_size
+from aisquare_pipe_snowflake.rows import canonical, columns_of, iter_rows
 
 STATEMENTS_PATH = "/api/v2/statements"
 DEFAULT_TIMEOUT = 30.0
@@ -82,12 +82,19 @@ class SnowflakeAPIError(Exception):
     nothing came back); ``code`` and ``sql_state`` are Snowflake's;
     ``retry_after`` is set for a 429/503 that said when; ``timed_out`` for a
     timeout or a deadline; ``credential_refused`` when Snowflake or the
-    token endpoint refused the credential itself."""
+    token endpoint refused the credential itself.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, Snowflake's own error text when it gave one (redacted and
+    bounded). That text can quote the statement and name objects, so only
+    the toolkit, which answers the caller, shows it; the source's errors
+    carry ``summary`` alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         code: str | None = None,
         sql_state: str | None = None,
@@ -95,8 +102,11 @@ class SnowflakeAPIError(Exception):
         timed_out: bool = False,
         credential_refused: bool = False,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.code = code
         self.sql_state = sql_state
@@ -119,6 +129,15 @@ class StatementResult:
     truncated: str | None = None
     result_bytes: int = 0
     num_rows: int | None = None
+    #: Read with ``encoded=True``: each row's canonical JSON instead of
+    #: ``rows`` (as the source's envelopes carry them; about a fifth of the
+    #: memory objects take).
+    encoded: list[bytes] | None = None
+
+    @property
+    def count(self) -> int:
+        """The rows read, as objects or encoded."""
+        return len(self.rows) if self.encoded is None else len(self.encoded)
 
 
 def _monotonic() -> float:
@@ -226,11 +245,13 @@ class SnowflakeClient:
         database: str | None = None,
         schema: str | None = None,
         bindings: Mapping[str, Mapping[str, str]] | None = None,
+        encoded: bool = False,
     ) -> StatementResult:
         """Run ONE statement (a caller's, already checked SELECT-only, or one
         of the connector's own fixed SHOW / INFORMATION_SCHEMA forms) and
         wait for it, at most ``timeout_seconds`` (and the budget). At most
-        ``row_limit`` rows and ``byte_limit`` bytes of JSON rows come back.
+        ``row_limit`` rows and ``byte_limit`` bytes of JSON rows come back
+        (``encoded``: as canonical JSON, :class:`StatementResult`).
         Past the deadline the statement is cancelled and a timed-out
         :class:`SnowflakeAPIError` raised."""
         seconds = self.statement_seconds(timeout_seconds)
@@ -288,10 +309,17 @@ class SnowflakeClient:
             status, answer = self._json(
                 "GET", f"{STATEMENTS_PATH}/{quote(handle, safe='')}", {}, polling=True
             )
-        return self._collect(answer, row_limit=row_limit, byte_limit=byte_limit)
+        return self._collect(
+            answer, row_limit=row_limit, byte_limit=byte_limit, encoded=encoded
+        )
 
     def _collect(
-        self, answer: dict[str, Any], *, row_limit: int, byte_limit: int
+        self,
+        answer: dict[str, Any],
+        *,
+        row_limit: int,
+        byte_limit: int,
+        encoded: bool = False,
     ) -> StatementResult:
         meta = answer.get("resultSetMetaData")
         meta = meta if isinstance(meta, dict) else {}
@@ -303,12 +331,17 @@ class SnowflakeClient:
             query_id=handle,
             columns=columns,
             num_rows=num_rows if isinstance(num_rows, int) and num_rows >= 0 else None,
+            encoded=[] if encoded else None,
         )
         partitions = [p for p in meta.get("partitionInfo") or [] if isinstance(p, dict)]
-        page: Any = answer.get("data")
+        # Taken out of the answer (its caller still holds it), so each parsed
+        # partition goes before the next one is read.
+        page: Any = answer.pop("data", None)
         index = 0
         while True:
-            if self._take(result, page, row_limit=row_limit, byte_limit=byte_limit):
+            cut = self._take(result, page, row_limit=row_limit, byte_limit=byte_limit)
+            page = None
+            if cut:
                 break
             index += 1
             if index >= len(partitions) or index >= MAX_PARTITIONS:
@@ -325,7 +358,8 @@ class SnowflakeClient:
                 f"{STATEMENTS_PATH}/{quote(handle, safe='')}",
                 {"partition": index},
             )
-            page = more.get("data")
+            page = more.pop("data", None)
+            del more
         return result
 
     @staticmethod
@@ -333,15 +367,19 @@ class SnowflakeClient:
         result: StatementResult, page: Any, *, row_limit: int, byte_limit: int
     ) -> bool:
         """Add ``page``'s rows within the caps; True when a cap stopped it."""
-        for row in convert_rows(result.columns, page):
-            if len(result.rows) >= row_limit:
+        for row in iter_rows(result.columns, page):
+            if result.count >= row_limit:
                 result.truncated = TRUNCATED_MAX_ROWS
                 return True
-            size = row_size(row) + 1
+            encoded = canonical(row)
+            size = len(encoded) + 1
             if result.result_bytes + size > byte_limit:
                 result.truncated = TRUNCATED_MAX_RESULT_BYTES
                 return True
-            result.rows.append(row)
+            if result.encoded is None:
+                result.rows.append(row)
+            else:
+                result.encoded.append(encoded)
             result.result_bytes += size
         return False
 
@@ -467,7 +505,6 @@ class SnowflakeClient:
         state = state if state is not None and _CODE.match(state) else None
         message = info.get("message")
         detail = self.redact(message if isinstance(message, str) else "")
-        suffix = f": {detail}" if detail else ""
         label = ", ".join(x for x in (str(status), code) if x)
         if status == 408:
             return SnowflakeAPIError(
@@ -479,13 +516,15 @@ class SnowflakeClient:
             )
         if status == 422:
             return SnowflakeAPIError(
-                f"the statement failed ({label}){suffix}",
+                f"the statement failed ({label})",
+                detail=detail,
                 status=status,
                 code=code,
                 sql_state=state,
             )
         return SnowflakeAPIError(
-            f"Snowflake failed ({label}){suffix}",
+            f"Snowflake failed ({label})",
+            detail=detail,
             status=status,
             code=code,
             sql_state=state,

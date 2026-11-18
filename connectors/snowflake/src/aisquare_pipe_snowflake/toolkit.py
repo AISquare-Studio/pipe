@@ -20,6 +20,7 @@ which Composio's tools take, are server-controlled here and refused.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -41,6 +42,7 @@ from aisquare.pipe import (
     error_code_for_status,
     time_budget,
 )
+from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_snowflake.client import (
     SnowflakeAPIError,
@@ -352,14 +354,16 @@ _PERMISSION_STATES = frozenset({"42501"})
 _NO_WAREHOUSE_CODES = frozenset({"000606"})
 
 
-def _describe(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> tuple[str, str]:
-    """``(error_code, message)``: the failure, and what to fix where the
-    cause is known."""
+def _classify(
+    e: SnowflakeAPIError, creds: SnowflakeCredentials
+) -> tuple[str, str | None]:
+    """``(error_code, hint)``: the failure's kind, and what to fix where the
+    cause is known (no Snowflake text in it)."""
     role, warehouse = shown(creds.role), shown(creds.warehouse)
     if e.timed_out or e.code in _TIMEOUT_CODES:
-        return ERROR_TIMEOUT, e.message
+        return ERROR_TIMEOUT, None
     if e.status == 429:
-        return ERROR_RATE_LIMITED, e.message
+        return ERROR_RATE_LIMITED, None
     if e.credential_refused or e.status == 401:
         if creds.auth == AUTH_KEYPAIR:
             hint = (
@@ -374,11 +378,11 @@ def _describe(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> tuple[str, s
                 "expired client secret, or a token the External OAuth integration does not "
                 "accept; the tenant's Snowflake credential must be fixed"
             )
-        return ERROR_UNAUTHORIZED, f"{e.message} — {hint}"
+        return ERROR_UNAUTHORIZED, hint
     if e.code in _NO_WAREHOUSE_CODES:
         return ERROR_FORBIDDEN, (
-            f"{e.message} — role {role} cannot use warehouse {warehouse} (grant it USAGE, "
-            "or check that the warehouse exists and can resume)"
+            f"role {role} cannot use warehouse {warehouse} (grant it USAGE, or check "
+            "that the warehouse exists and can resume)"
         )
     if (
         e.code in _PERMISSION_CODES
@@ -386,24 +390,78 @@ def _describe(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> tuple[str, s
         or e.status == 403
     ):
         return ERROR_FORBIDDEN, (
-            f"{e.message} — role {role} lacks a grant for this (USAGE on the database and "
-            "schema, SELECT on the table), or the role is not granted to the user"
+            f"role {role} lacks a grant for this (USAGE on the database and schema, "
+            "SELECT on the table), or the role is not granted to the user"
         )
     if e.code in _NOT_FOUND_CODES or e.sql_state in _NOT_FOUND_STATES:
-        return ERROR_NOT_FOUND, (
-            f"{e.message} — it does not exist, or role {role} has no grant on it"
-        )
+        return ERROR_NOT_FOUND, f"it does not exist, or role {role} has no grant on it"
     if e.status == 422:
-        return ERROR_INVALID_ARGUMENTS, e.message
+        return ERROR_INVALID_ARGUMENTS, None
     if e.status is None or 300 <= e.status < 400:
-        return ERROR_UPSTREAM_ERROR, e.message
-    return error_code_for_status(e.status), e.message
+        return ERROR_UPSTREAM_ERROR, None
+    return error_code_for_status(e.status), None
+
+
+def _describe(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> tuple[str, str]:
+    """``(error_code, message)``: the failure, Snowflake's own text included,
+    and what to fix where the cause is known: what the toolkit answers."""
+    code, hint = _classify(e, creds)
+    return code, f"{e.message} — {hint}" if hint else e.message
 
 
 def failure(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> ToolResult:
     """A Snowflake failure as a canonical ``ToolResult`` error."""
     code, message = _describe(e, creds)
     return ToolResult.fail(message, code=code, retry_after=e.retry_after)
+
+
+class SnowflakeRequestError(ValueError):
+    """Snowflake refused what the caller asked for: a statement that does not
+    compile, a table that does not exist (or the role can't see). A
+    ``ValueError``, so pipe-as-service answers it 422. ``status``, ``code``
+    and ``sql_state`` are Snowflake's."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str | None = None,
+        sql_state: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.sql_state = sql_state
+
+
+#: Where Snowflake points into the statement ("line 3 at position 15").
+_POSITION = re.compile(r"\bline (\d{1,6}) at position (\d{1,6})\b")
+
+
+def source_error(e: SnowflakeAPIError, creds: SnowflakeCredentials) -> Exception:
+    """A Snowflake failure as the source raises it: what the caller can fix
+    (``invalid_arguments``, ``not_found``) is a
+    :class:`SnowflakeRequestError` (422 in pipe-as-service); everything
+    else (upstream, throttling, a timeout, a refused credential or grant) is
+    a :class:`~aisquare.pipe.errors.PipelineError` (502), with
+    ``retry_after`` when Snowflake gave one. The message is ``summary`` and
+    the hint, never Snowflake's own text (it can quote the SQL, and hosts
+    log these), but for a statement that does not compile it keeps where
+    ("line 1 at position 7")."""
+    code, hint = _classify(e, creds)
+    text = e.summary
+    if code == ERROR_INVALID_ARGUMENTS:
+        where = _POSITION.search(e.detail)
+        if where is not None:
+            text += f" at line {where.group(1)}, position {where.group(2)}"
+    if hint:
+        text += f" — {hint}"
+    if code in (ERROR_INVALID_ARGUMENTS, ERROR_NOT_FOUND):
+        return SnowflakeRequestError(
+            text, status=e.status, code=e.code, sql_state=e.sql_state
+        )
+    return PipelineError(text, retry_after=e.retry_after)
 
 
 def _bounded_int(

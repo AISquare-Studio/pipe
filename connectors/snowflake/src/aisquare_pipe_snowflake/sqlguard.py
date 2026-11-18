@@ -27,8 +27,10 @@
    parse is refused. sqlglot logs pieces of the SQL (its "unsupported
    syntax" warning; "Invalid JSON path syntax" with the path, for any JSON
    key with a dash), so nothing it logs while this module parses gets out:
-   a filter on the "sqlglot" logger drops those records, in this context
-   only. Nothing is disabled globally.
+   :func:`aisquare.pipe.core.sql.quiet_sqlglot`, the helper every guard
+   shares, drops those records in this context only. Nothing is disabled
+   globally. A sqlglot older than the extra's floor (:data:`SQLGLOT_FLOOR`)
+   refuses every statement.
 
 Either one refusing refuses the statement (:class:`NotReadOnly`, with a
 message naming why and never echoing the SQL). The parser understands the
@@ -39,13 +41,11 @@ Snowflake does. Behind both, Snowflake is told to run ONE statement
 
 from __future__ import annotations
 
-import logging
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 
+import sqlglot
+from aisquare.pipe.core.sql import quiet_sqlglot, sqlglot_at_least
 from sqlglot import exp
 from sqlglot.dialects.snowflake import Snowflake
 from sqlglot.errors import SqlglotError
@@ -53,6 +53,8 @@ from sqlglot.errors import SqlglotError
 from aisquare_pipe_snowflake.refs import TableRef
 
 MAX_SQL_CHARS = 20_000
+#: The oldest sqlglot the guard runs on: the ``[snowflake]`` extra's floor.
+SQLGLOT_FLOOR = (26, 25)
 #: Table functions a SELECT may call: built-in, read-only, row generators.
 TABLE_FUNCTIONS = frozenset(
     {"FLATTEN", "SPLIT_TO_TABLE", "STRTOK_SPLIT_TO_TABLE", "GENERATOR"}
@@ -212,44 +214,18 @@ class _QuietParser(Snowflake.Parser):
 
 _DIALECT = Snowflake()
 
-# sqlglot logs pieces of the SQL it parses: "Invalid JSON path syntax. ...
-# <the path>" for any JSON key with a dash (``GET_PATH(v, 'a-b')``,
-# ``v:'x-y'``), at WARNING, for statements this guard admits. Every sqlglot
-# module logs through the one "sqlglot" logger. This filter drops its records
-# while THIS module parses, in this context only (a ContextVar, so another
-# thread or task logging through sqlglot meanwhile is untouched). Nothing is
-# disabled globally.
-_SQLGLOT_LOGGER = logging.getLogger("sqlglot")
-_PARSING: ContextVar[bool] = ContextVar(
-    "aisquare_pipe_snowflake_sqlguard_parsing", default=False
-)
-
-
-class _DropWhileParsing(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _PARSING.get()
-
-
-_QUIET_WHILE_PARSING = _DropWhileParsing()
-
-
-@contextmanager
-def _sqlglot_silenced() -> Iterator[None]:
-    # Re-attached on every parse: a host that resets the logger's filters
-    # doesn't bring the leak back.
-    if _QUIET_WHILE_PARSING not in _SQLGLOT_LOGGER.filters:
-        _SQLGLOT_LOGGER.addFilter(_QUIET_WHILE_PARSING)
-    token = _PARSING.set(True)
-    try:
-        yield
-    finally:
-        _PARSING.reset(token)
-
 
 def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
     pass): stripped, without a single trailing ``;``. Else
     :class:`NotReadOnly`."""
+    if not sqlglot_at_least(str(getattr(sqlglot, "__version__", "")), SQLGLOT_FLOOR):
+        raise NotReadOnly(
+            "the SQL guard needs sqlglot "
+            + ".".join(map(str, SQLGLOT_FLOOR))
+            + " or later and this host has an older one, so no statement may run; "
+            "the host must install aisquare-pipe[snowflake] as declared"
+        )
     if not isinstance(sql, str) or not sql.strip():
         raise NotReadOnly("the statement is empty")
     if len(sql) > MAX_SQL_CHARS:
@@ -427,7 +403,7 @@ def _blank(
 def _parse(sql: str) -> list[exp.Expression]:
     """Every statement in ``sql`` (sqlglot, Snowflake dialect, silently:
     nothing sqlglot logs while it parses gets out)."""
-    with _sqlglot_silenced():
+    with quiet_sqlglot():
         tokens = _DIALECT.tokenize(sql)
         parser = _QuietParser(dialect=_DIALECT)
         return [s for s in parser.parse(tokens, sql) if s is not None]
@@ -528,6 +504,7 @@ def table_references(
 
 __all__ = [
     "MAX_SQL_CHARS",
+    "SQLGLOT_FLOOR",
     "TABLE_FUNCTIONS",
     "NotReadOnly",
     "check_select_only",
