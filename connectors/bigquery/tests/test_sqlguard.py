@@ -4,6 +4,8 @@ that each of its two checks refuses on its own."""
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
@@ -255,6 +257,108 @@ def test_the_guard_never_logs_the_sql(caplog):
         with pytest.raises(NotReadOnly):
             check_select_only(sql)
     assert "payroll" not in caplog.text and "secret_column" not in caplog.text
+
+
+# Admitted statements whose JSON paths sqlglot can't read: it logs "Invalid
+# JSON path syntax. ... <the path>" at WARNING while parsing them (each
+# marker is in the path).
+ADMITTED_WITH_DASHED_JSON_PATHS = [
+    "SELECT JSON_VALUE(p, '$.member.ssn-123-45-6789') FROM claims",
+    "SELECT JSON_EXTRACT(p, '$.patient-4111111111111111') FROM t",
+    "SELECT JSON_EXTRACT_SCALAR(p, '$.dob-1970-01-01') AS d FROM t",
+    "SELECT JSON_QUERY(p, '$.dx-F32.1') FROM t",
+    "SELECT JSON_EXTRACT(p, 'member.ssn-555') FROM t",
+    "WITH c AS (SELECT JSON_VALUE(p, '$.cte-777') AS v FROM ds.t) SELECT v FROM c",
+    "SELECT a FROM ds.t WHERE JSON_VALUE(p, '$.where-888') = 'x'",
+]
+MARKERS = (
+    "123-45-6789",
+    "4111111111111111",
+    "1970-01-01",
+    "F32.1",
+    "ssn-555",
+    "cte-777",
+    "where-888",
+)
+# The lexer passes these and the parser refuses them, after the JSON path.
+REFUSED_WITH_DASHED_JSON_PATHS = [
+    "SELECT JSON_VALUE(p, '$.refused-999') FROM",
+    "SELECT JSON_EXTRACT(p, '$.refused-998') FROM t WHERE",
+]
+
+
+@pytest.fixture
+def sqlglot_records(caplog):
+    """Every record the "sqlglot" logger emits, at DEBUG and up: through
+    caplog's root handler and through a handler on the logger itself."""
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sqlglot_logger = logging.getLogger("sqlglot")
+    keep = Keep(level=logging.DEBUG)
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlglot")
+    sqlglot_logger.addHandler(keep)
+    try:
+        yield records
+    finally:
+        sqlglot_logger.removeHandler(keep)
+
+
+def test_the_guard_never_logs_a_json_path(caplog, sqlglot_records):
+    """sqlglot quotes a JSON path it can't read (a key with a dash) at
+    WARNING, for statements the guard admits: nothing it logs while the
+    guard parses gets out (seq 13748/13800)."""
+    import sqlglot
+
+    for sql in ADMITTED_WITH_DASHED_JSON_PATHS:
+        assert check_select_only(sql) == sql
+        table_references(sql, default_dataset=(None, "ds"))
+    for sql in REFUSED_WITH_DASHED_JSON_PATHS:
+        with pytest.raises(NotReadOnly):
+            check_select_only(sql)
+    assert [r.getMessage() for r in sqlglot_records] == []
+    for marker in (*MARKERS, "refused-99"):
+        assert marker not in caplog.text
+    # The control: sqlglot itself logs them.
+    for sql in ADMITTED_WITH_DASHED_JSON_PATHS:
+        sqlglot.parse_one(sql, read="bigquery")
+    logged = " ".join(r.getMessage() for r in sqlglot_records)
+    assert sum(marker in logged for marker in MARKERS) >= 5, logged
+
+
+def test_the_guard_prints_nothing_through_python_last_resort():
+    """With no logging configured at all, Python prints WARNING records to
+    stderr (logging.lastResort): the guard's parse sends it nothing."""
+    script = (
+        "import sqlglot\n"
+        "from aisquare_pipe_bigquery.sqlguard import check_select_only\n"
+        f"for sql in {ADMITTED_WITH_DASHED_JSON_PATHS!r}:\n"
+        "    check_select_only(sql)\n"
+        "sqlglot.parse_one(\"SELECT JSON_VALUE(p, '$.control-1') FROM t\", "
+        "read='bigquery')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    for marker in MARKERS:
+        assert marker not in proc.stderr
+    assert "control-1" in proc.stderr  # lastResort does print sqlglot's warning
+
+
+def test_an_old_sqlglot_refuses_every_statement(monkeypatch):
+    """The [bigquery] extra needs sqlglot >= 26.25; a host that got an older
+    one from another package fails closed (review #37 n2)."""
+    import sqlglot
+
+    monkeypatch.setattr(sqlglot, "__version__", "26.24.0")
+    with pytest.raises(NotReadOnly, match="needs sqlglot 26.25 or later"):
+        check_select_only("SELECT 1")
+    monkeypatch.setattr(sqlglot, "__version__", "26.25.0")
+    assert check_select_only("SELECT 1") == "SELECT 1"
 
 
 def test_a_statement_over_the_length_limit_is_refused():

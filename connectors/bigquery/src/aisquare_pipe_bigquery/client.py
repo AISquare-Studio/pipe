@@ -72,25 +72,38 @@ class BigQueryAPIError(Exception):
     nothing came back); ``reason`` BigQuery's error reason, if any;
     ``retry_after`` is set for a 429/503 that said when to retry;
     ``timed_out`` for a timeout; ``key_refused`` when Google's token
-    endpoint refused the service account key itself."""
+    endpoint refused the service account key itself; ``www_authenticate``
+    the answer's ``WWW-Authenticate`` header.
+
+    ``message`` (the str) is ``summary``, the connector's own words, then
+    ``detail``, BigQuery's own error text when it gave one (redacted and
+    bounded). That text can quote the statement and name tables, so only
+    the toolkit, which answers the caller, shows it; the source's errors
+    carry ``summary`` alone (hosts log those)."""
 
     def __init__(
         self,
         message: str,
         *,
+        detail: str = "",
         status: int | None = None,
         reason: str | None = None,
         retry_after: float | None = None,
         timed_out: bool = False,
         key_refused: bool = False,
+        www_authenticate: str | None = None,
     ) -> None:
-        super().__init__(message)
-        self.message = message
+        full = f"{message}: {detail}" if detail else message
+        super().__init__(full)
+        self.message = full
+        self.summary = message
+        self.detail = detail
         self.status = status
         self.reason = reason
         self.retry_after = retry_after
         self.timed_out = timed_out
         self.key_refused = key_refused
+        self.www_authenticate = www_authenticate
 
 
 def _segment(value: str) -> str:
@@ -419,14 +432,17 @@ class BigQueryClient:
         if status >= 400:
             message, reason = self._detail(resp)
             resp.close()
+            headers = resp.headers or {}
+            challenge = headers.get("WWW-Authenticate")
             raise BigQueryAPIError(
-                f"BigQuery failed ({status}{', ' + reason if reason else ''})"
-                + (f": {message}" if message else ""),
+                f"BigQuery failed ({status}{', ' + reason if reason else ''})",
+                detail=message,
                 status=status,
                 reason=reason,
-                retry_after=retry_after_seconds((resp.headers or {}).get("Retry-After"))
+                retry_after=retry_after_seconds(headers.get("Retry-After"))
                 if status in (429, 503)
                 else None,
+                www_authenticate=challenge if isinstance(challenge, str) else None,
             )
         return resp
 

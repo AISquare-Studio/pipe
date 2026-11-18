@@ -18,7 +18,8 @@ ceiling. Exactly one of:
 
 And for both: ``batch_size`` rows per envelope (default 500, at most
 10,000), ``max_rows`` (default 10,000, at most 100,000) and
-``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 100 MiB).
+``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 64 MiB:
+sized for a 512 MiB pod, see the README's "Memory").
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``; ``schema`` carries the columns
@@ -81,17 +82,17 @@ from aisquare_pipe_bigquery.query import (
 )
 from aisquare_pipe_bigquery.refs import TableRef, parse_dataset, parse_table
 from aisquare_pipe_bigquery.rows import (
-    canonical,
+    encoded_batch,
+    encoded_result_sha256,
+    encoded_rows_sha256,
     millis_rfc3339,
-    result_sha256,
-    rows_sha256,
 )
 from aisquare_pipe_bigquery.sqlguard import (
     NotReadOnly,
     check_select_only,
     table_references,
 )
-from aisquare_pipe_bigquery.toolkit import bytes_cap
+from aisquare_pipe_bigquery.toolkit import BigQueryRequestError, bytes_cap, source_error
 
 logger = logging.getLogger("aisquare.pipe.bigquery")
 
@@ -100,7 +101,10 @@ MAX_BATCH_SIZE = 10_000
 DEFAULT_MAX_ROWS = 10_000
 MAX_ROWS = 100_000
 DEFAULT_MAX_RESULT_BYTES = 25 * 1024 * 1024
-MAX_RESULT_BYTES = 100 * 1024 * 1024
+#: Sized for a 512 MiB pod: the source peaks at about 1.35x the rows' JSON
+#: plus 25 MiB (the README's "Memory" has the measurements), and a host
+#: holds its envelopes too (pipe-as-service base64-encodes each, ~1.33x).
+MAX_RESULT_BYTES = 64 * 1024 * 1024
 DEFAULT_JOB_TIMEOUT = 120
 MAX_JOB_TIMEOUT = 600
 #: Tables whose lastModifiedTime a query's marker reads at most.
@@ -131,7 +135,7 @@ def _options(params: PullParams | dict[str, Any] | None) -> dict[str, Any]:
         return {}
     raw = params.params if isinstance(params, PullParams) else params
     if not isinstance(raw, dict):
-        raise TypeError("pull params must be a mapping")
+        raise ValueError("pull params must be a mapping")  # noqa: TRY004 — a host answers TypeError 500
     server = sorted(SERVER_KEYS.intersection(raw))
     if server:
         raise ValueError(
@@ -277,13 +281,31 @@ class BigQueryQuerySource(SourceConnector):
     def pull(
         self, config: dict, params: PullParams | None = None
     ) -> Iterator[DataEnvelope]:
-        """Yield one envelope per batch of rows. Raises
-        :class:`BigQueryNotConfigured` without a usable credential (before any
-        request), ``ValueError`` for bad params, SQL that is not one SELECT
-        (:class:`~aisquare_pipe_bigquery.sqlguard.NotReadOnly`) or a query
-        over its byte cap (:class:`~aisquare_pipe_bigquery.query.CapExceeded`),
-        and :class:`BigQueryAPIError` when BigQuery fails."""
+        """Yield one envelope per batch of rows.
+
+        Raises, as pipe-as-service answers them:
+
+        * 422, a ``ValueError``: :class:`BigQueryNotConfigured` without a
+          usable credential (before any request); bad params; SQL that is
+          not one SELECT (:class:`~aisquare_pipe_bigquery.sqlguard.NotReadOnly`);
+          a query over its byte cap
+          (:class:`~aisquare_pipe_bigquery.query.CapExceeded`); and what
+          BigQuery refused that the caller can fix, an invalid query or a
+          missing table (:class:`~aisquare_pipe_bigquery.toolkit.BigQueryRequestError`);
+        * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
+          BigQuery failure (a refused key or permission, a quota, throttling,
+          a timeout, a 5xx), with ``retry_after`` when BigQuery gave one.
+
+        Neither carries BigQuery's own error text."""
         creds = load_credentials(config)
+        try:
+            yield from self._pull(creds, params)
+        except BigQueryAPIError as e:
+            raise source_error(e, creds.project_id) from None
+
+    def _pull(
+        self, creds: BigQueryCredentials, params: PullParams | None
+    ) -> Iterator[DataEnvelope]:
         options = _options(params)
         has_table = options.get("table") not in (None, "")
         has_sql = options.get("sql") not in (None, "")
@@ -363,6 +385,7 @@ class BigQueryQuerySource(SourceConnector):
             max_result_bytes=max_bytes,
             start_index=start,
             selected_fields=selected,
+            encoded=True,
         )
         name = ref.qualified(creds.project_id)
         common: dict[str, Any] = {"kind": "table", "table": name}
@@ -398,6 +421,7 @@ class BigQueryQuerySource(SourceConnector):
             job_timeout=job_timeout,
             default_dataset=default_dataset,
             estimate=estimate,
+            encoded=True,
         )
         digest = hashlib.sha256(sql.encode()).hexdigest()
         common: dict[str, Any] = {"kind": "query", "query_sha256": digest, **markers}
@@ -470,14 +494,19 @@ def _batches(
     source_id: str,
     kind: str,
 ) -> Iterator[DataEnvelope]:
-    """The result as envelopes of ``batch_size`` rows (one when empty)."""
-    rows = result.rows
-    whole = result_sha256(result.fields, rows)
+    """The result as envelopes of ``batch_size`` rows (one when empty),
+    from the rows' canonical JSON (``encoded=True``). Each batch's rows are
+    let go once its envelope is built, so the rows and the envelopes a
+    consumer keeps add up to about one copy of the result."""
+    rows: list[bytes | None] = list(result.encoded or [])
+    result.encoded = None
+    count = len(rows)
+    whole = encoded_result_sha256(result.fields, (r for r in rows if r is not None))
     millis = common.get("table_last_modified_ms")
     common = {
         **common,
         "result_sha256": whole,
-        "result_row_count": len(rows),
+        "result_row_count": count,
         "version": f"{millis}:{whole}" if millis else whole,
     }
     if result.total_rows is not None:
@@ -490,13 +519,15 @@ def _batches(
             kind,
             result.truncated,
         )
-    starts = list(range(0, len(rows), batch_size)) or [0]
+    starts = list(range(0, count, batch_size)) or [0]
     columns = {"fields": result.fields}
     for index, offset in enumerate(starts):
-        batch = rows[offset : offset + batch_size]
-        yield DataEnvelope(
+        end = min(offset + batch_size, count)
+        batch = [r for r in rows[offset:end] if r is not None]
+        rows[offset:end] = [None] * (end - offset)
+        envelope = DataEnvelope(
             content_type="application/json",
-            data=canonical({"columns": result.fields, "rows": batch}),
+            data=encoded_batch(result.fields, batch),
             source_id=f"{source_id}#rows={first + offset}-{first + offset + len(batch)}",
             metadata={
                 **common,
@@ -504,16 +535,19 @@ def _batches(
                 "batch_count": len(starts),
                 "first_row": first + offset,
                 "row_count": len(batch),
-                "batch_sha256": rows_sha256(batch),
+                "batch_sha256": encoded_rows_sha256(batch),
             },
             schema=json.loads(json.dumps(columns)),
         )
+        del batch
+        yield envelope
 
 
 __all__ = [
     "BigQueryAPIError",
     "BigQueryNotConfigured",
     "BigQueryQuerySource",
+    "BigQueryRequestError",
     "CapExceeded",
     "NotATable",
     "NotReadOnly",

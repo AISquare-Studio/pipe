@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -58,9 +59,16 @@ def schema_fields(schema: Any) -> list[dict[str, Any]]:
 
 def convert_rows(fields: list[dict[str, Any]], rows: Any) -> list[dict[str, Any]]:
     """REST rows (``[{"f": [...]}, ...]``) as objects keyed by column name."""
+    return list(iter_rows(fields, rows))
+
+
+def iter_rows(fields: list[dict[str, Any]], rows: Any) -> Iterator[dict[str, Any]]:
+    """:func:`convert_rows`, one row at a time (a page's rows are never all
+    objects at once)."""
     if not isinstance(rows, list):
-        return []
-    return [_record(fields, row) for row in rows]
+        return
+    for row in rows:
+        yield _record(fields, row)
 
 
 def _record(fields: list[dict[str, Any]], row: Any) -> dict[str, Any]:
@@ -142,24 +150,49 @@ def row_size(row: dict[str, Any]) -> int:
 
 def rows_sha256(rows: list[dict[str, Any]]) -> str:
     """SHA-256 of ``rows`` in order (one batch's hash)."""
+    return encoded_rows_sha256(canonical(row) for row in rows)
+
+
+def encoded_rows_sha256(encoded: Iterable[bytes]) -> str:
+    """:func:`rows_sha256` of rows already in :func:`canonical` form."""
     digest = hashlib.sha256()
-    for row in rows:
-        digest.update(canonical(row))
+    for row in encoded:
+        digest.update(row)
         digest.update(b"\n")
     return digest.hexdigest()
 
 
 def result_sha256(fields: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str:
     """SHA-256 of the schema and the rows, whatever order the rows came in."""
+    return encoded_result_sha256(fields, (canonical(r) for r in rows))
+
+
+def encoded_result_sha256(
+    fields: list[dict[str, Any]], encoded: Iterable[bytes]
+) -> str:
+    """:func:`result_sha256` of rows already in :func:`canonical` form."""
     digest = hashlib.sha256(canonical(fields))
-    for row_digest in sorted(hashlib.sha256(canonical(r)).digest() for r in rows):
+    for row_digest in sorted(hashlib.sha256(row).digest() for row in encoded):
         digest.update(row_digest)
     return digest.hexdigest()
+
+
+def encoded_batch(fields: list[dict[str, Any]], encoded: Iterable[bytes]) -> bytes:
+    """``canonical({"columns": fields, "rows": rows})`` built from the rows'
+    :func:`canonical` forms, byte for byte (the keys sort as
+    ``columns``, ``rows``), without turning them back into objects."""
+    return (
+        b'{"columns":' + canonical(fields) + b',"rows":[' + b",".join(encoded) + b"]}"
+    )
 
 
 __all__ = [
     "canonical",
     "convert_rows",
+    "encoded_batch",
+    "encoded_result_sha256",
+    "encoded_rows_sha256",
+    "iter_rows",
     "millis_rfc3339",
     "result_sha256",
     "row_size",
