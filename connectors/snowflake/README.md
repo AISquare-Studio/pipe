@@ -243,8 +243,8 @@ refused (`invalid_arguments`), and the message never echoes the SQL. Snowflake a
 
 **Caps.**
 - **Rows and bytes returned.** `max_rows` (sent as `ROWS_PER_RESULTSET`, so Snowflake sends no more, and cut again
-  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 64 MiB, for the source). Result
-  partitions are read only while they fit. A result cut short says `truncated`.
+  here), and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most 64 MiB, for the source). A result
+  is read a row at a time and reading stops at the cap (see [Memory](#memory)). A result cut short says `truncated`.
 - **Time.** A tool call fits inside the host's `timeout_seconds`, all of its requests together. Each request, the
   OAuth token POST included, gets the time left (at most 30 s), and a call with less than a second left fails
   `timeout` before it submits anything. Every request starts inside the budget and gets at most the time left
