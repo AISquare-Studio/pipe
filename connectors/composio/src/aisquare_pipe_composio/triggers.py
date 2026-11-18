@@ -38,6 +38,7 @@ from aisquare_pipe_composio.client import (
     default_cursor_path,
     is_transient_error,
     load_trigger_cursor,
+    log_call_failure,
     migrate_legacy_cursor,
     save_trigger_cursor,
 )
@@ -252,7 +253,11 @@ class ComposioTriggersSource(SourceConnector):
                 )
                 raise
             except Exception as e:
-                logger.exception("composio: trigger poll cycle failed")
+                # A Composio error is logged by type and HTTP status only,
+                # with no traceback: its message, which a traceback prints,
+                # carries Composio's answer (a 500's body text). The host
+                # gets the error itself (on_cycle_error).
+                log_call_failure(logger, "composio: trigger poll cycle failed", e)
                 failure = e
                 if not is_transient_error(e) and state.pending_cursor is not None:
                     # Not a failure a retry fixes: the resume cursor may be
@@ -457,8 +462,8 @@ class ComposioTriggersSource(SourceConnector):
 
         try:
             instances = client.list_trigger_instances()
-        except Exception:
-            logger.exception("composio: listing trigger instances failed")
+        except Exception as e:
+            log_call_failure(logger, "composio: listing trigger instances failed", e)
             instances = []
         for instance in instances:
             instance_id = str(instance.get("id") or "")

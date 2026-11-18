@@ -155,6 +155,39 @@ def is_transient_error(exc: BaseException) -> bool:
     return False
 
 
+_SDK_ERRORS = (ComposioError, APIStatusError, APIConnectionError)
+
+
+def failure_label(exc: BaseException) -> str:
+    """How a Composio call failed, fit for a log line: the error's type, the
+    SDK error it was mapped from (``_map_composio_errors`` chains it as the
+    cause) and the HTTP status Composio answered. Never a message: an SDK
+    error's message carries Composio's answer (a 500's body text included),
+    which may echo request data."""
+    label = type(exc).__name__
+    cause = exc.__cause__
+    if cause is not None:
+        label += f" from {type(cause).__name__}"
+    status = getattr(cause if cause is not None else exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        label += f" (HTTP {status})"
+    return label
+
+
+def log_call_failure(log: logging.Logger, message: str, exc: BaseException) -> None:
+    """Log a failed call at ERROR. An error from Composio (a ``PipelineError``:
+    what ``_map_composio_errors`` turns every SDK error into, carrying the SDK
+    error's message; or an SDK error itself) is logged as ``failure_label``
+    with no traceback: the traceback prints both messages, Composio's answer
+    in them. Anything else is this connector's own and keeps its traceback."""
+    if isinstance(exc, (PipelineError, *_SDK_ERRORS)) or isinstance(
+        exc.__cause__, _SDK_ERRORS
+    ):
+        log.error("%s: %s", message, failure_label(exc))
+    else:
+        log.error(message, exc_info=exc)
+
+
 def _retry_on_rate_limit(func):  # type: ignore[no-untyped-def]
     """Retry with exponential backoff on HTTP 429."""
 
