@@ -1,172 +1,211 @@
 # Releasing
 
-This repo is a monorepo of independently published PyPI packages:
-
-| Package | Path |
-|---|---|
-| `aisquare-pipe` | `.` |
-| `aisquare-pipe-local` | `connectors/local` |
-| `aisquare-pipe-dropbox` | `connectors/dropbox` |
-| `aisquare-pipe-onedrive` | `connectors/onedrive` |
-| `aisquare-pipe-googledrive` | `connectors/googledrive` |
-| `aisquare-pipe-salesforce` | `connectors/salesforce` |
-| `aisquare-pipe-docusign` | `connectors/docusign` |
-| `aisquare-pipe-composio` | `connectors/composio` |
-| `aisquare-pipe-gateway` | `connectors/gateway` |
-| `aisquare-pipe-n8n` | `connectors/n8n` |
-| `aisquare-pipe-github` | `connectors/github` |
-| `aisquare-pipe-graphify` | `connectors/graphify` |
-| `aisquare-pipe-slack` | `connectors/slack` |
-| `aisquare-pipe-gmail` | `connectors/gmail` |
-| `aisquare-pipe-googlecalendar` | `connectors/googlecalendar` |
+This repo publishes **one** PyPI distribution, `aisquare-pipe`. It carries the
+framework and every connector under `connectors/` (D8): each connector is a
+top-level module (`aisquare_pipe_<name>`) inside it, and its third-party
+dependencies are the `aisquare-pipe[<name>]` extra. No connector is ever its
+own PyPI project, so adding one never needs a new project or a new trusted
+publisher.
 
 Publishing is automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
-using **PyPI Trusted Publishing (OIDC)** — no API tokens are stored anywhere.
+using **PyPI Trusted Publishing (OIDC)**: no API tokens are stored anywhere.
+`scripts/release_packages.py` makes every decision; the workflow wires its
+steps together.
+
+## What a publish run does
+
+1. **plan** reads the version from the root `pyproject.toml` and checks the
+   metadata. Every `aisquare-pipe[...]` reference must name an existing extra,
+   nothing may depend on an `aisquare-pipe-*` package, every connector must
+   have an extra, and `[full]` must pull in every one. On a GitHub Release
+   the tag must be `v<version>`. It then looks the version up on PyPI.
+2. **build** builds the wheel and sdist and checks them:
+   - both carry the planned name and version;
+   - the wheel's RECORD holds every module under `src/` and every
+     `connectors/<dir>/src/`;
+   - `twine check --strict` passes.
+3. **publish** uploads, unless that version is already on PyPI: then it is
+   skipped, and the run summary says so. The upload doesn't use
+   `skip-existing`, so a rejected upload fails the run.
+4. **verify** checks each file on PyPI against the sha256 of the file the
+   run built.
+
+`plan` refuses to upload anything whose PyPI project doesn't exist yet. This
+workflow never creates a project.
+
+## Dry run
+
+Every pull request runs the same workflow as a dry run of everything a
+publish could upload: plan, then build and check the distribution and all ten
+shims (below), with no upload. To dry-run a branch by hand, use **Actions →
+publish → Run workflow**, pick the branch and the target, and leave
+**dry-run** ticked (the default). Locally:
+
+```bash
+python scripts/release_packages.py plan --pypi            # a PR's plan: the distribution and the shims
+python scripts/release_packages.py build --path . --outdir dist
+python scripts/release_packages.py check-dist --path . dist
+twine check --strict dist/*
+```
 
 ## Versioning
 
-Each package carries its own version, declared in two places that must match
-(enforced by `pipe validate`'s `hygiene.version-sync` check):
+`aisquare-pipe` has one version: `version` in the root `pyproject.toml`.
+Bump it for every release that changes anything, the framework or any
+connector. A version already on PyPI is never re-published.
 
-- `version` in the package's `pyproject.toml`
-- the `version` attribute on its connector class
-
-The release workflow publishes **every** package on each release, each at the
-version declared in its `pyproject.toml`, and **skips any version already on
-PyPI** (`skip-existing: true`). So bumping only the packages that changed is
-enough — unchanged packages are simply skipped. Keep all versions equal if you
-prefer strict lockstep; the workflow supports either model.
+Each connector class still carries a `version` attribute. It is that
+connector's own contract version (toolkit cards and the search index key on
+it), and it is independent of the distribution's version. `pipe validate`'s
+`hygiene.version-sync` checks that all of one connector's classes agree on
+it.
 
 ## One-time setup
 
-Trusted Publishing must be configured once per project. For projects that don't
-exist on PyPI yet, use a **pending publisher**:
+A new connector never needs any of this. Each PyPI project this workflow
+uploads to needs a **trusted publisher** with exactly these values (PyPI →
+Your projects → the project → Manage → Publishing, or
+`https://pypi.org/manage/project/<project>/settings/publishing/`; only a
+project Owner sees the page):
 
-1. Go to <https://pypi.org/manage/account/publishing/>.
-2. Add a pending publisher for **each** package name in the table above with:
-   - **Owner:** `AISquare-Studio`
-   - **Repository:** `pipe`
-   - **Workflow:** `publish.yml`
-   - **Environment:** `pypi`
-3. In GitHub: **Settings → Environments → New environment** named `pypi`
-   (optionally add required reviewers to gate publishes).
+| Field on PyPI's "Add a new publisher" → GitHub form | Value |
+|---|---|
+| Owner | `AISquare-Studio` |
+| Repository name | `pipe` |
+| Workflow name | `publish.yml` |
+| Environment name | `pypi` |
+
+- **`aisquare-pipe`:** in place. Its 0.1.1 files (2026-06-29) carry a
+  provenance attestation from this publisher.
+- **The ten shim projects** (see "The shims"): seven are proven the same way,
+  since their last upload carries an attestation from this publisher:
+  `aisquare-pipe-composio`, `-gateway`, `-github`, `-graphify`, `-n8n`,
+  `-onedrive` and `-salesforce`. Three are **not**: `aisquare-pipe-docusign`,
+  `aisquare-pipe-dropbox` and `aisquare-pipe-local`. Their only release,
+  0.1.0, was uploaded by hand on 2026-05-26, before this workflow existed,
+  and has no attestation. A green job of theirs in run 28394718052 proves
+  nothing: that workflow uploaded with `skip-existing`, which skipped their
+  already-published 0.1.0 before PyPI checked any permission. Check them
+  before the shim run (step 1 of "The shims").
+- **GitHub:** the `pypi` environment (Settings → Environments → `pypi`).
+  Recommended, since a Run workflow with **dry-run** unticked otherwise
+  publishes from any branch:
+  - **Deployment branches and tags** → Selected branches and tags → add the
+    branch rules `main` and `release/*` and the tag rule `v*`. A release runs
+    on its tag, and a Run workflow on its branch.
+  - **Required reviewers:** yourself, so no upload starts until you approve
+    it.
+
+  Pull requests never reach the environment: only the two upload jobs use it.
+
+A provenance attestation shows the publisher was registered when that file
+was uploaded. The Publishing page is the only check that it still is.
 
 ## Cutting a release
 
-1. Bump `version` in the `pyproject.toml` (and the matching connector class
-   attribute) for each package you're releasing; update `CHANGELOG.md`.
-2. Open a PR and merge to `main`.
-3. **Create a GitHub Release** with a tag like `vX.Y.Z`
-   (Releases → Draft a new release). Publishing the release triggers the
-   workflow, which builds and uploads all packages.
+1. Bump `version` in the root `pyproject.toml` and update `CHANGELOG.md`.
+2. Open a PR and merge it. The PR's publish dry run must be green.
+3. **Create a GitHub Release** whose tag is `v<version>`, e.g. `v0.5.0` when
+   the root `pyproject.toml` says `0.5.0` (Releases → Draft a new release).
+   Its target is the branch that carries that version. Publishing the release
+   triggers the workflow.
 
-You can also run it manually: **Actions → publish → Run workflow**
-(`workflow_dispatch`). Either way, every package whose project is new on PyPI
-needs its pending trusted publisher registered first ("One-time setup").
+   A tag that doesn't match the version fails the run before anything is
+   built. History: `v0.2.0` (2026-07-10) was cut while the root still said
+   `0.1.1`. Its framework job rebuilt 0.1.1, `skip-existing` skipped it, and
+   the job went green with nothing uploaded.
 
-## Toolkits before the `[toolkits]` extra
+Run workflow with **dry-run** unticked publishes the same way without a
+release (for a re-run, or to publish from a branch without tagging).
 
-`aisquare-pipe[toolkits]` names every toolkit package with a floor
-(`aisquare-pipe-github>=0.3.0`, …), and pipe-as-service installs it to get
-every toolkit. `scripts/check_toolkits_extra.py` keeps the list complete in CI,
-so a PR that adds a toolkit package also adds it there.
+## The shims (once, after 0.5.0)
 
-**Publish order: the toolkit packages first, then the `aisquare-pipe` release
-whose `[toolkits]` names them.** An `aisquare-pipe` on PyPI whose `[toolkits]`
-names a package (or a floor) that isn't there cannot be installed with that
-extra, and every host that relocks against it fails. The publish workflow
-uploads every package in one parallel run, so the order comes from versions:
+Before 0.5.0, ten connectors were their own PyPI projects:
+`aisquare-pipe-composio`, `-docusign`, `-dropbox`, `-gateway`, `-github`,
+`-graphify`, `-local`, `-n8n`, `-onedrive` and `-salesforce`. Each gets one
+last release, **0.5.0**. It has no code and one requirement,
+`aisquare-pipe[<name>]>=0.5.0`, so `pip install aisquare-pipe-<name>` keeps
+working and pulls in the connector from `aisquare-pipe`. The four connectors
+that never reached PyPI (googledrive, slack, gmail, googlecalendar) get none.
 
-1. Bump and publish the new or changed toolkit packages. Leave the
-   `aisquare-pipe` version alone: `skip-existing` skips the framework, so the
-   extra change rides along unpublished.
-2. Confirm each one on the simple index (`pip index versions <project>`).
-3. Then bump `aisquare-pipe` and publish it: its `[toolkits]` now resolves.
+Publish them with **Run workflow, target `shims`**:
 
-When one run must carry both (as 0.5.0 does, the first release with the
-extra), check every toolkit package is on the index (step 3 of the 0.5.0 list
-below) before anyone relocks against the new `aisquare-pipe`; until then its
-`[toolkits]` cannot resolve.
+1. **Check the publisher on `aisquare-pipe-docusign`, `aisquare-pipe-dropbox`
+   and `aisquare-pipe-local`** (see "One-time setup"). For each, open
+   `https://pypi.org/manage/project/<project>/settings/publishing/`.
+   - If "Manage current publishers" lists GitHub, `AISquare-Studio/pipe`,
+     `publish.yml`, environment `pypi`, there is nothing to do.
+   - Otherwise, under "Add a new publisher" → GitHub, enter Owner
+     `AISquare-Studio`, Repository name `pipe`, Workflow name `publish.yml`,
+     Environment name `pypi`, then **Add**.
 
-## The 0.5.0 release (tool router)
+   No dry run can see a missing publisher. Without it, step 4 uploads seven
+   shims, fails these three with HTTP 403, and `verify` fails. Adding the
+   publisher and re-running then uploads only the three: the seven already on
+   PyPI are skipped.
+2. Only after `aisquare-pipe` 0.5.0 is on PyPI. `plan` fails a real shim run
+   until it is, and warns in a dry run.
+3. Leave **dry-run** ticked first. The run builds and checks all ten shims:
+   each has no code, requires exactly `aisquare-pipe[<name>]>=0.5.0`, and
+   passes `twine check --strict`. Every pull request builds and checks them
+   too.
+4. Then run it again with **dry-run** unticked. `verify` checks the ten
+   uploads.
 
-`aisquare-pipe` 0.5.0 is the first release with `aisquare.pipe.core.search`
-(the BM25F tool index) and the `[toolkits]` extra. pipe-as-service's tool
-router (`/v1/pipe/*`, tool retrieval) requires `aisquare-pipe>=0.5.0`: on 0.4.0
-it would install and serve search with no lexical layer. 0.4.0 publishes
-first, from `release/native-connectors` (pipe#50), and has neither.
+**Upgrading in place** (the user-facing version is README.md, "Upgrading from
+`aisquare-pipe-<x>`"). pip removes the old per-connector release's files when
+it installs the shim. They are the same paths `aisquare-pipe` 0.5.0 has just
+installed, so in an environment that had, say, `aisquare-pipe-onedrive`
+0.1.0, `pip install -U aisquare-pipe-onedrive aisquare-pipe` leaves
+`aisquare_pipe_onedrive` broken. So does a later `pip uninstall
+aisquare-pipe-onedrive` after `aisquare-pipe[onedrive]` was installed over
+0.1.0. Uninstall the old package first; if it's too late, run `pip install
+--force-reinstall --no-deps aisquare-pipe`, or use a fresh environment.
+Discovery logs the breakage as a warning (`Failed to load toolkit onedrive:
+No module named 'aisquare_pipe_onedrive.constants'`), while `pip check` sees
+nothing wrong. Fresh installs (Docker image builds, CI) are not affected. The
+shim's README on PyPI says the same.
 
-Five toolkit packages change with it. Their main tools carry the
-`pipe:primary` marker, which only 0.5.0 reads as a ranking marker (0.4.0's
-ranker would match it as text), so each now requires `aisquare-pipe>=0.5.0`,
-and `[toolkits]` floors each at its new version:
+## The 0.5.0 release
 
-| Project | 0.4.0 run | 0.5.0 run |
-|---|---|---|
-| `aisquare-pipe` | 0.4.0 | **0.5.0** |
-| `aisquare-pipe-gmail` | 0.1.0 | **0.2.0** |
-| `aisquare-pipe-googlecalendar` | 0.1.0 | **0.2.0** |
-| `aisquare-pipe-googledrive` | 0.3.0 | **0.4.0** |
-| `aisquare-pipe-onedrive` | 0.3.0 | **0.4.0** |
-| `aisquare-pipe-slack` | 0.1.0 | **0.2.0** |
-| `aisquare-pipe-github` | 0.3.0 | 0.3.0 (unchanged, skipped) |
+0.5.0 is the first single-distribution release, and 0.4.0 is skipped: PyPI
+goes from `aisquare-pipe` 0.1.1 straight to 0.5.0. Cut it from
+**`release/rc-2026-11`**, once `feat/single-distribution` (this packaging) is
+merged into it. That branch then carries 0.5.0 whole: the tool router, the
+search index, the native toolkits and this packaging. `release/pipe-router`
+is already in it, without this packaging, so don't publish from
+`release/pipe-router`.
 
-1. **0.4.0 first**: "The 0.4.0 release" below, through its step 3. This
-   run then creates no new PyPI project, so it needs no new publisher.
-   If 0.4.0 was never run, do its step 1 (the four pending publishers)
-   before this one; this run then also uploads `aisquare-pipe-github`
-   0.3.0 and `aisquare-pipe-graphify` 0.2.1.
-2. Publish once the router branch has merged to `main` (a GitHub Release
-   `v0.5.0`, or Run workflow on `main`). One run carries the framework and
-   the five toolkits.
-3. **After the run, before relocking pipe-as-service**, confirm the six
-   bold uploads above on the simple index (`pip index versions <project>`),
-   seven if 0.4.0 never ran: then `aisquare-pipe-github` 0.3.0 is new on
-   PyPI too, and `[toolkits]` floors it.
-   Until all of them are there, `aisquare-pipe[toolkits]` 0.5.0 cannot resolve,
-   and a toolkit at its new version cannot install without
-   `aisquare-pipe` 0.5.0. A missing one: fix its publisher and rerun
-   (`skip-existing` uploads only what is missing).
-4. Then relock pipe-as-service (its DEPLOYMENT.md, "Release order"). Its
-   image is built from that lock, so it is never built before step 3.
+**Never run the workflow on a branch without this packaging.** `main`,
+`release/pipe-router` and `release/rc-2026-11` still carry the old
+`publish.yml` until this packaging reaches them, and it has no dry run: Run
+workflow, or a release, uploads at once. It would upload an `aisquare-pipe`
+0.5.0 with no connectors inside, and PyPI never takes a version twice, so
+0.5.0 would be used up. Check the branch first: its `publish.yml` must have
+the `dry-run` input.
 
-## The 0.4.0 release (native connectors)
+```bash
+git fetch origin
+git show origin/release/rc-2026-11:.github/workflows/publish.yml | grep -c 'dry-run:'   # 1, not 0
+```
 
-PyPI has `aisquare-pipe` 0.1.0 and 0.1.1 only (checked 2026-10-31): the
-0.3.0 release was never published. Four projects in this run have never been
-on PyPI at all:
+Required reviewers on the `pypi` environment (see "One-time setup") also
+stop the old workflow: its upload job waits for your approval.
 
-| New on PyPI | Version |
-|---|---|
-| `aisquare-pipe-googledrive` | 0.3.0 |
-| `aisquare-pipe-slack` | 0.1.0 |
-| `aisquare-pipe-gmail` | 0.1.0 |
-| `aisquare-pipe-googlecalendar` | 0.1.0 |
+1. Dry-run it: Run workflow on `release/rc-2026-11` with **dry-run**
+   ticked. The summary should say `aisquare-pipe` 0.5.0 "would upload", and
+   the build job's check should say its RECORD holds every module of the
+   checkout.
+2. Publish: a GitHub Release tagged `v0.5.0` with target `release/rc-2026-11`.
+3. Wait for `verify` to go green: `aisquare-pipe` 0.5.0 is on PyPI.
+4. Shims: "The shims" above, publisher check and dry run first.
+5. Relock pipe-as-service against `aisquare-pipe[full,toolkits]==0.5.0`. Its
+   per-connector requirements must become extras first: `scripts/release_packages.py
+   coverage` (below) names each one.
 
-1. **Before tagging**, register a pending trusted publisher for each of the
-   four ("One-time setup", step 2). This is the maintainer's step on
-   pypi.org. The workflow runs with `fail-fast: false`, so a package with no
-   publisher fails alone while the others upload. `aisquare-pipe-googledrive`
-   is in `[popular]`, and so in `[full]`: if it is missing,
-   `pip install "aisquare-pipe[popular]"` / `"aisquare-pipe[full]"` 0.4.0
-   cannot resolve.
-2. Publish (a GitHub Release `v0.4.0`, or Run workflow on `main`).
-3. **After the run, before relocking pipe-as-service**, confirm all 8
-   expected uploads on the simple index
-   (`https://pypi.org/simple/<project>/`, or
-   `pip index versions <project>`). Every other package was already on PyPI
-   at its version when checked on 2026-10-31, so the run skips it.
+Check a consumer's requirements against what a branch publishes:
 
-   | Project | Version |
-   |---|---|
-   | `aisquare-pipe` | 0.4.0 |
-   | `aisquare-pipe-github` | 0.3.0 |
-   | `aisquare-pipe-googledrive` | 0.3.0 |
-   | `aisquare-pipe-onedrive` | 0.3.0 |
-   | `aisquare-pipe-slack` | 0.1.0 |
-   | `aisquare-pipe-gmail` | 0.1.0 |
-   | `aisquare-pipe-googlecalendar` | 0.1.0 |
-   | `aisquare-pipe-graphify` | 0.2.1 |
-
-   If one is missing, fix its publisher and run the workflow again:
-   `skip-existing` makes the rerun upload only what is missing.
+```bash
+python scripts/release_packages.py coverage --pipe-root . \
+    --consumer-root ../pipe-as-service --consumer-ref origin/release/pipe-router
+```

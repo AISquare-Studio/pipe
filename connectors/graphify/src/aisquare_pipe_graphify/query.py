@@ -10,7 +10,7 @@ The traversal/scoring logic is graphifyy's own (``graphify.serve`` /
 ``graphify.affected`` pure functions) — re-exported, not reimplemented, so the
 chat answers and the local ``graphify query`` CLI stay byte-consistent. This
 module is the connector's Python-API face of those functions; it needs the
-``[engine]`` extra (``pip install "aisquare-pipe-graphify[engine]"``) so that
+``[graphify-engine]`` extra (``pip install "aisquare-pipe[graphify,graphify-engine]"``) so that
 ``graphify`` and ``networkx`` are importable in-process.
 
 Verb contract (mirrors the V2 build plan §5.2): node ids in graph.json are
@@ -29,8 +29,8 @@ try:
     from networkx.readwrite import json_graph
 except ImportError as exc:  # pragma: no cover — import-time guard
     raise ModuleNotFoundError(
-        "aisquare-pipe-graphify's query face needs networkx/graphifyy importable — "
-        "install the engine extra: pip install 'aisquare-pipe-graphify[engine]'"
+        "the graphify connector's query face needs networkx/graphifyy importable — "
+        "install the engine: pip install 'aisquare-pipe[graphify,graphify-engine]'"
     ) from exc
 
 __all__ = [

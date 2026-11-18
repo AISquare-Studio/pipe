@@ -1,4 +1,4 @@
-# aisquare-pipe-github
+# aisquare-pipe[github]
 
 GitHub for [aisquare.pipe](../../README.md). The package ships two things:
 
@@ -9,9 +9,17 @@ GitHub for [aisquare.pipe](../../README.md). The package ships two things:
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[github]` extra:
+
 ```bash
-cd connectors/github
-pip install -e ".[dev]"
+pip install "aisquare-pipe[github]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/github && pytest tests
 ```
 
 ## Toolkit
@@ -247,7 +255,7 @@ config = {
 }
 ```
 
-### Usage (Python API — pairs with aisquare-pipe-graphify)
+### Usage (Python API — pairs with aisquare-pipe[graphify])
 
 ```python
 from aisquare.pipe import Pipeline

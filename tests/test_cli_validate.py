@@ -57,7 +57,7 @@ def fake_repo(tmp_path, monkeypatch):
         DiscoveredConnector(
             ep_name="good-source",
             ep_value="aisquare_pipe_good.connector:GoodSource",
-            dist_name="aisquare-pipe-good",
+            dist_name="aisquare-pipe",
             dist_version="0.1.0",
             cls=_GoodSource,
             load_error=None,
@@ -80,10 +80,14 @@ def fake_repo(tmp_path, monkeypatch):
         ),
     ]
 
-    def fake_dist_info(dist_name, discovered_list):
-        if dist_name == "aisquare-pipe-good":
+    def fake_dist_info(cdir, discovered_list):
+        # Only `good` is installed: any connector a test adds later is not.
+        if cdir.dir_name == "good":
             return DistInfo(
-                found=True, version="0.1.0", editable_path=root / "connectors" / "good"
+                found=True,
+                version="0.5.0",
+                editable_path=root,
+                installed_entry_points=cdir.declared_entry_points(),
             )
         return DistInfo(found=False)
 
@@ -129,7 +133,7 @@ class TestRepoMode:
         build_connector(fake_repo, "uninstalled")
         result = CliRunner().invoke(cli, ["validate"])
         assert result.exit_code == 1
-        assert "pip install -e connectors/uninstalled" in result.output
+        assert 'pip install -e ".[full,dev]"' in result.output
 
     def test_json_output(self, fake_repo):
         result = CliRunner().invoke(cli, ["validate", "--json", "--skip-tests"])
@@ -150,6 +154,43 @@ class TestRepoMode:
     def test_dist_name_target_resolves(self, fake_repo):
         result = CliRunner().invoke(cli, ["validate", "aisquare-pipe-good", "--skip-tests"])
         assert result.exit_code == 0, result.output
+
+    def test_extra_target_resolves(self, fake_repo):
+        result = CliRunner().invoke(cli, ["validate", "aisquare-pipe[good]", "--skip-tests"])
+        assert result.exit_code == 0, result.output
+
+
+class TestInstall:
+    """--install is one editable install of the repo with its extras."""
+
+    def _stub(self, monkeypatch):
+        calls: list[tuple[Path, str]] = []
+
+        def fake_install(repo_root, extras):
+            calls.append((repo_root, extras))
+            return True, ""
+
+        monkeypatch.setattr(validate_mod, "_install_repo", fake_install)
+        monkeypatch.setattr(hygiene_mod, "check_framework_install", lambda repo_root: [])
+        return calls
+
+    def test_nothing_to_install_when_every_connector_is_installed(self, fake_repo, monkeypatch):
+        calls = self._stub(monkeypatch)
+        assert validate_mod.install_missing_connectors(fake_repo, echo=lambda *a, **k: None) == 0
+        assert calls == []
+
+    def test_a_missing_connector_installs_the_repo_once_with_full(self, fake_repo, monkeypatch):
+        build_connector(fake_repo, "one")
+        build_connector(fake_repo, "two")
+        calls = self._stub(monkeypatch)
+        assert validate_mod.install_missing_connectors(fake_repo, echo=lambda *a, **k: None) == 1
+        assert calls == [(fake_repo, "full,dev")]
+
+    def test_one_connector_installs_only_its_extra(self, fake_repo, monkeypatch):
+        build_connector(fake_repo, "one")
+        calls = self._stub(monkeypatch)
+        validate_mod.install_missing_connectors(fake_repo, "one", echo=lambda *a, **k: None)
+        assert calls == [(fake_repo, "one,dev")]
 
 
 VALID_CONNECTOR_FILE = '''\
@@ -209,6 +250,67 @@ class TestInstalledOnlyMode:
         assert result.exit_code == 0, result.output
         assert "contract layer only" in result.output
 
+    def test_a_connector_whose_extra_is_missing_is_not_installed_not_failed(self, monkeypatch):
+        monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
+        monkeypatch.setattr(validate_mod, "discover_toolkit_entry_points", list)
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_connector_entry_points",
+            lambda: [
+                DiscoveredConnector(
+                    ep_name="dropbox-source",
+                    ep_value="aisquare_pipe_dropbox.connector:DropboxSource",
+                    dist_name="aisquare-pipe",
+                    dist_version="0.5.0",
+                    cls=None,
+                    load_error="ModuleNotFoundError: No module named 'dropbox'",
+                    missing_requirements=("dropbox",),
+                )
+            ],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json"])
+        assert result.exit_code == 0, result.output
+        (report,) = json.loads(result.output)["connectors"]
+        assert (report["name"], report["dist"], report["install_state"]) == (
+            "dropbox",
+            "aisquare-pipe[dropbox]",
+            "missing",
+        )
+
+    @pytest.mark.parametrize(
+        ("dist_name", "label"),
+        [
+            ("aisquare-pipe", "aisquare-pipe[acme]"),
+            # A plugin in its own distribution, even one named aisquare-pipe-<x>
+            # (an old per-connector release, or a third party's), is that
+            # distribution: it has no aisquare-pipe extra.
+            ("aisquare-pipe-acme", "aisquare-pipe-acme"),
+        ],
+    )
+    def test_the_dist_label_names_the_extra_only_inside_aisquare_pipe(
+        self, monkeypatch, dist_name, label
+    ):
+        monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
+        monkeypatch.setattr(validate_mod, "discover_toolkit_entry_points", list)
+        monkeypatch.setattr(
+            validate_mod,
+            "discover_connector_entry_points",
+            lambda: [
+                DiscoveredConnector(
+                    ep_name="mock-source",
+                    ep_value="aisquare_pipe_acme.connector:AcmeSource",
+                    dist_name=dist_name,
+                    dist_version="0.5.0",
+                    cls=MockSource,
+                    load_error=None,
+                )
+            ],
+        )
+        result = CliRunner().invoke(cli, ["validate", "--json"])
+        assert result.exit_code == 0, result.output
+        (report,) = json.loads(result.output)["connectors"]
+        assert (report["name"], report["dist"]) == ("acme", label)
+
     def test_named_target_without_repo_exit_two(self, monkeypatch):
         monkeypatch.setattr(hygiene_mod, "find_repo_root", lambda start=None: None)
         result = CliRunner().invoke(cli, ["validate", "composio"])
@@ -220,10 +322,17 @@ class _GoodKit(MockToolkit):
     slug_prefix = "MOCK_"  # keep the inherited MOCK_* slugs valid under the new name
 
 
-def _toolkit_ep(ep_name: str, cls: type, dist_name: str = "aisquare-pipe-good") -> DiscoveredConnector:
+FRAMEWORK_MODULE = "aisquare.pipe.testing.mock_connectors"
+
+
+def _toolkit_ep(
+    ep_name: str, cls: type, module: str = "aisquare_pipe_good.toolkit", dist_name: str = "aisquare-pipe"
+) -> DiscoveredConnector:
+    """A toolkit entry point; it belongs to the connector its module names
+    (aisquare_pipe_<name>), or to the framework (FRAMEWORK_MODULE)."""
     return DiscoveredConnector(
         ep_name=ep_name,
-        ep_value=f"aisquare_pipe_good.toolkit:{cls.__name__}",
+        ep_value=f"{module}:{cls.__name__}",
         dist_name=dist_name,
         dist_version="0.1.0",
         cls=cls,
@@ -266,7 +375,7 @@ class TestToolkitEntryPoints:
         monkeypatch.setattr(
             validate_mod,
             "discover_toolkit_entry_points",
-            lambda: [_toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe")],
+            lambda: [_toolkit_ep("mock", MockToolkit, FRAMEWORK_MODULE)],
         )
         result = CliRunner().invoke(cli, ["validate", "--json"])
         assert result.exit_code == 0, result.output
@@ -357,7 +466,7 @@ class TestSlugPrefixUniqueness:
             validate_mod,
             "discover_toolkit_entry_points",
             lambda: [
-                _toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"),
+                _toolkit_ep("mock", MockToolkit, FRAMEWORK_MODULE),
                 _toolkit_ep("twin", _TwinKit),
             ],
         )
@@ -370,7 +479,7 @@ class TestSlugPrefixUniqueness:
         monkeypatch.setattr(
             validate_mod,
             "discover_toolkit_entry_points",
-            lambda: [_toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"), _toolkit_ep("other", _OtherKit)],
+            lambda: [_toolkit_ep("mock", MockToolkit, FRAMEWORK_MODULE), _toolkit_ep("other", _OtherKit)],
         )
         result = CliRunner().invoke(cli, ["validate", "--json", "--skip-tests"])
         assert result.exit_code == 0, result.output
@@ -387,8 +496,8 @@ class TestSlugPrefixUniqueness:
             validate_mod,
             "discover_toolkit_entry_points",
             lambda: [
-                _toolkit_ep("mock", MockToolkit, dist_name="aisquare-pipe"),
-                _toolkit_ep("twin", _TwinKit, dist_name="aisquare-pipe-twin"),
+                _toolkit_ep("mock", MockToolkit, FRAMEWORK_MODULE),
+                _toolkit_ep("twin", _TwinKit, "aisquare_pipe_twin.toolkit"),
             ],
         )
         result = CliRunner().invoke(cli, ["validate", "--json"])

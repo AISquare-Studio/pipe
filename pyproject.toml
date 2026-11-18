@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm"]
+requires = ["setuptools>=84.2.1", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,6 +25,9 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.0",
+    # Used by most connectors, so they ship with the core.
+    "requests>=2.34.2",
+    "urllib3>=1.26",
 ]
 
 [project.urls]
@@ -35,38 +38,58 @@ Issues = "https://github.com/AISquare-Studio/pipe/issues"
 Changelog = "https://github.com/AISquare-Studio/pipe/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy", "pyyaml"]
-popular = [
-    "aisquare-pipe-local",
-    "aisquare-pipe-dropbox",
-    "aisquare-pipe-onedrive",
-    "aisquare-pipe-googledrive",
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pyyaml",
+    "types-requests",
+    "responses",
 ]
-full = [
-    "aisquare-pipe[popular]",
-    "aisquare-pipe-salesforce",
-    "aisquare-pipe-docusign",
-    "aisquare-pipe-composio",
-    "aisquare-pipe-github",
-    "aisquare-pipe-slack",
-    "aisquare-pipe-gmail",
-    "aisquare-pipe-googlecalendar",
+# One extra per connector, named after its directory (connectors/<name>,
+# module aisquare_pipe_<name>): that connector's third-party deps beyond the
+# core ones. It may be empty, and `pip install "aisquare-pipe[<name>]"` always
+# works. Without it the connector's code is installed but its entry points
+# count as not installed (the registry logs that at info level).
+# tests/test_distribution.py keeps these in step with connectors/.
+composio = [
+    "composio>=0.13.1,<2.0",
+    "composio-client>=1.39,<2.0",
 ]
-# Every package under connectors/ that registers an `aisquare_pipe.toolkits`
-# entry point, each floored at a release that ships its toolkit (a bare name
-# could resolve aisquare-pipe-github 0.1.0, which has none) and, from 0.5.0,
-# its pipe:primary markers (gmail/googlecalendar/slack 0.2.0,
-# googledrive/onedrive 0.4.0). Hosts install this to get every toolkit.
-# scripts/check_toolkits_extra.py (CI) fails when a toolkit package is missing
-# here or an entry here has no toolkit.
-toolkits = [
-    "aisquare-pipe-github>=0.3.0",
-    "aisquare-pipe-gmail>=0.2.0",
-    "aisquare-pipe-googlecalendar>=0.2.0",
-    "aisquare-pipe-googledrive>=0.4.0",
-    "aisquare-pipe-onedrive>=0.4.0",
-    "aisquare-pipe-slack>=0.2.0",
+docusign = [
+    "docusign-esign>=4.0",
 ]
+dropbox = [
+    "dropbox>=12.0",
+]
+gateway = []
+github = []
+gmail = []
+googlecalendar = []
+googledrive = []
+graphify = [
+    "tiktoken>=0.7",
+]
+# The graph engine itself, heavy and pinned; not part of [full].
+graphify-engine = ["graphifyy==0.9.106"]
+local = []
+n8n = []
+onedrive = [
+    "azure-identity>=1.27.0",
+]
+salesforce = [
+    "simple-salesforce>=1.12",
+]
+slack = []
+# Bundles of connector extras.
+popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
+# Every connector's deps (graphify's engine stays separate).
+full = ["aisquare-pipe[popular,composio,docusign,gateway,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+# The deps of every connector that registers an `aisquare_pipe.toolkits`
+# entry point. Hosts (pipe-as-service) install this to serve every toolkit;
+# scripts/check_toolkits_extra.py (CI) keeps it complete.
+toolkits = ["aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -74,15 +97,59 @@ pipe = "aisquare.pipe.cli.main:cli"
 [project.entry-points."aisquare_pipe.connectors"]
 mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
 mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
+composio-source = "aisquare_pipe_composio.connector:ComposioSource"
+composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
+composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
+docusign-source = "aisquare_pipe_docusign.connector:DocusignSource"
+docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
+dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
+dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
+aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
+github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
+googledrive-source = "aisquare_pipe_googledrive.connector:GoogleDriveSource"
+googledrive-sink = "aisquare_pipe_googledrive.connector:GoogleDriveSink"
+graphify-source = "aisquare_pipe_graphify.connector:GraphifySource"
+local-source = "aisquare_pipe_local.connector:LocalSource"
+local-sink = "aisquare_pipe_local.connector:LocalSink"
+n8n-source = "aisquare_pipe_n8n.connector:N8nSource"
+onedrive-source = "aisquare_pipe_onedrive.connector:OneDriveSource"
+onedrive-sink = "aisquare_pipe_onedrive.connector:OneDriveSink"
+salesforce-source = "aisquare_pipe_salesforce.connector:SalesforceSource"
+salesforce-sink = "aisquare_pipe_salesforce.connector:SalesforceSink"
+slack-message-sink = "aisquare_pipe_slack.connector:SlackMessageSink"
 
 [project.entry-points."aisquare_pipe.converters"]
 mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
+graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
-
+github = "aisquare_pipe_github.toolkit:GitHubToolkit"
+gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
+googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
+googledrive = "aisquare_pipe_googledrive.toolkit:GoogleDriveToolkit"
+onedrive = "aisquare_pipe_onedrive.toolkit:OneDriveToolkit"
+slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
 [tool.setuptools.packages.find]
-where = ["src"]
+# The framework, then every connector's src dir. Each connector keeps its
+# own directory (code, tests, README); only this file packages it.
+where = [
+    "src",
+    "connectors/composio/src",
+    "connectors/docusign/src",
+    "connectors/dropbox/src",
+    "connectors/gateway/src",
+    "connectors/github/src",
+    "connectors/gmail/src",
+    "connectors/googlecalendar/src",
+    "connectors/googledrive/src",
+    "connectors/graphify/src",
+    "connectors/local/src",
+    "connectors/n8n/src",
+    "connectors/onedrive/src",
+    "connectors/salesforce/src",
+    "connectors/slack/src",
+]
 
 [tool.setuptools.package-data]
 "aisquare.pipe" = ["py.typed"]

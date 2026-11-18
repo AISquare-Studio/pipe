@@ -1,61 +1,213 @@
 name: publish
 
-# Publishes every package in this monorepo to PyPI using Trusted Publishing
-# (OIDC) — no API tokens are stored. Runs when a GitHub Release is published,
-# or manually via "Run workflow". Each package is uploaded at the version
-# declared in its own pyproject.toml; versions already on PyPI are skipped.
+# Builds, checks and uploads to PyPI with Trusted Publishing (OIDC). No API
+# tokens are stored. `scripts/release_packages.py` decides everything; this
+# file only wires its steps together.
 #
-# One-time setup is documented in RELEASING.md (register a trusted publisher
-# per package on PyPI, and create the `pypi` GitHub environment).
+# What it publishes (D8): ONE distribution, `aisquare-pipe`, which carries the
+# framework and every connector (each connector's deps are its
+# `aisquare-pipe[<name>]` extra). There is no per-connector package and no new
+# PyPI project, ever. Separately, and once, the ten connectors that used to
+# be their own PyPI projects get a code-free shim release requiring
+# `aisquare-pipe[<name>]`: Run workflow with target "shims".
+#
+# - pull_request: a dry run of everything a publish could upload, the
+#   distribution and all ten shims. Build, check (name/version, the wheel's
+#   RECORD against connectors/, a shim's lone requirement, `twine check
+#   --strict`) and upload nothing.
+# - Run workflow with "dry-run" ticked (the default): the same for the chosen
+#   target, aisquare-pipe or the shims.
+# - A published GitHub Release (its tag must be v<aisquare-pipe version>), or
+#   Run workflow with "dry-run" unticked: the same build and checks, then the
+#   upload if that version isn't on PyPI yet. Then `verify` checks each file
+#   on PyPI against the sha256 of the file this run built.
+#
+# A version already on PyPI is skipped by an explicit lookup in `plan`, and the
+# run summary lists it as skipped. The upload runs without skip-existing, so a
+# rejected upload fails the run. It can't pass as a skip.
+#
+# The trusted publishers (one per existing PyPI project) are bound to this file
+# name and the `pypi` environment: renaming either breaks publishing.
 
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      target:
+        description: "What to publish: aisquare-pipe, or the one-time shims (after aisquare-pipe is on PyPI)"
+        type: choice
+        options: [aisquare-pipe, shims]
+        default: aisquare-pipe
+      dry-run:
+        description: "Dry run: build and check, upload nothing"
+        type: boolean
+        default: true
+  pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  # One publishing run at a time. A newer push to a PR replaces its dry run.
+  group: ${{ github.event_name == 'pull_request' && format('publish-pr-{0}', github.ref) || 'publish-pypi' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  pypi:
-    name: "publish: ${{ matrix.package }}"
+  plan:
     runs-on: ubuntu-latest
-    environment: pypi
+    timeout-minutes: 10
+    outputs:
+      target: ${{ steps.plan.outputs.target }}
+      packages: ${{ steps.plan.outputs.packages }}
+      upload: ${{ steps.plan.outputs.upload }}
+      framework: ${{ steps.plan.outputs.framework }}
+      shims: ${{ steps.plan.outputs.shims }}
+      uploads: ${{ steps.plan.outputs.uploads }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install --upgrade packaging
+
+      # Reads the version from pyproject.toml, checks the metadata, and looks
+      # each version up on PyPI. Fails on a release whose tag isn't
+      # v<aisquare-pipe version>, and on anything that would create a project.
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ inputs.target }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: >-
+          python scripts/release_packages.py plan --pypi
+          --event "$EVENT" --tag "$TAG" --target "${TARGET:-aisquare-pipe}" --dry-run "${DRY_RUN:-true}"
+
+  build:
+    name: "build: ${{ matrix.package.name }}"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.packages) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - run: python -m pip install --upgrade build twine packaging
+
+      - name: Build
+        env:
+          PKG_PATH: ${{ matrix.package.path }}
+        run: python scripts/release_packages.py build --path "$PKG_PATH" --outdir dist
+
+      # The wheel and sdist carry the planned name and version. The
+      # distribution's wheel RECORD holds every module under src/ and every
+      # connectors/<dir>/src/; a shim's wheel has no code and requires exactly
+      # aisquare-pipe[<name>]>=0.5.0. --strict also fails twine's warnings.
+      - name: Check
+        env:
+          PKG_PATH: ${{ matrix.package.path }}
+        run: |
+          python scripts/release_packages.py check-dist --path "$PKG_PATH" dist
+          python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.package.name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-framework:
+    name: "publish: aisquare-pipe"
+    needs: [plan, build]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.framework == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aisquare-pipe/
+    permissions:
+      contents: read
+      id-token: write # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-aisquare-pipe
+          path: dist/
+
+      - name: Upload aisquare-pipe
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-shims:
+    name: "publish: ${{ matrix.package.name }}"
+    needs: [plan, build]
+    # Only on Run workflow with target "shims"; plan fails it unless
+    # aisquare-pipe 0.5.0 is already on PyPI and every shim's project exists.
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.shims != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/${{ matrix.package.name }}/${{ matrix.package.version }}/
     permissions:
       contents: read
       id-token: write # required for Trusted Publishing (OIDC)
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - "."
-          - connectors/local
-          - connectors/dropbox
-          - connectors/onedrive
-          - connectors/googledrive
-          - connectors/salesforce
-          - connectors/docusign
-          - connectors/composio
-          - connectors/gateway
-          - connectors/n8n
-          - connectors/github
-          - connectors/graphify
-          - connectors/slack
-          - connectors/gmail
-          - connectors/googlecalendar
+        package: ${{ fromJSON(needs.plan.outputs.shims) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-${{ matrix.package.name }}
+          path: dist/
+
+      - name: Upload ${{ matrix.package.name }} ${{ matrix.package.version }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  verify:
+    needs: [plan, build, publish-framework, publish-shims]
+    # Runs whether or not each upload job succeeded, and fails if any planned
+    # upload isn't on PyPI. A failed build uploads nothing, and fails the run
+    # by itself.
+    if: ${{ !cancelled() && needs.plan.outputs.upload == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
-      - name: Build ${{ matrix.package }}
-        run: |
-          python -m pip install --upgrade build
-          python -m build --outdir dist "${{ matrix.package }}"
+      - run: python -m pip install --upgrade packaging
 
-      - name: Publish ${{ matrix.package }} to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: actions/download-artifact@v8
         with:
-          skip-existing: true
+          pattern: dist-*
+          path: dist/
+
+      # Every planned upload is on PyPI, file for file, with this run's
+      # sha256. It fails on any upload that didn't land, however its job
+      # ended.
+      - name: Verify uploads on PyPI
+        env:
+          UPLOADS: ${{ needs.plan.outputs.uploads }}
+        run: python scripts/release_packages.py verify --uploads "$UPLOADS" --dist-root dist

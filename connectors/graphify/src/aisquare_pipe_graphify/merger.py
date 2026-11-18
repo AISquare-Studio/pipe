@@ -36,8 +36,8 @@ try:
     from networkx.readwrite import json_graph
 except ImportError as exc:  # pragma: no cover — import-time guard
     raise ModuleNotFoundError(
-        "aisquare-pipe-graphify's merger needs networkx/graphifyy importable — "
-        "install the engine extra: pip install 'aisquare-pipe-graphify[engine]'"
+        "the graphify connector's merger needs networkx/graphifyy importable — "
+        "install the engine: pip install 'aisquare-pipe[graphify,graphify-engine]'"
     ) from exc
 
 from aisquare_pipe_graphify.query import load_graph_from_json

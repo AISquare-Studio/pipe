@@ -1,4 +1,4 @@
-# aisquare-pipe-googledrive
+# aisquare-pipe[googledrive]
 
 Google Drive for [aisquare.pipe](../../README.md), over the Drive v3 REST API
 (plain `requests`, no Google SDK). The package ships three things:
@@ -13,9 +13,17 @@ My Drive and shared drives both work everywhere.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[googledrive]` extra:
+
 ```bash
-pip install aisquare-pipe-googledrive        # or: pip install "aisquare-pipe[popular]"
-cd connectors/googledrive && pip install -e ".[dev]"   # development
+pip install "aisquare-pipe[googledrive]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/googledrive && pytest tests
 ```
 
 ## Connecting (OAuth)

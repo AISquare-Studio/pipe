@@ -19,10 +19,18 @@ def test_mock_toolkit_is_registered():
     assert "mock" in {dc.ep_name for dc in _DISCOVERED}
 
 
-@pytest.mark.parametrize("dc", _DISCOVERED, ids=lambda dc: dc.ep_name)
-def test_contract(dc):
+def _require_installed(dc):
+    """A toolkit whose aisquare-pipe[<name>] extra isn't installed is not
+    installed (D8): skip it. Any other load failure fails."""
+    if dc.cls is None and dc.missing_requirements:
+        pytest.skip(f"not installed: its extra needs {', '.join(dc.missing_requirements)}")
     if dc.cls is None:
         pytest.fail(f"entry point {dc.ep_name} failed to load: {dc.load_error}")
+
+
+@pytest.mark.parametrize("dc", _DISCOVERED, ids=lambda dc: dc.ep_name)
+def test_contract(dc):
+    _require_installed(dc)
     failures = [
         r
         for r in run_toolkit_contract_checks(dc.cls, dc.ep_name, installed=_INSTALLED)
@@ -33,6 +41,7 @@ def test_contract(dc):
 
 @pytest.mark.parametrize("dc", _DISCOVERED, ids=lambda dc: dc.ep_name)
 def test_card_and_slug_prefix(dc):
+    _require_installed(dc)
     ids = {r.id: r for r in run_toolkit_contract_checks(dc.cls, dc.ep_name, installed=_INSTALLED)}
     assert ids["contract.toolkit.card"].passed, ids["contract.toolkit.card"].message
     assert ids["contract.toolkit.slug-prefix-unique"].passed, ids["contract.toolkit.slug-prefix-unique"].message

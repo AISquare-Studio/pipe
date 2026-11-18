@@ -1,4 +1,4 @@
-# aisquare-pipe-gmail
+# aisquare-pipe[gmail]
 
 Gmail for [aisquare.pipe](../../README.md), over the Gmail v1 REST API (plain
 `requests`, no Google SDK). The package ships one thing:
@@ -9,9 +9,17 @@ Gmail for [aisquare.pipe](../../README.md), over the Gmail v1 REST API (plain
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[gmail]` extra:
+
 ```bash
-pip install aisquare-pipe-gmail              # or: pip install "aisquare-pipe[full]"
-cd connectors/gmail && pip install -e ".[dev]"   # development
+pip install "aisquare-pipe[gmail]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/gmail && pytest tests
 ```
 
 ## Connecting (OAuth)
