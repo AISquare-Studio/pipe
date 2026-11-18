@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AWS connectors** (`connectors/aws`, module `aisquare_pipe_aws`, extra
+  `aisquare-pipe[aws]`, in `[full]` and `[toolkits]`): read-only access to a
+  customer's AWS account through one cross-account IAM role.
+  - `aisquare_pipe_aws.credentials`: the shared credential. STS `AssumeRole`
+    runs with the server-issued `ExternalId`, and reads use the role's
+    refreshable temporary credentials. A role in the service's own account is
+    refused, as is one in an account listed in `PIPE_AWS_REFUSED_ACCOUNT_IDS`.
+    So are a role outside the commercial partition and an external ID
+    shorter than 32 characters. No customer client is built from ambient,
+    default or empty credentials. The blob is
+    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`. The
+    README's registration checklist covers `sts:TagSession` (EKS Pod
+    Identity's session tags are transitive), KMS `Decrypt` and
+    `DescribeKey` under `kms:ViaService`, and the order of the two sides'
+    steps. Prod's customer trusts both prod principals from day one: the ECS
+    task role `ais-studio-pipe-task-role-prod` and the EKS Pod Identity role
+    of pipe-service's cutover runbook.
+  - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
+    AgentCore policy, in every configured region (`ListPolicyEngines` →
+    `ListPolicies`, every page; `GetPolicy` only for a policy listed without
+    its definition). Each envelope carries the definition text, with the
+    name, ids, ARN, status, enforcement mode and timestamps as metadata, and
+    `version` = `updatedAt`.
+  - `s3-source`: one envelope per object under the configured bucket and
+    prefix (`ListObjectsV2`, every page; `GetObject`). Its `version` is the
+    `VersionId`, else the `ETag`. A `VersionId` of `"null"` (a bucket whose
+    versioning is suspended) counts as none, so the `ETag` is used.
+  - Toolkits `bedrock_agentcore` (`LIST_POLICY_ENGINES`, `LIST_POLICIES`,
+    `GET_POLICY`) and `s3` (`LIST_OBJECTS`, `GET_OBJECT`, `HEAD_OBJECT`). All
+    their tools are read-only, with strict schemas. Both AgentCore list
+    tools page with an opaque `next_token` (region, engine and AgentCore's
+    `nextToken`), so every engine and policy is reachable past `limit`.
+  - Pull params and tool arguments only narrow what the blob allows (a
+    prefix inside the configured one, one engine, a time filter). Neither
+    can name an account, role, region, bucket or credential.
+  - AWS's refusals map to tool error codes: a body-less S3 `403` is
+    `forbidden`; `ValidationException`, `InvalidArgument` and a body-less S3
+    `400` are `invalid_arguments`.
+  - The `[aws]` extra is `boto3`/`botocore` >= 1.43.32, < 2. The AgentCore
+    Policy GA model arrived in 1.42.60, but a policy's `enforcementMode` only
+    in 1.43.32. The tests' AWS fake, `moto[s3,sts]`, is in `[dev]`.
 - **Glean connector** (`connectors/glean`, module `aisquare_pipe_glean`, extra
   `aisquare-pipe[glean]`, in `[full]` and `[toolkits]`). It is read-only over
   Glean's Client API.

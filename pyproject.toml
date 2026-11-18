@@ -46,6 +46,8 @@ dev = [
     "pyyaml",
     "types-requests",
     "responses",
+    # AWS fakes (STS, S3) for connectors/aws's hermetic tests.
+    "moto[s3,sts]>=5.0,<6",
 ]
 # One extra per connector, named after its directory (connectors/<name>,
 # module aisquare_pipe_<name>): that connector's third-party deps beyond the
@@ -53,6 +55,14 @@ dev = [
 # works. Without it the connector's code is installed but its entry points
 # count as not installed (the registry logs that at info level).
 # tests/test_distribution.py keeps these in step with connectors/.
+# AWS (cross-account role): AgentCore Policy (bedrock-agentcore-control
+# ListPolicyEngines / ListPolicies / GetPolicy) is in botocore's model from
+# 1.42.60 (GA), but a policy's enforcementMode only from 1.43.32: botocore
+# drops response members its model lacks, so an older one silently loses it.
+aws = [
+    "boto3>=1.43.32,<2",
+    "botocore>=1.43.32,<2",
+]
 composio = [
     "composio>=0.13.1,<2.0",
     "composio-client>=1.39,<2.0",
@@ -87,11 +97,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,composio,docusign,gateway,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[aws,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -99,6 +109,8 @@ pipe = "aisquare.pipe.cli.main:cli"
 [project.entry-points."aisquare_pipe.connectors"]
 mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
 mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
+bedrock-agentcore-policies-source = "aisquare_pipe_aws.connector:BedrockAgentCorePoliciesSource"
+s3-source = "aisquare_pipe_aws.connector:S3Source"
 composio-source = "aisquare_pipe_composio.connector:ComposioSource"
 composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
 composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
@@ -127,6 +139,8 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
+bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
+s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
 gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
@@ -139,6 +153,7 @@ slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
 # own directory (code, tests, README); only this file packages it.
 where = [
     "src",
+    "connectors/aws/src",
     "connectors/composio/src",
     "connectors/docusign/src",
     "connectors/dropbox/src",
