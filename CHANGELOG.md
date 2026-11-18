@@ -166,6 +166,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `next_start_index`.
   - Not built: stage file listing and reading (GoodRx hasn't said policies live in stages).
   Setup, the registration checklist and the exact secret: `connectors/snowflake/README.md`.
+- **Amazon Redshift connector** (module `aisquare_pipe_aws.redshift` in `connectors/aws`; extra
+  `aisquare-pipe[redshift]`, an alias of `[aws]`, which now also brings `sqlglot>=26.25,<28`): the
+  read-only toolkit `redshift` (`REDSHIFT_RUN_SELECT`, primary; `REDSHIFT_LIST_SCHEMAS`,
+  `REDSHIFT_LIST_TABLES`, `REDSHIFT_DESCRIBE_TABLE`) and the source `redshift-query-source`, for a
+  provisioned cluster or a Serverless workgroup, through the Redshift Data API. They read the tenant
+  secret `redshift`: the AWS blob plus `redshift: {cluster_identifier | workgroup_name, database,
+  db_user | secret_arn, region?}` (neither user key: the role's own `IAMR:` user, through
+  `GetClusterCredentialsWithIAM` or Serverless `GetCredentials`).
+  - It lives in `aisquare_pipe_aws` because it assumes the role through
+    `aisquare_pipe_aws.credentials` and one connector never imports another; the toolkit and source
+    subclass `_AwsToolkit` and `_AwsSource`, so the session, the service principal and the refusals
+    are the S3 and AgentCore connectors' own.
+  - SQL is SELECT-only, refused before any AWS call (not even `sts:AssumeRole`) otherwise: a lexer
+    and a sqlglot parse (Redshift dialect) must both find ONE `SELECT`/`WITH` statement with no
+    write, DDL, session or side-effect word or node (`SELECT ... INTO`, `UNLOAD`, `COPY`, `SET`,
+    `PG_TERMINATE_BACKEND`, ...). The lexer ends `--` comments at a CR or an LF, refuses a `/*`
+    inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
+    and control characters outside quotes, and the side-effect functions in double quotes.
+    Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
+    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so a filter on
+    the `sqlglot` logger drops its records in the parsing thread or task only (no global
+    switch). Python's last-resort stderr handler doesn't see them either.
+  - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
+    (paged) inside one deadline: the host's time budget, else 60 s (the source's
+    `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
+    inside what is left when it goes out, because a client is rebuilt with shorter timeouts as
+    the deadline nears, and botocore never retries. A slice of the deadline (a fifth, 0.2 s to
+    3 s) is kept back to cancel a statement still running: polling stops there, the statement is
+    cancelled on a client of its own sized to all of what is left, and the call fails with
+    `timeout`. Caps: `max_rows` and a JSON byte cap (`truncated` says which).
+    The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
+  - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
+    `version` = `result_sha256` (order-independent).
+  - CI runs the AWS suite at the sqlglot floor too: `scripts/dep_floor.py` and validate.yml's
+    "SQL guards at the sqlglot floor" step, byte for byte #37's, so the branches merge cleanly.
+  Setup, the registration checklist (the role's `redshift-data` and credential permissions, the
+  read-only database user, the secret JSON) and the exact secret: `connectors/aws/README.md`,
+  "Amazon Redshift".
 - `aisquare.pipe.core.sql.quiet_sqlglot()`: the one helper every connector's SQL guard parses inside.
   sqlglot logs pieces of the SQL while it parses ("Invalid JSON path syntax ... <path>" at WARNING for a
   JSON key with a dash, in statements the guards admit); a ContextVar-gated filter on the `sqlglot`

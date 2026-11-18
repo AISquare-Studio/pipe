@@ -1,7 +1,8 @@
 """Hermetic AWS for every test: no socket opens, no real credential is read.
 
 The service's own principal is a fake static key (``AMBIENT_KEY``); moto plays
-STS and S3; AgentCore (which moto does not model) is a botocore ``Stubber``.
+STS and S3; AgentCore and the Redshift Data API are botocore ``Stubber``s on
+the real clients (``redshift_fakes.py`` for Redshift, with its fake clock).
 """
 
 from __future__ import annotations
@@ -94,6 +95,26 @@ def assume_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     monkeypatch.setattr(connector._AwsSource, "base_session", staticmethod(base))
     monkeypatch.setattr(toolkit._AwsToolkit, "base_session", staticmethod(base))
     return calls
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The Redshift Data API's clock and sleep, faked: time passes only in sleep."""
+    from aisquare_pipe_aws.redshift import dataapi
+    from tests.redshift_fakes import Clock
+
+    fake = Clock()
+    monkeypatch.setattr(dataapi, "monotonic", fake.monotonic)
+    monkeypatch.setattr(dataapi, "sleep", fake.sleep)
+    return fake
+
+
+@pytest.fixture
+def data_api(monkeypatch: pytest.MonkeyPatch, clock: Any) -> Any:
+    """A stubbed Redshift Data API (``redshift_fakes.DataApi``)."""
+    from tests.redshift_fakes import DataApi
+
+    return DataApi(monkeypatch, clock)
 
 
 def access_key_of(client: Any) -> str:
