@@ -193,6 +193,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PullParams` `on_cycle_error`: called with a failed cycle's exception,
     after its progress is saved. A host running one cycle per pull learns
     the read failed, which the pull doesn't raise.
+- **Composio: a failed call's log line no longer carries Composio's answer**
+  (pipe-as-service #49, review seq 14129 n3). A failed trigger poll cycle, a
+  failed trigger-instance listing (`composio-triggers-source`
+  `list_resources`) and a failed connected-account listing (a source's toolkit
+  resources) were logged with `logger.exception`. The traceback printed the
+  `PipelineError`'s message and its chained SDK error's, and both carry
+  Composio's answer: a 500's body text, which may echo request data. Each one
+  is now one ERROR line with the error's type, the SDK error behind it and the
+  HTTP status (`composio: trigger poll cycle failed: PipelineError from
+  InternalServerError (HTTP 500)`), and no traceback
+  (`client.log_call_failure`, `client.failure_label`). An error that isn't
+  from Composio (a bug in this connector) keeps its traceback. A host still
+  gets the error itself (`on_cycle_error`). Not changed: the sink's
+  `Composio push failed: <error>` and `validate_config`'s warning still log
+  the error's message.
 
 ## [0.5.0] - 2026-11-04
 
