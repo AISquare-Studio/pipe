@@ -323,7 +323,7 @@ def _validate_file(path: str) -> None:
 @click.option("--live", is_flag=True, help="Also run live tests (tests/test_live.py) where present; they self-skip without their env credentials.")
 @click.option("--skip-tests", is_flag=True, help="Contract + hygiene only — skip the per-connector unit suites (fast).")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON report.")
-@click.option("--install", "do_install", is_flag=True, help="pip install -e any missing/broken connector dirs before validating.")
+@click.option("--install", "do_install", is_flag=True, help='pip install -e ".[full,dev]" first if a connector is missing, broken or stale.')
 @click.option("--timeout", default=300, type=int, show_default=True, help="Per-suite subprocess timeout in seconds.")
 def validate(
     target: str | None,
@@ -374,7 +374,11 @@ def validate(
     only: str | None = None
     if target:
         names = [c.dir_name for c in list_connector_dirs(repo_root)]
+        # "slack", "aisquare-pipe[slack]" (its extra) or the old per-connector
+        # dist name "aisquare-pipe-slack" all name connectors/slack.
         resolved = target.removeprefix("aisquare-pipe-")
+        if target.startswith("aisquare-pipe[") and target.endswith("]"):
+            resolved = target[len("aisquare-pipe[") : -1]
         for candidate in (target, resolved):
             if candidate in names:
                 only = candidate

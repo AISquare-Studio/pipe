@@ -1,16 +1,20 @@
 """scripts/release_packages.py: what publish.yml builds, skips, uploads and verifies.
 
-Hermetic: PyPI is a fake ``fetch``; nothing touches the network.
+Hermetic: PyPI is a fake ``fetch``, wheels are built by hand as zip files, and
+nothing touches the network.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.util
+import io
 import json
-import subprocess
 import sys
 import textwrap
+import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -40,57 +44,41 @@ def _write(path: Path, text: str) -> None:
     path.write_text(textwrap.dedent(text))
 
 
-def _pyproject(
-    name: str,
-    version: str,
-    deps: list[str] | tuple[str, ...] = (),
-    extras: dict[str, list[str]] | None = None,
-) -> str:
-    out = f'[project]\nname = "{name}"\nversion = "{version}"\ndependencies = {json.dumps(list(deps))}\n'
-    if extras:
-        out += "\n[project.optional-dependencies]\n"
-        out += "".join(f"{k} = {json.dumps(v)}\n" for k, v in extras.items())
-    return out
+ROOT_PYPROJECT = """\
+    [project]
+    name = "aisquare-pipe"
+    version = "{version}"
+    dependencies = ["click>=8.0", "requests>=2.31"]
+
+    [project.optional-dependencies]
+    dev = ["pytest>=7.0"]
+    gmail = []
+    slack = []
+    dropbox = ["dropbox>=12.0"]
+    popular = ["aisquare-pipe[dropbox]"]
+    full = ["aisquare-pipe[popular,gmail,slack]"]
+    toolkits = ["aisquare-pipe[gmail,slack]"]
+    """
 
 
 def _repo(
     root: Path,
-    framework: str = "0.5.0",
-    connectors: dict[str, tuple[str, list[str]]] | None = None,
-    extras=None,
+    version: str = "0.5.0",
+    pyproject: str | None = None,
+    dirs: tuple[str, ...] = ("dropbox", "gmail", "slack"),
 ) -> Path:
-    """A pipe-shaped tree: the root package plus connectors/<dir>."""
-    connectors = (
-        connectors
-        if connectors is not None
-        else {
-            "gmail": ("0.2.0", ["aisquare-pipe>=0.5.0"]),
-            "slack": ("0.2.0", ["aisquare-pipe>=0.5.0", "requests>=2.31"]),
-            "local": ("0.1.0", ["aisquare-pipe>=0.1.0"]),
-        }
-    )
-    extras = (
-        extras
-        if extras is not None
-        else {
-            "dev": ["pytest>=7.0"],
-            "popular": ["aisquare-pipe-local"],
-            "full": [
-                "aisquare-pipe[popular]",
-                "aisquare-pipe-slack",
-                "aisquare-pipe-gmail",
-            ],
-            "toolkits": ["aisquare-pipe-gmail>=0.2.0", "aisquare-pipe-slack>=0.2.0"],
-        }
-    )
+    """A pipe-shaped tree: the root distribution and connectors/<dir>/src."""
     _write(
         root / "pyproject.toml",
-        _pyproject("aisquare-pipe", framework, ["click>=8.0"], extras),
+        pyproject if pyproject is not None else ROOT_PYPROJECT.format(version=version),
     )
-    for d, (version, deps) in connectors.items():
+    _write(root / "src" / "aisquare" / "pipe" / "__init__.py", "")
+    for d in dirs:
         _write(
-            root / "connectors" / d / "pyproject.toml",
-            _pyproject(f"aisquare-pipe-{d}", version, deps),
+            root / "connectors" / d / "src" / f"aisquare_pipe_{d}" / "__init__.py", ""
+        )
+        _write(
+            root / "connectors" / d / "src" / f"aisquare_pipe_{d}" / "connector.py", ""
         )
     return root
 
@@ -119,56 +107,72 @@ class FakePypi:
         return (200 if parts[0] in self.projects else 404), b"{}"
 
 
-# --------------------------------------------------------------- discovery
+SHIM_NAMES = [f"aisquare-pipe-{n}" for n in rp.SHIM_PROJECTS]
 
 
-def test_discover_lists_the_framework_first_then_every_connector_dir(tmp_path):
-    pkgs = rp.discover(rp.FsTree(_repo(tmp_path)))
-    assert [(p.path, p.name, p.version) for p in pkgs] == [
-        (".", "aisquare-pipe", "0.5.0"),
-        ("connectors/gmail", "aisquare-pipe-gmail", "0.2.0"),
-        ("connectors/local", "aisquare-pipe-local", "0.1.0"),
-        ("connectors/slack", "aisquare-pipe-slack", "0.2.0"),
-    ]
+def _wheel(
+    path: Path, files: dict[str, str], metadata: str = "Name: x\nVersion: 0\n"
+) -> Path:
+    """A wheel at ``path`` holding ``files`` plus a dist-info with METADATA and RECORD."""
+    dist_info = f"{path.name.split('-')[0]}-{path.name.split('-')[1]}.dist-info"
+    entries = {**files, f"{dist_info}/METADATA": metadata}
+    record = io.StringIO()
+    writer = csv.writer(record)
+    for name in entries:
+        writer.writerow([name, "sha256=x", "1"])
+    writer.writerow([f"{dist_info}/RECORD", "", ""])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, text in entries.items():
+            zf.writestr(name, text)
+        zf.writestr(f"{dist_info}/RECORD", record.getvalue())
+    return path
 
 
-def test_a_connector_dir_without_pyproject_is_not_a_package(tmp_path):
-    _repo(tmp_path)
-    (tmp_path / "connectors" / "notes").mkdir()
-    assert "connectors/notes" not in [p.path for p in rp.discover(rp.FsTree(tmp_path))]
+# --------------------------------------------------------------- the package
+
+
+def test_the_distribution_is_read_from_the_root_pyproject(tmp_path):
+    pkg = rp.framework_package(rp.FsTree(_repo(tmp_path)))
+    assert (pkg.path, pkg.name, pkg.version) == (".", "aisquare-pipe", "0.5.0")
+    assert set(pkg.extras) >= {"gmail", "slack", "dropbox", "full", "toolkits"}
 
 
 @pytest.mark.parametrize(
     ("pyproject", "message"),
     [
+        ('[project]\nname = "aisquare-pipe"\ndynamic = ["version"]\n', "static string"),
+        ('[project]\nname = "aisquare-pipe"\nversion = "soon"\n', "PEP 440"),
         (
-            '[project]\nname = "aisquare-pipe-x"\ndynamic = ["version"]\n',
-            "static string",
-        ),
-        ('[project]\nname = "aisquare-pipe-x"\nversion = "soon"\n', "PEP 440"),
-        (
-            '[project]\nname = "other-thing"\nversion = "0.1.0"\n',
-            "is not aisquare-pipe",
-        ),
-        (
-            '[project]\nname = "aisquare_pipe.gmail"\nversion = "0.1.0"\n',
-            "both declare",
+            '[project]\nname = "aisquare-pipe-slack"\nversion = "0.1.0"\n',
+            "must be aisquare-pipe",
         ),
     ],
 )
-def test_discover_rejects_a_package_publish_yml_could_not_release(
+def test_a_distribution_publish_yml_could_not_release_is_rejected(
     tmp_path, pyproject, message
 ):
-    _repo(tmp_path)
-    _write(tmp_path / "connectors" / "x" / "pyproject.toml", pyproject)
     with pytest.raises(rp.ReleaseError, match=message):
-        rp.discover(rp.FsTree(tmp_path))
+        rp.framework_package(rp.FsTree(_repo(tmp_path, pyproject=pyproject)))
 
 
-def test_git_tree_reads_the_same_packages_as_the_working_tree(tmp_path):
+def test_the_shims_are_the_ten_projects_that_existed_before_0_5_0():
+    shims = rp.shim_packages()
+    assert [p.name for p in shims] == SHIM_NAMES
+    assert {p.version for p in shims} == {"0.5.0"}
+    assert shims[0].dependencies == ("aisquare-pipe[composio]>=0.5.0",)
+    # Never-published connectors get no shim: they never had a PyPI project.
+    assert not {
+        "aisquare-pipe-slack",
+        "aisquare-pipe-gmail",
+        "aisquare-pipe-googledrive",
+    } & set(SHIM_NAMES)
+
+
+def test_git_tree_reads_the_same_distribution_as_the_working_tree(tmp_path):
+    import subprocess
+
     repo = _repo(tmp_path / "repo")
-    (repo / "connectors" / "notes").mkdir()
-    (repo / "connectors" / "notes" / "README.md").write_text("no pyproject\n")
     git = [
         "git",
         "-C",
@@ -183,110 +187,102 @@ def test_git_tree_reads_the_same_packages_as_the_working_tree(tmp_path):
     subprocess.run([*git, "init", "-q"], check=True)
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "init"], check=True)
-    assert rp.discover(rp.GitTree(repo, "HEAD")) == rp.discover(rp.FsTree(repo))
+    assert rp.framework_package(rp.GitTree(repo, "HEAD")) == rp.framework_package(
+        rp.FsTree(repo)
+    )
 
 
 # ------------------------------------------------------------- consistency
 
 
-def test_this_repo_is_a_consistent_package_set():
-    """The packages here, uploaded as they stand, could be installed together."""
-    pkgs = rp.discover(rp.FsTree(REPO_ROOT))
-    assert pkgs[0].path == "."
-    on_disk = sorted(
-        p.parent.relative_to(REPO_ROOT).as_posix()
-        for p in REPO_ROOT.glob("connectors/*/pyproject.toml")
-    )
-    assert [p.path for p in pkgs[1:]] == on_disk
-    assert rp.internal_problems(pkgs) == []
+def test_this_repo_is_a_consistent_distribution():
+    """Every extra the root names exists, nothing depends on an old per-connector
+    package, and every connectors/<dir>/ has an extra that [full] pulls in."""
+    framework = rp.framework_package(rp.FsTree(REPO_ROOT))
+    assert rp.internal_problems(framework, rp.FsTree(REPO_ROOT)) == []
+    assert set(rp.connector_dirs(REPO_ROOT)) <= rp.bundle(framework, "full")
 
 
-def test_internal_problems_flag_requirements_the_set_cannot_satisfy(tmp_path):
-    _repo(
-        tmp_path,
-        connectors={
-            "gmail": ("0.2.0", ["aisquare-pipe>=0.6.0"]),  # framework is 0.5.0
-            "slack": (
-                "0.1.0",
-                ["aisquare-pipe>=0.5.0"],
-            ),  # [toolkits] floors it at 0.2.0
-            "local": ("0.1.0", ["aisquare-pipe-ghost>=0.1"]),  # no such package here
-        },
+def test_internal_problems_flag_metadata_that_would_not_install(tmp_path):
+    pyproject = ROOT_PYPROJECT.format(version="0.5.0").replace(
+        'full = ["aisquare-pipe[popular,gmail,slack]"]',
+        'full = ["aisquare-pipe[popular,gmail,nope]", "aisquare-pipe-slack>=0.2.0", "aisquare-pipe[gmail]>=0.6"]',
     )
-    problems = "\n".join(rp.internal_problems(rp.discover(rp.FsTree(tmp_path))))
-    assert (
-        "aisquare-pipe-gmail dependencies requires 'aisquare-pipe>=0.6.0'" in problems
+    root = _repo(
+        tmp_path, pyproject=pyproject, dirs=("dropbox", "gmail", "slack", "orphan")
     )
-    assert "aisquare-pipe [toolkits] requires 'aisquare-pipe-slack>=0.2.0'" in problems
-    assert "no package here is named aisquare-pipe-ghost" in problems
+    problems = "\n".join(
+        rp.internal_problems(rp.framework_package(rp.FsTree(root)), rp.FsTree(root))
+    )
+    assert "there is no [nope] extra" in problems
     assert (
-        "click" not in problems and "pytest" not in problems
-    )  # third-party: not ours to check
+        "requires 'aisquare-pipe-slack>=0.2.0': connectors ship inside aisquare-pipe"
+        in problems
+    )
+    assert "requires 'aisquare-pipe[gmail]>=0.6', but this is 0.5.0" in problems
+    assert "connectors/orphan/ has no [orphan] extra" in problems
+    assert "[full] doesn't pull in [slack]" in problems
 
 
 # -------------------------------------------------------------------- plan
 
 
-def test_pr_dry_run_builds_everything_and_uploads_nothing(tmp_path):
-    pypi = FakePypi(
-        published={("aisquare-pipe-local", "0.1.0"): {"x.whl": "0"}},
-        projects={"aisquare-pipe"},
+def test_pr_dry_run_builds_the_distribution_and_uploads_nothing(tmp_path):
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="pull_request",
+        fetch=FakePypi(projects={"aisquare-pipe"}),
     )
-    plan = rp.make_plan(rp.FsTree(_repo(tmp_path)), event="pull_request", fetch=pypi)
     out = plan.outputs()
     assert plan.problems == []
-    assert [p["path"] for p in json.loads(out["packages"])] == [
-        ".",
-        "connectors/gmail",
-        "connectors/local",
-        "connectors/slack",
+    assert json.loads(out["packages"]) == [
+        {"path": ".", "name": "aisquare-pipe", "version": "0.5.0"}
     ]
-    assert (
-        out["upload"] == "false"
-        and out["uploads"] == "[]"
-        and out["connectors"] == "[]"
+    assert (out["upload"], out["uploads"], out["shims"], out["target"]) == (
+        "false",
+        "[]",
+        "[]",
+        "aisquare-pipe",
     )
     assert "would upload" in plan.summary() and "**upload**" not in plan.summary()
 
 
-def test_publish_uploads_only_versions_missing_from_pypi_and_says_what_it_skipped(
-    tmp_path,
-):
+def test_a_release_uploads_the_new_version(tmp_path):
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="release",
+        tag="v0.5.0",
+        fetch=FakePypi(projects={"aisquare-pipe"}),
+    )
+    out = plan.outputs()
+    assert plan.problems == []
+    assert (out["upload"], out["framework"]) == ("true", "true")
+    assert [u["name"] for u in json.loads(out["uploads"])] == ["aisquare-pipe"]
+
+
+def test_a_version_already_on_pypi_is_skipped_out_loud(tmp_path):
     pypi = FakePypi(
-        published={("aisquare-pipe-local", "0.1.0"): {"x.whl": "0"}},
-        projects={"aisquare-pipe", "aisquare-pipe-gmail"},
+        published={("aisquare-pipe", "0.5.0"): {"aisquare_pipe-0.5.0.tar.gz": "0"}}
     )
     plan = rp.make_plan(
         rp.FsTree(_repo(tmp_path)), event="release", tag="v0.5.0", fetch=pypi
     )
-    out = plan.outputs()
-    assert plan.problems == []
-    assert out["upload"] == "true" and out["framework"] == "true"
-    assert [c["name"] for c in json.loads(out["connectors"])] == [
-        "aisquare-pipe-gmail",
-        "aisquare-pipe-slack",
-    ]
-    assert [u["name"] for u in json.loads(out["uploads"])] == [
-        "aisquare-pipe",
-        "aisquare-pipe-gmail",
-        "aisquare-pipe-slack",
-    ]
-    summary = plan.summary()
+    assert plan.outputs()["upload"] == "false"
     assert (
-        "| `aisquare-pipe-local` | `connectors/local` | 0.1.0 | yes | skip: this version is already on PyPI |"
-        in summary
+        "| `aisquare-pipe` | 0.5.0 | yes | skip: this version is already on PyPI |"
+        in plan.summary()
     )
-    assert "no (new project: needs a pending trusted publisher)" in summary  # slack
+    assert plan.warnings == ["every version is already on PyPI: nothing to upload"]
 
 
-def test_a_release_tag_that_is_not_the_framework_version_fails_the_plan(tmp_path):
+def test_a_release_tag_that_is_not_the_version_fails_the_plan(tmp_path):
     """v0.2.0 (2026-07-10), a connector-only release: the tag said 0.2.0 and
     pyproject.toml 0.1.1, and the aisquare-pipe job went green on a silent skip."""
     pypi = FakePypi(
         published={("aisquare-pipe", "0.1.1"): {"aisquare_pipe-0.1.1.tar.gz": "0"}}
     )
     plan = rp.make_plan(
-        rp.FsTree(_repo(tmp_path, framework="0.1.1", connectors={}, extras={})),
+        rp.FsTree(_repo(tmp_path, version="0.1.1")),
         event="release",
         tag="v0.2.0",
         fetch=pypi,
@@ -294,19 +290,28 @@ def test_a_release_tag_that_is_not_the_framework_version_fails_the_plan(tmp_path
     assert plan.problems == [
         (
             "release tag 'v0.2.0' does not match aisquare-pipe 0.1.1 in pyproject.toml: "
-            "tag the release v0.1.1, or bump pyproject.toml first (publish connectors "
-            "alone with Run workflow, dry-run unticked)"
+            "tag the release v0.1.1, or bump pyproject.toml first"
         )
+    ]
+
+
+def test_the_plan_never_creates_a_project(tmp_path):
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)), event="release", tag="v0.5.0", fetch=FakePypi()
+    )
+    assert plan.problems == [
+        "aisquare-pipe is not on PyPI at all, and this workflow never creates a project"
     ]
 
 
 def test_manual_run_is_a_dry_run_unless_asked_otherwise(tmp_path):
     tree = rp.FsTree(_repo(tmp_path))
+    pypi = FakePypi(projects={"aisquare-pipe"})
     assert not rp.make_plan(
-        tree, event="workflow_dispatch", dry_run=True, fetch=FakePypi()
+        tree, event="workflow_dispatch", dry_run=True, fetch=pypi
     ).upload
     assert rp.make_plan(
-        tree, event="workflow_dispatch", dry_run=False, fetch=FakePypi()
+        tree, event="workflow_dispatch", dry_run=False, fetch=pypi
     ).upload
 
 
@@ -317,7 +322,7 @@ def test_a_failed_lookup_stops_a_publish_but_only_warns_in_a_dry_run(tmp_path):
     )
     assert publish.problems and all("HTTP 403" in p for p in publish.problems)
     dry = rp.make_plan(tree, event="pull_request", fetch=FakePypi(status=403))
-    assert dry.problems == [] and len(dry.warnings) == 4
+    assert dry.problems == [] and len(dry.warnings) == 1
     assert json.loads(dry.outputs()["uploads"]) == []
 
 
@@ -336,6 +341,98 @@ def test_a_version_on_pypi_with_no_files_is_a_problem(tmp_path):
     assert any("registered on PyPI with no files" in p for p in plan.problems)
 
 
+# ------------------------------------------------------------------ shims
+
+
+def _pypi_with_shim_projects(**kw) -> FakePypi:
+    return FakePypi(projects={"aisquare-pipe", *SHIM_NAMES}, **kw)
+
+
+def test_the_shim_run_uploads_every_shim_once_aisquare_pipe_is_out(tmp_path):
+    pypi = _pypi_with_shim_projects(
+        published={("aisquare-pipe", "0.5.0"): {"aisquare_pipe-0.5.0.tar.gz": "0"}}
+    )
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="workflow_dispatch",
+        dry_run=False,
+        fetch=pypi,
+        target="shims",
+    )
+    out = plan.outputs()
+    assert plan.problems == []
+    assert out["target"] == "shims" and out["framework"] == "false"
+    assert [s["name"] for s in json.loads(out["shims"])] == SHIM_NAMES
+    assert json.loads(out["shims"])[0]["path"] == "shims/composio"
+
+
+def test_shims_wait_for_the_aisquare_pipe_they_require(tmp_path):
+    tree = rp.FsTree(_repo(tmp_path))
+    publish = rp.make_plan(
+        tree,
+        event="workflow_dispatch",
+        dry_run=False,
+        fetch=_pypi_with_shim_projects(),
+        target="shims",
+    )
+    assert publish.problems == [
+        (
+            "aisquare-pipe 0.5.0 is not on PyPI yet (new version), and every shim requires it: "
+            "publish aisquare-pipe first"
+        )
+    ]
+    dry = rp.make_plan(
+        tree,
+        event="workflow_dispatch",
+        fetch=_pypi_with_shim_projects(),
+        target="shims",
+    )
+    assert dry.problems == [] and "publish aisquare-pipe first" in dry.warnings[0]
+
+
+def test_a_shim_never_creates_a_project(tmp_path):
+    pypi = FakePypi(
+        projects={"aisquare-pipe", *SHIM_NAMES[1:]},
+        published={("aisquare-pipe", "0.5.0"): {"x": "0"}},
+    )
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="workflow_dispatch",
+        dry_run=False,
+        fetch=pypi,
+        target="shims",
+    )
+    assert plan.problems == [
+        "aisquare-pipe-composio is not on PyPI at all, and this workflow never creates a project"
+    ]
+
+
+def test_a_release_only_ever_publishes_the_distribution(tmp_path):
+    plan = rp.make_plan(
+        rp.FsTree(_repo(tmp_path)),
+        event="release",
+        tag="v0.5.0",
+        fetch=FakePypi(projects={"aisquare-pipe"}),
+        target="shims",
+    )
+    assert plan.target == "aisquare-pipe" and [p.name for p in plan.packages] == [
+        "aisquare-pipe"
+    ]
+
+
+def test_shim_sources_have_no_code_and_one_requirement():
+    files = rp.shim_files("onedrive")
+    data = tomllib.loads(files["pyproject.toml"])
+    assert (data["project"]["name"], data["project"]["version"]) == (
+        "aisquare-pipe-onedrive",
+        "0.5.0",
+    )
+    assert data["project"]["dependencies"] == ["aisquare-pipe[onedrive]>=0.5.0"]
+    assert data["tool"]["setuptools"] == {"packages": [], "py-modules": []}
+    assert 'pip install "aisquare-pipe[onedrive]"' in files["README.md"]
+    assert "--force-reinstall --no-deps aisquare-pipe" in files["README.md"]
+
+
 def test_plan_cli_writes_github_outputs_and_fails_on_a_problem(tmp_path, monkeypatch):
     _repo(tmp_path / "repo")
     output, summary = tmp_path / "out", tmp_path / "summary"
@@ -343,8 +440,14 @@ def test_plan_cli_writes_github_outputs_and_fails_on_a_problem(tmp_path, monkeyp
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
     assert rp.main(["plan", "--root", str(tmp_path / "repo")]) == 0
     written = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert set(written) == {"packages", "upload", "connectors", "framework", "uploads"}
-    assert len(json.loads(written["packages"])) == 4
+    assert set(written) == {
+        "target",
+        "packages",
+        "upload",
+        "framework",
+        "shims",
+        "uploads",
+    }
     assert "### PyPI dry run" in summary.read_text()
     assert (
         rp.main(
@@ -362,7 +465,7 @@ def test_plan_cli_writes_github_outputs_and_fails_on_a_problem(tmp_path, monkeyp
     )
 
 
-# --------------------------------------------------------------- check-dist
+# --------------------------------------------------------------- dist checks
 
 
 def _dist(tmp_path: Path, *names: str) -> Path:
@@ -374,13 +477,9 @@ def _dist(tmp_path: Path, *names: str) -> Path:
 
 
 def test_check_dist_accepts_the_declared_name_and_version(tmp_path):
-    pkg = rp.Package(
-        path="connectors/gmail", name="aisquare-pipe-gmail", version="0.2.0"
-    )
+    pkg = rp.Package(path=".", name="aisquare-pipe", version="0.5.0")
     dist = _dist(
-        tmp_path,
-        "aisquare_pipe_gmail-0.2.0-py3-none-any.whl",
-        "aisquare_pipe_gmail-0.2.0.tar.gz",
+        tmp_path, "aisquare_pipe-0.5.0-py3-none-any.whl", "aisquare_pipe-0.5.0.tar.gz"
     )
     assert rp.dist_problems(pkg, dist) == []
 
@@ -392,7 +491,7 @@ def test_check_dist_rejects_a_build_at_another_version(tmp_path):
     )
     problems = rp.dist_problems(pkg, dist)
     assert len(problems) == 2 and all(
-        "declares aisquare-pipe 0.2.0" in p for p in problems
+        "the package is aisquare-pipe 0.2.0" in p for p in problems
     )
 
 
@@ -402,6 +501,82 @@ def test_check_dist_wants_exactly_one_wheel_and_one_sdist(tmp_path):
         pkg, _dist(tmp_path, "aisquare_pipe-0.5.0-py3-none-any.whl")
     )
     assert rp.dist_problems(pkg, tmp_path / "missing")
+
+
+def _framework_wheel(tmp_path: Path, root: Path, drop: str = "", add: str = "") -> Path:
+    files = dict.fromkeys(rp.expected_modules(root), "")
+    files.pop(drop, None)
+    if add:
+        files[add] = ""
+    return _wheel(tmp_path / "w" / "aisquare_pipe-0.5.0-py3-none-any.whl", files)
+
+
+def test_the_wheel_record_must_hold_every_module_of_the_checkout(tmp_path):
+    root = _repo(tmp_path / "repo")
+    assert rp.expected_modules(root) == {
+        "aisquare/pipe/__init__.py",
+        *(
+            f"aisquare_pipe_{d}/{f}"
+            for d in ("dropbox", "gmail", "slack")
+            for f in ("__init__.py", "connector.py")
+        ),
+    }
+    assert rp.framework_wheel_problems(_framework_wheel(tmp_path, root), root) == []
+    wheel = _framework_wheel(tmp_path, root, drop="aisquare_pipe_gmail/connector.py")
+    assert rp.framework_wheel_problems(wheel, root) == [
+        "aisquare_pipe-0.5.0-py3-none-any.whl: RECORD lacks aisquare_pipe_gmail/connector.py"
+    ]
+
+
+def test_a_connector_module_without_a_directory_is_a_problem(tmp_path):
+    root = _repo(tmp_path / "repo")
+    wheel = _framework_wheel(tmp_path, root, add="aisquare_pipe_ghost/__init__.py")
+    assert rp.framework_wheel_problems(wheel, root) == [
+        "aisquare_pipe-0.5.0-py3-none-any.whl: carries aisquare_pipe_ghost, which no connectors/<dir>/src provides"
+    ]
+
+
+SHIM = rp.shim_packages()[rp.SHIM_PROJECTS.index("onedrive")]
+
+
+def _shim_wheel(
+    tmp_path: Path, requires: list[str], files: dict[str, str] | None = None
+) -> Path:
+    metadata = "Metadata-Version: 2.4\nName: aisquare-pipe-onedrive\nVersion: 0.5.0\n"
+    metadata += "".join(f"Requires-Dist: {r}\n" for r in requires)
+    return _wheel(
+        tmp_path / "s" / "aisquare_pipe_onedrive-0.5.0-py3-none-any.whl",
+        files or {},
+        metadata,
+    )
+
+
+def test_a_shim_wheel_has_no_code_and_one_requirement(tmp_path):
+    assert (
+        rp.shim_wheel_problems(
+            SHIM, _shim_wheel(tmp_path, ["aisquare-pipe[onedrive]>=0.5.0"])
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("requires", "files", "says"),
+    [
+        (
+            ["aisquare-pipe[onedrive]>=0.5.0"],
+            {"aisquare_pipe_onedrive/__init__.py": ""},
+            "carries files besides",
+        ),
+        (["aisquare-pipe>=0.5.0"], None, "not exactly"),
+        (["aisquare-pipe[onedrive]>=0.4.0"], None, "not exactly"),
+        (["aisquare-pipe[onedrive]>=0.5.0", "requests"], None, "not exactly"),
+        (['aisquare-pipe[onedrive]>=0.5.0; python_version < "3"'], None, "not exactly"),
+    ],
+)
+def test_a_wrong_shim_wheel_is_a_problem(tmp_path, requires, files, says):
+    problems = rp.shim_wheel_problems(SHIM, _shim_wheel(tmp_path, requires, files))
+    assert len(problems) == 1 and says in problems[0]
 
 
 # ------------------------------------------------------------------- verify
@@ -415,53 +590,49 @@ def _built(root: Path, name: str, files: dict[str, bytes]) -> dict[str, str]:
     return {fname: hashlib.sha256(data).hexdigest() for fname, data in files.items()}
 
 
-UPLOAD = {"path": "connectors/gmail", "name": "aisquare-pipe-gmail", "version": "0.2.0"}
+UPLOAD = {"path": ".", "name": "aisquare-pipe", "version": "0.5.0"}
 FILES = {
-    "aisquare_pipe_gmail-0.2.0-py3-none-any.whl": b"wheel",
-    "aisquare_pipe_gmail-0.2.0.tar.gz": b"sdist",
+    "aisquare_pipe-0.5.0-py3-none-any.whl": b"wheel",
+    "aisquare_pipe-0.5.0.tar.gz": b"sdist",
 }
 
 
 def test_verify_passes_when_pypi_has_this_runs_files(tmp_path):
-    digests = _built(tmp_path, "aisquare-pipe-gmail", FILES)
-    pypi = FakePypi(published={("aisquare-pipe-gmail", "0.2.0"): digests})
+    digests = _built(tmp_path, "aisquare-pipe", FILES)
+    pypi = FakePypi(published={("aisquare-pipe", "0.5.0"): digests})
     assert rp.verify_problems([UPLOAD], tmp_path, pypi, timeout=0) == []
 
 
 def test_verify_fails_an_upload_that_never_landed(tmp_path):
-    _built(tmp_path, "aisquare-pipe-gmail", FILES)
+    _built(tmp_path, "aisquare-pipe", FILES)
     problems = rp.verify_problems([UPLOAD], tmp_path, FakePypi(), timeout=0)
     assert problems == [
         (
-            "aisquare-pipe-gmail 0.2.0: not on PyPI after the upload: "
-            "aisquare_pipe_gmail-0.2.0-py3-none-any.whl, aisquare_pipe_gmail-0.2.0.tar.gz"
+            "aisquare-pipe 0.5.0: not on PyPI after the upload: "
+            "aisquare_pipe-0.5.0-py3-none-any.whl, aisquare_pipe-0.5.0.tar.gz"
         )
     ]
 
 
 def test_verify_fails_when_pypi_holds_different_bytes(tmp_path):
-    digests = _built(tmp_path, "aisquare-pipe-gmail", FILES)
-    digests["aisquare_pipe_gmail-0.2.0.tar.gz"] = "f" * 64
-    problems = rp.verify_problems(
-        [UPLOAD],
-        tmp_path,
-        FakePypi(published={("aisquare-pipe-gmail", "0.2.0"): digests}),
-        timeout=0,
-    )
+    digests = _built(tmp_path, "aisquare-pipe", FILES)
+    digests["aisquare_pipe-0.5.0.tar.gz"] = "f" * 64
+    pypi = FakePypi(published={("aisquare-pipe", "0.5.0"): digests})
+    problems = rp.verify_problems([UPLOAD], tmp_path, pypi, timeout=0)
     assert (
         len(problems) == 1
-        and "aisquare_pipe_gmail-0.2.0.tar.gz has sha256 ffff" in problems[0]
+        and "aisquare_pipe-0.5.0.tar.gz has sha256 ffff" in problems[0]
     )
 
 
 def test_verify_polls_until_pypi_catches_up(tmp_path):
-    digests = _built(tmp_path, "aisquare-pipe-gmail", FILES)
+    digests = _built(tmp_path, "aisquare-pipe", FILES)
     pypi = FakePypi()
     now = [0.0]
 
     def sleep(seconds):
         now[0] += seconds
-        pypi.published[("aisquare-pipe-gmail", "0.2.0")] = (
+        pypi.published[("aisquare-pipe", "0.5.0")] = (
             digests  # lands after the first look
         )
 
@@ -498,109 +669,113 @@ SERVICE = """\
     dependencies = ["aisquare-pipe>=0.5.0", "fastapi>=0.110"]
 
     [project.optional-dependencies]
-    gmail = ["aisquare-pipe-gmail>=0.2.0"]
+    gmail = ["aisquare-pipe[gmail]>=0.5.0"]
     toolkits = ["aisquare-pipe[toolkits]>=0.5.0", "aisquare-pipe-service[gmail]"]
     """
 LOCK = """\
     aisquare-pipe==0.1.1 \\
         --hash=sha256:00
-        # via
-        #   aisquare-pipe-local
-    aisquare-pipe-local==0.1.0 \\
+    aisquare-pipe-onedrive==0.1.0 \\
         --hash=sha256:11
     fastapi==0.115.0 \\
         --hash=sha256:22
     """
 
 
-def test_coverage_follows_extras_and_dependencies_through_the_pipe_tree(tmp_path):
+def test_coverage_of_a_consumer_written_for_one_distribution(tmp_path):
     pipe = rp.FsTree(_repo(tmp_path / "pipe"))
     consumer = rp.FsTree(
         _consumer(
             tmp_path / "svc",
             SERVICE,
-            "aisquare-pipe[full,toolkits]>=0.5.0  # the image\n-c constraints.txt\n",
+            "aisquare-pipe[full,toolkits]>=0.5.0  # image\n-c c.txt\n",
             LOCK,
         )
     )
-    needs = rp.coverage(pipe, consumer)
-    by = {(n.requirement, n.source): n for n in needs}
-    assert all(not n.verdict.startswith("FAIL") for n in needs)
-    # through [full] -> [popular] and [toolkits], to every connector here
-    assert {n.package for n in needs} == {
-        ".",
-        "connectors/gmail",
-        "connectors/local",
-        "connectors/slack",
-    }
-    assert by[("aisquare-pipe-local", "aisquare-pipe[popular]")].verdict == "ok"
+    by = {(n.requirement, n.source): n for n in rp.coverage(pipe, consumer)}
+    assert not any(n.verdict.startswith("FAIL") for n in by.values())
     assert (
-        by[("aisquare-pipe>=0.5.0", "aisquare-pipe-gmail dependencies")].verdict == "ok"
+        by[("aisquare-pipe[full,toolkits]>=0.5.0", "requirements.in")].verdict == "ok"
     )
-    # a lock pin below what the branch declares is the stale lock, relocked after publishing
+    assert (
+        by[("aisquare-pipe[gmail]>=0.5.0", "pyproject.toml [gmail]")].provided_by
+        == "aisquare-pipe 0.5.0"
+    )
+    # The lock before its relock: an old framework pin, and an old per-connector one.
     assert by[("aisquare-pipe==0.1.1", "requirements.lock")].verdict.startswith(
         "ok (pinned below"
     )
-    # the consumer's own extras and third-party pins are not checked
-    assert not any(
-        "aisquare-pipe-service" in n.requirement or "fastapi" in n.requirement
-        for n in needs
+    assert (
+        "the relock must drop it"
+        in by[("aisquare-pipe-onedrive==0.1.0", "requirements.lock")].verdict
     )
+    # The consumer's own extras and third-party pins are not checked.
+    assert not any("aisquare-pipe-service" in r or "fastapi" in r for r, _ in by)
 
 
-def test_coverage_fails_a_missing_package_a_floor_above_the_branch_and_a_pin_above_it(
-    tmp_path,
-):
+def test_coverage_of_a_consumer_still_written_for_per_connector_packages(tmp_path):
+    """pipe-as-service's release/pipe-router before its D8 change."""
     pipe = rp.FsTree(_repo(tmp_path / "pipe"))
     consumer = rp.FsTree(
         _consumer(
             tmp_path / "svc",
-            SERVICE.replace("aisquare-pipe-gmail>=0.2.0", "aisquare-pipe-gmail>=0.3.0"),
-            "aisquare-pipe-googlecalendar>=0.2.0\naisquare-pipe[nope]\n",
-            "aisquare-pipe-slack==0.9.0 \\\n    --hash=sha256:00\n",
+            SERVICE.replace(
+                "aisquare-pipe[gmail]>=0.5.0", "aisquare-pipe-gmail>=0.2.0"
+            ),
+            "aisquare-pipe-github>=0.3.0\naisquare-pipe-github>=0.6.0\naisquare-pipe[nope]\naisquare-pipe>=0.6.0\n",
         )
     )
-    failed = {
-        n.requirement: n.verdict
-        for n in rp.coverage(pipe, consumer)
-        if n.verdict.startswith("FAIL")
-    }
-    assert failed == {
-        "aisquare-pipe-gmail>=0.3.0": "FAIL: needs >=0.3.0, connectors/gmail declares 0.2.0",
-        "aisquare-pipe-googlecalendar>=0.2.0": f"FAIL: no package named aisquare-pipe-googlecalendar in {pipe.describe()}",
-        "aisquare-pipe[nope]": "FAIL: aisquare-pipe has no [nope] extra",
-        "aisquare-pipe-slack==0.9.0": "FAIL: needs ==0.9.0, connectors/slack declares 0.2.0",
-    }
+    verdicts = {n.requirement: n.verdict for n in rp.coverage(pipe, consumer)}
+    assert verdicts["aisquare-pipe-gmail>=0.2.0"].startswith(
+        "FAIL: aisquare-pipe-gmail is not a distribution"
+    )
+    assert "require aisquare-pipe[gmail]" in verdicts["aisquare-pipe-gmail>=0.2.0"]
+    assert (
+        verdicts["aisquare-pipe-github>=0.3.0"]
+        == "ok via the shim; replace with aisquare-pipe[github]>=0.5.0"
+    )
+    assert (
+        verdicts["aisquare-pipe-github>=0.6.0"]
+        == "FAIL: needs >=0.6.0; its last release is the shim 0.5.0"
+    )
+    assert verdicts["aisquare-pipe[nope]"] == "FAIL: aisquare-pipe has no [nope] extra"
+    assert (
+        verdicts["aisquare-pipe>=0.6.0"]
+        == "FAIL: needs >=0.6.0, this tree publishes 0.5.0"
+    )
 
 
 def test_coverage_cli_exits_nonzero_on_a_failure(tmp_path, capsys):
     _repo(tmp_path / "pipe")
     _consumer(tmp_path / "svc", SERVICE.replace(">=0.5.0", ">=0.6.0"))
-    assert (
-        rp.main(
-            [
-                "coverage",
-                "--pipe-root",
-                str(tmp_path / "pipe"),
-                "--consumer-root",
-                str(tmp_path / "svc"),
-            ]
-        )
-        == 1
-    )
+    args = [
+        "coverage",
+        "--pipe-root",
+        str(tmp_path / "pipe"),
+        "--consumer-root",
+        str(tmp_path / "svc"),
+    ]
+    assert rp.main(args) == 1
     assert "failing" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------- publish.yml
 
 
-def test_publish_workflow_takes_its_matrix_from_the_plan_and_never_skips_silently():
+def test_publish_workflow_is_plan_driven_and_never_skips_silently():
     """The two ways the 2026-07-10 runs went wrong: a hand-kept matrix, and
-    skip-existing turning an upload of an old version into a green job."""
+    skip-existing turning an upload of an old version into a green job. Plus
+    the D8 shape: one distribution, and the shims on their own manual run."""
     text = PUBLISH_YML.read_text()
     assert "skip-existing" not in text.replace("without skip-existing", "")
-    assert "scripts/release_packages.py plan --pypi" in text
+    assert "release_packages.py plan --pypi" in text
     assert "fromJSON(needs.plan.outputs.packages)" in text
-    assert "fromJSON(needs.plan.outputs.connectors)" in text
+    assert "fromJSON(needs.plan.outputs.shims)" in text
+    assert "release_packages.py check-dist" in text and "twine check --strict" in text
     assert "release_packages.py verify" in text
-    assert "connectors/" not in text.split("jobs:", 1)[1].replace("connectors/*", "")
+    jobs = [
+        line
+        for line in text.split("jobs:", 1)[1].splitlines()
+        if not line.strip().startswith("#")
+    ]
+    assert not any("connectors/" in line for line in jobs)  # no hand-kept package list

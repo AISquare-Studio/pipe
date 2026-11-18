@@ -1,12 +1,20 @@
-# aisquare-pipe-local
+# aisquare-pipe[local]
 
 Local filesystem source and sink connectors for [aisquare.pipe](../../README.md). No external dependencies — uses only Python stdlib.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[local]` extra:
+
 ```bash
-cd connectors/local
-pip install -e ".[dev]"
+pip install "aisquare-pipe[local]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/local && pytest tests
 ```
 
 ## Configuration

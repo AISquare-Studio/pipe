@@ -4,6 +4,12 @@ This guide explains how to build a connector plugin for `aisquare.pipe` —
 its data-moving connectors and, optionally, its agent-facing toolkit
 (see [Building a Toolkit](#building-a-toolkit)).
 
+**Connectors in this repo ship inside the one `aisquare-pipe` distribution**
+(see [Adding a connector to this repo](#adding-a-connector-to-this-repo)): they
+have no `[project]` table of their own and are never separate PyPI packages.
+The scaffold below makes a standalone plugin project, which is how a
+connector *outside* this repo is built and published.
+
 ## Quick Start
 
 ```bash
@@ -144,7 +150,7 @@ It runs four layers per connector:
 | Layer | What it checks | Credentials |
 |---|---|---|
 | **Contract** | spec attributes, plus behavior with empty config under a socket guard: `validate_config({})` returns `False` without network, `pull({})` fails cleanly (`ConfigValidationError`/`ValueError`, never `KeyError`/`TypeError`), `push(garbage, {})` returns `PushResult(success=False)` without raising | none |
-| **Hygiene** | packaging rules (package name, `aisquare-pipe>=` dep, entry points resolve, class version == pyproject version), scaffold completeness, no cross-connector imports, no bare `except:` | none |
+| **Hygiene** | packaging rules (the root pyproject packages `connectors/<name>/src`, declares its entry points and its `[<name>]` extra, and `[full]` pulls it in; its own pyproject holds tool settings only; entry points resolve; its classes agree on one version), scaffold completeness, no cross-connector imports, no bare `except:` | none |
 | **Unit suite** | your `tests/` directory, run in its own pytest process | none — mock your service at the client boundary |
 | **Live** | optional `tests/test_live.py` against the real API | opt-in (`--live` + env vars) |
 
@@ -203,7 +209,7 @@ SEARCH = ToolSpec(
 
 class MyServiceToolkit(Toolkit):
     name = "mysvc"                         # == entry-point name
-    version = "0.1.0"                      # == pyproject version
+    version = "0.1.0"                      # the connector's own version (all its classes agree)
     display_name = "My Service"
     description = "Files in My Service"
     category = "files"                     # one of aisquare.pipe.CATEGORIES (default "other")
@@ -355,14 +361,11 @@ class TestMyServiceToolkit(toolkit_compliance_suite(MyServiceToolkit)):
     pass
 ```
 
-Then add the package to the `[toolkits]` extra in the root `pyproject.toml`,
-floored at the first release that ships the toolkit:
+Then add the connector to the `[toolkits]` extra in the root `pyproject.toml`
+(it names connector extras of this same distribution):
 
 ```toml
-toolkits = [
-    # ...
-    "aisquare-pipe-mysvc>=0.1.0",
-]
+toolkits = ["aisquare-pipe[github,gmail,...,mysvc]"]
 ```
 
 `pip install "aisquare-pipe[toolkits]"` is how a host (pipe-as-service)
@@ -562,31 +565,51 @@ Conventions: env vars are named `<SERVICE>_API_KEY` (or the service's natural
 credential set), tests self-skip without them, and `pipe validate --live` is
 the only thing that runs them (`SKIP (no creds)` when the env is absent).
 
-## Publishing to PyPI
+## Adding a connector to this repo
 
-1. Name your package: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-google-drive`)
-2. Add `aisquare-pipe>=0.1.0` as a dependency (`>=0.3.0` if the package registers a toolkit)
-3. Register entry points as shown above
-4. Build and publish:
+Every connector here ships inside `aisquare-pipe` (one PyPI project, one
+trusted publisher; see [RELEASING.md](RELEASING.md)). For a connector
+`mysvc`:
 
-```bash
-python -m build
-twine upload dist/*
-```
+1. Code in `connectors/mysvc/src/aisquare_pipe_mysvc/`, tests in
+   `connectors/mysvc/tests/`, a README in `connectors/mysvc/README.md`.
+2. `connectors/mysvc/pyproject.toml` holds **tool settings only** (the
+   suite's `[tool.pytest.ini_options]`, with the `live` marker, and
+   `[tool.ruff.lint.isort]`). Copy `connectors/github/pyproject.toml`. No
+   `[project]` and no `[build-system]`.
+3. In the **root** `pyproject.toml`:
+   - add `"connectors/mysvc/src"` to `[tool.setuptools.packages.find] where`;
+   - register its entry points under `[project.entry-points."aisquare_pipe.connectors"]`
+     (and `.toolkits` / `.converters`);
+   - add an extra named exactly `mysvc` with its third-party deps beyond
+     core (core: click, requests, urllib3). It may be `[]`;
+   - add `mysvc` to `[full]`, and to `[toolkits]` if it registers a toolkit.
+4. Import its SDK at module top. Without `aisquare-pipe[mysvc]` installed, its
+   entry points then fail to import and discovery counts it as *not
+   installed* (one info log line), never as a broken plugin.
+5. `pip install -e ".[full,dev]"` and `pipe validate mysvc`.
+   `tests/test_distribution.py` and the hygiene checks fail until step 3 is
+   complete.
+
+A plugin outside this repo is its own distribution, named
+`aisquare-pipe-{service}` by convention, depending on `aisquare-pipe>=0.5.0`
+and registering the same entry-point groups. Build and publish it from its own
+repo (`python -m build`, then upload).
 
 ## Naming Convention
 
-- Package name: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
+- In this repo: module `aisquare_pipe_{service}` in `connectors/{service}/`, installed as `aisquare-pipe[{service}]`
+- Outside it: package name `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
 - Connector name attribute: `{service}` (e.g., `"s3"`)
 - Entry point name: `{service}` or `{service}-source` / `{service}-sink`
 - Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`), matching `TOOLKIT_NAME_RULE` `^[a-z][a-z0-9_]{0,63}$`: underscores, never hyphens (`one_drive`, not `one-drive`). It is the connector id hosts route on, and pipe-as-service keeps hyphenated names for pull/push connectors, so `pipe validate` and `scripts/check_toolkits_extra.py` fail a hyphenated toolkit and `installed_toolkits()` leaves it out. Connector entry-point names (`mysvc-source`) are not bound by it.
 
 ## Which Tier?
 
-All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`. A package that registers a toolkit also goes in `[toolkits]` whatever its tier (see [Building a Toolkit](#building-a-toolkit)); CI enforces that one.
+All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`. Every connector is in `[full]`. A connector that registers a toolkit also goes in `[toolkits]` whatever its tier (see [Building a Toolkit](#building-a-toolkit)); CI enforces both.
 
-- **Super-popular and broadly useful** → add the package name to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
-- **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via direct install (`pip install aisquare-pipe-{service}`).
+- **Super-popular and broadly useful** → add its extra to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
+- **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via its own extra (`pip install "aisquare-pipe[{service}]"`).
 - **When in doubt, leave it out of `[popular]`.** Promoting later is cheap; demoting feels worse to users.
 
 ## Code & Folder Isolation

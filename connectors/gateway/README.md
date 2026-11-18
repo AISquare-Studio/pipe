@@ -1,14 +1,22 @@
-# aisquare-pipe-gateway
+# aisquare-pipe[gateway]
 
 Sink connector that POSTs envelopes to the AISquare Explainability gateway's
-trace-ingest endpoint. Pairs with `aisquare-pipe-n8n` and other Tier-0 sources
+trace-ingest endpoint. Pairs with the `n8n` source and other Tier-0 sources
 that emit `application/x-aisquare-trace+json`.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[gateway]` extra:
+
 ```bash
-cd connectors/gateway
-pip install -e ".[dev]"
+pip install "aisquare-pipe[gateway]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/gateway && pytest tests
 ```
 
 ## Configuration

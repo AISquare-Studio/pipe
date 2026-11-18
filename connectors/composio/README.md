@@ -1,17 +1,20 @@
-# aisquare-pipe-composio
+# aisquare-pipe[composio]
 
 One API key, 500+ SaaS toolkits: Gmail, Slack, GitHub, Notion, Google Drive, HubSpot, ... — this meta-connector bridges [aisquare.pipe](../../README.md) to the entire [Composio](https://composio.dev) catalog, so any pipe source can feed a Composio app and any Composio app can feed a pipe sink. Ships in `aisquare-pipe[full]`.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[composio]` extra:
+
 ```bash
-pip install aisquare-pipe-composio
+pip install "aisquare-pipe[composio]"   # or "aisquare-pipe[full]": every connector
 ```
 
-For development:
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-pip install -e "connectors/composio[dev]"
+pip install -e ".[full,dev]"
+cd connectors/composio && pytest tests
 ```
 
 ## How it works
@@ -162,7 +165,7 @@ for envelope in source.pull(config):               # polls forever
 
 ## Example pipelines
 
-These examples compose with other pipe connectors — install them first: `pip install aisquare-pipe-local aisquare-pipe-salesforce` (both included in `aisquare-pipe[full]`).
+These examples compose with other pipe connectors — install their extras too: `pip install "aisquare-pipe[composio,local,salesforce]"` (all included in `aisquare-pipe[full]`).
 
 ```python
 from aisquare.pipe import Pipeline, PullParams, PushParams
