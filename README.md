@@ -58,6 +58,7 @@ Every connector lives under `connectors/<name>/` (code in `src/aisquare_pipe_<na
 | Google Cloud Storage (service account key, one bucket) | `aisquare_pipe_gcs` | `aisquare-pipe[gcs]` |   | ✓ |
 | Google BigQuery (service account key, SELECT-only) | `aisquare_pipe_bigquery` | `aisquare-pipe[bigquery]` |   | ✓ |
 | Amazon Redshift (cross-account role, SELECT-only) | `aisquare_pipe_aws.redshift` | `aisquare-pipe[redshift]` (= `[aws]`) |   | ✓ |
+| Snowflake (key-pair service user, SELECT-only) | `aisquare_pipe_snowflake` | `aisquare-pipe[snowflake]` |   | ✓ |
 
 Before 0.5.0 some connectors were separate PyPI packages (`aisquare-pipe-dropbox`, …). Their last release, 0.5.0, has no code and only requires `aisquare-pipe[<name>]`, so old install lines still resolve in a fresh environment; new ones should use the extra. To upgrade an existing environment, see below.
 
