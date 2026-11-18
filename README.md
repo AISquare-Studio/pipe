@@ -11,42 +11,53 @@
 
 ## Install
 
+One distribution, `aisquare-pipe`, carries the framework and every connector.
+Each connector's third-party dependencies are an extra named after it:
+
 ```bash
-pip install aisquare-pipe                       # framework only
-pip install "aisquare-pipe[popular]"            # framework + the canonical core connectors
-pip install "aisquare-pipe[full]"               # framework + all connectors maintained in this repo
-pip install "aisquare-pipe[toolkits]"           # framework + every agent toolkit (what pipe-as-service installs)
-pip install aisquare-pipe-<service>             # framework + a single connector (e.g. aisquare-pipe-dropbox)
+pip install aisquare-pipe                       # framework, plus every connector that needs no extra deps
+pip install "aisquare-pipe[dropbox]"            # ... plus one connector's deps (any connector's name)
+pip install "aisquare-pipe[popular]"            # the core connectors: local, dropbox, onedrive, googledrive
+pip install "aisquare-pipe[full]"               # every connector in this repo
+pip install "aisquare-pipe[toolkits]"           # every agent toolkit's deps (what pipe-as-service installs)
 ```
 
-For development:
+A connector whose extra isn't installed is simply not installed: its entry
+points don't load, and discovery logs one info line naming the extra.
+
+For development (one editable install for the framework and every connector):
 
 ```bash
 git clone git@github.com:AISquare-Studio/pipe.git && cd pipe
-pip install -e ".[dev]"
+pip install -e ".[full,dev]"
 ```
 
 > **Note:** Plugin discovery via `entry_points` requires the package to be installed (`pip install -e .`).
 
 ## Connectors
 
-Each connector is its own independently published pip package under `connectors/<name>/`. The user-facing tier is encoded in the extras bundles — folder location does not determine tier.
+Every connector lives under `connectors/<name>/` (code in `src/aisquare_pipe_<name>/`, its own tests and README) and ships inside `aisquare-pipe`. The root `pyproject.toml` packages it, declares its entry points, and holds its third-party deps as the `[<name>]` extra. The user-facing tier is encoded in the extras bundles — folder location does not determine tier.
 
-| Connector | Package | In `[popular]` | In `[full]` |
-|---|---|:-:|:-:|
-| Local filesystem | `aisquare-pipe-local` | ✓ | ✓ |
-| Dropbox | `aisquare-pipe-dropbox` | ✓ | ✓ |
-| OneDrive | `aisquare-pipe-onedrive` | ✓ | ✓ |
-| Google Drive | `aisquare-pipe-googledrive` | ✓ | ✓ |
-| Salesforce | `aisquare-pipe-salesforce` |   | ✓ |
-| DocuSign | `aisquare-pipe-docusign` |   | ✓ |
-| Composio | `aisquare-pipe-composio` |   | ✓ |
-| GitHub | `aisquare-pipe-github` |   | ✓ |
-| Slack | `aisquare-pipe-slack` |   | ✓ |
-| Gmail | `aisquare-pipe-gmail` |   | ✓ |
-| Google Calendar | `aisquare-pipe-googlecalendar` |   | ✓ |
+| Connector | Module | Install | In `[popular]` | In `[full]` |
+|---|---|---|:-:|:-:|
+| Local filesystem | `aisquare_pipe_local` | `aisquare-pipe[local]` | ✓ | ✓ |
+| Dropbox | `aisquare_pipe_dropbox` | `aisquare-pipe[dropbox]` | ✓ | ✓ |
+| OneDrive | `aisquare_pipe_onedrive` | `aisquare-pipe[onedrive]` | ✓ | ✓ |
+| Google Drive | `aisquare_pipe_googledrive` | `aisquare-pipe[googledrive]` | ✓ | ✓ |
+| Salesforce | `aisquare_pipe_salesforce` | `aisquare-pipe[salesforce]` |   | ✓ |
+| DocuSign | `aisquare_pipe_docusign` | `aisquare-pipe[docusign]` |   | ✓ |
+| Composio | `aisquare_pipe_composio` | `aisquare-pipe[composio]` |   | ✓ |
+| GitHub | `aisquare_pipe_github` | `aisquare-pipe[github]` |   | ✓ |
+| Slack | `aisquare_pipe_slack` | `aisquare-pipe[slack]` |   | ✓ |
+| Gmail | `aisquare_pipe_gmail` | `aisquare-pipe[gmail]` |   | ✓ |
+| Google Calendar | `aisquare_pipe_googlecalendar` | `aisquare-pipe[googlecalendar]` |   | ✓ |
+| AISquare gateway | `aisquare_pipe_gateway` | `aisquare-pipe[gateway]` |   | ✓ |
+| n8n | `aisquare_pipe_n8n` | `aisquare-pipe[n8n]` |   | ✓ |
+| Graphify | `aisquare_pipe_graphify` | `aisquare-pipe[graphify]` (engine: `[graphify-engine]`) |   | ✓ |
 
-Third-party connectors published as `aisquare-pipe-<name>` (or any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
+Before 0.5.0 some connectors were separate PyPI packages (`aisquare-pipe-dropbox`, …). Their last release, 0.5.0, has no code and only requires `aisquare-pipe[<name>]`, so old install lines keep working; new ones should use the extra.
+
+Third-party connectors in their own distribution (any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
 ## Quick Start
 

@@ -1,37 +1,44 @@
 name: publish
 
-# Builds every package in this monorepo, checks it, and uploads the new versions
-# to PyPI with Trusted Publishing (OIDC). No API tokens are stored.
+# Builds, checks and uploads to PyPI with Trusted Publishing (OIDC). No API
+# tokens are stored. `scripts/release_packages.py` decides everything; this
+# file only wires its steps together.
 #
-# What it publishes: the root `aisquare-pipe` and every connectors/*/ that has
-# a pyproject.toml. `scripts/release_packages.py plan` lists them, so the
-# matrix can't miss a package. Each one uploads at the version its own
-# pyproject.toml declares.
+# What it publishes (D8): ONE distribution, `aisquare-pipe`, which carries the
+# framework and every connector (each connector's deps are its
+# `aisquare-pipe[<name>]` extra). There is no per-connector package and no new
+# PyPI project, ever. Separately, and once, the ten connectors that used to
+# be their own PyPI projects get a code-free shim release requiring
+# `aisquare-pipe[<name>]`: Run workflow with target "shims".
 #
-# - pull_request, or Run workflow with "dry-run" ticked (the default): build
-#   each package and run `twine check --strict` on it. Nothing is uploaded.
+# - pull_request, or Run workflow with "dry-run" ticked (the default): build,
+#   check (name/version, the wheel's RECORD against connectors/, `twine check
+#   --strict`) and upload nothing. A dry run of target "shims" builds and
+#   checks all ten shims.
 # - A published GitHub Release (its tag must be v<aisquare-pipe version>), or
-#   Run workflow with "dry-run" unticked: build and check as above, then upload
-#   every package whose version isn't on PyPI yet. Connectors upload first.
-#   aisquare-pipe uploads only once every connector has, because its extras
-#   name them. Then `verify` checks each file on PyPI against the sha256 of
-#   the file this run built.
+#   Run workflow with "dry-run" unticked: the same build and checks, then the
+#   upload if that version isn't on PyPI yet. Then `verify` checks each file
+#   on PyPI against the sha256 of the file this run built.
 #
 # A version already on PyPI is skipped by an explicit lookup in `plan`, and the
 # run summary lists it as skipped. The upload runs without skip-existing, so a
 # rejected upload fails the run. It can't pass as a skip.
 #
-# One-time setup (a trusted publisher per PyPI project, the `pypi` environment)
-# is in RELEASING.md. The publisher is bound to this file name and that
-# environment: renaming either breaks publishing.
+# The trusted publishers (one per existing PyPI project) are bound to this file
+# name and the `pypi` environment: renaming either breaks publishing.
 
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
+      target:
+        description: "What to publish: aisquare-pipe, or the one-time shims (after aisquare-pipe is on PyPI)"
+        type: choice
+        options: [aisquare-pipe, shims]
+        default: aisquare-pipe
       dry-run:
-        description: "Dry run: build and check every package, upload nothing"
+        description: "Dry run: build and check, upload nothing"
         type: boolean
         default: true
   pull_request:
@@ -49,10 +56,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      target: ${{ steps.plan.outputs.target }}
       packages: ${{ steps.plan.outputs.packages }}
       upload: ${{ steps.plan.outputs.upload }}
-      connectors: ${{ steps.plan.outputs.connectors }}
       framework: ${{ steps.plan.outputs.framework }}
+      shims: ${{ steps.plan.outputs.shims }}
       uploads: ${{ steps.plan.outputs.uploads }}
     steps:
       - uses: actions/checkout@v7
@@ -65,17 +73,19 @@ jobs:
 
       - run: python -m pip install --upgrade packaging
 
-      # Lists every package, checks the set, and looks each version up on
-      # PyPI. Fails on a release whose tag isn't v<aisquare-pipe version>.
+      # Reads the version from pyproject.toml, checks the metadata, and looks
+      # each version up on PyPI. Fails on a release whose tag isn't
+      # v<aisquare-pipe version>, and on anything that would create a project.
       - name: Plan
         id: plan
         env:
           EVENT: ${{ github.event_name }}
           TAG: ${{ github.event.release.tag_name }}
+          TARGET: ${{ inputs.target }}
           DRY_RUN: ${{ inputs.dry-run }}
         run: >-
           python scripts/release_packages.py plan --pypi
-          --event "$EVENT" --tag "$TAG" --dry-run "${DRY_RUN:-true}"
+          --event "$EVENT" --tag "$TAG" --target "${TARGET:-aisquare-pipe}" --dry-run "${DRY_RUN:-true}"
 
   build:
     name: "build: ${{ matrix.package.name }}"
@@ -100,11 +110,12 @@ jobs:
       - name: Build
         env:
           PKG_PATH: ${{ matrix.package.path }}
-        run: python -m build --outdir dist "$PKG_PATH"
+        run: python scripts/release_packages.py build --path "$PKG_PATH" --outdir dist
 
-      # The wheel and sdist carry the name and version from this package's
-      # pyproject.toml, and their metadata renders on PyPI (--strict also
-      # fails on warnings, such as a missing readme).
+      # The wheel and sdist carry the planned name and version. The
+      # distribution's wheel RECORD holds every module under src/ and every
+      # connectors/<dir>/src/; a shim's wheel has no code and requires exactly
+      # aisquare-pipe[<name>]>=0.5.0. --strict also fails twine's warnings.
       - name: Check
         env:
           PKG_PATH: ${{ matrix.package.path }}
@@ -119,39 +130,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish-connectors:
-    name: "publish: ${{ matrix.package.name }}"
-    needs: [plan, build]
-    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.connectors != '[]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment:
-      name: pypi
-      url: https://pypi.org/project/${{ matrix.package.name }}/${{ matrix.package.version }}/
-    permissions:
-      contents: read
-      id-token: write # required for Trusted Publishing (OIDC)
-    strategy:
-      fail-fast: false
-      matrix:
-        package: ${{ fromJSON(needs.plan.outputs.connectors) }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist-${{ matrix.package.name }}
-          path: dist/
-
-      - name: Upload ${{ matrix.package.name }} ${{ matrix.package.version }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-
   publish-framework:
     name: "publish: aisquare-pipe"
-    needs: [plan, build, publish-connectors]
-    # Only after every connector upload succeeded (or there were none).
-    if: >-
-      !cancelled() && needs.plan.outputs.framework == 'true'
-      && needs.build.result == 'success'
-      && (needs.publish-connectors.result == 'success' || needs.publish-connectors.result == 'skipped')
+    needs: [plan, build]
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.framework == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
@@ -169,8 +151,35 @@ jobs:
       - name: Upload aisquare-pipe
         uses: pypa/gh-action-pypi-publish@release/v1
 
+  publish-shims:
+    name: "publish: ${{ matrix.package.name }}"
+    needs: [plan, build]
+    # Only on Run workflow with target "shims"; plan fails it unless
+    # aisquare-pipe 0.5.0 is already on PyPI and every shim's project exists.
+    if: needs.plan.outputs.upload == 'true' && needs.plan.outputs.shims != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/${{ matrix.package.name }}/${{ matrix.package.version }}/
+    permissions:
+      contents: read
+      id-token: write # required for Trusted Publishing (OIDC)
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.plan.outputs.shims) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-${{ matrix.package.name }}
+          path: dist/
+
+      - name: Upload ${{ matrix.package.name }} ${{ matrix.package.version }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+
   verify:
-    needs: [plan, build, publish-connectors, publish-framework]
+    needs: [plan, build, publish-framework, publish-shims]
     # Runs whether or not each upload job succeeded, and fails if any planned
     # upload isn't on PyPI. A failed build uploads nothing, and fails the run
     # by itself.

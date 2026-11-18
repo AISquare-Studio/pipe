@@ -1,10 +1,9 @@
-"""scripts/check_toolkits_extra.py: the [toolkits] extra lists every toolkit package, nothing else."""
+"""scripts/check_toolkits_extra.py: the [toolkits] extra pulls in every toolkit connector, nothing else."""
 
 from __future__ import annotations
 
 import importlib.util
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -27,63 +26,55 @@ def _load_script():
 ctx = _load_script()
 
 
-def _connector(
-    root: Path,
-    dirname: str,
+def _repo(
+    tmp_path: Path,
+    toolkits_extra: list[str] | None,
     *,
-    version: str = "0.1.0",
-    toolkit: bool,
-    toolkit_name: str | None = None,
-) -> None:
-    pkg = root / "connectors" / dirname
-    pkg.mkdir(parents=True)
-    module = f"aisquare_pipe_{dirname}"
-    toolkit_ep = (
-        f'[project.entry-points."aisquare_pipe.toolkits"]\n'
-        f'"{toolkit_name or dirname}" = "{module}.toolkit:Toolkit"\n'
-        if toolkit
-        else ""
-    )
-    (pkg / "pyproject.toml").write_text(
-        textwrap.dedent(
-            f"""\
-            [project]
-            name = "aisquare-pipe-{dirname}"
-            version = "{version}"
-
-            [project.entry-points."aisquare_pipe.connectors"]
-            {dirname}-source = "{module}.connector:Source"
-
-            """
-        )
-        + toolkit_ep
-    )
-
-
-def _repo(tmp_path: Path, toolkits_extra: list[str] | None) -> Path:
-    """A pipe checkout: alpha and beta register toolkits, plain does not."""
-    extras = ""
+    toolkit_names: dict[str, str] | None = None,
+    extras: tuple[str, ...] = ("alpha", "beta", "plain"),
+    dirs: tuple[str, ...] = ("alpha", "beta", "plain"),
+) -> Path:
+    """A pipe checkout: connectors alpha and beta register toolkits (named
+    ``toolkit_names[dir]``, default the dir), plain registers a connector only.
+    ``toolkits_extra`` is the [toolkits] list (None: no such extra)."""
+    toolkit_names = {"alpha": "alpha", "beta": "beta", **(toolkit_names or {})}
+    for d in dirs:
+        (tmp_path / "connectors" / d / "src" / f"aisquare_pipe_{d}").mkdir(parents=True)
+    lines = [
+        "[project]",
+        'name = "aisquare-pipe"',
+        'version = "0.5.0"',
+        "",
+        "[project.optional-dependencies]",
+    ]
+    lines += [f"{e} = []" for e in extras]
     if toolkits_extra is not None:
-        entries = ", ".join(f'"{e}"' for e in toolkits_extra)
-        extras = f"[project.optional-dependencies]\ntoolkits = [{entries}]\n"
-    (tmp_path / "pyproject.toml").write_text(
-        f'[project]\nname = "aisquare-pipe"\nversion = "0.4.0"\n\n{extras}'
-    )
-    _connector(tmp_path, "alpha", version="0.3.0", toolkit=True)
-    _connector(tmp_path, "beta", toolkit=True)
-    _connector(tmp_path, "plain", toolkit=False)
+        lines.append(
+            f"toolkits = [{', '.join(repr(e).replace(chr(39), chr(34)) for e in toolkits_extra)}]"
+        )
+    lines += ["", '[project.entry-points."aisquare_pipe.connectors"]']
+    lines += [f'"{d}-source" = "aisquare_pipe_{d}.connector:Source"' for d in dirs]
+    lines += ['mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"']
+    lines += ["", '[project.entry-points."aisquare_pipe.toolkits"]']
+    lines += [
+        f'"{name}" = "aisquare_pipe_{d}.toolkit:Toolkit"'
+        for d, name in toolkit_names.items()
+        if d in dirs
+    ]
+    lines += ['mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"']
+    (tmp_path / "pyproject.toml").write_text("\n".join(lines) + "\n")
     return tmp_path
 
 
-GOOD = ["aisquare-pipe-alpha>=0.3.0", "aisquare-pipe-beta>=0.1.0"]
+GOOD = ["aisquare-pipe[alpha,beta]"]
 
 
-def test_the_extra_on_this_branch_lists_every_toolkit_package(capsys):
+def test_the_extra_on_this_branch_pulls_in_every_toolkit_connector(capsys):
     assert ctx.check(REPO_ROOT) == []
     assert ctx.main(["--root", str(REPO_ROOT)]) == 0
     out = capsys.readouterr().out
     assert out.startswith("check_toolkits_extra: ok")
-    # The six toolkit packages of the native-connectors release, at least.
+    # The six toolkit connectors of the native-connectors release, at least.
     for name in (
         "github",
         "gmail",
@@ -92,13 +83,13 @@ def test_the_extra_on_this_branch_lists_every_toolkit_package(capsys):
         "onedrive",
         "slack",
     ):
-        assert f"aisquare-pipe-{name}" in out
+        assert name in out
 
 
-def test_the_extra_on_this_branch_names_exactly_the_toolkit_packages():
-    found = {ctx.canonical(p.name) for p in ctx.toolkit_packages(REPO_ROOT)}
-    assert {"aisquare-pipe-github", "aisquare-pipe-slack"} <= found
-    assert "aisquare-pipe-composio" not in found  # a connector, no toolkit
+def test_the_toolkit_connectors_on_this_branch():
+    found = {c.dir_name for c in ctx.toolkit_connectors(REPO_ROOT)}
+    assert {"github", "slack"} <= found
+    assert "composio" not in found  # a connector, no toolkit
 
 
 def test_a_well_formed_extra_passes(tmp_path):
@@ -108,57 +99,71 @@ def test_a_well_formed_extra_passes(tmp_path):
 
 
 def test_names_compare_as_pip_compares_them(tmp_path):
-    root = _repo(tmp_path, ["aisquare_pipe.Alpha>=0.3", "aisquare-pipe-beta[x]>=0.1.0"])
+    root = _repo(tmp_path, ["aisquare_pipe[Alpha]", "Aisquare.Pipe[beta]>=0.5"])
     assert ctx.check(root) == []
 
 
-def test_a_toolkit_package_missing_from_the_extra_fails(tmp_path, capsys):
-    root = _repo(tmp_path, ["aisquare-pipe-alpha>=0.3.0"])
+def test_the_framework_mock_is_not_a_toolkit_connector(tmp_path):
+    root = _repo(tmp_path, GOOD)
+    assert [c.dir_name for c in ctx.toolkit_connectors(root)] == ["alpha", "beta"]
+
+
+def test_a_toolkit_connector_missing_from_the_extra_fails(tmp_path, capsys):
+    root = _repo(tmp_path, ["aisquare-pipe[alpha]"])
     [problem] = ctx.check(root)
     assert "connectors/beta registers toolkit(s) beta" in problem
-    assert "'aisquare-pipe-beta>=0.1.0'" in problem
+    assert "[beta] is not in the toolkits extra" in problem
     assert ctx.main(["--root", str(root)]) == 1
     assert "1 problem(s)" in capsys.readouterr().err
 
 
-def test_a_new_toolkit_package_fails_until_it_is_added(tmp_path):
-    root = _repo(tmp_path, GOOD)
-    _connector(root, "gamma", version="0.2.0", toolkit=True)
+def test_a_new_toolkit_connector_fails_until_it_is_added(tmp_path):
+    root = _repo(
+        tmp_path,
+        GOOD,
+        dirs=("alpha", "beta", "plain", "gamma"),
+        extras=("alpha", "beta", "plain", "gamma"),
+        toolkit_names={"gamma": "gamma"},
+    )
     [problem] = ctx.check(root)
-    assert "aisquare-pipe-gamma is not in the toolkits extra" in problem
+    assert "connectors/gamma registers toolkit(s) gamma" in problem
+
+
+def test_a_toolkit_connector_needs_its_own_extra(tmp_path):
+    root = _repo(tmp_path, ["aisquare-pipe[alpha]"], extras=("alpha", "plain"))
+    problems = ctx.check(root)
+    assert any("connectors/beta has no [beta] extra" in p for p in problems), problems
 
 
 @pytest.mark.parametrize(
     "entry, says",
     [
-        ("aisquare-pipe-plain>=0.1.0", "no package under connectors/ registers"),
-        ("aisquare-pipe-nowhere>=0.1.0", "no package under connectors/ registers"),
+        ("aisquare-pipe[alpha,beta,plain]", "[plain] is not a toolkit connector"),
+        ("aisquare-pipe[alpha,beta,nowhere]", "aisquare-pipe has no [nowhere] extra"),
     ],
 )
 def test_an_entry_without_a_toolkit_fails(tmp_path, entry, says):
-    root = _repo(tmp_path, [*GOOD, entry])
+    root = _repo(tmp_path, [entry])
     [problem] = ctx.check(root)
     assert repr(entry) in problem and says in problem
 
 
 @pytest.mark.parametrize(
-    "entry, says",
+    "entry",
     [
-        ("aisquare-pipe-beta", "write it as 'aisquare-pipe-beta>=<floor>'"),
-        ("aisquare-pipe-beta==0.1.0", "write it as"),
-        ("aisquare-pipe-beta>=0.1.0,<1", "write it as"),
-        ("aisquare-pipe-beta>=0.2.0", "floor 0.2.0 is above aisquare-pipe-beta 0.1.0"),
-        ("aisquare-pipe-beta @ file:///x", "not a plain requirement"),
+        "aisquare-pipe-alpha>=0.3.0",
+        "requests>=2.31",
+        "aisquare-pipe[alpha] @ file:///x",
     ],
 )
-def test_an_entry_needs_a_floor_the_repo_satisfies(tmp_path, entry, says):
-    root = _repo(tmp_path, ["aisquare-pipe-alpha>=0.3.0", entry])
-    problems = ctx.check(root)
-    assert any(says in p for p in problems), problems
+def test_entries_other_than_a_self_reference_fail(tmp_path, entry):
+    root = _repo(tmp_path, [*GOOD, entry])
+    [problem] = ctx.check(root)
+    assert "write the toolkits as aisquare-pipe[<dir>,...]" in problem
 
 
 def test_a_duplicate_entry_fails(tmp_path):
-    root = _repo(tmp_path, [*GOOD, "aisquare_pipe_alpha>=0.1.0"])
+    root = _repo(tmp_path, [*GOOD, "aisquare-pipe[Alpha]"])
     [problem] = ctx.check(root)
     assert "listed twice" in problem
 
@@ -169,7 +174,7 @@ def test_no_extra_at_all_fails(tmp_path):
     assert "no [project.optional-dependencies] toolkits extra" in problem
 
 
-def test_dirs_lists_the_toolkit_packages_for_the_dev_install(tmp_path, capsys):
+def test_dirs_lists_the_toolkit_connectors(tmp_path, capsys):
     root = _repo(tmp_path, GOOD).resolve()
     assert ctx.main(["--root", str(root), "--dirs"]) == 0
     dirs = capsys.readouterr().out.split()
@@ -190,25 +195,22 @@ def test_the_script_holds_toolkits_to_pipes_name_rule():
 
 @pytest.mark.parametrize("name", ["led-ger", "Ledger", "led.ger", "l" * 65])
 def test_a_toolkit_name_hosts_cannot_route_fails(tmp_path, name):
-    root = _repo(tmp_path, [*GOOD, "aisquare-pipe-ledger>=0.1.0"])
-    _connector(root, "ledger", toolkit=True, toolkit_name=name)
+    root = _repo(tmp_path, GOOD, toolkit_names={"beta": name})
     [problem] = ctx.check(root)
-    assert f"connectors/ledger: toolkit entry point {name!r} must match" in problem
+    assert f"connectors/beta: toolkit entry point {name!r} must match" in problem
     assert TOOLKIT_NAME_RULE in problem and "no hyphens" in problem
     assert ctx.main(["--root", str(root)]) == 1
 
 
 @pytest.mark.parametrize("name", ["ledger", "led_ger", "l" * 64])
 def test_underscored_and_plain_toolkit_names_pass(tmp_path, name):
-    root = _repo(tmp_path, [*GOOD, "aisquare-pipe-ledger>=0.1.0"])
-    _connector(root, "ledger", toolkit=True, toolkit_name=name)
+    root = _repo(tmp_path, GOOD, toolkit_names={"beta": name})
     assert ctx.check(root) == []
 
 
 def test_connector_entry_points_may_keep_their_hyphens(tmp_path):
-    """Only the toolkits group is bound: every fixture package registers a
-    hyphenated ``<name>-source`` connector, and the repo passes."""
+    """Only the toolkits group is bound: every fixture connector registers a
+    hyphenated ``<dir>-source`` connector, and the repo passes."""
     root = _repo(tmp_path, GOOD)
-    text = (root / "connectors" / "alpha" / "pyproject.toml").read_text()
-    assert 'alpha-source = "' in text
+    assert '"alpha-source" = "' in (root / "pyproject.toml").read_text()
     assert ctx.check(root) == []

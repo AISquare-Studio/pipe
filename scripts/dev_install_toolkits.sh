@@ -1,32 +1,22 @@
 #!/usr/bin/env bash
-# Editable-install aisquare-pipe and every toolkit package from this checkout
-# into the active Python environment, in ONE pip resolve (so the toolkits'
-# `aisquare-pipe>=…` and a host's `aisquare-pipe[toolkits]` are met by the
-# local copies, not PyPI).
+# Editable-install aisquare-pipe from this checkout, with every toolkit's deps
+# ([toolkits]), into the active Python environment.
 #
-# The toolkit list is not typed here: scripts/check_toolkits_extra.py --dirs
-# reads it from connectors/*/pyproject.toml (every package registering an
-# `aisquare_pipe.toolkits` entry point), the same set CI holds the [toolkits]
-# extra to.
+# Every connector and toolkit ships inside the one aisquare-pipe distribution
+# (D8), so this is a single `pip install -e "<checkout>[toolkits]"`: a host's
+# `aisquare-pipe[toolkits]` is then met by the local copy, not PyPI.
+# scripts/check_toolkits_extra.py keeps [toolkits] complete in CI.
 #
 # Usage, from any venv (e.g. pipe-as-service's), with a pipe worktree at $P:
-#   $P/scripts/dev_install_toolkits.sh                          # framework + every toolkit
-#   $P/scripts/dev_install_toolkits.sh -e $P/connectors/composio  # extra pip args are passed on
-#   PYTHON=.venv/bin/python $P/scripts/dev_install_toolkits.sh    # a venv that is not active
+#   $P/scripts/dev_install_toolkits.sh                         # framework + every toolkit's deps
+#   $P/scripts/dev_install_toolkits.sh --no-deps               # extra pip args are passed on
+#   EXTRAS=full,toolkits $P/scripts/dev_install_toolkits.sh    # other extras ([full]: every connector)
+#   PYTHON=.venv/bin/python $P/scripts/dev_install_toolkits.sh   # a venv that is not active
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
+EXTRAS="${EXTRAS:-toolkits}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-args=(-e "$ROOT")
-while IFS= read -r dir; do
-  args+=(-e "$dir")
-done < <("$PYTHON" "$ROOT/scripts/check_toolkits_extra.py" --root "$ROOT" --dirs)
-
-if [ "${#args[@]}" -le 2 ]; then
-  echo "dev_install_toolkits: no toolkit packages found under $ROOT/connectors" >&2
-  exit 1
-fi
-
-echo "dev_install_toolkits: $PYTHON -m pip install ${args[*]} $*"
-"$PYTHON" -m pip install "${args[@]}" "$@"
+echo "dev_install_toolkits: $PYTHON -m pip install -e $ROOT[$EXTRAS] $*"
+"$PYTHON" -m pip install -e "$ROOT[$EXTRAS]" "$@"

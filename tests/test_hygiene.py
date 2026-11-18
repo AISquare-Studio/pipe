@@ -1,8 +1,13 @@
 """Tests for the Layer B hygiene checks (testing/hygiene.py) against
-tmp_path fake repo trees."""
+tmp_path fake repo trees.
+
+A fake repo mirrors the real layout (D8): one root pyproject (aisquare-pipe)
+packages every connectors/<dir>/src, declares its entry points and its
+[<dir>] extra; a connector's own pyproject holds tool settings only."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from urllib.parse import unquote
@@ -11,30 +16,22 @@ import pytest
 
 from aisquare.pipe.testing import hygiene
 from aisquare.pipe.testing.hygiene import (
+    DEV_INSTALL,
     INSTALL_BROKEN,
     INSTALL_MISSING,
     INSTALL_OK,
     ConnectorDir,
     DistInfo,
     _file_url_to_path,
+    check_framework_install,
     check_install_state,
     classify_install_state,
     find_repo_root,
     list_connector_dirs,
+    load_dist_info,
     run_hygiene_checks,
 )
-from aisquare.pipe.testing.validation import Severity
-
-GOOD_PYPROJECT = """\
-[project]
-name = "aisquare-pipe-good"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = ["aisquare-pipe>=0.1.0"]
-
-[project.entry-points."aisquare_pipe.connectors"]
-good-source = "aisquare_pipe_good.connector:GoodSource"
-"""
+from aisquare.pipe.testing.validation import DiscoveredConnector, Severity
 
 GOOD_CONNECTOR = '''\
 """Good connector."""
@@ -45,22 +42,44 @@ class GoodSource:
     version = "0.1.0"
 '''
 
-ROOT_PYPROJECT = """\
-[project]
-name = "aisquare-pipe"
-version = "0.1.0"
-
-[project.optional-dependencies]
-popular = ["aisquare-pipe-good"]
-full = ["aisquare-pipe[popular]"]
+TOOL_SETTINGS = """\
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 """
+
+_STATE = ".fixture-root.json"
+
+
+def _write_root(root: Path) -> None:
+    """Regenerate the root pyproject from the registered connectors."""
+    state = json.loads((root / _STATE).read_text())
+    where = ["src"] + [
+        f"connectors/{d}/src" for d, c in sorted(state.items()) if c["packaged"]
+    ]
+    extras = {d: c["deps"] for d, c in sorted(state.items()) if c["extra"]}
+    full = sorted(d for d, c in state.items() if c["extra"] and c["in_full"])
+    groups: dict[str, dict[str, str]] = {}
+    for c in state.values():
+        for group, eps in c["entry_points"].items():
+            groups.setdefault(group, {}).update(eps)
+    text = '[project]\nname = "aisquare-pipe"\nversion = "0.5.0"\n\n[project.optional-dependencies]\n'
+    text += "".join(
+        f"{json.dumps(d)} = {json.dumps(deps)}\n" for d, deps in extras.items()
+    )
+    text += f'popular = []\nfull = ["aisquare-pipe[{",".join(["popular", *full])}]"]\n'
+    for group, eps in sorted(groups.items()):
+        text += f'\n[project.entry-points."{group}"]\n'
+        text += "".join(f'{json.dumps(k)} = "{v}"\n' for k, v in sorted(eps.items()))
+    text += f"\n[tool.setuptools.packages.find]\nwhere = {json.dumps(where)}\n"
+    (root / "pyproject.toml").write_text(text, encoding="utf-8")
 
 
 def build_repo(tmp_path: Path) -> Path:
     """A minimal fake repo with one fully-compliant connector `good`."""
     root = tmp_path / "repo"
     (root / "connectors").mkdir(parents=True)
-    (root / "pyproject.toml").write_text(ROOT_PYPROJECT, encoding="utf-8")
+    (root / _STATE).write_text("{}")
+    _write_root(root)
     build_connector(root, "good")
     return root
 
@@ -69,28 +88,52 @@ def build_connector(
     root: Path,
     name: str,
     *,
-    pyproject: str | None = None,
+    pyproject: str | None = TOOL_SETTINGS,
     connector_py: str | None = None,
-    compliance: str | None = "from x import connector_compliance_suite\nconnector_compliance_suite(object)\n",
+    compliance: str
+    | None = "from x import connector_compliance_suite\nconnector_compliance_suite(object)\n",
+    entry_points: dict[str, dict[str, str]] | None = None,
+    packaged: bool = True,
+    extra: bool = True,
+    in_full: bool = True,
+    deps: list[str] | None = None,
 ) -> Path:
+    """A connectors/<name> tree, registered in the root pyproject unless told
+    otherwise (``packaged``/``extra``/``in_full``/``entry_points``)."""
     cdir = root / "connectors" / name
     safe = name.replace("-", "_")
     module = cdir / "src" / f"aisquare_pipe_{safe}"
     module.mkdir(parents=True)
     (cdir / "tests").mkdir()
-    (cdir / "pyproject.toml").write_text(
-        pyproject if pyproject is not None else GOOD_PYPROJECT.replace("good", name),
-        encoding="utf-8",
-    )
+    if pyproject is not None:
+        (cdir / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     (cdir / "README.md").write_text(f"# {name}\n", encoding="utf-8")
     (module / "__init__.py").write_text("", encoding="utf-8")
     (module / "connector.py").write_text(
-        connector_py if connector_py is not None else GOOD_CONNECTOR.replace("good", name),
+        connector_py
+        if connector_py is not None
+        else GOOD_CONNECTOR.replace("good", name),
         encoding="utf-8",
     )
     (cdir / "tests" / "__init__.py").write_text("", encoding="utf-8")
     if compliance is not None:
         (cdir / "tests" / "test_compliance.py").write_text(compliance, encoding="utf-8")
+    if entry_points is None:
+        entry_points = {
+            "aisquare_pipe.connectors": {
+                f"{name}-source": f"aisquare_pipe_{safe}.connector:{name.title().replace('-', '')}Source"
+            }
+        }
+    state = json.loads((root / _STATE).read_text())
+    state[name] = {
+        "packaged": packaged,
+        "extra": extra,
+        "in_full": in_full,
+        "deps": deps or [],
+        "entry_points": entry_points,
+    }
+    (root / _STATE).write_text(json.dumps(state))
+    _write_root(root)
     return cdir
 
 
@@ -106,6 +149,12 @@ def run(root: Path, name: str, dist: DistInfo | None = None) -> dict[str, object
 
 def _ok(results: dict, check_id: str) -> bool:
     return results[check_id].passed  # type: ignore[union-attr]
+
+
+def _errors(results: dict) -> list:
+    return [
+        r for r in results.values() if not r.passed and r.severity is Severity.ERROR
+    ]
 
 
 class TestRepoDiscovery:
@@ -128,61 +177,98 @@ class TestRepoDiscovery:
         build_connector(root, "my-svc")
         cdir = get_cdir(root, "my-svc")
         assert cdir.module_name == "aisquare_pipe_my_svc"
-        assert cdir.dist_name == "aisquare-pipe-my-svc"
+        assert cdir.extra == "my-svc"
+        assert cdir.requirement == cdir.dist_name == "aisquare-pipe[my-svc]"
+
+    def test_entry_points_are_read_from_the_root_pyproject_by_module(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(
+            root,
+            "both",
+            entry_points={
+                "aisquare_pipe.connectors": {
+                    "both-source": "aisquare_pipe_both.connector:BothSource"
+                },
+                "aisquare_pipe.toolkits": {
+                    "both": "aisquare_pipe_both.toolkit:BothToolkit"
+                },
+            },
+        )
+        cdir = get_cdir(root, "both")
+        assert cdir.entry_points("aisquare_pipe.connectors") == {
+            "both-source": "aisquare_pipe_both.connector:BothSource"
+        }
+        assert cdir.registers_toolkit and cdir.registers_connector
+        assert get_cdir(root, "good").declared_entry_points() == {"good-source"}
 
 
 class TestGoodTreePasses:
     def test_no_error_failures(self, tmp_path):
         root = build_repo(tmp_path)
-        results = run(root, "good", DistInfo(found=True, version="0.1.0"))
-        errors = [
-            r for r in results.values() if not r.passed and r.severity is Severity.ERROR
-        ]
-        assert errors == []
+        results = run(root, "good", DistInfo(found=True, version="0.5.0"))
+        assert _errors(results) == []
 
-    def test_tier_listed_passes_for_popular(self, tmp_path):
+    def test_tier_listed_passes_through_full(self, tmp_path):
         root = build_repo(tmp_path)
         assert _ok(run(root, "good"), "hygiene.tier-listed")
 
 
-class TestPyprojectRules:
-    def test_wrong_package_name(self, tmp_path):
+class TestPackagingRules:
+    def test_a_connector_pyproject_with_a_project_table_fails(self, tmp_path):
         root = build_repo(tmp_path)
         build_connector(
-            root, "bad", pyproject=GOOD_PYPROJECT.replace(
-                'name = "aisquare-pipe-good"', 'name = "aisquare_bad"'
-            )
+            root,
+            "bad",
+            pyproject='[build-system]\nrequires = ["setuptools"]\n\n[project]\nname = "aisquare-pipe-bad"\n'
+            + TOOL_SETTINGS,
         )
-        assert not _ok(run(root, "bad"), "hygiene.package-name")
+        result = run(root, "bad")["hygiene.not-a-package"]
+        assert not result.passed and "[build-system], [project]" in result.message
 
-    def test_missing_framework_dep(self, tmp_path):
+    def test_src_dir_not_packaged_fails(self, tmp_path):
         root = build_repo(tmp_path)
-        build_connector(
-            root, "bad", pyproject=GOOD_PYPROJECT.replace("good", "bad").replace(
-                'dependencies = ["aisquare-pipe>=0.1.0"]', "dependencies = []"
-            )
+        build_connector(root, "bad", packaged=False)
+        result = run(root, "bad")["hygiene.packaged"]
+        assert not result.passed and '"connectors/bad/src"' in result.message
+
+    def test_missing_extra_fails(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "bad", extra=False)
+        result = run(root, "bad")["hygiene.extra-declared"]
+        assert (
+            not result.passed and "aisquare-pipe[bad] does not exist" in result.message
         )
-        assert not _ok(run(root, "bad"), "hygiene.framework-dep")
+
+    def test_an_empty_extra_is_enough(self, tmp_path):
+        root = build_repo(tmp_path)
+        assert _ok(run(root, "good"), "hygiene.extra-declared")  # good = []
 
     def test_missing_entry_points(self, tmp_path):
         root = build_repo(tmp_path)
-        bad = GOOD_PYPROJECT.replace("good", "bad").split("[project.entry-points")[0]
-        build_connector(root, "bad", pyproject=bad)
+        build_connector(root, "bad", entry_points={})
         assert not _ok(run(root, "bad"), "hygiene.entry-points-registered")
 
-    def test_missing_requires_python(self, tmp_path):
+    def test_another_connectors_entry_point_does_not_count(self, tmp_path):
         root = build_repo(tmp_path)
         build_connector(
-            root, "bad", pyproject=GOOD_PYPROJECT.replace("good", "bad").replace(
-                'requires-python = ">=3.11"\n', ""
-            )
+            root,
+            "bad",
+            entry_points={
+                "aisquare_pipe.connectors": {"stolen": "aisquare_pipe_good.connector:X"}
+            },
         )
-        assert not _ok(run(root, "bad"), "hygiene.requires-python")
+        assert not _ok(run(root, "bad"), "hygiene.entry-points-registered")
 
     def test_unparseable_pyproject(self, tmp_path):
         root = build_repo(tmp_path)
         build_connector(root, "bad", pyproject="not [ valid toml")
         assert not _ok(run(root, "bad"), "hygiene.pyproject-parses")
+
+    def test_missing_pyproject(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(root, "bad", pyproject=None)
+        result = run(root, "bad")["hygiene.pyproject-parses"]
+        assert not result.passed and "pytest settings" in result.message
 
 
 class TestScaffoldFiles:
@@ -202,53 +288,49 @@ class TestScaffoldFiles:
     def test_module_name_mismatch(self, tmp_path):
         root = build_repo(tmp_path)
         cdir = build_connector(root, "bad")
-        (cdir / "src" / "aisquare_pipe_bad").rename(cdir / "src" / "aisquare_pipe_other")
+        (cdir / "src" / "aisquare_pipe_bad").rename(
+            cdir / "src" / "aisquare_pipe_other"
+        )
         assert not _ok(run(root, "bad"), "hygiene.module-name")
 
 
-TOOLKIT_ONLY_PYPROJECT = """\
-[project]
-name = "aisquare-pipe-kit"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = ["aisquare-pipe>=0.3.0"]
-
-[project.entry-points."aisquare_pipe.toolkits"]
-kit = "aisquare_pipe_kit.toolkit:KitToolkit"
-"""
-
-BOTH_PYPROJECT = GOOD_PYPROJECT.replace("good", "both") + """
-[project.entry-points."aisquare_pipe.toolkits"]
-both = "aisquare_pipe_both.toolkit:BothToolkit"
-"""
-
-TOOLKIT_COMPLIANCE = "from x import toolkit_compliance_suite\ntoolkit_compliance_suite(object)\n"
-
-
-def _errors(results: dict) -> list:
-    return [r for r in results.values() if not r.passed and r.severity is Severity.ERROR]
+TOOLKIT_ONLY = {
+    "aisquare_pipe.toolkits": {"kit": "aisquare_pipe_kit.toolkit:KitToolkit"}
+}
+BOTH = {
+    "aisquare_pipe.connectors": {
+        "both-source": "aisquare_pipe_both.connector:BothSource"
+    },
+    "aisquare_pipe.toolkits": {"both": "aisquare_pipe_both.toolkit:BothToolkit"},
+}
+TOOLKIT_COMPLIANCE = (
+    "from x import toolkit_compliance_suite\ntoolkit_compliance_suite(object)\n"
+)
 
 
 class TestToolkitPackages:
     def test_toolkit_only_package_passes_without_connector_py(self, tmp_path):
         root = build_repo(tmp_path)
         cdir = build_connector(
-            root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT, compliance=TOOLKIT_COMPLIANCE
+            root, "kit", entry_points=TOOLKIT_ONLY, compliance=TOOLKIT_COMPLIANCE
         )
         (cdir / "src" / "aisquare_pipe_kit" / "connector.py").unlink()
-        results = run(root, "kit", DistInfo(found=True, version="0.1.0"))
+        (cdir / "src" / "aisquare_pipe_kit" / "toolkit.py").write_text(
+            'class KitToolkit:\n    version = "0.1.0"\n', encoding="utf-8"
+        )
+        results = run(root, "kit", DistInfo(found=True, version="0.5.0"))
         assert _errors(results) == []
         assert _ok(results, "hygiene.entry-points-registered")
 
     def test_toolkit_package_needs_toolkit_compliance_suite(self, tmp_path):
         root = build_repo(tmp_path)
-        build_connector(root, "kit", pyproject=TOOLKIT_ONLY_PYPROJECT)  # connector suite only
+        build_connector(root, "kit", entry_points=TOOLKIT_ONLY)  # connector suite only
         result = run(root, "kit")["hygiene.scaffold-files"]
         assert not result.passed and "toolkit_compliance_suite" in result.message
 
     def test_connector_and_toolkit_need_both_suites(self, tmp_path):
         root = build_repo(tmp_path)
-        build_connector(root, "both", pyproject=BOTH_PYPROJECT)
+        build_connector(root, "both", entry_points=BOTH)
         result = run(root, "both")["hygiene.scaffold-files"]
         assert not result.passed
         assert "toolkit_compliance_suite" in result.message
@@ -265,8 +347,7 @@ class TestToolkitPackages:
 
     def test_package_without_any_entry_points_keeps_connector_rules(self, tmp_path):
         root = build_repo(tmp_path)
-        bad = GOOD_PYPROJECT.replace("good", "bad").split("[project.entry-points")[0]
-        cdir = build_connector(root, "bad", pyproject=bad)
+        cdir = build_connector(root, "bad", entry_points={})
         (cdir / "src" / "aisquare_pipe_bad" / "connector.py").unlink()
         results = run(root, "bad")
         assert not _ok(results, "hygiene.entry-points-registered")
@@ -313,45 +394,78 @@ class TestSourceCode:
 
 
 class TestVersions:
-    def test_version_sync_mismatch_via_source_scan(self, tmp_path):
+    """A connector's classes carry its own contract version, not the
+    distribution's: one version per connector, any value."""
+
+    def test_classes_of_one_connector_must_agree_via_source_scan(self, tmp_path):
         root = build_repo(tmp_path)
         build_connector(
             root,
             "bad",
-            connector_py='class BadSource:\n    name = "bad"\n    version = "9.9.9"\n',
+            connector_py=(
+                'class BadSource:\n    version = "0.1.0"\n\n\n'
+                'class BadSink:\n    version = "9.9.9"\n'
+            ),
         )
         result = run(root, "bad")["hygiene.version-sync"]
         assert not result.passed and "9.9.9" in result.message
 
-    def test_version_sync_via_loaded_class(self, tmp_path):
+    def test_a_connector_version_need_not_match_the_distribution(self, tmp_path):
+        root = build_repo(tmp_path)
+        build_connector(
+            root, "old", connector_py='class OldSource:\n    version = "0.1.0"\n'
+        )
+        results = run(root, "old", DistInfo(found=True, version="0.5.0"))
+        assert _ok(results, "hygiene.version-sync") and _ok(
+            results, "hygiene.version-set"
+        )
+
+    def test_version_sync_via_loaded_classes(self, tmp_path):
         root = build_repo(tmp_path)
         cdir = get_cdir(root, "good")
 
-        class FakeLoaded:
+        class FakeSource:
             version = "2.0.0"
 
-        FakeLoaded.__module__ = "aisquare_pipe_good.connector"
+        class FakeToolkit:
+            version = "2.1.0"
+
+        for cls in (FakeSource, FakeToolkit):
+            cls.__module__ = "aisquare_pipe_good.connector"
         results = {
             r.id: r
             for r in run_hygiene_checks(
-                cdir, root, DistInfo(found=False), {"good-source": FakeLoaded}
+                cdir, root, DistInfo(found=False), {"a": FakeSource, "b": FakeToolkit}
             )
         }
         assert not results["hygiene.version-sync"].passed
 
-    def test_stale_dist_version_warns(self, tmp_path):
+    def test_no_version_anywhere_warns(self, tmp_path):
         root = build_repo(tmp_path)
-        results = run(root, "good", DistInfo(found=True, version="0.0.9"))
-        stale = results["hygiene.dist-version-fresh"]
+        build_connector(root, "bad", connector_py="class BadSource:\n    pass\n")
+        result = run(root, "bad")["hygiene.version-set"]
+        assert not result.passed and result.severity is Severity.WARNING
+
+    def test_stale_framework_install_warns(self, tmp_path, monkeypatch):
+        root = build_repo(tmp_path)
+        monkeypatch.setattr(
+            hygiene, "_framework_dist_facts", lambda: (True, "0.4.9", None)
+        )
+        (stale,) = check_framework_install(root)
+        assert stale.id == "hygiene.dist-version-fresh"
         assert not stale.passed and stale.severity is Severity.WARNING
+        monkeypatch.setattr(
+            hygiene, "_framework_dist_facts", lambda: (True, "0.5.0", None)
+        )
+        assert check_framework_install(root) == []
 
 
 class TestTier:
-    def test_unlisted_connector_warns(self, tmp_path):
+    def test_a_connector_missing_from_full_fails(self, tmp_path):
         root = build_repo(tmp_path)
-        build_connector(root, "niche")
+        build_connector(root, "niche", in_full=False)
         result = run(root, "niche")["hygiene.tier-listed"]
-        assert not result.passed and result.severity is Severity.WARNING
+        assert not result.passed and result.severity is Severity.ERROR
 
 
 class TestLiveMarkers:
@@ -367,8 +481,8 @@ class TestLiveMarkers:
 
     def test_live_file_with_marker_passes(self, tmp_path):
         root = build_repo(tmp_path)
-        pyproject = GOOD_PYPROJECT.replace("good", "ok") + (
-            "\n[tool.pytest.ini_options]\n"
+        pyproject = (
+            "[tool.pytest.ini_options]\n"
             'markers = ["live: hits real APIs"]\n'
             "addopts = \"-m 'not live'\"\n"
         )
@@ -379,32 +493,103 @@ class TestLiveMarkers:
         assert _ok(results, "hygiene.live-deselected-by-default")
 
 
+def _installed(cdir: ConnectorDir, **kw) -> DistInfo:
+    return DistInfo(
+        found=True,
+        version="0.5.0",
+        installed_entry_points=cdir.declared_entry_points(),
+        **kw,
+    )
+
+
 class TestInstallState:
     @pytest.fixture
     def cdir(self, tmp_path) -> ConnectorDir:
         return get_cdir(build_repo(tmp_path), "good")
 
-    def test_missing(self, cdir):
+    def test_framework_not_installed(self, cdir):
         assert classify_install_state(cdir, DistInfo(found=False)) == INSTALL_MISSING
         result = check_install_state(cdir, DistInfo(found=False))[0]
-        assert not result.passed and "pip install -e connectors/good" in result.message
+        assert not result.passed and "aisquare-pipe is not installed" in result.message
+        assert DEV_INSTALL in result.message
 
-    def test_ok_editable_path_matches(self, cdir):
-        dist = DistInfo(found=True, version="0.1.0", editable_path=cdir.path)
+    def test_extra_not_installed_is_missing(self, cdir):
+        dist = _installed(cdir, missing_requirements=["good-sdk"])
+        assert classify_install_state(cdir, dist) == INSTALL_MISSING
+        result = check_install_state(cdir, dist)[0]
+        assert "aisquare-pipe[good] is missing good-sdk" in result.message
+
+    def test_ok_editable_install_of_this_checkout(self, cdir):
+        dist = _installed(cdir, editable_path=cdir.path.parents[1])
         assert classify_install_state(cdir, dist) == INSTALL_OK
 
-    def test_broken_editable_path_elsewhere(self, cdir, tmp_path):
-        dist = DistInfo(found=True, version="0.1.0", editable_path=tmp_path / "old" / "good")
+    def test_broken_install_of_another_checkout(self, cdir, tmp_path):
+        dist = _installed(cdir, editable_path=tmp_path / "old-repo")
         assert classify_install_state(cdir, dist) == INSTALL_BROKEN
         result = check_install_state(cdir, dist)[0]
-        assert not result.passed and "repo moved" in result.message
+        assert not result.passed and "not this checkout" in result.message
 
     def test_broken_ep_load_errors(self, cdir):
-        dist = DistInfo(found=True, version="0.1.0", ep_load_errors={"good-source": "ModuleNotFoundError"})
+        dist = _installed(cdir, ep_load_errors={"good-source": "SyntaxError"})
         assert classify_install_state(cdir, dist) == INSTALL_BROKEN
 
-    def test_non_editable_install_ok(self, cdir):
-        assert classify_install_state(cdir, DistInfo(found=True, version="0.1.0")) == INSTALL_OK
+    def test_declared_but_not_installed_entry_points_are_stale(self, cdir):
+        dist = DistInfo(found=True, version="0.5.0", installed_entry_points=set())
+        assert classify_install_state(cdir, dist) == INSTALL_BROKEN
+        result = check_install_state(cdir, dist)[0]
+        assert "good-source are declared but not installed" in result.message
+
+    def test_install_from_a_wheel_is_ok(self, cdir):
+        assert classify_install_state(cdir, _installed(cdir)) == INSTALL_OK
+
+
+def _ep(
+    name: str, value: str, *, error: str | None = None, missing=()
+) -> DiscoveredConnector:
+    return DiscoveredConnector(
+        ep_name=name,
+        ep_value=value,
+        dist_name="aisquare-pipe",
+        dist_version="0.5.0",
+        cls=None if error else object,
+        load_error=error,
+        missing_requirements=tuple(missing),
+    )
+
+
+class TestLoadDistInfo:
+    def test_attributes_entry_points_by_module_and_separates_missing_extras(
+        self, tmp_path, monkeypatch
+    ):
+        root = build_repo(tmp_path)
+        build_connector(root, "sdk", deps=["sdk-lib>=1"])
+        monkeypatch.setattr(
+            hygiene, "_framework_dist_facts", lambda: (True, "0.5.0", root)
+        )
+        discovered = [
+            _ep("good-source", "aisquare_pipe_good.connector:GoodSource"),
+            _ep(
+                "sdk-source",
+                "aisquare_pipe_sdk.connector:SdkSource",
+                error="ModuleNotFoundError: No module named 'sdk_lib'",
+                missing=["sdk-lib"],
+            ),
+            _ep("mock-source", "aisquare.pipe.testing.mock_connectors:MockSource"),
+        ]
+        good = load_dist_info(get_cdir(root, "good"), discovered)
+        assert (
+            good.installed_entry_points == {"good-source"} and good.ep_load_errors == {}
+        )
+        sdk = load_dist_info(get_cdir(root, "sdk"), discovered)
+        assert sdk.missing_requirements == ["sdk-lib"] and sdk.ep_load_errors == {}
+        assert classify_install_state(get_cdir(root, "sdk"), sdk) == INSTALL_MISSING
+
+    def test_framework_not_installed(self, tmp_path, monkeypatch):
+        root = build_repo(tmp_path)
+        monkeypatch.setattr(
+            hygiene, "_framework_dist_facts", lambda: (False, None, None)
+        )
+        assert load_dist_info(get_cdir(root, "good"), []) == DistInfo(found=False)
 
 
 class TestFileUrlToPath:

@@ -1,56 +1,68 @@
 #!/usr/bin/env python3
-"""The packages this monorepo publishes to PyPI, and the checks around publishing them.
+"""What this repo publishes to PyPI, and the checks around publishing it.
 
-``.github/workflows/publish.yml`` takes its build matrix from ``plan``, so no
-package can be left out of a release. A package is the root ``pyproject.toml``
-(``aisquare-pipe``) plus every ``connectors/*/pyproject.toml``.
+From 0.5.0 the repo publishes ONE distribution, ``aisquare-pipe``, which
+carries the framework and every connector (D8). The ten connectors that were
+once their own PyPI projects get one last *shim* release each: no code, just
+a dependency on ``aisquare-pipe[<name>]``, so ``pip install aisquare-pipe-<name>``
+keeps working. ``.github/workflows/publish.yml`` drives everything from here.
 
 Subcommands:
 
-    plan        List every package and check the set: each version is static
-                and valid, each ``aisquare-pipe*`` requirement between the
-                packages is satisfied by a version declared here, and on a
-                release the tag is ``v<aisquare-pipe version>``. With ``--pypi``,
-                look each version up on PyPI and decide what to upload. Writes
-                GitHub Actions outputs and a step summary when run in Actions.
-    check-dist  A built dist directory holds exactly one wheel and one sdist,
-                both named for the package's declared name and version.
-    verify      After an upload: each planned upload is on PyPI, with the
-                sha256 of the file this run built.
-    coverage    Every ``aisquare-pipe*`` requirement of a consumer
-                (pipe-as-service's pyproject.toml / requirements.in /
-                requirements.lock), followed through extras and the packages'
-                own dependencies, is a package here, at a declared version
-                that satisfies it.
+    plan         What a publish run builds and uploads. ``--target aisquare-pipe``
+                 (the default): the distribution; it checks the version is
+                 static and valid, the extras that name each other exist, and
+                 on a release that the tag is ``v<version>``. ``--target shims``:
+                 the ten shim projects. With ``--pypi``, look each version up
+                 on PyPI. Writes GitHub Actions outputs and a step summary.
+    build        Build one planned package (the distribution, or a shim) into
+                 a dist directory.
+    check-dist   A built dist directory holds exactly one wheel and one sdist
+                 of the package at its version. For the distribution, the
+                 wheel's RECORD holds every module under ``src/`` and every
+                 ``connectors/<dir>/src/``. For a shim, the wheel has no code
+                 and requires exactly ``aisquare-pipe[<name>]>=<floor>``.
+    verify       After an upload: each planned upload is on PyPI, with the
+                 sha256 of the file this run built.
+    coverage     Every ``aisquare-pipe*`` requirement of a consumer
+                 (pipe-as-service's pyproject.toml / requirements.in /
+                 requirements.lock) is met by this tree: the distribution at
+                 its version with the extras asked for, or a shim.
 
 Examples:
 
     python scripts/release_packages.py plan
-    python scripts/release_packages.py plan --pypi --event release --tag v0.4.0
-    python scripts/release_packages.py check-dist --path connectors/slack dist/
+    python scripts/release_packages.py plan --pypi --event release --tag v0.5.0
+    python scripts/release_packages.py plan --pypi --target shims --event workflow_dispatch
+    python scripts/release_packages.py build --path . --outdir dist/
+    python scripts/release_packages.py check-dist --path . dist/
     python scripts/release_packages.py coverage \\
-        --pipe-root . --pipe-ref origin/release/pipe-router \\
-        --consumer-root ../pipe-as-service --consumer-ref origin/release/pipe-router
+        --pipe-root . --consumer-root ../pipe-as-service --consumer-ref origin/release/pipe-router
 
-Needs ``packaging`` (pytest, build and twine all depend on it). Reads files
-only: nothing is imported from the packages and nothing is uploaded.
+Needs ``packaging`` (pytest, build and twine all depend on it), and ``build``
+for the build subcommand. Nothing here uploads anything.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from email.parser import Parser
 from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -63,19 +75,41 @@ from packaging.utils import (
 )
 from packaging.version import InvalidVersion, Version
 
-FAMILY = "aisquare-pipe"  # every distribution here is this or aisquare-pipe-<name>
+FRAMEWORK = "aisquare-pipe"
 PYPI = "https://pypi.org"
 USER_AGENT = "aisquare-pipe-release-check (+https://github.com/AISquare-Studio/pipe)"
 
-# A pip-compile lock line: ``name==version \`` (extras are stripped by --strip-extras,
-# but tolerate them). Comments and hash lines are indented and never match.
+TARGET_FRAMEWORK = "aisquare-pipe"
+TARGET_SHIMS = "shims"
+
+#: The connectors that were their own PyPI projects (aisquare-pipe-<name>)
+#: before 0.5.0. Fixed: no other connector ever gets a PyPI project.
+SHIM_PROJECTS = (
+    "composio",
+    "docusign",
+    "dropbox",
+    "gateway",
+    "github",
+    "graphify",
+    "local",
+    "n8n",
+    "onedrive",
+    "salesforce",
+)
+#: Each shim's version (above every per-connector release on PyPI, the
+#: highest being aisquare-pipe-n8n 0.2.1) and the aisquare-pipe it requires.
+SHIM_VERSION = "0.5.0"
+SHIM_FLOOR = "0.5.0"
+
+# A pip-compile lock line: ``name==version \``. Comments and hash lines are
+# indented and never match.
 _LOCK_PIN = re.compile(
     r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==(?P<version>[^\s\\;]+)"
 )
 
 
 class ReleaseError(Exception):
-    """The package set can't be read or released as it stands."""
+    """The package can't be read or released as it stands."""
 
 
 # --------------------------------------------------------------------------- trees
@@ -85,10 +119,6 @@ class Tree:
     """Read-only view of a checkout: a directory on disk or a git ref."""
 
     def read(self, rel: str) -> str | None:
-        raise NotImplementedError
-
-    def connector_dirs(self) -> list[str]:
-        """``connectors/<name>`` for each connector dir holding a pyproject.toml."""
         raise NotImplementedError
 
     def describe(self) -> str:
@@ -103,16 +133,6 @@ class FsTree(Tree):
         path = self.root / rel
         return path.read_text(encoding="utf-8") if path.is_file() else None
 
-    def connector_dirs(self) -> list[str]:
-        base = self.root / "connectors"
-        if not base.is_dir():
-            return []
-        return sorted(
-            f"connectors/{d.name}"
-            for d in base.iterdir()
-            if (d / "pyproject.toml").is_file()
-        )
-
     def describe(self) -> str:
         return str(self.root)
 
@@ -122,29 +142,14 @@ class GitTree(Tree):
     repo: Path
     ref: str
 
-    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(self.repo), *args],
+    def read(self, rel: str) -> str | None:
+        done = subprocess.run(
+            ["git", "-C", str(self.repo), "show", f"{self.ref}:{rel}"],
             capture_output=True,
             text=True,
             check=False,
         )
-
-    def read(self, rel: str) -> str | None:
-        done = self._git("show", f"{self.ref}:{rel}")
         return done.stdout if done.returncode == 0 else None
-
-    def connector_dirs(self) -> list[str]:
-        done = self._git("ls-tree", "-r", "--name-only", self.ref, "--", "connectors")
-        if done.returncode != 0:
-            raise ReleaseError(
-                f"git ls-tree {self.ref} in {self.repo}: {done.stderr.strip()}"
-            )
-        found = (
-            re.fullmatch(r"(connectors/[^/]+)/pyproject\.toml", line)
-            for line in done.stdout.splitlines()
-        )
-        return sorted(m.group(1) for m in found if m)
 
     def describe(self) -> str:
         return f"{self.repo}@{self.ref}"
@@ -159,8 +164,8 @@ def make_tree(root: str, ref: str | None) -> Tree:
 
 @dataclass(frozen=True)
 class Package:
-    path: str  # "." or "connectors/<name>", relative to the repo root
-    name: str  # the distribution name as its pyproject spells it
+    path: str  # "." for the distribution, "shims/<name>" for a shim
+    name: str
     version: str
     dependencies: tuple[str, ...] = ()
     extras: dict[str, tuple[str, ...]] = field(default_factory=dict)
@@ -173,42 +178,48 @@ class Package:
     def is_framework(self) -> bool:
         return self.path == "."
 
+    @property
+    def is_shim(self) -> bool:
+        return self.path.startswith("shims/")
+
+    @property
+    def shim_of(self) -> str:
+        """The connector a shim stands for (``shims/<name>`` → ``<name>``)."""
+        return self.path.removeprefix("shims/")
+
     def matrix_entry(self) -> dict[str, str]:
         return {"path": self.path, "name": self.name, "version": self.version}
 
 
-def _load_package(tree: Tree, path: str) -> Package:
-    rel = "pyproject.toml" if path == "." else f"{path}/pyproject.toml"
-    text = tree.read(rel)
+def framework_package(tree: Tree) -> Package:
+    """The distribution, from the root pyproject."""
+    text = tree.read("pyproject.toml")
     if text is None:
-        raise ReleaseError(f"{rel}: not found in {tree.describe()}")
+        raise ReleaseError(f"pyproject.toml: not found in {tree.describe()}")
     try:
         project = tomllib.loads(text).get("project", {})
     except tomllib.TOMLDecodeError as exc:
-        raise ReleaseError(f"{rel}: {exc}") from exc
+        raise ReleaseError(f"pyproject.toml: {exc}") from exc
     name, version = project.get("name"), project.get("version")
     if "version" in project.get("dynamic", []) or not isinstance(version, str):
         raise ReleaseError(
-            f"{rel}: [project] version must be a static string; the publish run reads it "
-            "from here to decide what to upload"
+            "pyproject.toml: [project] version must be a static string; the publish run "
+            "reads it from here to decide what to upload"
         )
-    if not isinstance(name, str):
-        raise ReleaseError(f"{rel}: [project] has no name")
+    if not isinstance(name, str) or canonicalize_name(name) != FRAMEWORK:
+        raise ReleaseError(f"the root pyproject.toml must be {FRAMEWORK}, not {name!r}")
     try:
         Version(version)
     except InvalidVersion as exc:
         raise ReleaseError(
-            f"{rel}: version {version!r} is not a PEP 440 version"
+            f"pyproject.toml: version {version!r} is not a PEP 440 version"
         ) from exc
-    key = canonicalize_name(name)
-    if key != FAMILY and not key.startswith(f"{FAMILY}-"):
-        raise ReleaseError(f"{rel}: {name!r} is not {FAMILY} or {FAMILY}-<name>")
     extras = {
-        str(extra): tuple(reqs)
+        canonicalize_name(str(extra)): tuple(reqs)
         for extra, reqs in project.get("optional-dependencies", {}).items()
     }
     return Package(
-        path=path,
+        path=".",
         name=name,
         version=version,
         dependencies=tuple(project.get("dependencies", [])),
@@ -216,22 +227,26 @@ def _load_package(tree: Tree, path: str) -> Package:
     )
 
 
-def discover(tree: Tree) -> list[Package]:
-    """Every package in the tree: the framework first, then connectors by directory."""
-    packages = [_load_package(tree, ".")]
-    packages += [_load_package(tree, d) for d in tree.connector_dirs()]
-    seen: dict[str, str] = {}
-    for pkg in packages:
-        if pkg.key in seen:
-            raise ReleaseError(
-                f"{pkg.path} and {seen[pkg.key]} both declare {pkg.name}"
-            )
-        seen[pkg.key] = pkg.path
-    if not packages[0].is_framework or packages[0].key != FAMILY:
-        raise ReleaseError(
-            f"the root pyproject.toml must be {FAMILY}, not {packages[0].name}"
+def shim_packages() -> list[Package]:
+    return [
+        Package(
+            path=f"shims/{name}",
+            name=f"{FRAMEWORK}-{name}",
+            version=SHIM_VERSION,
+            dependencies=(f"{FRAMEWORK}[{name}]>={SHIM_FLOOR}",),
         )
-    return packages
+        for name in SHIM_PROJECTS
+    ]
+
+
+def packages_for(tree: Tree, target: str) -> list[Package]:
+    if target == TARGET_FRAMEWORK:
+        return [framework_package(tree)]
+    if target == TARGET_SHIMS:
+        return shim_packages()
+    raise ReleaseError(
+        f"unknown target {target!r} ({TARGET_FRAMEWORK} or {TARGET_SHIMS})"
+    )
 
 
 def _family_requirement(spec: str) -> Requirement | None:
@@ -241,43 +256,90 @@ def _family_requirement(spec: str) -> Requirement | None:
     except InvalidRequirement:
         return None
     key = canonicalize_name(req.name)
-    return req if key == FAMILY or key.startswith(f"{FAMILY}-") else None
+    return req if key == FRAMEWORK or key.startswith(f"{FRAMEWORK}-") else None
 
 
 def _satisfies(req: Requirement, version: str) -> bool:
     return req.specifier.contains(Version(version), prereleases=True)
 
 
-def internal_problems(packages: Sequence[Package]) -> list[str]:
-    """Each aisquare-pipe* requirement a package declares (dependencies and extras)
-    must name a package here, at a declared version that satisfies it. Otherwise
-    this set, uploaded as it stands, could not be installed together."""
-    by_key = {p.key: p for p in packages}
-    problems = []
-    for pkg in packages:
-        declared = [("dependencies", s) for s in pkg.dependencies]
-        declared += [
-            (f"[{extra}]", s) for extra, specs in pkg.extras.items() for s in specs
-        ]
-        for where, spec in declared:
+def connector_dirs(root: Path) -> list[str]:
+    """Every ``connectors/<dir>/`` with a ``src/`` (the connectors the wheel carries)."""
+    base = root / "connectors"
+    if not base.is_dir():
+        return []
+    return sorted(
+        d.name
+        for d in base.iterdir()
+        if (d / "src").is_dir() and not d.name.startswith((".", "_"))
+    )
+
+
+def bundle(framework: Package, extra: str) -> set[str]:
+    """Every extra ``extra`` pulls in through ``aisquare-pipe[...]`` references,
+    itself included (canonical names)."""
+    seen: set[str] = set()
+    todo = [canonicalize_name(extra)]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for spec in framework.extras.get(name, ()):
             req = _family_requirement(spec)
-            if req is None:
-                continue
-            target = by_key.get(canonicalize_name(req.name))
-            if target is None:
+            if req is not None and canonicalize_name(req.name) == FRAMEWORK:
+                todo += [canonicalize_name(e) for e in req.extras]
+    return seen
+
+
+def internal_problems(framework: Package, tree: Tree | None = None) -> list[str]:
+    """Problems in the distribution's own metadata that would make it
+    uninstallable, or not what it claims:
+
+    - an ``aisquare-pipe[...]`` reference (``[full]`` → ``[popular]``) names an
+      extra that doesn't exist, or a version this one isn't;
+    - a dependency on another ``aisquare-pipe-*`` distribution (every connector
+      ships inside, so it would pull in an old per-connector copy);
+    - given a working tree: a ``connectors/<dir>/`` with no ``[<dir>]`` extra,
+      or a ``[full]`` that doesn't pull in every connector's extra.
+    """
+    problems = []
+    declared = [("dependencies", s) for s in framework.dependencies]
+    declared += [
+        (f"[{extra}]", s) for extra, specs in framework.extras.items() for s in specs
+    ]
+    for where, spec in declared:
+        req = _family_requirement(spec)
+        if req is None:
+            continue
+        if canonicalize_name(req.name) != FRAMEWORK:
+            problems.append(
+                f"{framework.name} {where} requires {spec!r}: connectors ship inside "
+                f"{FRAMEWORK}; require {FRAMEWORK}[<name>] instead"
+            )
+            continue
+        if not _satisfies(req, framework.version):
+            problems.append(
+                f"{framework.name} {where} requires {spec!r}, but this is {framework.version}"
+            )
+        for extra in req.extras:
+            if canonicalize_name(extra) not in framework.extras:
                 problems.append(
-                    f"{pkg.name} {where} requires {spec!r}: no package here is named {req.name}"
+                    f"{framework.name} {where} requires {spec!r}: there is no [{extra}] extra"
                 )
-            elif not _satisfies(req, target.version):
-                problems.append(
-                    f"{pkg.name} {where} requires {spec!r}, but {target.path} declares "
-                    f"{target.name} {target.version}"
-                )
-            for extra in req.extras:
-                if target is not None and extra not in target.extras:
-                    problems.append(
-                        f"{pkg.name} {where} requires {spec!r}: {target.name} has no [{extra}] extra"
-                    )
+    if isinstance(tree, FsTree):
+        dirs = connector_dirs(tree.root)
+        missing = [d for d in dirs if canonicalize_name(d) not in framework.extras]
+        problems += [
+            f"connectors/{d}/ has no [{d}] extra in the root pyproject.toml"
+            for d in missing
+        ]
+        full = bundle(framework, "full")
+        problems += [
+            f"[full] doesn't pull in [{d}]: it must carry every connector's deps"
+            for d in dirs
+            if d not in missing and canonicalize_name(d) not in full
+        ]
     return problems
 
 
@@ -309,7 +371,7 @@ def http_fetch(
 
 
 # A package version's state on PyPI.
-NEW_PROJECT = "new project"  # the project doesn't exist: the upload needs a pending trusted publisher
+NEW_PROJECT = "new project"  # the project doesn't exist
 NEW_VERSION = "new version"  # the project exists, this version doesn't
 PUBLISHED = "published"  # this exact version is on PyPI: nothing to upload
 UNKNOWN = "unknown"  # the lookup failed (dry runs only; a real run stops instead)
@@ -324,8 +386,9 @@ class PypiState:
     detail: str = ""
 
 
-def pypi_state(pkg: Package, fetch: Fetch) -> PypiState:
-    status, body = fetch(f"{PYPI}/pypi/{pkg.key}/{pkg.version}/json")
+def pypi_state(name: str, version: str, fetch: Fetch) -> PypiState:
+    key = canonicalize_name(name)
+    status, body = fetch(f"{PYPI}/pypi/{key}/{version}/json")
     if status == 200:
         files = {
             u["filename"]: u["digests"]["sha256"]
@@ -333,18 +396,18 @@ def pypi_state(pkg: Package, fetch: Fetch) -> PypiState:
         }
         if not files:
             raise ReleaseError(
-                f"{pkg.name} {pkg.version} is registered on PyPI with no files. PyPI never "
+                f"{name} {version} is registered on PyPI with no files. PyPI never "
                 "accepts a filename twice, so this version can't be uploaded: bump it"
             )
         return PypiState(PUBLISHED, files)
     if status != 404:
-        raise ReleaseError(f"PyPI lookup of {pkg.name} {pkg.version}: HTTP {status}")
-    status, _ = fetch(f"{PYPI}/pypi/{pkg.key}/json")
+        raise ReleaseError(f"PyPI lookup of {name} {version}: HTTP {status}")
+    status, _ = fetch(f"{PYPI}/pypi/{key}/json")
     if status == 404:
         return PypiState(NEW_PROJECT)
     if status == 200:
         return PypiState(NEW_VERSION)
-    raise ReleaseError(f"PyPI lookup of {pkg.name}: HTTP {status}")
+    raise ReleaseError(f"PyPI lookup of {name}: HTTP {status}")
 
 
 # --------------------------------------------------------------------------- plan
@@ -352,6 +415,7 @@ def pypi_state(pkg: Package, fetch: Fetch) -> PypiState:
 
 @dataclass
 class Plan:
+    target: str
     packages: list[Package]
     upload: bool  # a real publish run (not a dry run)
     states: dict[str, PypiState] = field(default_factory=dict)  # by package key
@@ -369,22 +433,21 @@ class Plan:
     def outputs(self) -> dict[str, str]:
         uploads = self.to_upload() if self.upload else []
         return {
+            "target": self.target,
             "packages": json.dumps([p.matrix_entry() for p in self.packages]),
             "upload": json.dumps(self.upload and bool(uploads)),
-            "connectors": json.dumps(
-                [p.matrix_entry() for p in uploads if not p.is_framework]
-            ),
             "framework": json.dumps(any(p.is_framework for p in uploads)),
+            "shims": json.dumps([p.matrix_entry() for p in uploads if p.is_shim]),
             "uploads": json.dumps([p.matrix_entry() for p in uploads]),
         }
 
     def summary(self) -> str:
         mode = "publish" if self.upload else "dry run (nothing is uploaded)"
         lines = [
-            f"### PyPI {mode}",
+            f"### PyPI {mode}: {self.target}",
             "",
-            "| Package | Path | Version | On PyPI | This run |",
-            "|---|---|---|---|---|",
+            "| Package | Version | On PyPI | This run |",
+            "|---|---|---|---|",
         ]
         for p in self.packages:
             st = self.states.get(p.key)
@@ -395,15 +458,9 @@ class Plan:
             elif st.state == UNKNOWN:
                 on_pypi, action = f"lookup failed ({st.detail})", "build + check"
             else:
-                on_pypi = (
-                    "no (new project: needs a pending trusted publisher)"
-                    if st.state == NEW_PROJECT
-                    else "no"
-                )
+                on_pypi = "no (new project)" if st.state == NEW_PROJECT else "no"
                 action = "**upload**" if self.upload else "would upload"
-            lines.append(
-                f"| `{p.name}` | `{p.path}` | {p.version} | {on_pypi} | {action} |"
-            )
+            lines.append(f"| `{p.name}` | {p.version} | {on_pypi} | {action} |")
         for title, items in (
             ("Problems (the run fails)", self.problems),
             ("Warnings", self.warnings),
@@ -420,44 +477,152 @@ def make_plan(
     tag: str = "",
     dry_run: bool = True,
     fetch: Fetch | None = None,
+    target: str = TARGET_FRAMEWORK,
 ) -> Plan:
     """What a publish run does. ``fetch`` is None to skip the PyPI lookups."""
-    packages = discover(tree)
-    upload = event == "release" or (event == "workflow_dispatch" and not dry_run)
-    plan = Plan(packages=packages, upload=upload)
-    plan.problems += internal_problems(packages)
-    framework = packages[0]
-    if event == "release" and tag != f"v{framework.version}":
-        plan.problems.append(
-            f"release tag {tag!r} does not match {framework.name} {framework.version} in "
-            f"pyproject.toml: tag the release v{framework.version}, or bump pyproject.toml "
-            "first (publish connectors alone with Run workflow, dry-run unticked)"
+    if event == "release":
+        target = (
+            TARGET_FRAMEWORK  # a GitHub Release only ever publishes the distribution
         )
+    packages = packages_for(tree, target)
+    upload = event == "release" or (event == "workflow_dispatch" and not dry_run)
+    plan = Plan(target=target, packages=packages, upload=upload)
+    if target == TARGET_FRAMEWORK:
+        framework = packages[0]
+        plan.problems += internal_problems(framework, tree)
+        if event == "release" and tag != f"v{framework.version}":
+            plan.problems.append(
+                f"release tag {tag!r} does not match {framework.name} {framework.version} in "
+                f"pyproject.toml: tag the release v{framework.version}, or bump pyproject.toml first"
+            )
     if upload and fetch is None:
         plan.problems.append("a publish run must look versions up on PyPI (--pypi)")
     if fetch is None:
         return plan
     for pkg in packages:
         try:
-            plan.states[pkg.key] = pypi_state(pkg, fetch)
+            plan.states[pkg.key] = pypi_state(pkg.name, pkg.version, fetch)
         except ReleaseError as exc:
             if upload:
                 plan.problems.append(str(exc))
             else:
                 plan.states[pkg.key] = PypiState(UNKNOWN, detail=str(exc))
                 plan.warnings.append(str(exc))
+    for pkg in packages:
+        if plan.states.get(pkg.key, PypiState(UNKNOWN)).state == NEW_PROJECT:
+            # Never create a project: its trusted publisher wouldn't exist.
+            plan.problems.append(
+                f"{pkg.name} is not on PyPI at all, and this workflow never creates a project"
+            )
+    if target == TARGET_SHIMS:
+        _check_shim_floor(plan, fetch)
     if upload and not plan.problems and not plan.to_upload():
-        plan.warnings.append(
-            "every package's version is already on PyPI: nothing to upload"
-        )
+        plan.warnings.append("every version is already on PyPI: nothing to upload")
     return plan
 
 
-# ------------------------------------------------------------------ dist + verify
+def _check_shim_floor(plan: Plan, fetch: Fetch) -> None:
+    """Shims upload only once the aisquare-pipe they require is on PyPI:
+    before that, installing a shim could not resolve."""
+    try:
+        floor = pypi_state(FRAMEWORK, SHIM_FLOOR, fetch)
+    except ReleaseError as exc:
+        floor = PypiState(UNKNOWN, detail=str(exc))
+    if floor.state != PUBLISHED:
+        message = (
+            f"{FRAMEWORK} {SHIM_FLOOR} is not on PyPI yet ({floor.state}), and every shim "
+            f"requires it: publish {FRAMEWORK} first"
+        )
+        (plan.problems if plan.upload else plan.warnings).append(message)
+
+
+# ----------------------------------------------------------------------- shims
+
+
+def shim_files(name: str) -> dict[str, str]:
+    """The source files of the shim for connector ``name``."""
+    project = f"{FRAMEWORK}-{name}"
+    module = f"aisquare_pipe_{name.replace('-', '_')}"
+    readme = (
+        f"# {project}\n\n"
+        f"**This package has moved.** From {FRAMEWORK} {SHIM_FLOOR}, the `{name}` connector "
+        f"ships inside [{FRAMEWORK}](https://pypi.org/project/{FRAMEWORK}/), with its "
+        f"third-party dependencies as the `[{name}]` extra:\n\n"
+        f'```bash\npip install "{FRAMEWORK}[{name}]"\n```\n\n'
+        f"This release has no code. It only requires `{FRAMEWORK}[{name}]>={SHIM_FLOOR}`, so "
+        f"existing `pip install {project}` lines keep working. The module is still "
+        f"`{module}`.\n\n"
+        f"Upgrading an environment that has an older {project} installed: afterwards run "
+        f"`pip install --force-reinstall --no-deps {FRAMEWORK}`, or use a fresh environment. "
+        f"The old release and {FRAMEWORK} install the same files, and removing the old "
+        f"release removes them.\n"
+    )
+    pyproject = f'''[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{project}"
+version = "{SHIM_VERSION}"
+description = "Moved: the {name} connector now ships inside {FRAMEWORK} (install {FRAMEWORK}[{name}])"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{{name = "AISquare Studio"}}]
+classifiers = [
+    "Development Status :: 7 - Inactive",
+    "Programming Language :: Python :: 3",
+]
+dependencies = ["{FRAMEWORK}[{name}]>={SHIM_FLOOR}"]
+
+[project.urls]
+Homepage = "https://github.com/AISquare-Studio/pipe"
+Repository = "https://github.com/AISquare-Studio/pipe"
+
+[tool.setuptools]
+packages = []
+py-modules = []
+'''
+    return {"pyproject.toml": pyproject, "README.md": readme}
+
+
+def build(path: str, outdir: Path, root: Path) -> list[Path]:
+    """Build the distribution (``.``) or a shim (``shims/<name>``) into
+    ``outdir`` with ``python -m build``; the files built."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    before = set(outdir.iterdir())
+    if path == ".":
+        _run_build(root, outdir)
+    elif path.startswith("shims/") and path.removeprefix("shims/") in SHIM_PROJECTS:
+        with tempfile.TemporaryDirectory(prefix="aisquare-pipe-shim-") as tmp:
+            for rel, text in shim_files(path.removeprefix("shims/")).items():
+                (Path(tmp) / rel).write_text(text, encoding="utf-8")
+            _run_build(Path(tmp), outdir)
+    else:
+        raise ReleaseError(
+            f"{path!r} is not a package here ('.' or shims/<one of {', '.join(SHIM_PROJECTS)}>)"
+        )
+    return sorted(set(outdir.iterdir()) - before)
+
+
+def _run_build(src: Path, outdir: Path) -> None:
+    done = subprocess.run(
+        [sys.executable, "-m", "build", "--outdir", str(outdir), str(src)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise ReleaseError(
+            f"python -m build {src} failed:\n{done.stdout[-2000:]}\n{done.stderr[-2000:]}"
+        )
+
+
+# ------------------------------------------------------------------ dist checks
 
 
 def dist_problems(pkg: Package, dist: Path) -> list[str]:
-    """The dist dir holds one wheel and one sdist, named for the declared name and version."""
+    """The dist dir holds one wheel and one sdist, named for the package and version."""
     files = (
         sorted(f.name for f in dist.iterdir() if f.is_file()) if dist.is_dir() else []
     )
@@ -481,8 +646,100 @@ def dist_problems(pkg: Package, dist: Path) -> list[str]:
             continue
         if (canonicalize_name(name), version) != want:
             problems.append(
-                f"{fname} is {name} {version}, but {pkg.path}/pyproject.toml declares {pkg.name} {pkg.version}"
+                f"{fname} is {name} {version}, but the package is {pkg.name} {pkg.version}"
             )
+    return problems
+
+
+def wheel_record(wheel: Path) -> list[str]:
+    """The paths a wheel's RECORD lists."""
+    with zipfile.ZipFile(wheel) as zf:
+        record = next(
+            (n for n in zf.namelist() if n.endswith(".dist-info/RECORD")), None
+        )
+        if record is None:
+            raise ReleaseError(f"{wheel.name} has no RECORD")
+        rows = csv.reader(io.StringIO(zf.read(record).decode("utf-8")))
+        return [row[0] for row in rows if row]
+
+
+def wheel_metadata(wheel: Path) -> dict[str, list[str]]:
+    """A wheel's METADATA headers (each header's values, in order)."""
+    with zipfile.ZipFile(wheel) as zf:
+        name = next(
+            (n for n in zf.namelist() if n.endswith(".dist-info/METADATA")), None
+        )
+        if name is None:
+            raise ReleaseError(f"{wheel.name} has no METADATA")
+        message = Parser().parsestr(zf.read(name).decode("utf-8"), headersonly=True)
+    found: dict[str, list[str]] = {}
+    for key, value in message.items():
+        found.setdefault(key, []).append(value)
+    return found
+
+
+def expected_modules(root: Path) -> set[str]:
+    """Every ``.py`` file the distribution must carry, as a wheel path:
+    ``src/<...>`` and each ``connectors/<dir>/src/<...>``."""
+    paths: set[str] = set()
+    for base in [
+        root / "src",
+        *(root / "connectors" / d / "src" for d in connector_dirs(root)),
+    ]:
+        for py in base.rglob("*.py"):
+            if "__pycache__" not in py.parts:
+                paths.add(py.relative_to(base).as_posix())
+    return paths
+
+
+def framework_wheel_problems(wheel: Path, root: Path) -> list[str]:
+    """The wheel's RECORD holds every module of the checkout, and no connector
+    module that isn't in ``connectors/``."""
+    recorded = set(wheel_record(wheel))
+    expected = expected_modules(root)
+    problems = [f"{wheel.name}: RECORD lacks {p}" for p in sorted(expected - recorded)]
+    dirs = {f"aisquare_pipe_{d.replace('-', '_')}" for d in connector_dirs(root)}
+    tops = {p.split("/", 1)[0] for p in recorded if p.endswith(".py")}
+    problems += [
+        f"{wheel.name}: carries {top}, which no connectors/<dir>/src provides"
+        for top in sorted(tops)
+        if top.startswith("aisquare_pipe_") and top not in dirs
+    ]
+    return problems
+
+
+def shim_wheel_problems(pkg: Package, wheel: Path) -> list[str]:
+    """A shim wheel has no code, and requires exactly ``aisquare-pipe[<name>]>=<floor>``."""
+    problems = []
+    code = [p for p in wheel_record(wheel) if ".dist-info/" not in p]
+    if code:
+        problems.append(
+            f"{wheel.name} carries files besides its metadata: {', '.join(code)}"
+        )
+    requires = wheel_metadata(wheel).get("Requires-Dist", [])
+    want = Requirement(f"{FRAMEWORK}[{pkg.shim_of}]>={SHIM_FLOOR}")
+    got = [Requirement(r) for r in requires]
+    same = len(got) == 1 and (
+        canonicalize_name(got[0].name),
+        got[0].extras,
+        got[0].specifier,
+        got[0].marker,
+    ) == (canonicalize_name(want.name), want.extras, want.specifier, None)
+    if not same:
+        problems.append(
+            f"{wheel.name} requires {requires}, not exactly [{str(want)!r}]"
+        )
+    return problems
+
+
+def check_dist(pkg: Package, dist: Path, root: Path) -> list[str]:
+    problems = dist_problems(pkg, dist)
+    wheels = sorted(dist.glob("*.whl")) if dist.is_dir() else []
+    if len(wheels) == 1:
+        if pkg.is_framework:
+            problems += framework_wheel_problems(wheels[0], root)
+        elif pkg.is_shim:
+            problems += shim_wheel_problems(pkg, wheels[0])
     return problems
 
 
@@ -511,30 +768,29 @@ def verify_problems(
     little, so this polls whatever is still missing until ``timeout``."""
     problems: list[str] = []
     built: dict[
-        str, tuple[Package, dict[str, str]]
-    ] = {}  # key -> (package, {filename: sha256})
+        str, tuple[dict[str, str], dict[str, str]]
+    ] = {}  # key -> (entry, {file: sha256})
     for entry in uploads:
-        pkg = Package(path=entry["path"], name=entry["name"], version=entry["version"])
-        local_dir = dist_root / f"dist-{pkg.name}"
+        local_dir = dist_root / f"dist-{entry['name']}"
         local = (
             {f.name: sha256(f) for f in sorted(local_dir.iterdir()) if f.is_file()}
             if local_dir.is_dir()
             else {}
         )
         if local:
-            built[pkg.key] = (pkg, local)
+            built[canonicalize_name(entry["name"])] = (entry, local)
         else:
-            problems.append(f"{pkg.name} {pkg.version}: no built files in {local_dir}")
-    on_pypi: dict[
-        str, dict[str, str]
-    ] = {}  # key -> {filename: sha256} as PyPI lists them
+            problems.append(
+                f"{entry['name']} {entry['version']}: no built files in {local_dir}"
+            )
+    on_pypi: dict[str, dict[str, str]] = {}
     pending = set(built)
     deadline = clock() + timeout
     while True:
         for key in sorted(pending):
-            pkg, local = built[key]
+            entry, local = built[key]
             try:
-                on_pypi[key] = pypi_state(pkg, fetch).files
+                on_pypi[key] = pypi_state(entry["name"], entry["version"], fetch).files
             except ReleaseError:
                 on_pypi[key] = {}
             if set(local) <= set(on_pypi[key]):
@@ -542,17 +798,17 @@ def verify_problems(
         if not pending or clock() >= deadline:
             break
         sleep(interval)
-    for key, (pkg, local) in built.items():
+    for key, (entry, local) in built.items():
         missing = sorted(set(local) - set(on_pypi.get(key, {})))
         if missing:
             problems.append(
-                f"{pkg.name} {pkg.version}: not on PyPI after the upload: {', '.join(missing)}"
+                f"{entry['name']} {entry['version']}: not on PyPI after the upload: {', '.join(missing)}"
             )
         for fname, digest in sorted(local.items()):
             remote = on_pypi.get(key, {}).get(fname)
             if remote is not None and remote != digest:
                 problems.append(
-                    f"{pkg.name} {pkg.version}: PyPI's {fname} has sha256 {remote}, not this "
+                    f"{entry['name']} {entry['version']}: PyPI's {fname} has sha256 {remote}, not this "
                     f"run's {digest} (an older upload of the same version?)"
                 )
     return problems
@@ -563,13 +819,10 @@ def verify_problems(
 
 @dataclass(frozen=True)
 class Need:
-    requirement: str  # as the consumer (or a package's metadata) wrote it
-    source: str  # where it came from, e.g. "requirements.in" or "aisquare-pipe[full]"
-    package: str  # the package path that provides it, "" if none
-    declared: str  # that package's declared version
-    verdict: (
-        str  # "ok", "ok (pin below declared: relock after publishing)" or "FAIL: ..."
-    )
+    requirement: str  # as the consumer wrote it
+    source: str  # where it came from, e.g. "requirements.in"
+    provided_by: str  # what meets it: "aisquare-pipe 0.5.0", "shim aisquare-pipe-github 0.5.0", ""
+    verdict: str  # "ok", "ok (...)" or "FAIL: ..."
 
 
 def consumer_requirements(tree: Tree) -> tuple[str, list[tuple[str, str]]]:
@@ -585,13 +838,11 @@ def consumer_requirements(tree: Tree) -> tuple[str, list[tuple[str, str]]]:
     ]
     for extra, specs in project.get("optional-dependencies", {}).items():
         found += [(f"pyproject.toml [{extra}]", s) for s in specs]
-    req_in = tree.read("requirements.in")
-    for line in (req_in or "").splitlines():
+    for line in (tree.read("requirements.in") or "").splitlines():
         line = line.split("#", 1)[0].strip()
         if line and not line.startswith("-"):
             found.append(("requirements.in", line))
-    lock = tree.read("requirements.lock")
-    for line in (lock or "").splitlines():
+    for line in (tree.read("requirements.lock") or "").splitlines():
         m = _LOCK_PIN.match(line)
         if m:
             found.append(("requirements.lock", f"{m['name']}=={m['version']}"))
@@ -599,60 +850,66 @@ def consumer_requirements(tree: Tree) -> tuple[str, list[tuple[str, str]]]:
 
 
 def coverage(pipe: Tree, consumer: Tree) -> list[Need]:
-    """Every aisquare-pipe* requirement of the consumer, followed through the
-    extras it asks for and each package's own aisquare-pipe* dependencies."""
-    packages = {p.key: p for p in discover(pipe)}
+    """Every aisquare-pipe* requirement of the consumer against what this tree
+    publishes: ``aisquare-pipe`` at its version (with the extras asked for),
+    or one of the shims. A lock pin below what is published is the lock
+    before its relock (reported, not a failure)."""
+    framework = framework_package(pipe)
+    shims = {p.key: p for p in shim_packages()}
     own, found = consumer_requirements(consumer)
     own_key = canonicalize_name(own) if own else ""
-    queue: list[tuple[str, str]] = [(src, spec) for src, spec in found]
-    seen: set[tuple[str, str]] = set()
     needs: list[Need] = []
-    while queue:
-        source, spec = queue.pop(0)
+    for source, spec in found:
         req = _family_requirement(spec)
         if req is None or canonicalize_name(req.name) == own_key:
-            continue  # not ours, or the consumer's self-reference (e.g. svc[toolkits])
-        if (source, spec) in seen:
-            continue
-        seen.add((source, spec))
-        pkg = packages.get(canonicalize_name(req.name))
-        if pkg is None:
-            needs.append(
-                Need(
-                    spec,
-                    source,
-                    "",
-                    "",
-                    f"FAIL: no package named {req.name} in {pipe.describe()}",
+            continue  # not ours, or the consumer's own extras
+        key = canonicalize_name(req.name)
+        pins = list(req.specifier)
+        pinned = bool(pins) and all(s.operator in ("==", "===") for s in pins)
+        if key == FRAMEWORK:
+            unknown = sorted(
+                e for e in req.extras if canonicalize_name(e) not in framework.extras
+            )
+            if unknown:
+                verdict = f"FAIL: {FRAMEWORK} has no [{', '.join(unknown)}] extra"
+            elif _satisfies(req, framework.version):
+                verdict = "ok"
+            elif pinned and all(
+                Version(s.version) <= Version(framework.version) for s in pins
+            ):
+                verdict = (
+                    "ok (pinned below the published version: relock after publishing)"
                 )
+            else:
+                verdict = f"FAIL: needs {req.specifier}, this tree publishes {framework.version}"
+            needs.append(
+                Need(spec, source, f"{FRAMEWORK} {framework.version}", verdict)
             )
             continue
-        pins = list(req.specifier)
-        if _satisfies(req, pkg.version):
-            verdict = "ok"
-        elif (
-            pins
-            and all(s.operator in ("==", "===") for s in pins)
-            and all(Version(s.version) <= Version(pkg.version) for s in pins)
-        ):
-            verdict = "ok (pinned below the declared version: relock after publishing)"
+        connector = key.removeprefix(f"{FRAMEWORK}-")
+        shim = shims.get(key)
+        if shim is None:
+            verdict = (
+                f"FAIL: {req.name} is not a distribution (it never reached PyPI, and from 0.5.0 "
+                f"it ships inside {FRAMEWORK}): require {FRAMEWORK}[{connector}]"
+            )
+            needs.append(Need(spec, source, "", verdict))
+        elif pinned:
+            verdict = (
+                f"ok (a pin of the old per-connector release: the relock must drop it, since "
+                f"{FRAMEWORK}[{connector}] replaces it)"
+            )
+            needs.append(
+                Need(spec, source, f"shim {shim.name} {shim.version}", verdict)
+            )
+        elif _satisfies(req, shim.version):
+            verdict = f"ok via the shim; replace with {FRAMEWORK}[{connector}]>={framework.version}"
+            needs.append(
+                Need(spec, source, f"shim {shim.name} {shim.version}", verdict)
+            )
         else:
-            verdict = f"FAIL: needs {req.specifier}, {pkg.path} declares {pkg.version}"
-        needs.append(Need(spec, source, pkg.path, pkg.version, verdict))
-        for extra in sorted(req.extras):
-            if extra not in pkg.extras:
-                needs.append(
-                    Need(
-                        spec,
-                        source,
-                        pkg.path,
-                        pkg.version,
-                        f"FAIL: {pkg.name} has no [{extra}] extra",
-                    )
-                )
-                continue
-            queue += [(f"{pkg.name}[{extra}]", s) for s in pkg.extras[extra]]
-        queue += [(f"{pkg.name} dependencies", s) for s in pkg.dependencies]
+            verdict = f"FAIL: needs {req.specifier}; its last release is the shim {shim.version}"
+            needs.append(Need(spec, source, "", verdict))
     return needs
 
 
@@ -666,6 +923,15 @@ def _write_github(name: str, text: str) -> None:
             fh.write(text)
 
 
+def _package(args: argparse.Namespace) -> Package:
+    if args.path == ".":
+        return framework_package(FsTree(Path(args.root)))
+    for pkg in shim_packages():
+        if pkg.path == args.path:
+            return pkg
+    raise ReleaseError(f"{args.path!r} is not a package here ('.' or shims/<name>)")
+
+
 def _cmd_plan(args: argparse.Namespace) -> int:
     plan = make_plan(
         make_tree(args.root, None),
@@ -673,6 +939,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         tag=args.tag,
         dry_run=args.dry_run,
         fetch=http_fetch if args.pypi else None,
+        target=args.target,
     )
     outputs = plan.outputs()
     _write_github("GITHUB_OUTPUT", "".join(f"{k}={v}\n" for k, v in outputs.items()))
@@ -688,20 +955,29 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     return 1 if plan.problems else 0
 
 
+def _cmd_build(args: argparse.Namespace) -> int:
+    pkg = _package(args)
+    files = build(pkg.path, Path(args.outdir), Path(args.root))
+    print(f"built {pkg.name} {pkg.version}: " + ", ".join(f.name for f in files))
+    return 0
+
+
 def _cmd_check_dist(args: argparse.Namespace) -> int:
-    pkg = next(
-        (p for p in discover(make_tree(args.root, None)) if p.path == args.path), None
-    )
-    if pkg is None:
-        print(f"::error::{args.path} is not a package directory here", file=sys.stderr)
-        return 1
-    problems = dist_problems(pkg, Path(args.dist))
+    pkg = _package(args)
+    dist = Path(args.dist)
+    problems = check_dist(pkg, dist, Path(args.root))
     for p in problems:
         print(f"::error::{p}")
     if not problems:
+        what = (
+            f"its RECORD holds all {len(expected_modules(Path(args.root)))} modules of the checkout"
+            if pkg.is_framework
+            else f"no code; requires {pkg.dependencies[0]}"
+        )
         print(
             f"{pkg.name} {pkg.version}: "
-            + ", ".join(sorted(f.name for f in Path(args.dist).iterdir()))
+            + ", ".join(sorted(f.name for f in dist.iterdir()))
+            + f" ({what})"
         )
     return 1 if problems else 0
 
@@ -731,9 +1007,11 @@ def _cmd_coverage(args: argparse.Namespace) -> int:
     print(f"pipe:     {pipe.describe()}\nconsumer: {consumer.describe()}\n")
     width = max((len(n.requirement) for n in needs), default=10)
     src_width = max((len(n.source) for n in needs), default=10)
+    by_width = max((len(n.provided_by) for n in needs), default=10)
     for n in needs:
         print(
-            f"{n.requirement:<{width}}  {n.source:<{src_width}}  {n.package or '-':<26} {n.declared or '-':<8} {n.verdict}"
+            f"{n.requirement:<{width}}  {n.source:<{src_width}}  "
+            f"{n.provided_by or '-':<{by_width}}  {n.verdict}"
         )
     failed = [n for n in needs if n.verdict.startswith("FAIL")]
     print(f"\n{len(needs)} requirement(s), {len(failed)} failing")
@@ -744,10 +1022,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser(
-        "plan", help="list the packages and decide what a publish run uploads"
-    )
+    p = sub.add_parser("plan", help="decide what a publish run builds and uploads")
     p.add_argument("--root", default=".")
+    p.add_argument(
+        "--target", default=TARGET_FRAMEWORK, choices=[TARGET_FRAMEWORK, TARGET_SHIMS]
+    )
     p.add_argument("--event", default="pull_request", help="github.event_name")
     p.add_argument("--tag", default="", help="the release tag (release events)")
     p.add_argument(
@@ -760,11 +1039,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--json", action="store_true", help="also print the outputs as JSON")
     p.set_defaults(func=_cmd_plan)
 
+    p = sub.add_parser("build", help="build one package into a dist directory")
+    p.add_argument("--root", default=".")
+    p.add_argument("--path", required=True, help='"." or shims/<name>')
+    p.add_argument("--outdir", required=True)
+    p.set_defaults(func=_cmd_build)
+
     p = sub.add_parser("check-dist", help="check one package's built dist directory")
     p.add_argument("--root", default=".")
-    p.add_argument(
-        "--path", required=True, help='the package path, "." or connectors/<name>'
-    )
+    p.add_argument("--path", required=True, help='"." or shims/<name>')
     p.add_argument("dist")
     p.set_defaults(func=_cmd_check_dist)
 
@@ -775,7 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--uploads", required=True, help="the plan's `uploads` output (JSON)"
     )
     p.add_argument("--dist-root", required=True, help="holds dist-<name>/ per package")
-    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--timeout", type=float, default=180.0)
     p.set_defaults(func=_cmd_verify)
 
     p = sub.add_parser(
