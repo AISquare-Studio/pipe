@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import google.auth
+import google.auth.exceptions
 import pytest
 
 from aisquare_pipe_gcs import GcsToolkit
@@ -92,8 +93,15 @@ def test_application_default_credentials_are_never_consulted(monkeypatch, tmp_pa
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(decoy))
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "decoy-project")
 
+    consulted: list[str] = []
+
     def no_adc(*args, **kwargs):
-        raise AssertionError("Application Default Credentials were consulted")
+        # Recorded, not only raised: call_tool turns any exception into a
+        # failed result, which would hide a consultation that raised.
+        consulted.append("google.auth.default")
+        raise google.auth.exceptions.DefaultCredentialsError(
+            "ADC must not be consulted"
+        )
 
     monkeypatch.setattr(google.auth, "default", no_adc)
     google_ = FakeGoogle(objects={"policies/a.txt": StoredObject(b"hi", "text/plain")})
@@ -113,6 +121,7 @@ def test_application_default_credentials_are_never_consulted(monkeypatch, tmp_pa
     (claims,) = google_.token_requests
     assert claims["iss"] == "reader@acme-proj.iam.gserviceaccount.com"
     assert claims["scope"] == READ_ONLY_SCOPE
+    assert consulted == []
 
 
 def test_tokens_are_minted_once_per_key_and_reused():
