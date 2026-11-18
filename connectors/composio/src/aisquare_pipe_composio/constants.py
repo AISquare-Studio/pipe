@@ -36,3 +36,7 @@ DEFAULT_TRIGGER_PAGE_LIMIT = 100
 TRIGGER_LOG_SDK_RETRIES = 2
 MAX_TRIGGER_PAGES_PER_POLL = 10
 SEEN_IDS_MAX = 500
+# How far past this host's clock an event's time may be and still move the
+# watermark (clock skew between Composio and us). A later time is no real
+# event's: a watermark there would read nothing until that time came.
+MAX_EVENT_CLOCK_SKEW_MS = 5 * 60 * 1000

@@ -117,20 +117,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     something other than a dict. A `TypeError` or `AttributeError` raised
     inside an SDK call keeps its type, and malformed API data is no SDK error.
   - A malformed trigger-log entry (the entry, or its `meta`, not an object) no
-    longer stops the triggers source. It is skipped with one WARNING, and its
-    id and time are recorded in the cursor, so one bad event can't crash-loop
-    the poller. A timestamp that isn't a finite number reads as no time.
-  - The triggers source stops on the two errors no retry can fix, a
-    `ComposioSDKShapeError` and a `ConfigValidationError` (Composio refused the
-    API key: HTTP 401/403). It logs one ERROR line, with no traceback of its
-    own (the caller logs the raised error once), and raises. Before, a 401 was
-    logged and re-polled every cycle. Other failures still retry next cycle.
+    longer stops the triggers source. It is skipped with a WARNING and its
+    time moves the watermark, so one bad event can't crash-loop the poller.
+    Its id is recorded in the cursor: later cycles, and later pulls on the
+    same `cursor_path`, step past it silently. A pull on a fresh cursor
+    (pipe-as-service's poller: one `pull(max_polls=1)` per poll, each on a
+    temp file) warns again on every pull while the entry is in its window, and
+    an entry with no id warns on every cycle (it can't be recorded). A readable
+    entry with no id is now skipped with that warning too (it was dropped
+    without one), and its time moves the watermark (it didn't). A timestamp
+    that isn't a finite number reads as no time.
+  - An event time more than 5 minutes (`MAX_EVENT_CLOCK_SKEW_MS`) past this
+    host's clock no longer moves the watermark, and a stored watermark (or
+    pending window maximum) past it is reset to now with one WARNING. Before,
+    one such time, from malformed data or a valid entry alike, became the
+    watermark, and every later poll sent `from=<that time>` and silently saw
+    nothing. (Not clamped to now + 5 minutes: that would skip the next five
+    minutes' real events.)
+  - A `pull` of the triggers source ends on the two errors no retry can fix,
+    a `ComposioSDKShapeError` and a `ConfigValidationError` (Composio refused
+    the API key: HTTP 401/403). It logs one ERROR line ("trigger pull
+    stopped"), with no traceback of its own (the caller logs the raised
+    error), and raises. Before, a 401 was logged and re-polled every cycle.
+    Other failures still retry next cycle. This is per pull: a host that
+    pulls again gets the same error and line again, so it must stop or back
+    off itself (pipe-as-service backs the subscription off).
   - composio-client 2.x gives a POST no SDK retries (1.x retried a 429, 5xx or
     connection error twice on any method). The trigger-log read is a POST that
     only reads, so on 2.x it passes `request_options={"max_retries": 2}`: a 503
     is tried 3 times and a 429 15 times (with our own 429 backoff), as on 1.x.
     `tools.execute` is unaffected: composio sends it without SDK retries on
-    both lines (0.22.0 and 0.33.0). `authorize_toolkit` and
+    both lines (0.18.1, 0.22.0 and 0.33.0). `authorize_toolkit` and
     `initiate_connection` have no retry of their own, so on 2.x a 429 or 5xx
     fails them at once, where 1.x retried twice. They create a connection
     request, so that is left as is.
@@ -139,9 +156,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     SDK methods (all 13 this connector calls) make a call that doesn't bind to
     the installed SDK fail, and a faked `httpx` transport runs the SDK's own
     request, retry and parsing code. validate.yml's new `composio-sdk` job runs
-    the connector's suite on composio 0.22.0 + client 1.43.0 and on the newest
-    pair the extra resolves (0.33.0 + 2.1.33 today), on every PR and on
-    `workflow_dispatch`.
+    the connector's suite on composio 0.18.1 + client 1.43.0 (the pair
+    pipe-as-service's requirements.lock pins, so what production runs) and on
+    the newest pair the extra resolves (0.33.0 + 2.1.33 today), on every PR,
+    every push to `main` and on `workflow_dispatch`.
+  - `list_trigger_events` reads the SDK method's signature once (it read it
+    twice: once for `request_options`, once to bind the call).
 
 ## [0.5.0] - 2026-11-04
 

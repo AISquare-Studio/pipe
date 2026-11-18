@@ -14,8 +14,9 @@ Two kinds of test:
   request, retry and response-parsing code runs on scripted answers.
 
 Runs under whichever composio / composio-client pair is installed.
-validate.yml's ``composio-sdk`` job runs it twice: on composio 0.22.0 +
-composio-client 1.43.0, and on the newest pair the ``[composio]`` extra
+validate.yml's ``composio-sdk`` job runs it twice: on composio 0.18.1 +
+composio-client 1.43.0 (the pair pipe-as-service's requirements.lock pins,
+i.e. what production runs), and on the newest pair the ``[composio]`` extra
 resolves.
 """
 
@@ -360,6 +361,72 @@ def test_the_poller_steps_past_a_malformed_event(composio_http, tmp_path, caplog
     warned = [r for r in caplog.records if "evt_bad" in r.getMessage()]
     assert [r.levelno for r in warned] == [logging.WARNING]
     assert "not an object" in warned[0].getMessage()
+
+
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+def test_an_event_dated_in_the_future_does_not_blind_the_poller(
+    composio_http, tmp_path
+):
+    """createdAt 9999-01-01 (malformed data) on a real SDK response. Before:
+    from=253370764800000 was sent on every later poll, which then saw nothing.
+    Now the watermark stays at the newest real event."""
+    from aisquare_pipe_composio.triggers import ComposioTriggersSource
+
+    real = "2026-11-14T22:13:00Z"
+    composio_http.respond = _pages(
+        {
+            None: (
+                [
+                    _log_item("evt_1", real),
+                    _log_item("evt_future", "9999-01-01T00:00:00Z"),
+                    _bad_meta_item("evt_bad", "9999-06-01T00:00:00Z"),
+                ],
+                None,
+            )
+        }
+    )
+    config = {**OFFLINE_CONFIG, "cursor_path": str(tmp_path / "cursor.json")}
+    source = ComposioTriggersSource()
+
+    def poll(**params: Any) -> list:
+        pull = PullParams(params={"max_polls": 1, "sleep": lambda _s: None, **params})
+        return list(source.pull(config, pull))
+
+    first = poll(since=0)
+    assert [e.metadata["composio_event_id"] for e in first] == [
+        "evt_1",
+        "evt_future",
+    ]
+    assert poll() == []
+    bodies = [json.loads(r.content) for r in composio_http.requests]
+    assert "from" not in bodies[0]
+    assert bodies[1]["from"] == _epoch_ms(real)
+
+
+def test_the_trigger_log_signature_is_read_once(sockets, monkeypatch):
+    """Before: list_trigger_events introspected list() for request_options,
+    then _sdk_call introspected it again to bind the call."""
+    from aisquare_pipe_composio import client as client_module
+
+    calls: list[object] = []
+    real_signature = client_module._signature
+
+    def counting(method):
+        calls.append(method)
+        return real_signature(method)
+
+    monkeypatch.setattr(client_module, "_signature", counting)
+    client = ComposioClient(OFFLINE_CONFIG)
+    resource = _installed_trigger_logs(client)
+    listed = create_autospec(
+        resource.list, return_value=_real_response([], next_cursor=None)
+    )
+    monkeypatch.setattr(resource, "list", listed)
+
+    client.list_trigger_events(user_id="test-user")
+
+    assert len(calls) == 1 and listed.call_count == 1
+    assert sockets == []
 
 
 # -- the trigger-log read keeps 1.x's SDK retries on 2.x (m3) ------------------

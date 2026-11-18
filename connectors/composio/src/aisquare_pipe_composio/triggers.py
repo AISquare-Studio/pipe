@@ -41,12 +41,33 @@ from aisquare_pipe_composio.constants import (
     DEFAULT_TRIGGER_PAGE_LIMIT,
     JSON_CONTENT_TYPE,
     LEGACY_CURSOR_PATH,
+    MAX_EVENT_CLOCK_SKEW_MS,
     MAX_TRIGGER_PAGES_PER_POLL,
 )
 
 logger = logging.getLogger("aisquare.pipe.composio")
 
 IDEMPOTENCY_PREFIX = "composio:event"
+
+
+def _reset_future_watermark(state: TriggerCursor, now_ms: int) -> bool:
+    """A stored watermark past now + ``MAX_EVENT_CLOCK_SKEW_MS`` (saved before
+    the ceiling existed, from a malformed event time) is reset to now, and
+    such a pending window maximum is dropped: polling from it would read
+    nothing until that time came. Returns whether ``state`` changed."""
+    ceiling_ms = now_ms + MAX_EVENT_CLOCK_SKEW_MS
+    reset = False
+    if state.last_ts_ms > ceiling_ms:
+        logger.warning(
+            "composio: trigger watermark was %d ms ahead of now; reset to now",
+            state.last_ts_ms - now_ms,
+        )
+        state.last_ts_ms = now_ms
+        reset = True
+    if state.pending_max_ts > ceiling_ms:
+        state.pending_max_ts = 0
+        reset = True
+    return reset
 
 
 class ComposioTriggersSource(SourceConnector):
@@ -142,10 +163,23 @@ class ComposioTriggersSource(SourceConnector):
             limit (int): event-log page size (default 100)
 
         A failed cycle is logged and retried next cycle, except two errors
-        no retry can fix, which stop polling (raised): ``ComposioSDKShapeError``
+        no retry can fix, which end this pull (raised): ``ComposioSDKShapeError``
         (an unsupported composio SDK) and ``ConfigValidationError`` (Composio
-        refused the API key: HTTP 401/403). A malformed event is skipped with
-        a warning and recorded, so it can't stall the poller either.
+        refused the API key: HTTP 401/403). That is per pull: a host that
+        calls ``pull`` again gets the same error each time, so stopping or
+        backing off is the host's (pipe-as-service backs the subscription
+        off).
+
+        A malformed event is skipped with a warning, so it can't stall the
+        poller. Its id is recorded in the cursor: later cycles, and later
+        pulls on the same ``cursor_path``, step past it silently. A host that
+        gives each pull a fresh cursor (pipe-as-service: one pull per poll,
+        ``max_polls=1``) sees the warning on every pull while the entry is in
+        its window, and so does an entry with no id (it can't be recorded).
+
+        An event time more than ``MAX_EVENT_CLOCK_SKEW_MS`` past this host's
+        clock never moves the watermark, and a stored watermark past it is
+        reset to now: a watermark in the future reads nothing until then.
         """
         if params is None:
             params = PullParams()
@@ -176,19 +210,22 @@ class ComposioTriggersSource(SourceConnector):
                 state.last_ts_ms = (
                     since_ms if since_ms is not None else int(time.time() * 1000)
                 )
+            reset = _reset_future_watermark(state, int(time.time() * 1000))
 
             try:
                 changed = yield from self._poll_once(
                     client, config, user_id, state, limit
                 )
             except (ComposioSDKShapeError, ConfigValidationError) as e:
-                # Not transient: every cycle would fail the same way, so the
-                # failure is surfaced, never polled on. One ERROR line names
-                # why. The traceback and message travel with the raised error
-                # (the caller logs it once), and the message may carry
-                # Composio's response text, so it isn't logged here.
+                # Not transient: every cycle would fail the same way, so this
+                # pull ends and raises instead of polling on. Only this pull:
+                # a host that pulls again gets the same error (and this line)
+                # again. One ERROR line names why. The traceback and message
+                # travel with the raised error (the caller logs it), and the
+                # message may carry Composio's response text, so it isn't
+                # logged here.
                 logger.error(
-                    "composio: trigger polling stopped: %s",
+                    "composio: trigger pull stopped: %s",
                     "unsupported composio SDK"
                     if isinstance(e, ComposioSDKShapeError)
                     else "Composio refused the API key",
@@ -205,7 +242,7 @@ class ComposioTriggersSource(SourceConnector):
                     state.pending_max_ts = 0
                     changed = True
 
-            if changed:
+            if changed or reset:
                 save_trigger_cursor(cursor_path, state)
 
             polls += 1
@@ -233,6 +270,8 @@ class ComposioTriggersSource(SourceConnector):
         changed = False
         cursor = state.pending_cursor
         max_ts = max(state.last_ts_ms, state.pending_max_ts)
+        # No real event is dated past this; a later time can't move max_ts.
+        ceiling_ms = int(time.time() * 1000) + MAX_EVENT_CLOCK_SKEW_MS
         exhausted = False
         for _ in range(MAX_TRIGGER_PAGES_PER_POLL):
             events, next_cursor = client.list_trigger_events(
@@ -246,22 +285,27 @@ class ComposioTriggersSource(SourceConnector):
                 event_id = str(event.get("id") or "")
                 if event_id and event_id in state.seen_ids:
                     continue
-                skipped = event.get("skipped")
+                skipped = event.get("skipped") or (
+                    None if event_id else "the entry has no id"
+                )
                 if skipped:
-                    # Malformed API data: warned about once (its id is then
-                    # recorded) and stepped past, never retried.
+                    # Malformed API data: warned about and stepped past, never
+                    # retried. Its id is recorded in the cursor, so a pull on
+                    # the same cursor doesn't warn again; a pull on a fresh
+                    # cursor, or an entry with no id, warns again.
                     logger.warning(
                         "composio: skipping trigger event %s: %s",
                         event_id or "(no id)",
                         skipped,
                     )
+                # Its time moves the window past it, even with no id.
+                ts_ms = event.get("timestamp_ms")
+                if isinstance(ts_ms, int) and max_ts < ts_ms <= ceiling_ms:
+                    max_ts = ts_ms
                 if not event_id:
                     continue
 
                 state.seen_ids.append(event_id)
-                ts_ms = event.get("timestamp_ms")
-                if isinstance(ts_ms, int) and ts_ms > max_ts:
-                    max_ts = ts_ms
                 changed = True
                 if skipped:
                     continue

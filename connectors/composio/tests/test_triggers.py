@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -335,7 +336,7 @@ class TestNonRetryableErrors:
         assert mock_triggers_client.list_trigger_events.call_count == 1
         (logged,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert logged.exc_info is None
-        assert "trigger polling stopped" in logged.getMessage()
+        assert "trigger pull stopped" in logged.getMessage()
         assert str(error) not in logged.getMessage()
 
 
@@ -396,6 +397,123 @@ class TestMalformedEvents:
             assert json.load(fd)["seen_ids"] == ["evt_ok"]
         (warned,) = caplog.records
         assert warned.levelno == logging.WARNING and "(no id)" in warned.getMessage()
+
+    @pytest.mark.parametrize(
+        "no_id",
+        [
+            {"id": None, "timestamp_ms": BASE + 9000, "skipped": "malformed (meta)"},
+            # A readable entry with no id: never yielded, and now warned about.
+            make_event("", ts_ms=BASE + 9000),
+        ],
+        ids=["skipped", "readable"],
+    )
+    def test_an_entry_without_an_id_still_moves_the_watermark(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, caplog, no_id
+    ):
+        """It can't be recorded, so each cycle that reads it warns; its time
+        still moves the window past it. Before: the watermark stayed at the
+        last event with an id (BASE + 1000), and a readable one was dropped
+        without a word."""
+        mock_triggers_client.list_trigger_events.return_value = (
+            [make_event("evt_ok", ts_ms=self.BASE + 1000), no_id],
+            None,
+        )
+        with caplog.at_level(logging.WARNING, logger="aisquare.pipe.composio"):
+            envelopes = _pull_once(
+                ComposioTriggersSource(),
+                _config(composio_config, tmp_cursor_path),
+                since=self.BASE,
+            )
+
+        assert [e.metadata["composio_event_id"] for e in envelopes] == ["evt_ok"]
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        assert saved["seen_ids"] == ["evt_ok"]
+        assert saved["last_ts_ms"] == self.BASE + 9000
+        (warned,) = caplog.records
+        assert "(no id)" in warned.getMessage()
+
+
+class TestFutureTimestamps:
+    """No real event is dated past now + MAX_EVENT_CLOCK_SKEW_MS. Before, one
+    such time (malformed data, or a bad clock) became the watermark, and every
+    later poll sent that `from` and saw nothing: a silently blind poller."""
+
+    FAR_FUTURE = 253_370_764_800_000  # 9999-01-01
+
+    def test_a_future_event_time_does_not_move_the_watermark(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        now_ms = int(time.time() * 1000)
+        mock_triggers_client.list_trigger_events.return_value = (
+            [
+                make_event("evt_1", ts_ms=now_ms - 60_000),
+                make_event("evt_future", ts_ms=self.FAR_FUTURE),
+                make_event("evt_bad", ts_ms=self.FAR_FUTURE, skipped="malformed"),
+            ],
+            None,
+        )
+        config = _config(composio_config, tmp_cursor_path)
+        source = ComposioTriggersSource()
+
+        envelopes = _pull_once(source, config, since=now_ms - 120_000)
+        assert [e.metadata["composio_event_id"] for e in envelopes] == [
+            "evt_1",
+            "evt_future",
+        ]
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            assert json.load(fd)["last_ts_ms"] == now_ms - 60_000
+
+        mock_triggers_client.list_trigger_events.return_value = ([], None)
+        _pull_once(source, config)
+        from_ms = mock_triggers_client.list_trigger_events.call_args.kwargs["from_ms"]
+        assert from_ms == now_ms - 60_000
+
+    def test_a_time_within_the_clock_skew_moves_it(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        """A guard (passes before too): a real event a minute ahead of this
+        host's clock (clock skew) still moves the watermark."""
+        ahead = int(time.time() * 1000) + 60_000
+        mock_triggers_client.list_trigger_events.return_value = (
+            [make_event("evt_1", ts_ms=ahead)],
+            None,
+        )
+        _pull_once(
+            ComposioTriggersSource(),
+            _config(composio_config, tmp_cursor_path),
+            since=ahead - 1000,
+        )
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            assert json.load(fd)["last_ts_ms"] == ahead
+
+    def test_a_stored_future_watermark_is_reset_to_now(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, caplog
+    ):
+        with open(tmp_cursor_path, "w", encoding="utf-8") as fd:
+            json.dump(
+                {
+                    "last_ts_ms": self.FAR_FUTURE,
+                    "seen_ids": ["evt_0"],
+                    "pending_cursor": None,
+                    "pending_max_ts": self.FAR_FUTURE,
+                },
+                fd,
+            )
+        mock_triggers_client.list_trigger_events.return_value = ([], None)
+        before = int(time.time() * 1000)
+
+        with caplog.at_level(logging.WARNING, logger="aisquare.pipe.composio"):
+            _pull_once(
+                ComposioTriggersSource(), _config(composio_config, tmp_cursor_path)
+            )
+
+        from_ms = mock_triggers_client.list_trigger_events.call_args.kwargs["from_ms"]
+        assert before <= from_ms <= int(time.time() * 1000)
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        assert saved["last_ts_ms"] == from_ms and saved["pending_max_ts"] == 0
+        assert "reset to now" in caplog.text
 
 
 class TestValidateAndResources:

@@ -83,7 +83,19 @@ def _sdk_call(
             f"the installed composio SDK has no {label}(); "
             "this composio version is not supported"
         )
-    signature = _signature(method)
+    return _bound_sdk_call(method, _signature(method), label, *args, **kwargs)
+
+
+def _bound_sdk_call(
+    method: Callable[..., Any],
+    signature: inspect.Signature | None,
+    label: str,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """``_sdk_call`` for a caller that already holds ``method``'s
+    ``_signature`` (None: not introspectable), so it isn't computed twice."""
     if signature is not None:
         try:
             signature.bind(*args, **kwargs)
@@ -477,7 +489,8 @@ class ComposioClient:
             # composio-client 2.x gives a POST no SDK retries (1.x retries
             # every method). This POST only reads, so it asks for 1.x's.
             kwargs["request_options"] = {"max_retries": TRIGGER_LOG_SDK_RETRIES}
-        response = _sdk_call(list_logs, "trigger-log list", **kwargs)
+        # _trigger_logs() checked list is callable; bind it on this signature.
+        response = _bound_sdk_call(list_logs, signature, "trigger-log list", **kwargs)
         events = [self._normalize_trigger_event(item) for item in _items(response)]
         events.sort(key=lambda e: e.get("timestamp_ms") or 0)
         next_cursor = getattr(response, "next_cursor", None)
