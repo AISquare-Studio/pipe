@@ -7,9 +7,10 @@ import logging
 
 import pytest
 from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import PipelineError
+from aisquare.pipe.testing.host import host_answer
 
 from aisquare_pipe_glean import (
-    GleanAPIError,
     GleanNotConfigured,
     GleanSource,
     connector,
@@ -272,9 +273,10 @@ def test_bad_pull_params_are_refused_without_a_request(params):
     assert session.calls == []
 
 
-def test_glean_failure_surfaces_as_glean_api_error_without_the_token():
+def test_glean_failure_surfaces_as_a_502_pipeline_error_without_the_token():
     src, _ = _source(response(401, {"message": f"bad token {TOKEN}"}))
-    with pytest.raises(GleanAPIError) as e:
+    with pytest.raises(PipelineError) as e:
         _pull(src, {"query": "q"})
-    assert e.value.status == 401
+    assert host_answer(e.value).status == 502
+    assert "Glean search failed (401)" in str(e.value)
     assert TOKEN not in str(e.value)

@@ -29,6 +29,7 @@ from aisquare.pipe import (
     error_code_for_status,
     time_budget,
 )
+from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_glean.client import GleanAPIError, GleanClient
 from aisquare_pipe_glean.credentials import GleanNotConfigured, load_credentials
@@ -122,35 +123,70 @@ GET_DOCUMENT = ToolSpec(
 TOOL_SPECS = (SEARCH, GET_DOCUMENT)
 
 
-def _describe(e: GleanAPIError) -> str:
+def _hint(e: GleanAPIError) -> str | None:
+    """What to fix, where the cause is known (no Glean text in it)."""
     if e.status == 401:
         return (
-            f"{e.message} — Glean rejected the token (invalid, expired or revoked) or the "
-            "act_as email; the tenant's Glean credential must be fixed"
+            "Glean rejected the token (invalid, expired or revoked) or the act_as email; "
+            "the tenant's Glean credential must be fixed"
         )
     if e.status == 403:
         return (
-            f"{e.message} — the Glean token lacks the scope this needs (SEARCH to search, "
-            "DOCUMENTS to read documents), or the Glean user cannot see it"
+            "the Glean token lacks the scope this needs (SEARCH to search, DOCUMENTS to "
+            "read documents), or the Glean user cannot see it"
         )
     if e.status == 400 and "actas" in e.message.lower().replace("-", ""):
-        return (
-            f"{e.message} — this is a global token: set token_kind 'global' and act_as"
-        )
-    return e.message
+        return "this is a global token: set token_kind 'global' and act_as"
+    return None
+
+
+def _describe(e: GleanAPIError) -> str:
+    """The failure, Glean's own text included, plus what to fix where the
+    cause is known: what the toolkit answers the caller."""
+    hint = _hint(e)
+    return f"{e.message} — {hint}" if hint else e.message
+
+
+def error_code(e: GleanAPIError) -> str:
+    """The canonical ``error_code`` for a Glean failure."""
+    if e.timed_out:
+        return ERROR_TIMEOUT
+    if e.status == 429:
+        return ERROR_RATE_LIMITED
+    if e.status is None or 300 <= e.status < 400:
+        return ERROR_UPSTREAM_ERROR
+    return error_code_for_status(e.status)
 
 
 def failure(e: GleanAPIError) -> ToolResult:
     """A Glean failure as a canonical ``ToolResult`` error."""
-    if e.timed_out:
-        code = ERROR_TIMEOUT
-    elif e.status == 429:
-        code = ERROR_RATE_LIMITED
-    elif e.status is None or 300 <= e.status < 400:
-        code = ERROR_UPSTREAM_ERROR
-    else:
-        code = error_code_for_status(e.status)
-    return ToolResult.fail(_describe(e), code=code, retry_after=e.retry_after)
+    return ToolResult.fail(_describe(e), code=error_code(e), retry_after=e.retry_after)
+
+
+class GleanRequestError(ValueError):
+    """Glean refused what the caller asked for (a request it calls invalid,
+    something that does not exist). A ``ValueError``, so pipe-as-service
+    answers it 422. ``status`` is Glean's."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def source_error(e: GleanAPIError) -> Exception:
+    """A Glean failure as the source raises it: what the caller can fix
+    (``invalid_arguments``, ``not_found``) is a :class:`GleanRequestError`
+    (422 in pipe-as-service); everything else (upstream, throttling, a
+    timeout, a refused token or scope) is a
+    :class:`~aisquare.pipe.errors.PipelineError` (502), with ``retry_after``
+    when Glean gave one. The message is ``summary`` and the hint, never
+    Glean's own text (it can quote the query, and hosts log these)."""
+    code = error_code(e)
+    hint = _hint(e)
+    text = e.summary + (f" — {hint}" if hint else "")
+    if code in (ERROR_INVALID_ARGUMENTS, ERROR_NOT_FOUND):
+        return GleanRequestError(text, status=e.status)
+    return PipelineError(text, retry_after=e.retry_after)
 
 
 def _bounded_int(arguments: Mapping[str, Any], name: str, low: int, high: int) -> int:
