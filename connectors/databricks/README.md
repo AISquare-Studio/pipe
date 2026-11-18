@@ -83,15 +83,12 @@ In the customer's Databricks workspace:
    warehouse id (SQL Warehouses → the warehouse → Connection details → the id in its HTTP path), and the
    client id + secret (or the PAT), over a secure channel.
 
-On our side, store the tenant's credential blob in AWS Secrets Manager. pipe-as-service reads a
-first-party blob by service name: the toolkit `databricks` reads `<tenant>/databricks`, and the source
-`databricks-files-source` reads `<tenant>/databricks-files` (the service strips `-source` from the
-connector's name). Store the same JSON under both names, or drop the source if only the toolkit is used:
+On our side, store the tenant's credential blob ONCE in AWS Secrets Manager. pipe-as-service reads the
+same secret for the toolkit `databricks` and the source `databricks-files-source` (its tenant-secret
+mapping, `credentials/catalog.TENANT_BLOBS`: `databricks-files` -> `databricks`):
 
 - `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/databricks` (env backend
   `PIPE_SECRET__<TENANT>__DATABRICKS__JSON`)
-- `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/databricks-files` (env backend
-  `PIPE_SECRET__<TENANT>__DATABRICKS_FILES__JSON`)
 
 ```json
 {"workspace_url": "https://adb-1234567890123456.7.azuredatabricks.net",
