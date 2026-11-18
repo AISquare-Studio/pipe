@@ -13,6 +13,14 @@ a document when it changes:
 Pull params come from callers, so none of them can name an account, role,
 region, bucket or credential. Each source takes only filters that narrow what
 the blob already allows.
+
+A pull fails as pipe-as-service answers it: a ``ValueError`` (422) for what
+the caller can fix (a bad param, a blob that doesn't parse, a resource AWS
+says does not exist, an argument AWS refused: :class:`AwsRequestError`), and
+a :class:`~aisquare.pipe.errors.PipelineError` (502) for everything else AWS
+refused or failed (AssumeRole, a missing permission, throttling, an expired
+session, a 5xx). Messages name the AWS operation and AWS's error code, never
+its message text.
 """
 
 from __future__ import annotations
@@ -24,10 +32,11 @@ from datetime import datetime
 from typing import Any
 
 from aisquare.pipe import AuthType, DataEnvelope, MetaField, PullParams, SourceConnector
-from aisquare.pipe.errors import ConfigValidationError
+from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_aws import agentcore, s3
 from aisquare_pipe_aws.credentials import (
+    AwsAccessError,
     AwsNotConfiguredError,
     BaseSessionFactory,
     CrossAccountConfig,
@@ -88,6 +97,31 @@ def _after(value: Any, name: str) -> datetime | None:
     return moment
 
 
+class AwsRequestError(ValueError):
+    """AWS refused what the caller asked for: a resource that does not exist,
+    an argument it rejected. A ``ValueError``, so pipe-as-service answers it
+    422. ``code`` is the toolkit error code, ``aws_code`` AWS's own."""
+
+    def __init__(self, message: str, *, code: str, aws_code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.aws_code = aws_code
+
+
+#: Toolkit error codes a caller can fix by asking differently.
+_CALLER_CODES = frozenset({"invalid_arguments", "not_found"})
+
+
+def source_error(e: AwsAccessError) -> Exception:
+    """An AWS refusal as a source raises it: :class:`AwsRequestError` (422)
+    for ``invalid_arguments`` and ``not_found``, a
+    :class:`~aisquare.pipe.errors.PipelineError` (502) for the rest. The
+    message is the toolkit's (the operation and AWS's error code)."""
+    if e.code in _CALLER_CODES:
+        return AwsRequestError(str(e), code=e.code, aws_code=e.aws_code)
+    return PipelineError(str(e))
+
+
 class _AwsSource(SourceConnector):
     auth_type = AuthType.CUSTOM
     #: Tests replace it; production assumes from the default credential chain.
@@ -95,6 +129,18 @@ class _AwsSource(SourceConnector):
 
     def validate_config(self, config: dict) -> bool:
         return is_configured(config)
+
+    def pull(
+        self, config: dict, params: PullParams | None = None
+    ) -> Iterator[DataEnvelope]:
+        """Yield the envelopes; fails as the module docstring says."""
+        try:
+            yield from self._pull(config, params)
+        except AwsAccessError as e:
+            raise source_error(e) from None
+
+    def _pull(self, config: dict, params: PullParams | None) -> Iterator[DataEnvelope]:
+        raise NotImplementedError
 
     def _session(self, cfg: CrossAccountConfig) -> Any:
         return assume_role_session(cfg, base_session=type(self).base_session)
@@ -143,9 +189,7 @@ class BedrockAgentCorePoliciesSource(_AwsSource):
         ),
     }
 
-    def pull(
-        self, config: dict, params: PullParams | None = None
-    ) -> Iterator[DataEnvelope]:
+    def _pull(self, config: dict, params: PullParams | None) -> Iterator[DataEnvelope]:
         cfg = CrossAccountConfig.from_config(config)
         values = _params(params, POLICY_PARAMS)
         engine_filter = values.get("policy_engine_id")
@@ -246,9 +290,7 @@ class S3Source(_AwsSource):
         ),
     }
 
-    def pull(
-        self, config: dict, params: PullParams | None = None
-    ) -> Iterator[DataEnvelope]:
+    def _pull(self, config: dict, params: PullParams | None) -> Iterator[DataEnvelope]:
         cfg = CrossAccountConfig.from_config(config)
         if cfg.s3 is None:
             raise AwsNotConfiguredError(
@@ -289,7 +331,14 @@ class S3Source(_AwsSource):
                     max_bytes,
                 )
                 continue
-            data, meta = s3.get_object(client, location, key, max_bytes=max_bytes)
+            try:
+                data, meta = s3.get_object(client, location, key, max_bytes=max_bytes)
+            except s3.S3ObjectTooLarge:
+                # It grew past the limit after the listing: skipped the same way.
+                logger.info(
+                    "s3-source: skipped an object over the %d-byte limit", max_bytes
+                )
+                continue
             metadata = {**meta, "account_id": cfg.account_id}
             content_type = str(metadata.pop("content_type"))
             yield DataEnvelope(
