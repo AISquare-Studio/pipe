@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Databricks connector** (`connectors/databricks`, module `aisquare_pipe_databricks`, extra
+  `aisquare-pipe[databricks]`, in `[full]` and `[toolkits]`): the read-only toolkit `databricks`
+  (`DATABRICKS_READ_FILE`, primary; `DATABRICKS_LIST_FILES`; `DATABRICKS_RUN_SELECT`;
+  `DATABRICKS_LIST_CATALOGS`/`_SCHEMAS`/`_TABLES`) and the source `databricks-files-source`, over
+  Unity Catalog volumes (Files API) and DBFS, on the tenant's blob
+  `{workspace_url, auth: pat|oauth_m2m, token | client_id+client_secret, warehouse_id?}`.
+  `workspace_url` must be a Databricks host (cloud.databricks.com, azuredatabricks.net,
+  gcp.databricks.com). SQL runs only if a parser (sqlglot, `sqlglot>=25,<28`, the extra's only
+  dependency) and a lexer both accept ONE SELECT/WITH, checked before any HTTP call, with a row cap,
+  a 16 MiB byte cap and a deadline after which the statement is cancelled. Files carry version
+  markers `modified_time`, `etag`, `sha256`. A missing or malformed blob fails closed ("Databricks is
+  not configured", no request). Setup and the exact secret: `connectors/databricks/README.md`.
+
 ## [0.5.0] - 2026-11-04
 
 The tool-router release, and the first release as **one distribution**

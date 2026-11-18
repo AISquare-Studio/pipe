@@ -57,6 +57,11 @@ composio = [
     "composio>=0.13.1,<2.0",
     "composio-client>=1.39,<2.0",
 ]
+# Databricks: sqlglot parses SQL so only one SELECT is ever sent (HTTP via
+# requests, in core).
+databricks = [
+    "sqlglot>=25,<28",
+]
 docusign = [
     "docusign-esign>=4.0",
 ]
@@ -85,11 +90,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,composio,docusign,gateway,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,composio,databricks,docusign,gateway,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[databricks,github,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -100,6 +105,7 @@ mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
 composio-source = "aisquare_pipe_composio.connector:ComposioSource"
 composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
 composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
+databricks-files-source = "aisquare_pipe_databricks.connector:DatabricksFilesSource"
 docusign-source = "aisquare_pipe_docusign.connector:DocusignSource"
 docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
 dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
@@ -124,6 +130,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
+databricks = "aisquare_pipe_databricks.toolkit:DatabricksToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
 googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
@@ -136,6 +143,7 @@ slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
 where = [
     "src",
     "connectors/composio/src",
+    "connectors/databricks/src",
     "connectors/docusign/src",
     "connectors/dropbox/src",
     "connectors/gateway/src",
