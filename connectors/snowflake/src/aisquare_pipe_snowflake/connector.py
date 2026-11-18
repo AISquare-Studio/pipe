@@ -15,7 +15,10 @@ warehouse. Exactly one of:
 
 And for both: ``database`` and ``schema`` (the defaults for names written
 without them; the blob's otherwise), ``batch_size`` rows per envelope
-(default 500, at most 10,000), ``max_rows`` (default 10,000, at most
+(default 500, at most 10,000) and ``max_batch_bytes`` bytes of envelope data
+(default 256 KiB, what pipe-as-service returns inline in a synchronous pull;
+at least 1 KiB, at most 64 MiB; a single larger row still gets an envelope
+of its own), whichever comes first, ``max_rows`` (default 10,000, at most
 100,000), ``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most
 64 MiB, sized for a 512 MiB pod: see the README's "Memory") and
 ``timeout_seconds`` (the statement deadline, default 120, at
@@ -62,6 +65,7 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
+from aisquare.pipe.core.batches import INLINE_BATCH_BYTES, batch_bounds
 from aisquare.pipe.core.connector import AuthType, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
 
@@ -104,6 +108,9 @@ logger = logging.getLogger("aisquare.pipe.snowflake")
 
 DEFAULT_BATCH_SIZE = 500
 MAX_BATCH_SIZE = 10_000
+#: The smallest ``max_batch_bytes`` (the default is the host's inline size,
+#: :data:`~aisquare.pipe.core.batches.INLINE_BATCH_BYTES`).
+MIN_BATCH_BYTES = 1024
 DEFAULT_MAX_ROWS = 10_000
 MAX_ROWS = 100_000
 DEFAULT_MAX_RESULT_BYTES = 25 * 1024 * 1024
@@ -127,6 +134,7 @@ _PARAMS = frozenset(
         "order_by",
         "start_index",
         "batch_size",
+        "max_batch_bytes",
         "max_rows",
         "max_result_bytes",
         "timeout_seconds",
@@ -343,8 +351,15 @@ class SnowflakeQuerySource(SourceConnector):
                 if options.get("schema") not in (None, "")
                 else creds.schema
             )
-            batch_size = _bounded(
-                options, "batch_size", DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE
+            batch_size = (
+                _bounded(options, "batch_size", DEFAULT_BATCH_SIZE, 1, MAX_BATCH_SIZE),
+                _bounded(
+                    options,
+                    "max_batch_bytes",
+                    INLINE_BATCH_BYTES,
+                    MIN_BATCH_BYTES,
+                    MAX_RESULT_BYTES,
+                ),
             )
             max_rows = _bounded(options, "max_rows", DEFAULT_MAX_ROWS, 1, MAX_ROWS)
             max_bytes = _bounded(
@@ -405,7 +420,7 @@ class SnowflakeQuerySource(SourceConnector):
         statement: str,
         start: int,
         ordered: bool,
-        batch_size: int,
+        batch_size: tuple[int, int],
         max_rows: int,
         max_bytes: int,
         timeout: int,
@@ -438,7 +453,7 @@ class SnowflakeQuerySource(SourceConnector):
         statement: str,
         database: str | None,
         schema: str | None,
-        batch_size: int,
+        batch_size: tuple[int, int],
         max_rows: int,
         max_bytes: int,
         timeout: int,
@@ -522,13 +537,14 @@ def _markers(
 def _batches(
     result: StatementResult,
     common: dict[str, Any],
-    batch_size: int,
+    batch_size: tuple[int, int],
     first: int,
     source_id: str,
     kind: str,
 ) -> Iterator[DataEnvelope]:
-    """The result as envelopes of ``batch_size`` rows (one when empty),
-    from the rows' canonical JSON (``encoded=True``). Each batch's rows are
+    """The result as envelopes of at most ``batch_size`` (rows, bytes of
+    envelope data; one when empty), from the rows' canonical JSON
+    (``encoded=True``). Each batch's rows are
     let go once its envelope is built, so the rows and the envelopes a
     consumer keeps add up to about one copy of the result."""
     rows: list[bytes | None] = list(result.encoded or [])
@@ -552,9 +568,15 @@ def _batches(
             kind,
             result.truncated,
         )
-    starts = list(range(0, count, batch_size)) or [0]
-    for index, offset in enumerate(starts):
-        end = min(offset + batch_size, count)
+    bounds = batch_bounds(
+        [len(r) if r is not None else 0 for r in rows],
+        max_rows=batch_size[0],
+        max_bytes=batch_size[1],
+        header=len(encoded_batch(result.columns, [])) - 2,
+        separator=1,
+        closing=2,
+    )
+    for index, (offset, end) in enumerate(bounds):
         batch = [r for r in rows[offset:end] if r is not None]
         rows[offset:end] = [None] * (end - offset)
         envelope = DataEnvelope(
@@ -564,7 +586,7 @@ def _batches(
             metadata={
                 **common,
                 "batch_index": index,
-                "batch_count": len(starts),
+                "batch_count": len(bounds),
                 "first_row": first + offset,
                 "row_count": len(batch),
                 "batch_sha256": encoded_rows_sha256(batch),

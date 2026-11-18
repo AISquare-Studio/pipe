@@ -175,3 +175,50 @@ def test_envelopes_built_from_encoded_rows_are_byte_for_byte_the_same():
     assert rows.result_sha256_of_digests(columns, digests) == rows.result_sha256(
         columns, batch
     )
+
+
+# -- envelope size: what a host returns inline (#46, seq 13867 (b)) ----------------
+
+
+def test_default_envelopes_fit_a_sync_pull_inline(paged):
+    """pipe-as-service returns at most 256 KiB per envelope inline in a sync
+    pull and answers 400 for more; 500 rows of 1 KiB were twice that."""
+    from aisquare.pipe.core.batches import INLINE_BATCH_BYTES
+
+    paged(columns=10, width=98, total=2000)
+    envelopes = list(
+        RedshiftQuerySource().pull(blob(), PullParams({"sql": "SELECT 1"}))
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 2000
+    assert all(len(e.data) <= INLINE_BATCH_BYTES for e in envelopes)
+    assert all(e.metadata["row_count"] < 500 for e in envelopes)
+    assert {e.metadata["batch_count"] for e in envelopes} == {len(envelopes)}
+    assert all(json.loads(e.data)["rows"] for e in envelopes)
+
+
+@pytest.mark.parametrize("limit", [1024, 64 * 1024, 1024 * 1024])
+def test_max_batch_bytes_bounds_each_envelope(paged, limit):
+    paged(columns=10, width=98, total=3000)
+    envelopes = list(
+        RedshiftQuerySource().pull(
+            blob(),
+            PullParams(
+                {"sql": "SELECT 1", "max_batch_bytes": limit, "batch_size": 10_000}
+            ),
+        )
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 3000
+    assert all(len(e.data) <= limit or e.metadata["row_count"] == 1 for e in envelopes)
+
+
+@pytest.mark.parametrize("bad", [0, 1023, MAX_RESULT_BYTES + 1, "1", True])
+def test_max_batch_bytes_is_checked(paged, bad):
+    from aisquare.pipe.errors import ConfigValidationError
+
+    paged(columns=1, width=8, total=1)
+    with pytest.raises(ConfigValidationError, match="max_batch_bytes"):
+        list(
+            RedshiftQuerySource().pull(
+                blob(), PullParams({"sql": "SELECT 1", "max_batch_bytes": bad})
+            )
+        )

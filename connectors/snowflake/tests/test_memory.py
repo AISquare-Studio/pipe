@@ -16,6 +16,7 @@ import json
 import tracemalloc
 from typing import Any
 
+import pytest
 from aisquare.pipe.core.envelope import PullParams
 
 from aisquare_pipe_snowflake import SnowflakeQuerySource
@@ -183,3 +184,48 @@ def test_envelopes_built_from_encoded_rows_are_byte_for_byte_the_same():
         {"columns": columns, "rows": rows}
     )
     assert encoded_batch(columns, []) == canonical({"columns": columns, "rows": []})
+
+
+# -- envelope size: what a host returns inline (#46, seq 13867 (b)) ----------------
+
+
+def test_default_envelopes_fit_a_sync_pull_inline():
+    """pipe-as-service returns at most 256 KiB per envelope inline in a sync
+    pull and answers 400 for more; 500 rows of 1 KiB were twice that."""
+    from aisquare.pipe.core.batches import INLINE_BATCH_BYTES
+
+    columns = [col(f"S{i}", "text") for i in range(4)]
+    fake = PartitionedSnowflake(columns, 2000, _wide_cell)
+    envelopes = list(
+        SnowflakeQuerySource(session=fake).pull(blob(), PullParams({"sql": SQL}))
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 2000
+    assert all(len(e.data) <= INLINE_BATCH_BYTES for e in envelopes)
+    assert all(e.metadata["row_count"] < 500 for e in envelopes)
+    assert {e.metadata["batch_count"] for e in envelopes} == {len(envelopes)}
+    assert all(json.loads(e.data)["rows"] for e in envelopes)
+
+
+@pytest.mark.parametrize("limit", [1024, 64 * 1024, 1024 * 1024])
+def test_max_batch_bytes_bounds_each_envelope(limit):
+    columns = [col(f"S{i}", "text") for i in range(4)]
+    fake = PartitionedSnowflake(columns, 3000, _wide_cell)
+    envelopes = list(
+        SnowflakeQuerySource(session=fake).pull(
+            blob(),
+            PullParams({"sql": SQL, "max_batch_bytes": limit, "batch_size": 10_000}),
+        )
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 3000
+    assert all(len(e.data) <= limit or e.metadata["row_count"] == 1 for e in envelopes)
+
+
+@pytest.mark.parametrize("bad", [0, 1023, MAX_RESULT_BYTES + 1, "1", True])
+def test_max_batch_bytes_is_checked(bad):
+    fake = PartitionedSnowflake([col("S0", "text")], 1, _wide_cell)
+    with pytest.raises(ValueError, match="max_batch_bytes"):
+        list(
+            SnowflakeQuerySource(session=fake).pull(
+                blob(), PullParams({"sql": SQL, "max_batch_bytes": bad})
+            )
+        )

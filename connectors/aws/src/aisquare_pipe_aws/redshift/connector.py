@@ -10,7 +10,10 @@ secret (a param naming one is refused). Exactly one of:
   read as ``SELECT * FROM "schema"."table"``, which passes the same check.
 
 And for both: ``batch_size`` rows per envelope (default 500, at most
-10,000), ``max_rows`` (default 10,000, at most 100,000),
+10,000) and ``max_batch_bytes`` bytes of envelope data (default 256 KiB,
+what pipe-as-service returns inline in a synchronous pull; at least 1 KiB,
+at most 64 MiB; a single larger row still gets an envelope of its own),
+whichever comes first, ``max_rows`` (default 10,000, at most 100,000),
 ``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 64 MiB,
 sized for a 512 MiB pod: see the README's "Memory") and ``timeout_seconds`` (default 120, at most 600; never more than the
 host's time budget): the statement is cancelled if it runs past it.
@@ -64,6 +67,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from aisquare.pipe import time_budget
+from aisquare.pipe.core.batches import INLINE_BATCH_BYTES, batch_bounds
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PullParams
 from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
@@ -82,6 +86,9 @@ VERSION = "0.1.0"
 
 DEFAULT_BATCH_SIZE = 500
 MAX_BATCH_SIZE = 10_000
+#: The smallest ``max_batch_bytes`` (the default is the host's inline size,
+#: :data:`~aisquare.pipe.core.batches.INLINE_BATCH_BYTES`).
+MIN_BATCH_BYTES = 1024
 DEFAULT_MAX_ROWS = 10_000
 MAX_ROWS = 100_000
 DEFAULT_MAX_RESULT_BYTES = 25 * 1024 * 1024
@@ -93,7 +100,15 @@ DEFAULT_TIMEOUT_SECONDS = 120
 MAX_TIMEOUT_SECONDS = 600
 
 PARAMS = frozenset(
-    {"sql", "table", "batch_size", "max_rows", "max_result_bytes", "timeout_seconds"}
+    {
+        "sql",
+        "table",
+        "batch_size",
+        "max_batch_bytes",
+        "max_rows",
+        "max_result_bytes",
+        "timeout_seconds",
+    }
 )
 #: ``schema.table``: two plain Redshift names.
 _TABLE = re.compile(
@@ -262,6 +277,14 @@ class RedshiftQuerySource(_AwsSource):
         values = _options(params)
         sql, what = _statement(values)
         batch_size = _int(values, "batch_size", DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE)
+        batch_bytes = _int(
+            values, "max_batch_bytes", INLINE_BATCH_BYTES, MAX_RESULT_BYTES
+        )
+        if batch_bytes < MIN_BATCH_BYTES:
+            raise ConfigValidationError(
+                f"max_batch_bytes must be an integer from {MIN_BATCH_BYTES} to "
+                f"{MAX_RESULT_BYTES}"
+            )
         max_rows = _int(values, "max_rows", DEFAULT_MAX_ROWS, MAX_ROWS)
         max_bytes = _int(
             values, "max_result_bytes", DEFAULT_MAX_RESULT_BYTES, MAX_RESULT_BYTES
@@ -283,14 +306,18 @@ class RedshiftQuerySource(_AwsSource):
             max_result_bytes=max_bytes,
             encoded=True,
         )
-        yield from _envelopes(result, cfg.target, what, batch_size)
+        yield from _envelopes(result, cfg.target, what, (batch_size, batch_bytes))
 
 
 def _envelopes(
-    result: Result, target: RedshiftTarget, what: dict[str, Any], batch_size: int
+    result: Result,
+    target: RedshiftTarget,
+    what: dict[str, Any],
+    batch_size: tuple[int, int],
 ) -> Iterator[DataEnvelope]:
-    """The result (read ``encoded=True``) as envelopes of ``batch_size``
-    rows (one when empty). Each batch's rows are let go once its envelope is
+    """The result (read ``encoded=True``) as envelopes of at most
+    ``batch_size`` (rows, bytes of envelope data; one when empty). Each
+    batch's rows are let go once its envelope is
     built, so the rows and the envelopes a consumer keeps add up to about
     one copy of the result."""
     result_hash = result.result_sha256
@@ -298,18 +325,24 @@ def _envelopes(
     digests = result.digests or []
     result.encoded = result.digests = None
     count = len(encoded)
-    starts = list(range(0, count, batch_size)) or [0]
+    bounds = batch_bounds(
+        [len(r) if r is not None else 0 for r in encoded],
+        max_rows=batch_size[0],
+        max_bytes=batch_size[1],
+        header=len(rows.envelope_batch(result.columns, [])) - 2,
+        separator=2,
+        closing=2,
+    )
     where = target.cluster_identifier or target.workgroup_name
     label = what.get("table") or f"query:{what['query_sha256'][:16]}"
-    for index, start in enumerate(starts):
-        end = min(start + batch_size, count)
+    for index, (start, end) in enumerate(bounds):
         batch = [r for r in encoded[start:end] if r is not None]
         encoded[start:end] = [None] * (end - start)
         metadata: dict[str, Any] = {
             "version": result_hash,
             "result_sha256": result_hash,
             "batch_index": index,
-            "batch_count": len(starts),
+            "batch_count": len(bounds),
             "first_row": start,
             "row_count": len(batch),
             "batch_sha256": rows.digests_sha256(digests[start:end]),

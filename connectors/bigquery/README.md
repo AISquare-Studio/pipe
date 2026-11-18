@@ -53,7 +53,10 @@ rest as the strings BigQuery sends.
 - `sql`: one SELECT, guarded exactly as `BIGQUERY_RUN_SELECT`. Optional `default_dataset`, `max_bytes_processed`
   (default 1 GiB, never above the ceiling) and `job_timeout_seconds` (default 120, at most 600).
 
-For both: `batch_size` rows per envelope (default 500, at most 10,000), `max_rows` (default 10,000, at most 100,000)
+For both: `batch_size` rows per envelope (default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data
+(default 256 KiB, what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
+without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
+comes first, `max_rows` (default 10,000, at most 100,000)
 and `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see
 [Memory](#memory)).
 

@@ -70,7 +70,9 @@ name gets a unique key (`A`, `A_2`) and its `source_name`.
 - `sql`: one SELECT, guarded exactly as `SNOWFLAKE_RUN_SELECT`.
 
 For both: `database` and `schema` (the defaults for names written without them), `batch_size` rows per envelope
-(default 500, at most 10,000), `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (JSON bytes of
+(default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data (default 256 KiB, what pipe-as-service
+returns inline in a synchronous pull, which answers 400 for a larger envelope without a blob store; at least 1 KiB,
+at most 64 MiB; a single larger row still gets its own envelope), whichever comes first, `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (JSON bytes of
 rows, default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)) and `timeout_seconds` (the
 statement deadline, default 120, at most 600).
 

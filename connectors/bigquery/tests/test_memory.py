@@ -15,6 +15,7 @@ import json
 import tracemalloc
 from typing import Any
 
+import pytest
 from aisquare.pipe.core.envelope import PullParams
 
 from aisquare_pipe_bigquery import BigQueryQuerySource
@@ -180,3 +181,60 @@ def test_envelopes_built_from_encoded_rows_are_byte_for_byte_the_same():
     )
     assert encoded_batch(fields, []) == canonical({"columns": fields, "rows": []})
     assert rows_sha256(rows)  # unchanged API
+
+
+# -- envelope size: what a host returns inline (#46, seq 13867 (b)) ----------------
+
+
+def test_default_envelopes_fit_a_sync_pull_inline():
+    """pipe-as-service returns at most 256 KiB per envelope inline in a sync
+    pull and answers 400 for more; 500 rows of 1 KiB were twice that."""
+    from aisquare.pipe.core.batches import INLINE_BATCH_BYTES
+
+    from tests.fakes import blob
+
+    fields = [field_(f"s{i}", "STRING") for i in range(4)]
+    google = PagedGoogle(fields, 2000, _wide_cell)
+    envelopes = list(
+        BigQueryQuerySource(session=google).pull(
+            blob(), PullParams({"table": "sales.big"})
+        )
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 2000
+    assert all(len(e.data) <= INLINE_BATCH_BYTES for e in envelopes)
+    assert all(e.metadata["row_count"] < 500 for e in envelopes)
+    assert {e.metadata["batch_count"] for e in envelopes} == {len(envelopes)}
+    firsts = [e.metadata["first_row"] for e in envelopes]
+    assert firsts == sorted(firsts) and firsts[0] == 0
+    assert all(json.loads(e.data)["rows"] for e in envelopes)  # valid JSON
+
+
+@pytest.mark.parametrize("limit", [1024, 64 * 1024, 1024 * 1024])
+def test_max_batch_bytes_bounds_each_envelope(limit):
+    from tests.fakes import blob
+
+    fields = [field_(f"s{i}", "STRING") for i in range(4)]
+    google = PagedGoogle(fields, 3000, _wide_cell)
+    envelopes = list(
+        BigQueryQuerySource(session=google).pull(
+            blob(),
+            PullParams(
+                {"table": "sales.big", "max_batch_bytes": limit, "batch_size": 10_000}
+            ),
+        )
+    )
+    assert sum(e.metadata["row_count"] for e in envelopes) == 3000
+    assert all(len(e.data) <= limit or e.metadata["row_count"] == 1 for e in envelopes)
+
+
+@pytest.mark.parametrize("bad", [0, 1023, MAX_RESULT_BYTES + 1, "1", True])
+def test_max_batch_bytes_is_checked(bad):
+    from tests.fakes import blob
+
+    google = PagedGoogle([field_("s0", "STRING")], 1, _wide_cell)
+    with pytest.raises(ValueError, match="max_batch_bytes"):
+        list(
+            BigQueryQuerySource(session=google).pull(
+                blob(), PullParams({"table": "sales.big", "max_batch_bytes": bad})
+            )
+        )

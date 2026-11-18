@@ -248,6 +248,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step fails when it ran none (it used to pass having tested nothing).
 - S3: an object that grew past `max_object_bytes` between the listing and the read is skipped, not
   raised mid-pull.
+- BigQuery, Snowflake and Redshift sources cut a batch at `batch_size` rows or `max_batch_bytes` bytes of
+  envelope data, whichever comes first (`aisquare.pipe.core.batches.batch_bounds`). The default, 256 KiB, is
+  what pipe-as-service returns inline in a sync pull: before, a default 500-row batch of 1 KiB rows was about
+  500 KiB, and a sync pull without a blob store answered 400 at the first envelope (all three, measured through
+  the host's `from_envelope`); now the same pull is 200, 8 envelopes of at most 261,816 bytes.
 - GCS source memory: a download accumulates in one buffer (no chunk list and join), the source drops each
   object before the next download, and it holds an envelope back for a truncated pull's marker only when
   every object after it could still be skipped at download (unknown size, or stored gzip). `max_bytes`

@@ -545,7 +545,10 @@ Pull params, exactly one of:
 - `table`: `schema.table` (plain names: letters, digits, `_`, `$`), read as
   `SELECT * FROM "schema"."table"`.
 
-And `batch_size` (default 500, at most 10,000 rows per envelope), `max_rows` (default 10,000,
+And `batch_size` (default 500, at most 10,000 rows per envelope) and `max_batch_bytes` (bytes of envelope data,
+default 256 KiB: what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
+without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
+comes first, `max_rows` (default 10,000,
 at most 100,000), `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 64 MiB, sized
 for a 512 MiB pod: see [Memory](#memory)), `timeout_seconds`. Any other param is refused, and so
 is one naming a key of the secret.
