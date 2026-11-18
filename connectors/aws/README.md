@@ -133,7 +133,10 @@ type, so the AWS error classes themselves would be a 500):
   and `upstream_error`.
 
 The message is the table's: the operation and AWS's error code. An S3 object that grew past `max_object_bytes`
-between the listing and the read is skipped, as one the listing already shows too large is.
+between the listing and the read is skipped, as one the listing already shows too large is. An object body that
+breaks off while it is read (a read timeout, a dropped connection, a TLS record that fails mid-body, a body shorter
+than its `Content-Length`) is a 502 naming only the error's type: botocore's own message names the bucket and key,
+and urllib3's errors, which botocore passes through as they are, carry the TLS library's text.
 
 ## Customer setup (registration checklist)
 
@@ -548,10 +551,9 @@ Pull params, exactly one of:
 And `batch_size` (default 500, at most 10,000 rows per envelope) and `max_batch_bytes` (bytes of envelope data,
 default 256 KiB: what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
 without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
-comes first, `max_rows` (default 10,000,
-at most 100,000), `max_result_bytes` (JSON bytes of rows, default 25 MiB, at most 64 MiB, sized
-for a 512 MiB pod: see [Memory](#memory)), `timeout_seconds`. Any other param is refused, and so
-is one naming a key of the secret.
+comes first, `max_rows` (default 10,000, at most 100,000), `max_result_bytes` (bytes of the envelopes' data in all,
+each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see [Memory](#memory)),
+`timeout_seconds`. Any other param is refused, and so is one naming a key of the secret.
 
 Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
 (`application/json`). Its metadata:
@@ -608,9 +610,10 @@ database's error text, which can echo the caller's values (`invalid input syntax
 
 ### Memory
 
-A pull's peak memory, measured with `tracemalloc` (`tests/test_redshift_memory.py`; the fake
-client parses each `GetStatementResult` page from fresh JSON bytes, 1,000 rows a page, and every
-envelope is kept, as pipe-as-service keeps a pull's envelopes for its response):
+A pull's peak memory, measured with `tracemalloc` (`tests/test_redshift_memory.py`; the fake client parses each
+`GetStatementResult` page from fresh JSON bytes, 1,000 rows a page, and every envelope is kept: one inline copy
+each, as pipe-as-service keeps a pull's converted envelopes (inline up to 256 KiB; each test's docstring has the
+model)):
 
 | Pull | Rows | JSON of the rows | Peak |
 |---|---|---|---|
@@ -624,7 +627,28 @@ fifth of the memory a row object takes; the envelopes and hashes are byte for by
 were). A batch's rows are let go once its envelope is built. So a pull peaks at about 1.35 times
 the rows' JSON plus a page or two. A host keeps the envelopes too: pipe-as-service
 base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at 64 MiB on
-a 512 MiB pod. AWS, not the connector, sizes the result pages.
+a 512 MiB pod.
+
+**What these numbers assume: AWS's page size.** AWS, not the connector, sizes the result pages:
+`GetStatementResult` takes no page size, and AWS documents none for JSON results (only that a
+result is at most 500 MB after gzip, in the Data API's "Considerations"). botocore parses each
+page whole, so the connector can't cap one, and the peak grows about nine times a page's JSON.
+Measured at the caps with 10 narrow `varchar` columns, changing only the fake's page:
+
+| One `GetStatementResult` page | Peak |
+|---|---|
+| 1,000 rows, 0.3 MiB of JSON (the tests' fake) | 35.9 MiB |
+| 10,000 rows, 2.8 MiB | 58.2 MiB |
+| 30,000 rows, 8.3 MiB | 113.1 MiB |
+| 60,000 rows, 16.7 MiB | 186.0 MiB |
+| 90,000 rows, 25 MiB | 278.7 MiB (over the 256 MiB bar) |
+
+So the bound holds while a real page is under about 20 MiB of JSON. That is unmeasured: one
+page of a wide `SELECT` on stg is the check. If pages run larger, the way out is
+`GetStatementResultV2` (`ResultFormat` `CSV`), which AWS documents at up to 15 MB of results a
+request, in 1 MB chunks. It is not used yet because AWS documents neither how a CSV record
+writes SQL `NULL` (against an empty string) nor whether a chunk carries a header row, so the
+switch needs that stg check first.
 
 ### Redshift registration checklist
 

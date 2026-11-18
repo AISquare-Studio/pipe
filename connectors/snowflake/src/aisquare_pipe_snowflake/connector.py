@@ -19,10 +19,10 @@ without them; the blob's otherwise), ``batch_size`` rows per envelope
 (default 256 KiB, what pipe-as-service returns inline in a synchronous pull;
 at least 1 KiB, at most 64 MiB; a single larger row still gets an envelope
 of its own), whichever comes first, ``max_rows`` (default 10,000, at most
-100,000), ``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most
-64 MiB, sized for a 512 MiB pod: see the README's "Memory") and
-``timeout_seconds`` (the statement deadline, default 120, at
-most 600).
+100,000), ``max_result_bytes`` (bytes of the envelopes' data in all, each
+one's columns header included; default 25 MiB, at most 64 MiB, sized for a
+512 MiB pod: see the README's "Memory") and ``timeout_seconds`` (the
+statement deadline, default 120, at most 600).
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``; ``schema`` carries the columns
@@ -99,6 +99,7 @@ from aisquare_pipe_snowflake.rows import (
 )
 from aisquare_pipe_snowflake.sqlguard import (
     NotReadOnly,
+    check_context,
     check_select_only,
     table_references,
 )
@@ -384,6 +385,7 @@ class SnowflakeQuerySource(SourceConnector):
                 statement = _table_select(ref, columns, order_by, start, max_rows)
             else:
                 statement = check_select_only(options["sql"])
+                check_context(database, schema)
         except BadReference as e:
             raise ValueError(str(e)) from None
         with SnowflakeClient(creds, session=self._session) as client:
@@ -435,6 +437,7 @@ class SnowflakeQuerySource(SourceConnector):
             byte_limit=max_bytes,
             timeout_seconds=timeout,
             encoded=True,
+            batching=batch_size,
         )
         common: dict[str, Any] = {"kind": "table", "table": ref.display()}
         if info is not None and info.get("TABLE_TYPE") in DATA_TABLE_TYPES:
@@ -469,6 +472,7 @@ class SnowflakeQuerySource(SourceConnector):
             database=database,
             schema=schema,
             encoded=True,
+            batching=batch_size,
         )
         digest = hashlib.sha256(statement.encode()).hexdigest()
         common: dict[str, Any] = {"kind": "query", "query_sha256": digest, **markers}
@@ -568,13 +572,17 @@ def _batches(
             kind,
             result.truncated,
         )
-    bounds = batch_bounds(
-        [len(r) if r is not None else 0 for r in rows],
-        max_rows=batch_size[0],
-        max_bytes=batch_size[1],
-        header=len(encoded_batch(result.columns, [])) - 2,
-        separator=1,
-        closing=2,
+    bounds = (
+        result.plan.bounds()
+        if result.plan is not None
+        else batch_bounds(
+            [len(r) if r is not None else 0 for r in rows],
+            max_rows=batch_size[0],
+            max_bytes=batch_size[1],
+            header=len(encoded_batch(result.columns, [])) - 2,
+            separator=1,
+            closing=2,
+        )
     )
     for index, (offset, end) in enumerate(bounds):
         batch = [r for r in rows[offset:end] if r is not None]

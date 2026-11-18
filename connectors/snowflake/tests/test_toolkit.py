@@ -395,7 +395,10 @@ def test_the_result_byte_cap_cuts_the_result_and_says_so():
     assert len(json.dumps(result.data["rows"])) <= MAX_RESULT_BYTES
 
 
-def test_a_partition_past_the_byte_cap_is_never_downloaded():
+def test_a_partition_is_read_only_up_to_the_byte_cap():
+    """Rows are read one at a time (#46 review seq 14088 M2), so a partition
+    whose rows don't all fit is read up to the cap, not skipped whole (that
+    returned 2 rows here, not 3), and no partition after it is asked for."""
     fake = _fake()
     big = "y" * (1024 * 1024)
     fake.add(
@@ -404,10 +407,12 @@ def test_a_partition_past_the_byte_cap_is_never_downloaded():
     )
     result = _call(fake, "SNOWFLAKE_RUN_SELECT", {"statement": "SELECT * FROM blobs"})
     assert result.data["truncated"] == "max_result_bytes"
+    assert result.data["row_count"] == 3
+    assert len(json.dumps(result.data["rows"])) <= MAX_RESULT_BYTES
     partitions = [
         r["params"].get("partition") for r in fake.api_calls() if r["method"] == "GET"
     ]
-    assert partitions == [None]  # partition 1 would pass the cap: not read
+    assert partitions == [None, 1]  # partition 1 up to the cap; 2 and 3 never
 
 
 # -- server keys and bad arguments ---------------------------------------------------
@@ -706,6 +711,146 @@ def test_composio_era_slugs_and_arguments_still_work():
         result = _call(fake, slug, arguments)
         assert result.successful, (slug, result.error)
     assert all(b["timeout"] == 20 for b in fake.submits())
+
+
+# Reviewer seq 13859 m3: Composio's SHOW_SCHEMAS and SHOW_TABLES take in_scope
+# (pipe-as-service composio/guard.py); the native tools answered "unknown
+# argument(s) 'in_scope'".
+@pytest.mark.parametrize(
+    ("slug", "arguments", "statement", "names"),
+    [
+        (
+            "SNOWFLAKE_SHOW_SCHEMAS",
+            {"in_scope": "ACCOUNT"},
+            "SHOW SCHEMAS IN ACCOUNT LIMIT 101",
+            ["OLD", "HR", "PUBLIC"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_SCHEMAS",
+            {"in_scope": "database"},
+            'SHOW SCHEMAS IN DATABASE "POLICIES" LIMIT 101',
+            ["HR", "PUBLIC"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_SCHEMAS",
+            {"in_scope": "DATABASE", "database": "archive"},
+            'SHOW SCHEMAS IN DATABASE "ARCHIVE" LIMIT 101',
+            ["OLD"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "ACCOUNT"},
+            "SHOW TABLES IN ACCOUNT LIMIT 101",
+            ["DOCS", "DOCS", "DOC_INDEX", "HANDBOOK"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "DATABASE"},
+            'SHOW TABLES IN DATABASE "POLICIES" LIMIT 101',
+            ["DOCS", "DOC_INDEX", "HANDBOOK"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": " Database ", "database": "ARCHIVE"},
+            'SHOW TABLES IN DATABASE "ARCHIVE" LIMIT 101',
+            ["DOCS"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "SCHEMA"},
+            'SHOW TABLES IN SCHEMA "POLICIES"."PUBLIC" LIMIT 101',
+            ["DOCS", "DOC_INDEX"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "schema", "schema": "hr"},
+            'SHOW TABLES IN SCHEMA "POLICIES"."HR" LIMIT 101',
+            ["HANDBOOK"],
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "SCHEMA", "schema": "ARCHIVE.OLD"},
+            'SHOW TABLES IN SCHEMA "ARCHIVE"."OLD" LIMIT 101',
+            ["DOCS"],
+        ),
+        (
+            # With a database but no schema: the configured schema in it.
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "SCHEMA", "database": "archive"},
+            'SHOW TABLES IN SCHEMA "ARCHIVE"."PUBLIC" LIMIT 101',
+            [],
+        ),
+    ],
+)
+def test_composio_in_scope_maps_to_the_scope_the_tool_builds(
+    slug, arguments, statement, names
+):
+    fake = _fake()
+    result = _call(fake, slug, arguments)
+    assert result.successful, result.error
+    assert fake.statements() == [statement]
+    items = result.data["schemas" if slug.endswith("SCHEMAS") else "tables"]
+    assert sorted(i["name"] for i in items) == sorted(names)
+
+
+@pytest.mark.parametrize(
+    ("slug", "arguments", "config", "why"),
+    [
+        ("SNOWFLAKE_SHOW_SCHEMAS", {"in_scope": "SCHEMA"}, None, "ACCOUNT or DATABASE"),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "TABLE"},
+            None,
+            "ACCOUNT or DATABASE or SCHEMA",
+        ),
+        ("SNOWFLAKE_SHOW_TABLES", {"in_scope": 1}, None, "'in_scope' must be string"),
+        (
+            "SNOWFLAKE_SHOW_SCHEMAS",
+            {"in_scope": "ACCOUNT", "database": "POLICIES"},
+            None,
+            "leave database out",
+        ),
+        (
+            "SNOWFLAKE_SHOW_SCHEMAS",
+            {"in_scope": "DATABASE"},
+            blob(database=None, schema=None),
+            "needs a database",
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "ACCOUNT", "schema": "PUBLIC"},
+            None,
+            "leave database and schema out",
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "DATABASE", "schema": "PUBLIC"},
+            None,
+            "leave schema out",
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "DATABASE"},
+            blob(database=None, schema=None),
+            "needs a database",
+        ),
+        (
+            "SNOWFLAKE_SHOW_TABLES",
+            {"in_scope": "SCHEMA"},
+            blob(schema=None),
+            "needs a schema",
+        ),
+    ],
+)
+def test_an_in_scope_the_arguments_contradict_is_refused_before_any_request(
+    slug, arguments, config, why
+):
+    fake = _fake()
+    result = _call(fake, slug, arguments, config)
+    assert not result.successful
+    assert result.error_code == "invalid_arguments"
+    assert why in result.error
+    assert fake.requests == []
 
 
 def test_the_toolkit_is_found_by_search_scored_and_search_connectors():

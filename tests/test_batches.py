@@ -72,3 +72,36 @@ def test_a_row_larger_than_the_cap_gets_its_own_batch():
 
 def test_the_default_is_pipe_as_services_inline_size():
     assert INLINE_BATCH_BYTES == 262_144
+
+
+def test_a_plan_counts_every_envelope_s_header_in_its_total():
+    from aisquare.pipe.core.batches import BatchPlan
+
+    plan = BatchPlan(max_rows=2, max_bytes=10**6, header=100, separator=1, closing=2)
+    assert plan.total == 102  # no rows: one empty envelope
+    assert plan.cost(10) == 10
+    plan.add(10)
+    assert plan.cost(10) == 11  # a separator
+    plan.add(10)
+    assert plan.cost(10) == 112  # a new envelope: its header and closing too
+    plan.add(10)
+    assert plan.total == 102 + 10 + 11 + 112
+    assert plan.bounds() == [(0, 2), (2, 3)]
+    # The total is exactly what the envelopes hold.
+    sizes = [100 + 2 + 10 + 1 + 10, 100 + 2 + 10]
+    assert plan.total == sum(sizes)
+
+
+def test_batch_bounds_and_a_plan_agree():
+    from aisquare.pipe.core.batches import BatchPlan
+
+    rows = [7, 30, 30, 30, 5, 5, 5, 60, 1, 200, 3]
+    plan = BatchPlan(max_rows=3, max_bytes=80, header=10, separator=2, closing=2)
+    for row in rows:
+        plan.add(row)
+    assert plan.bounds() == batch_bounds(
+        rows, max_rows=3, max_bytes=80, header=10, separator=2, closing=2
+    )
+    assert plan.total == sum(
+        10 + 2 + sum(rows[a:b]) + 2 * max(0, b - a - 1) for a, b in plan.bounds()
+    )

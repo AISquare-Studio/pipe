@@ -327,6 +327,14 @@ class GcsSource(SourceConnector):
             skipped = 0
             candidates: list[dict[str, Any]] = []
             for record in records:
+                generation = record.get("generation")
+                if generation is not None and not isinstance(generation, str):
+                    # Cloud Storage sends int64s as strings: anything else is
+                    # its answer gone wrong, not the caller's to fix (502).
+                    raise GcsAPIError(
+                        "Cloud Storage answered an object whose generation is "
+                        "not a string"
+                    )
                 if since is not None and not _after(record.get("updated"), since):
                     continue
                 size = record.get("size")

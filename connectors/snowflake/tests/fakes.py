@@ -34,7 +34,7 @@ import io
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs
@@ -193,6 +193,12 @@ class FakeResponse:
 
     def json(self) -> Any:
         return json.loads(self.content)
+
+    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
+        """The body in ``chunk_size`` pieces, each a fresh copy (as the
+        network gives them)."""
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start : start + chunk_size]
 
     def close(self) -> None:
         pass
@@ -782,14 +788,26 @@ class _Body(io.RawIOBase):
 
 class _FakeSnowflakeAdapter(requests.adapters.HTTPAdapter):
     """Answers every request from a FakeSnowflake with a urllib3 response.
-    ``body_break`` makes every SQL API body break off after a few bytes."""
+    ``body_break`` makes every SQL API body (or each one ``break_when(url,
+    params)`` picks) break off after ``break_after`` bytes; ``gzip`` sends
+    200 bodies gzip-encoded (``Content-Encoding: gzip``), as Snowflake sends
+    later partitions."""
 
     def __init__(
-        self, fake: FakeSnowflake, body_break: BaseException | None = None
+        self,
+        fake: FakeSnowflake,
+        body_break: BaseException | None = None,
+        *,
+        break_when: Callable[[str, dict[str, str]], bool] | None = None,
+        break_after: int = 8,
+        gzip: bool = False,
     ) -> None:
         super().__init__()
         self._fake = fake
         self._break = body_break
+        self._break_when = break_when
+        self._break_after = break_after
+        self._gzip = gzip
 
     def send(self, request: Any, stream: bool = False, timeout: Any = None, **_: Any):
         url, _sep, query = str(request.url).partition("?")
@@ -803,12 +821,22 @@ class _FakeSnowflakeAdapter(requests.adapters.HTTPAdapter):
             timeout=timeout,
             allow_redirects=False,
         )
-        broken = (
-            (8, self._break) if self._break is not None and url != TOKEN_URL else None
-        )
+        broken = None
+        if (
+            self._break is not None
+            and url != TOKEN_URL
+            and (self._break_when is None or self._break_when(url, params))
+        ):
+            broken = (self._break_after, self._break)
+        content, headers = answer.content, dict(answer.headers)
+        if self._gzip and answer.status_code == 200 and url != TOKEN_URL:
+            import gzip as gzip_module
+
+            content = gzip_module.compress(content)
+            headers["Content-Encoding"] = "gzip"
         raw = urllib3.HTTPResponse(
-            body=_Body(answer.content, broken),
-            headers=answer.headers,
+            body=_Body(content, broken),
+            headers=headers,
             status=answer.status_code,
             preload_content=False,
             request_method=str(request.method),
@@ -817,11 +845,26 @@ class _FakeSnowflakeAdapter(requests.adapters.HTTPAdapter):
 
 
 def real_session(
-    fake: FakeSnowflake, *, body_break: BaseException | None = None
+    fake: FakeSnowflake,
+    *,
+    body_break: BaseException | None = None,
+    break_when: Callable[[str, dict[str, str]], bool] | None = None,
+    break_after: int = 8,
+    gzip: bool = False,
 ) -> requests.Session:
-    """A real ``requests.Session`` whose HTTPS goes to ``fake``. It ignores
-    proxy settings (a proxy lookup may resolve names on macOS)."""
+    """A real ``requests.Session`` whose HTTPS goes to ``fake`` (see
+    :class:`_FakeSnowflakeAdapter`). It ignores proxy settings (a proxy
+    lookup may resolve names on macOS)."""
     session = requests.Session()
     session.trust_env = False
-    session.mount("https://", _FakeSnowflakeAdapter(fake, body_break))
+    session.mount(
+        "https://",
+        _FakeSnowflakeAdapter(
+            fake,
+            body_break,
+            break_when=break_when,
+            break_after=break_after,
+            gzip=gzip,
+        ),
+    )
     return session

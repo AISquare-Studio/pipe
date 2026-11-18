@@ -135,3 +135,67 @@ def test_a_missing_credential_is_a_422():
         list(GcsSource(session=google).pull({}, PullParams(params={})))
     assert host_answer(raised.value).status == 422
     assert google.requests == []
+
+
+# Google's token endpoint answers: (status, body). The source's error never
+# carries Google's error/error_description (#46 reopen seq 13961, FAIL 2); the
+# toolkit, which answers the caller, still does.
+TOKEN_FAILURES = [
+    (400, {"error": "invalid_grant", "error_description": f"Invalid JWT {LEAK}"}),
+    (
+        400,
+        {
+            "error": "invalid_grant",
+            "error_description": f"Token must be a short-lived token (60 minutes) and in a reasonable timeframe {LEAK}",
+        },
+    ),
+    (403, {"error": "access_denied", "error_description": f"account disabled {LEAK}"}),
+    (429, {"error": "rate_limit_exceeded", "error_description": f"slow down {LEAK}"}),
+    (500, {"error": "internal_failure", "error_description": f"backend {LEAK}"}),
+    (503, {"error": "temporarily_unavailable", "error_description": f"later {LEAK}"}),
+]
+
+
+@pytest.mark.parametrize(("status", "body"), TOKEN_FAILURES)
+def test_token_endpoint_text_stays_out_of_the_source_s_error(status, body):
+    from aisquare_pipe_gcs import GcsToolkit
+
+    google = _google()
+    google.token_error = (status, body)
+    with pytest.raises(PipelineError) as raised:
+        _pull(google)
+    assert host_answer(raised.value).status == 502
+    assert LEAK not in str(raised.value)
+    assert body["error"] not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__
+    google = _google()
+    google.token_error = (status, body)
+    result = GcsToolkit(session=google).call_tool("GCS_LIST_OBJECTS", {}, blob())
+    assert LEAK in (result.error or "")
+
+
+@pytest.mark.parametrize("generation", [123, 1.5, ["1"], {"g": "1"}, True])
+@pytest.mark.parametrize("named", [False, True])
+def test_an_object_with_a_non_string_generation_is_a_502(
+    monkeypatch, generation, named
+):
+    """Cloud Storage sends a generation as a string; anything else is its
+    answer gone wrong, not the caller's to fix (#46 reopen seq 13961: it was a
+    422 GcsRequestError)."""
+    from tests.fakes import StoredObject as Stored
+
+    class Odd(Stored):
+        def resource(self, bucket, name):
+            resource = super().resource(bucket, name)
+            resource["generation"] = generation
+            return resource
+
+    google = FakeGoogle(objects={"policies/a.txt": Odd(b"hello", "text/plain")})
+    params = {"object_names": ["policies/a.txt"]} if named else {}
+    with pytest.raises(PipelineError) as raised:
+        _pull(google, **params)
+    assert host_answer(raised.value).status == 502
+    assert "a.txt" not in str(raised.value)
+    assert not [
+        r for r in google.requests if (r.get("params") or {}).get("alt") == "media"
+    ]

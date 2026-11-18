@@ -18,6 +18,12 @@ feat/native-auto-routing @ d6fcca9):
 So a source raises ``PipelineError`` itself for an upstream or transient
 failure and a ``ValueError`` subclass for what the caller can fix.
 :func:`host_answer` lets a connector's tests pin that without the host.
+
+This mirror is deliberately the STRICTEST host, not the newest one:
+pipe-as-service fix/source-errors-host (84de644, not yet on its router)
+looks ``PipeError`` up along the MRO, so there a ``PipelineError`` subclass
+answers 502 too. A source that passes here passes on both; one that relies
+on a subclass would answer 500 on any host still matching exact types.
 ``retry_after`` is the exception's own ``retry_after`` (what a host sends as
 ``Retry-After``), when it has one.
 """

@@ -16,13 +16,14 @@ ceiling. Exactly one of:
   ``job_timeout_seconds`` (default 120, at most 600) as ``jobTimeoutMs``.
   Optional ``default_dataset``.
 
-And for both: ``batch_size`` rows per envelope (default 500, at most
-10,000) and ``max_batch_bytes`` bytes of envelope data (default 256 KiB,
-what pipe-as-service returns inline in a synchronous pull; at least 1 KiB,
-at most 64 MiB; a single larger row still gets an envelope of its own),
+And for both: ``batch_size`` rows per envelope (default 500, at most 10,000)
+and ``max_batch_bytes`` bytes of envelope data (default 256 KiB, what
+pipe-as-service returns inline in a synchronous pull; at least 1 KiB, at
+most 64 MiB; a single larger row still gets an envelope of its own),
 whichever comes first, ``max_rows`` (default 10,000, at most 100,000) and
-``max_result_bytes`` (JSON bytes of rows, default 25 MiB, at most 64 MiB:
-sized for a 512 MiB pod, see the README's "Memory").
+``max_result_bytes`` (bytes of the envelopes' data in all, each one's
+columns header included; default 25 MiB, at most 64 MiB: sized for a 512 MiB
+pod, see the README's "Memory").
 
 Each envelope is one batch: ``data`` is JSON ``{"columns": [...], "rows":
 [{column: value}]}`` (``application/json``; ``schema`` carries the columns
@@ -48,9 +49,10 @@ plus ``batch_index``, ``batch_count``, ``first_row``, ``row_count``,
 ``job_id`` and ``total_bytes_processed``. A result with no rows is one
 envelope with no rows, so its markers still come out.
 
-A result cut short by ``max_rows`` or ``max_result_bytes`` says so on every
-envelope: ``truncated`` (``max_rows`` or ``max_result_bytes``), and for a
-table ``next_start_index``. Its ``result_sha256`` covers the rows read only.
+A result cut short by ``max_rows``, ``max_result_bytes`` or the page limit
+(5,000 pages) says so on every envelope: ``truncated`` (``max_rows``,
+``max_result_bytes`` or ``max_pages``), and for a table
+``next_start_index``. Its ``result_sha256`` covers the rows read only.
 
 A param naming a credential key is refused, and so is SQL that is not one
 SELECT. Logs carry no SQL, no table names and no row values.
@@ -79,6 +81,7 @@ from aisquare_pipe_bigquery.query import (
     CapExceeded,
     NotATable,
     Rows,
+    RowTooLarge,
     dry_run,
     read_table_rows,
     run_select,
@@ -267,7 +270,9 @@ class BigQueryQuerySource(SourceConnector):
         "truncated": MetaField(
             type=str,
             required=False,
-            description="When a cap cut the result: max_rows or max_result_bytes",
+            description=(
+                "When a cap cut the result: max_rows, max_result_bytes or max_pages"
+            ),
         ),
         "next_start_index": MetaField(
             type=int,
@@ -297,7 +302,9 @@ class BigQueryQuerySource(SourceConnector):
           usable credential (before any request); bad params; SQL that is
           not one SELECT (:class:`~aisquare_pipe_bigquery.sqlguard.NotReadOnly`);
           a query over its byte cap
-          (:class:`~aisquare_pipe_bigquery.query.CapExceeded`); and what
+          (:class:`~aisquare_pipe_bigquery.query.CapExceeded`); a single
+          row larger than one page may hold
+          (:class:`~aisquare_pipe_bigquery.query.RowTooLarge`); and what
           BigQuery refused that the caller can fix, an invalid query or a
           missing table (:class:`~aisquare_pipe_bigquery.toolkit.BigQueryRequestError`);
         * 502, a :class:`~aisquare.pipe.errors.PipelineError`: any other
@@ -401,6 +408,7 @@ class BigQueryQuerySource(SourceConnector):
             start_index=start,
             selected_fields=selected,
             encoded=True,
+            batching=batch_size,
         )
         name = ref.qualified(creds.project_id)
         common: dict[str, Any] = {"kind": "table", "table": name}
@@ -437,6 +445,7 @@ class BigQueryQuerySource(SourceConnector):
             default_dataset=default_dataset,
             estimate=estimate,
             encoded=True,
+            batching=batch_size,
         )
         digest = hashlib.sha256(sql.encode()).hexdigest()
         common: dict[str, Any] = {"kind": "query", "query_sha256": digest, **markers}
@@ -535,13 +544,17 @@ def _batches(
             kind,
             result.truncated,
         )
-    bounds = batch_bounds(
-        [len(r) if r is not None else 0 for r in rows],
-        max_rows=batch_size[0],
-        max_bytes=batch_size[1],
-        header=len(encoded_batch(result.fields, [])) - 2,
-        separator=1,
-        closing=2,
+    bounds = (
+        result.plan.bounds()
+        if result.plan is not None
+        else batch_bounds(
+            [len(r) if r is not None else 0 for r in rows],
+            max_rows=batch_size[0],
+            max_bytes=batch_size[1],
+            header=len(encoded_batch(result.fields, [])) - 2,
+            separator=1,
+            closing=2,
+        )
     )
     columns = {"fields": result.fields}
     for index, (offset, end) in enumerate(bounds):
@@ -573,4 +586,5 @@ __all__ = [
     "CapExceeded",
     "NotATable",
     "NotReadOnly",
+    "RowTooLarge",
 ]

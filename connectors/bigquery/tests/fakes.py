@@ -22,7 +22,7 @@ from __future__ import annotations
 import base64
 import io
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs, unquote
@@ -173,6 +173,10 @@ class FakeResponse:
     body: Any = None
     content: bytes = b""
     headers: dict[str, str] = field(default_factory=dict)
+    #: Called with the response when it is closed (``consumed`` is then how
+    #: much of a streamed body was read).
+    on_close: Callable[[FakeResponse], None] | None = None
+    consumed: int = 0
 
     def __post_init__(self) -> None:
         if self.body is not None and not self.content:
@@ -186,8 +190,17 @@ class FakeResponse:
     def json(self) -> Any:
         return json.loads(self.content)
 
+    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
+        """The body ``chunk_size`` bytes at a time (a streamed read)."""
+        for start in range(0, len(self.content), chunk_size):
+            chunk = self.content[start : start + chunk_size]
+            self.consumed += len(chunk)
+            yield chunk
+
     def close(self) -> None:
-        pass
+        if self.on_close is not None:
+            self.on_close(self)
+            self.on_close = None
 
 
 def _error(status: int, reason: str, message: str) -> FakeResponse:
@@ -475,7 +488,7 @@ class FakeGoogle:
         if canned.error is not None:
             return _error(*canned.error)
         size = self.result_page_rows or int(params.get("maxResults") or 100)
-        start = int(params.get("pageToken") or 0)
+        start = int(params.get("pageToken") or params.get("startIndex") or 0)
         page = canned.rows[start : start + size]
         body = {
             "kind": "bigquery#getQueryResultsResponse",
@@ -539,14 +552,21 @@ class _Body(io.RawIOBase):
 
 class _FakeGoogleAdapter(requests.adapters.HTTPAdapter):
     """Answers every request from a FakeGoogle with a urllib3 response.
-    ``body_break`` makes every BigQuery body break off after a few bytes."""
+    ``body_break`` makes every BigQuery body (or every one whose URL
+    ``break_url`` accepts) break off after ``break_after`` bytes."""
 
     def __init__(
-        self, google: FakeGoogle, body_break: BaseException | None = None
+        self,
+        google: FakeGoogle,
+        body_break: BaseException | None = None,
+        break_url: Callable[[str], bool] | None = None,
+        break_after: int = 8,
     ) -> None:
         super().__init__()
         self._google = google
         self._break = body_break
+        self._break_url = break_url
+        self._break_after = break_after
 
     def send(self, request: Any, stream: bool = False, timeout: Any = None, **_: Any):
         url, _sep, query = str(request.url).partition("?")
@@ -560,9 +580,12 @@ class _FakeGoogleAdapter(requests.adapters.HTTPAdapter):
             timeout=timeout,
             allow_redirects=False,
         )
-        broken = (
-            (8, self._break) if self._break is not None and url != TOKEN_URL else None
+        breaks = (
+            self._break is not None
+            and url != TOKEN_URL
+            and (self._break_url is None or self._break_url(url))
         )
+        broken = (self._break_after, self._break) if breaks and self._break else None
         raw = urllib3.HTTPResponse(
             body=_Body(answer.content, broken),
             headers=answer.headers,
@@ -574,11 +597,17 @@ class _FakeGoogleAdapter(requests.adapters.HTTPAdapter):
 
 
 def real_session(
-    google: FakeGoogle, *, body_break: BaseException | None = None
+    google: FakeGoogle,
+    *,
+    body_break: BaseException | None = None,
+    break_url: Callable[[str], bool] | None = None,
+    break_after: int = 8,
 ) -> requests.Session:
     """A real ``requests.Session`` whose HTTPS goes to ``google``. It ignores
     proxy settings (a proxy lookup may resolve names on macOS)."""
     session = requests.Session()
     session.trust_env = False
-    session.mount("https://", _FakeGoogleAdapter(google, body_break))
+    session.mount(
+        "https://", _FakeGoogleAdapter(google, body_break, break_url, break_after)
+    )
     return session

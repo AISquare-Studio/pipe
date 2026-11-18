@@ -2,9 +2,17 @@
 seq 13867 (a) / 13869), and the truncation marker it no longer needs to
 hold an envelope back for.
 
-The consumer drops each envelope, but its loop variable still holds the
-previous one while the next object downloads, as pipe-as-service's pull loop
-does. Before #46 a pull also held one envelope back, and a download held its
+What the consumer holds, the same model in every source's memory test: as
+pipe-as-service's pull loop does, it converts each envelope as it arrives
+and keeps the converted one (at most 1,000 in a sync pull, 10,000 async):
+inline (base64) up to 256 KiB, else a blob-store reference (an async pull;
+a sync pull refuses it). Its loop variable also holds the last envelope
+while the next one is pulled. So the row sources' tests (BigQuery,
+Snowflake, Redshift), whose envelopes are at most 256 KiB, KEEP every
+envelope: one inline copy each. The GCS test, whose objects are far larger
+than that, DROPS each one but holds the previous while the next downloads.
+
+Before #46 a pull also held one envelope back, and a download held its
 chunks and then their join: about four objects (400 MiB at 100 MiB objects).
 Now: the one being read and the one the consumer holds.
 """

@@ -26,13 +26,14 @@ comment ends, so the lexer is the authority on that), and both must pass.
    parse is refused.
 
 Either one refusing refuses the statement (:class:`NotReadOnly`, whose
-message says why and never echoes the SQL). Neither ever logs: sqlglot's
-"unsupported syntax" warning is switched off for this parser, and whatever
-else sqlglot logs while this module parses ("Invalid JSON path syntax" with
-the path, for ``JSON_VALUE(p, '$.a-b')``) is dropped, in this context only
-(:func:`aisquare.pipe.core.sql.quiet_sqlglot`). A sqlglot older than the
-extra's floor (:data:`SQLGLOT_FLOOR`; another package can bring one in)
-refuses every statement.
+message says why and never echoes the SQL). The parser runs through
+:func:`aisquare.pipe.core.sql.parse_statements`, as every guard's does: it
+never logs (sqlglot's "unsupported syntax" warning is switched off, and
+whatever else sqlglot logs while it parses, "Invalid JSON path syntax" with
+the path for ``JSON_VALUE(p, '$.a-b')``, is dropped, in this context only),
+any exception refuses, and a sqlglot older than core's
+:data:`~aisquare.pipe.core.sql.SQLGLOT_FLOOR` (the extras' floor; another
+package can bring an older one in) refuses every statement.
 
 Google adds its own layers behind these (see the README): the token's scope
 is ``bigquery.readonly``, the service account's roles grant no write, and the
@@ -47,19 +48,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-import sqlglot
-from aisquare.pipe.core.sql import quiet_sqlglot, sqlglot_at_least
+from aisquare.pipe.core.sql import (
+    SQLGLOT_FLOOR,
+    SqlglotTooOld,
+    Unparsable,
+    parse_statements,
+)
 from sqlglot import exp
 from sqlglot.dialects.bigquery import BigQuery
-from sqlglot.errors import SqlglotError
 
 from aisquare_pipe_bigquery.credentials import PROJECT_ID
 from aisquare_pipe_bigquery.refs import DATASET_ID, TABLE_ID, TableRef
 
 MAX_SQL_CHARS = 20_000
-#: The oldest sqlglot the guard runs on: the ``[bigquery]`` extra's floor
-#: (25.3 to 26.24 read GoogleSQL ``/* */`` comments as nested).
-SQLGLOT_FLOOR = (26, 25)
 
 # Statement roots that read.
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = tuple(
@@ -167,15 +168,6 @@ class NotReadOnly(ValueError):
     """The SQL is not one read-only query. The message says why."""
 
 
-class _QuietParser(BigQuery.Parser):
-    """sqlglot's BigQuery parser without its "contains unsupported syntax"
-    warning, which logs the SQL text. The statement is refused anyway: an
-    unsupported statement parses as a ``Command``."""
-
-    def _warn_unsupported(self) -> None:
-        return None
-
-
 _DIALECT = BigQuery()
 
 
@@ -183,13 +175,6 @@ def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
     pass): stripped, and without a single trailing ``;``. Else
     :class:`NotReadOnly`."""
-    if not sqlglot_at_least(str(getattr(sqlglot, "__version__", "")), SQLGLOT_FLOOR):
-        raise NotReadOnly(
-            "the SQL guard needs sqlglot "
-            + ".".join(map(str, SQLGLOT_FLOOR))
-            + " or later and this host has an older one, so no statement may run; "
-            "the host must install aisquare-pipe[bigquery] as declared"
-        )
     if not isinstance(sql, str) or not sql.strip():
         raise NotReadOnly("the statement is empty")
     if len(sql) > MAX_SQL_CHARS:
@@ -323,19 +308,19 @@ def _blank(sql: str) -> tuple[str, list[int]]:
 
 
 def _parse(sql: str) -> list[exp.Expression]:
-    """Every statement in ``sql`` (sqlglot, BigQuery dialect, silently)."""
-    with quiet_sqlglot():
-        tokens = _DIALECT.tokenize(sql)
-        parser = _QuietParser(dialect=_DIALECT)
-        return [s for s in parser.parse(tokens, sql) if s is not None]
+    """Every statement in ``sql`` (sqlglot, BigQuery dialect, through
+    :func:`~aisquare.pipe.core.sql.parse_statements`)."""
+    return parse_statements(sql, _DIALECT).statements
 
 
 def _parsed_problem(sql: str) -> str | None:
     try:
         statements = _parse(sql)
-    except SqlglotError:
-        return "it does not parse as GoogleSQL"
-    except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
+    except SqlglotTooOld as old:
+        raise NotReadOnly(
+            f"{old}; the host must install aisquare-pipe[bigquery] as declared"
+        ) from None
+    except Unparsable:
         return "it does not parse as GoogleSQL"
     if len(statements) != 1:
         return "it is more than one statement" if statements else "it is empty"

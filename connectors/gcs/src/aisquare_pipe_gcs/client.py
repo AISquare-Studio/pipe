@@ -121,12 +121,14 @@ def _token_failure(e: GcsTokenError) -> GcsAPIError:
     refused key is 401 (unauthorized); a timeout stays a timeout, and an
     unreachable or failing endpoint is an upstream error a host may retry."""
     if e.kind == TOKEN_REFUSED:
-        return GcsAPIError(e.message, status=401, key_refused=True)
+        return GcsAPIError(e.summary, detail=e.detail, status=401, key_refused=True)
     if e.kind == TOKEN_TIMED_OUT:
-        return GcsAPIError(e.message, timed_out=True)
+        return GcsAPIError(e.summary, detail=e.detail, timed_out=True)
     if e.kind == TOKEN_RATE_LIMITED:
-        return GcsAPIError(e.message, status=429, retry_after=e.retry_after)
-    return GcsAPIError(e.message, retry_after=e.retry_after)
+        return GcsAPIError(
+            e.summary, detail=e.detail, status=429, retry_after=e.retry_after
+        )
+    return GcsAPIError(e.summary, detail=e.detail, retry_after=e.retry_after)
 
 
 def _monotonic() -> float:

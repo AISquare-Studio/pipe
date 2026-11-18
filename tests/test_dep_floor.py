@@ -103,6 +103,35 @@ def test_no_matching_connector_directory_fails_the_floor_step(tmp_path, capsys):
     assert "no connectors/<dir>" in captured.err and "alpha" in captured.err
 
 
+def test_an_extra_naming_it_with_no_connector_directory_fails(tmp_path, capsys):
+    """Review seq 14088 n3: one suite matched, so the step passed, and the
+    extra with no connectors/<extra> directory (beta) was skipped silently:
+    its guard never ran at the floor. Now that exits 1, naming it."""
+    root = _repo(
+        tmp_path, {"alpha": ["sqlglot>=26.25,<28"], "beta": ["sqlglot>=26.25,<28"]}
+    )
+    (root / "connectors" / "beta").rmdir()
+    assert df.main(["sqlglot", "--root", str(root), "--connectors"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "[beta]" in captured.err and "connectors/beta" in captured.err
+
+
+def test_an_aggregate_extra_needs_no_connector_directory(tmp_path, capsys):
+    """[full] names the project itself (aisquare-pipe[...]): an aggregate,
+    with no directory of its own, even when it names sqlglot too."""
+    root = _repo(
+        tmp_path,
+        {
+            "alpha": ["sqlglot>=26.25,<28"],
+            "full": ["aisquare-pipe[alpha]", "sqlglot>=26.25,<28"],
+        },
+    )
+    (root / "connectors" / "full").rmdir()
+    assert df.main(["sqlglot", "--root", str(root), "--connectors"]) == 0
+    assert capsys.readouterr().out.splitlines() == [str(root / "connectors" / "alpha")]
+
+
 def test_the_floor_step_reads_the_list_before_it_loops():
     """validate.yml reads --connectors into a variable (set -e stops on its
     failure there, not in a for list) and fails when no suite ran."""

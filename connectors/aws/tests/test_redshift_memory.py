@@ -4,8 +4,17 @@ the caps' maxima, so a pull fits a 512 MiB pod (#46; review seq 13894 m6).
 The fake Data API client parses each GetStatementResult page from fresh JSON
 bytes, as botocore does (a Stubber would hand back the same objects every
 time, and their parse would not count). Pages of 1,000 rows, as the review
-measured; every envelope is kept, as pipe-as-service keeps a pull's
-envelopes for its response. The README's "Memory" table has the numbers.
+measured. The README's "Memory" table has the numbers.
+
+What the consumer holds, the same model in every source's memory test: as
+pipe-as-service's pull loop does, it converts each envelope as it arrives
+and keeps the converted one (at most 1,000 in a sync pull, 10,000 async):
+inline (base64) up to 256 KiB, else a blob-store reference (an async pull;
+a sync pull refuses it). Its loop variable also holds the last envelope
+while the next one is pulled. So the row sources' tests (BigQuery,
+Snowflake, Redshift), whose envelopes are at most 256 KiB, KEEP every
+envelope: one inline copy each. The GCS test, whose objects are far larger
+than that, DROPS each one but holds the previous while the next downloads.
 """
 
 from __future__ import annotations
@@ -222,3 +231,20 @@ def test_max_batch_bytes_is_checked(paged, bad):
                 blob(), PullParams({"sql": "SELECT 1", "max_batch_bytes": bad})
             )
         )
+
+
+def test_max_result_bytes_counts_every_envelope_s_columns_header(paged):
+    """Each envelope repeats the columns header: with 100 columns and one
+    row an envelope the headers were most of the output, uncounted (529 MiB
+    of envelopes under a 64 MiB cap; #46 reopen seq 13961). Now the
+    envelopes' bytes in all, headers included, stay within max_result_bytes."""
+    paged(columns=100, width=1, total=5000)
+    cap = 256 * 1024
+    envelopes = list(
+        RedshiftQuerySource().pull(
+            blob(),
+            PullParams({"sql": "SELECT 1", "batch_size": 1, "max_result_bytes": cap}),
+        )
+    )
+    assert sum(len(e.data) for e in envelopes) <= cap
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}

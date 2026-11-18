@@ -499,7 +499,8 @@ def test_another_thread_logging_through_sqlglot_meanwhile_is_untouched(
     thread logging through sqlglot while the guard parses still logs."""
     import threading
 
-    real_parse = sqlguard._QuietParser.parse
+    quiet = core_sql.quiet_parser_class(sqlguard._DIALECT)
+    real_parse = quiet.parse
     logged = threading.Event()
 
     def parse_while_another_thread_logs(self, *args, **kwargs):
@@ -512,7 +513,7 @@ def test_another_thread_logging_through_sqlglot_meanwhile_is_untouched(
         thread.join(timeout=10)
         return real_parse(self, *args, **kwargs)
 
-    monkeypatch.setattr(sqlguard._QuietParser, "parse", parse_while_another_thread_logs)
+    monkeypatch.setattr(quiet, "parse", parse_while_another_thread_logs)
     check_select_only(ADMITTED_WITH_JSON_PATHS[0])
     assert logged.is_set()
     assert [r.getMessage() for r in sqlglot_records] == ["another thread"]

@@ -38,17 +38,17 @@
 Either one refusing refuses the statement (:class:`NotReadOnly`, whose
 message says why and never echoes the SQL). Neither logs any of the SQL.
 sqlglot does log pieces of it while it parses: its "unsupported syntax"
-warning (switched off in :class:`_QuietParser`), and "Invalid JSON path
-syntax. ... <the path>" at WARNING for a JSON path it can't read (a key with
-a dash, a space or an open bracket, in ``JSON_EXTRACT``,
-``JSON_EXTRACT_SCALAR`` or ``JSONB_EXISTS``), for statements this guard
-admits. So this module parses inside
-:func:`aisquare.pipe.core.sql.quiet_sqlglot`, the helper every SQL guard
-shares: a filter on the "sqlglot" logger drops its records, in this context
-only, so they reach no handler, and not Python's ``lastResort`` either.
-Nothing is disabled globally, and sqlglot logs as usual everywhere else. A
-sqlglot older than the extra's floor (:data:`SQLGLOT_FLOOR`; another package
-can bring one in) refuses every statement.
+warning, and "Invalid JSON path syntax. ... <the path>" at WARNING for a JSON
+path it can't read (a key with a dash, a space or an open bracket, in
+``JSON_EXTRACT``, ``JSON_EXTRACT_SCALAR`` or ``JSONB_EXISTS``), for
+statements this guard admits. So this module parses through
+:func:`aisquare.pipe.core.sql.parse_statements`, as every SQL guard does:
+the warning is switched off, and a filter on the "sqlglot" logger drops its
+records, in this context only, so they reach no handler, and not Python's
+``lastResort`` either. Nothing is disabled globally, and sqlglot logs as
+usual everywhere else. Any exception while it parses refuses, and a sqlglot
+older than core's :data:`~aisquare.pipe.core.sql.SQLGLOT_FLOOR` (the
+extras' floor; another package can bring one in) refuses every statement.
 
 Behind these, Redshift itself: the database user the blob names should hold
 only ``USAGE`` and ``SELECT`` grants (see the README), so a write that got
@@ -60,15 +60,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-import sqlglot
-from aisquare.pipe.core.sql import quiet_sqlglot, sqlglot_at_least
+from aisquare.pipe.core.sql import (
+    SQLGLOT_FLOOR,
+    SqlglotTooOld,
+    Unparsable,
+    parse_statements,
+)
 from sqlglot import exp
 from sqlglot.dialects.redshift import Redshift
-from sqlglot.errors import SqlglotError
 
 MAX_SQL_CHARS = 20_000
-#: The oldest sqlglot the guard runs on: the ``[aws]`` extra's floor.
-SQLGLOT_FLOOR = (26, 25)
 
 # Statement roots that read.
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = tuple(
@@ -198,15 +199,6 @@ class NotReadOnly(ValueError):
     """The SQL is not one read-only query. The message says why."""
 
 
-class _QuietParser(Redshift.Parser):
-    """sqlglot's Redshift parser without its "contains unsupported syntax"
-    warning, which logs the SQL text. The statement is refused anyway: an
-    unsupported statement parses as a ``Command``."""
-
-    def _warn_unsupported(self) -> None:
-        return None
-
-
 _DIALECT = Redshift()
 
 
@@ -214,13 +206,6 @@ def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
     pass): stripped, and without a single trailing ``;``. Else
     :class:`NotReadOnly`."""
-    if not sqlglot_at_least(str(getattr(sqlglot, "__version__", "")), SQLGLOT_FLOOR):
-        raise NotReadOnly(
-            "the SQL guard needs sqlglot "
-            + ".".join(map(str, SQLGLOT_FLOOR))
-            + " or later and this host has an older one, so no statement may run; "
-            "the host must install aisquare-pipe[redshift] as declared"
-        )
     if not isinstance(sql, str) or not sql.strip():
         raise NotReadOnly("the statement is empty")
     if len(sql) > MAX_SQL_CHARS:
@@ -392,12 +377,10 @@ def _blank(sql: str, *, quoted_names: list[str] | None = None) -> tuple[str, lis
 
 
 def _parse(sql: str) -> list[exp.Expression]:
-    """Every statement in ``sql`` (sqlglot, Redshift dialect, silently:
-    nothing sqlglot logs while it parses gets out)."""
-    with quiet_sqlglot():
-        tokens = _DIALECT.tokenize(sql)
-        parser = _QuietParser(dialect=_DIALECT)
-        return [s for s in parser.parse(tokens, sql) if s is not None]
+    """Every statement in ``sql`` (sqlglot, Redshift dialect, through
+    :func:`~aisquare.pipe.core.sql.parse_statements`: nothing sqlglot logs
+    while it parses gets out)."""
+    return parse_statements(sql, _DIALECT).statements
 
 
 def _function_name(node: exp.Expression) -> str:
@@ -411,9 +394,11 @@ def _function_name(node: exp.Expression) -> str:
 def _parsed_problem(sql: str) -> str | None:
     try:
         statements = _parse(sql)
-    except SqlglotError:
-        return "it does not parse as Redshift SQL"
-    except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
+    except SqlglotTooOld as old:
+        raise NotReadOnly(
+            f"{old}; the host must install aisquare-pipe[redshift] as declared"
+        ) from None
+    except Unparsable:
         return "it does not parse as Redshift SQL"
     if len(statements) != 1:
         return "it is more than one statement" if statements else "it is empty"

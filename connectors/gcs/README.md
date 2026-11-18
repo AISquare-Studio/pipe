@@ -54,7 +54,9 @@ Read-only by construction: the token's scope is `devstorage.read_only`, the serv
 `roles/storage.objectViewer`, and no tool writes.
 
 **How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Cloud Storage's own
-error text, which names objects, because hosts log these):
+error text, which names objects, nor the token endpoint's `error` and `error_description`, because hosts log these;
+the toolkit, which answers the caller, still shows both. A listed object whose `generation` isn't a string is
+Cloud Storage's answer gone wrong: a 502):
 - **422**, a `ValueError`: the secret is missing or malformed (`GcsNotConfigured`); a bad param or a name outside
   the prefix; `GcsPullTruncated`; and what Cloud Storage refused that the caller can fix, as `GcsRequestError` (with
   its `status`): a named object that does not exist (404), a request it calls invalid (400).
@@ -62,7 +64,8 @@ error text, which names objects, because hosts log these):
   503): a key Google refused, a missing role, VPC Service Controls, throttling, a timeout, a 5xx or the network.
 
 **Memory.** A pull holds about two objects at a time: the one being read, and the one the consumer still holds
-while the next downloads (pipe-as-service's pull loop does). A download goes into one buffer that hands its bytes
+while the next downloads (pipe-as-service's pull loop does; it keeps no inline copy of an object over 256 KiB, but a
+blob-store reference, or a sync 400). A download goes into one buffer that hands its bytes
 over without a copy, and an envelope is held back (for a truncated pull's marker) only when every object after it
 could still be skipped at download, which only an object of unknown size or one stored gzip can be. Measured with
 `tracemalloc` (`tests/test_memory.py`, three objects, the consumer dropping each envelope):

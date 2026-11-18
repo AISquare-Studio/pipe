@@ -77,13 +77,19 @@ def iter_rows(columns: list[dict[str, Any]], rows: Any) -> Iterator[dict[str, An
     if not isinstance(rows, list):
         return
     for row in rows:
-        cells = row if isinstance(row, list) else []
-        yield {
-            column["name"]: convert_value(
-                column, cells[index] if index < len(cells) else None
-            )
-            for index, column in enumerate(columns)
-        }
+        yield convert_row(columns, row)
+
+
+def convert_row(columns: list[dict[str, Any]], row: Any) -> dict[str, Any]:
+    """One SQL API row (a list of strings and nulls; anything else is a row
+    of nulls) as an object keyed by column name."""
+    cells = row if isinstance(row, list) else []
+    return {
+        column["name"]: convert_value(
+            column, cells[index] if index < len(cells) else None
+        )
+        for index, column in enumerate(columns)
+    }
 
 
 def convert_value(column: dict[str, Any], value: Any) -> Any:
@@ -201,6 +207,7 @@ def encoded_batch(columns: list[dict[str, Any]], encoded: Iterable[bytes]) -> by
 __all__ = [
     "canonical",
     "columns_of",
+    "convert_row",
     "convert_rows",
     "convert_value",
     "encoded_batch",

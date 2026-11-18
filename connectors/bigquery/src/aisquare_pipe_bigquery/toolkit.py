@@ -55,6 +55,7 @@ from aisquare_pipe_bigquery.query import (
     CapExceeded,
     NotATable,
     Rows,
+    RowTooLarge,
     dry_run,
     read_table_rows,
     run_select,
@@ -680,7 +681,7 @@ class BigQueryToolkit(Toolkit):
                 )
             except BigQueryAPIError as e:
                 return failure(e, creds.project_id)
-            except (NotReadOnly, CapExceeded, NotATable) as e:
+            except (NotReadOnly, CapExceeded, NotATable, RowTooLarge) as e:
                 return ToolResult.fail(str(e), code=ERROR_INVALID_ARGUMENTS)
 
     # Each handler checks its arguments and returns the call to make.
