@@ -208,7 +208,8 @@ effect (usually within a few minutes).
 **Turning GCS on for a tenant is a deploy, today.** Every environment runs the env secrets backend
 (`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS task definitions in
 pipe-as-service). The blob reaches the pod only as the env var `PIPE_SECRET__<TENANT>__GCS__JSON`, from a
-secret that devops creates:
+secret that devops creates. Create the secret and fill it first ("Fill the secret" below), then add the
+entry:
 
 - **EKS:** Secrets Manager `<secrets.prefix>/pipe-service/gcs-<tenant>` (for example
   `nonprod/stg/pipe-service/gcs-<tenant>`), created empty by aisquare-infra and filled by its secrets
@@ -236,7 +237,7 @@ secret that devops creates:
   The new task-definition revision (the Deploy workflow) is the deploy.
 
 `<TENANT>` is the tenant id upper-cased, with every run of characters other than A-Z and 0-9 written as one
-`_` and any `_` at either end dropped (`goodrx-prod` gives `PIPE_SECRET__GOODRX_PROD__GCS__JSON`). Add the
+`_` and any `_` at either end dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__GCS__JSON`). Add the
 entry only once its secret has a value: on EKS, Argo CD waits for the ExternalSecret before the Deployment,
 so a missing secret holds the release; on ECS, a task whose secret doesn't exist does not start. The new
 value is read when the pod or task starts.
