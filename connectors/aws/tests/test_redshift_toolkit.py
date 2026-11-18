@@ -358,6 +358,47 @@ def test_every_request_fits_inside_what_is_left(data_api, clock):
     assert len(data_api.clients) <= 12 < len(data_api.calls)
 
 
+@pytest.mark.parametrize("seconds", [3, 60, 120])
+def test_the_cancel_gets_all_of_the_slice_kept_back_for_it(data_api, clock, seconds):
+    """seq 13843: once the polls had run the deadline down to the cancel's
+    slice, CancelStatement went out on the last poll's 0.2 s client (connect
+    0.04 s, read 0.16 s) with 3.15 s left. A cancel answered in more than
+    0.16 s (any real network) failed, and the statement kept running on the
+    customer's cluster. The cancel gets a client of its own now, whose
+    connect plus read timeout is all of what is left."""
+    # 90 ms RTT (eu-west-1) plus server time: far over 0.16 s, well inside
+    # the slice (0.6 s at a 3 s budget, 3 s at 60 s and up).
+    data_api.latencies = {"CancelStatement": 0.5}
+    fakes.submit(data_api, SQL)
+    for _ in range(400):
+        fakes.describe(data_api, "STARTED")
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    started = clock.now
+    result = run(
+        "REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": seconds}
+    )
+    assert result.error_code == ERROR_TIMEOUT
+    assert result.error.endswith("the statement was cancelled"), result.error
+    operations = data_api.operations()
+    assert operations[0] == "ExecuteStatement" and operations[-1] == "CancelStatement"
+    assert set(operations[1:-1]) == {"DescribeStatement"}
+    data_api.assert_drained()
+    # The polls ran the deadline down to the slice kept back for the cancel.
+    left = started + seconds - data_api.times[-1]
+    reserve = dataapi.Deadline(seconds).cancel_reserve()
+    assert reserve <= left <= reserve + dataapi.MIN_REQUEST_SECONDS + 1e-9
+    # The cancel's connect plus read timeout is what is left, in the 5:20
+    # split, on a client built for it (not the last poll's).
+    assert data_api.timeouts[-1] == pytest.approx(left)
+    cancel_client, _ = data_api.clients[-1]
+    config = cancel_client.meta.config
+    assert config.connect_timeout == pytest.approx(left / 5)
+    assert config.read_timeout == pytest.approx(left * 4 / 5)
+    assert data_api.timeouts[-2] < left  # the last poll's was shorter
+    assert clock.now - started <= seconds + 1e-9  # and nothing overran
+    _assert_every_request_fit(data_api, started, seconds)
+
+
 def test_every_request_fits_while_paging_slowly(data_api, clock):
     data_api.latency = 0.7
     fakes.submit(data_api, SQL)
@@ -447,6 +488,11 @@ def test_a_failed_poll_cancels_the_statement(data_api):
         "CancelStatement",
     ]
     data_api.assert_drained()
+    # Nearly all of the 60 s is left: the cancel's client gets the most a
+    # request ever waits.
+    assert (
+        data_api.timeouts[-1] == dataapi.MAX_CONNECT_TIMEOUT + dataapi.MAX_READ_TIMEOUT
+    )
 
 
 @pytest.mark.parametrize("seconds", [0.1, 0.3])

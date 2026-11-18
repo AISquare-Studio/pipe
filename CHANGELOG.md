@@ -128,8 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inside what is left when it goes out, because a client is rebuilt with shorter timeouts as
     the deadline nears, and botocore never retries. A slice of the deadline (a fifth, 0.2 s to
     3 s) is kept back to cancel a statement still running: polling stops there, the statement is
-    cancelled, and the call fails with `timeout`. Caps: `max_rows` and a JSON byte cap
-    (`truncated` says which).
+    cancelled on a client of its own sized to all of what is left, and the call fails with
+    `timeout`. Caps: `max_rows` and a JSON byte cap (`truncated` says which).
     The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
   - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
     `version` = `result_sha256` (order-independent).

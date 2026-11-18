@@ -493,9 +493,10 @@ database user should hold `SELECT` and nothing else (the checklist below).
   fails the call with its code (`rate_limited`, `upstream_error`).
 - While the statement runs, a fifth of the deadline (at least 0.2 s, at most 3 s) is kept back
   for `CancelStatement`. Polling backs off from 50 ms to 1 s and stops where that slice starts,
-  or when a request times out. The statement is cancelled in that slice, and the call fails with
-  `timeout`, saying whether the cancel was accepted. A poll that AWS refuses cancels it too. An
-  `ExecuteStatement` that times out leaves no statement id to cancel.
+  or when a request times out. The statement is cancelled in that slice, on a client of its own
+  whose connect plus read timeout is all of what is left (never the last poll's shorter one), and
+  the call fails with `timeout`, saying whether the cancel was accepted. A poll that AWS refuses
+  cancels it too. An `ExecuteStatement` that times out leaves no statement id to cancel.
 - The deadline covers the Data API requests. The AssumeRole before them is the shared helper's,
   on botocore's own timeouts, and the time it takes counts against the deadline.
 - Paging `GetStatementResult` stops at `max_rows`, at the byte cap or at the deadline.
@@ -528,8 +529,10 @@ Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
 A result with no rows is one envelope with no rows. The connector's own logs carry no SQL,
 names or values at any level, and nothing sqlglot logs while the guard parses gets out (see
 [SELECT only](#select-only)). botocore's own DEBUG log of each request ("Making request for ...
-with params") does hold the request body, SQL included. It is off unless the host sets the
-`botocore` logger to DEBUG, which a host handling health data should not do.
+with params") does hold the request body, SQL included. It is off unless botocore logs at
+DEBUG: setting the `botocore` logger to DEBUG does that, and so does a root logger at DEBUG
+while `botocore` is left unset. A host handling health data should keep `botocore` at INFO or
+above.
 
 Values: `isNull` → `null`, booleans, integers (`longValue`), floats (`NaN` and the infinities
 as strings), `NUMERIC`/`DECIMAL`, dates and timestamps as the strings Redshift sends, bytes as

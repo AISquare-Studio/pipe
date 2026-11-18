@@ -16,9 +16,12 @@ inside one :class:`Deadline`:
   ``CancelStatement`` (:data:`CANCEL_SHARE` of it, at most
   :data:`CANCEL_RESERVE_MAX` seconds, at least :data:`MIN_REQUEST_SECONDS`).
   Polling stops where that slice starts, and the statement is cancelled
-  inside it (best effort) before the call fails with ``timeout``. A request
-  that fails or times out while the statement runs cancels it the same way.
-  An ``ExecuteStatement`` that times out leaves no statement id to cancel.
+  inside it (best effort) before the call fails with ``timeout``. The
+  cancel goes out on a client of its own whose connect timeout plus read
+  timeout is all of what is left (at least :data:`MIN_REQUEST_SECONDS`), not
+  on the last poll's, which is sized for a poll. A request that fails or
+  times out while the statement runs cancels it the same way. An
+  ``ExecuteStatement`` that times out leaves no statement id to cancel.
 
 The deadline covers the Data API requests. The AssumeRole before them is the
 shared helper's (:mod:`aisquare_pipe_aws.credentials`, #31), on botocore's
@@ -166,7 +169,8 @@ class Api:
     when it is sent. A client is built (no AWS call) only for a first
     request, or when what is left no longer covers the current one's
     timeouts; the new one gets half of what is left (all of it near the end),
-    so a call builds a handful at most."""
+    so a call builds a handful at most. The cancel always gets a client of
+    its own (:meth:`cancel`)."""
 
     def __init__(self, session: Any, target: RedshiftTarget, deadline: Deadline):
         self._session = session
@@ -190,10 +194,19 @@ class Api:
     def cancel(self, statement_id: str) -> bool:
         """CancelStatement, best effort, in what is left (the slice kept back
         for it): whether it was accepted. A failure is logged (no SQL), never
-        raised."""
-        budget = max(self.deadline.left(), MIN_REQUEST_SECONDS)
+        raised.
+
+        It goes out on a new client whose connect plus read timeout is all of
+        what is left (at least :data:`MIN_REQUEST_SECONDS`; at most
+        :data:`MAX_CONNECT_TIMEOUT` + :data:`MAX_READ_TIMEOUT`). The current
+        client is never reused: after the polls have run the deadline down
+        to the slice, it is the last poll's, often 0.2 s, and a cancel on it
+        would leave the rest of the slice unused (seq 13843)."""
+        seconds = max(self.deadline.left(), MIN_REQUEST_SECONDS)
         try:
-            self._within(budget).cancel_statement(Id=statement_id)
+            build_client(self._session, self._region, seconds).cancel_statement(
+                Id=statement_id
+            )
         except Exception as e:  # noqa: BLE001 — the caller is already failing
             logger.info("redshift: CancelStatement failed (%s)", type(e).__name__)
             return False
