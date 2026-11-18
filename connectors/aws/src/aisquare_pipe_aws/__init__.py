@@ -1,4 +1,4 @@
-"""aisquare-pipe-aws — read a customer's AWS account through a cross-account role.
+"""AWS for aisquare.pipe (``aisquare-pipe[aws]``): read a customer's account through a cross-account role.
 
 One shared credential (:mod:`aisquare_pipe_aws.credentials`: STS AssumeRole
 with a server-issued external ID) and, on it, read-only connectors and

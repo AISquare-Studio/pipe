@@ -67,6 +67,26 @@ that service change's decision.
 
 Any other param is refused.
 
+## Paging (toolkits)
+
+Every list tool returns `items`, `has_more` and a cursor for the rest:
+
+- `S3_LIST_OBJECTS`: `next_continuation_token`, passed back as `continuation_token`.
+- `BEDROCK_AGENTCORE_LIST_POLICY_ENGINES` and `BEDROCK_AGENTCORE_LIST_POLICIES`: `next_token`,
+  passed back as `next_token` (with the same `policy_engine_id`, for policies). `limit` (at most
+  500) bounds one call; following `next_token` until it is `null` reaches every engine and every
+  policy, across every configured region.
+
+`next_token` is opaque: it records the region, the policy engine and AgentCore's own `nextToken`
+where the previous call stopped. Each AgentCore call asks only for as many items as the tool call
+still needs, so a tool call always stops on one of AgentCore's own page boundaries and nothing is
+skipped or repeated. `has_more` can be true with an empty next page when only empty engines or
+regions are left. A token is checked before anything reaches AWS:
+
+- one naming a region the credential blob doesn't list is refused;
+- so is one from the other tool, or from a call with another `policy_engine_id`;
+- one whose policy engine has been deleted since is refused as stale. List again without it.
+
 ## Version markers
 
 Each envelope's `metadata["version"]` changes when the document changes, so a caller can
@@ -75,7 +95,13 @@ re-read it then:
 - a policy: its `updatedAt`;
 - an S3 object: its `VersionId` in a versioned bucket, otherwise its `ETag`.
 
-The metadata also carries `etag`, `last_modified` and `version_id`.
+The metadata also carries `etag`, `last_modified` and `version_id`. The S3 tools `S3_GET_OBJECT`
+and `S3_HEAD_OBJECT` return the same `version`.
+
+An object stored before versioning was enabled, or written while it is suspended, has the
+`VersionId` `"null"`. In a suspended bucket every write replaces that null version, so the id stays
+`"null"` across edits. It therefore counts as no version id: `version_id` is left out, and
+`version` is the `ETag`.
 
 ## Customer setup (registration checklist)
 

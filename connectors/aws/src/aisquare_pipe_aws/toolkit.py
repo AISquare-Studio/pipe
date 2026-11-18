@@ -71,6 +71,14 @@ def _resource_id(args: Mapping[str, Any], name: str, *, required: bool) -> str |
     return value
 
 
+def _page(items: list[dict[str, Any]], next_token: str | None) -> dict[str, Any]:
+    return {
+        "items": items,
+        "has_more": next_token is not None,
+        "next_token": next_token,
+    }
+
+
 def _schema(
     properties: dict[str, Any], required: tuple[str, ...] = ()
 ) -> dict[str, Any]:
@@ -91,6 +99,13 @@ def _limit(description: str, default: int, maximum: int) -> dict[str, Any]:
         "description": description,
     }
 
+
+_NEXT_TOKEN = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": agentcore.NEXT_TOKEN_MAX,
+    "description": "next_token from the previous call, to continue the listing.",
+}
 
 _RESOURCE_ID = {
     "type": "string",
@@ -169,9 +184,13 @@ class BedrockAgentCoreToolkit(_AwsToolkit):
             "List the Amazon Bedrock AgentCore policy engines in every configured region of the "
             "customer's AWS account: id, name, status, ARN, region, timestamps and whether a "
             "customer-managed KMS key encrypts it. Use an engine's policy_engine_id with "
-            "BEDROCK_AGENTCORE_LIST_POLICIES.",
+            "BEDROCK_AGENTCORE_LIST_POLICIES. While has_more is true, pass next_token back "
+            "for the rest.",
             _schema(
-                {"limit": _limit("Most engines to return (default 100).", 100, 500)}
+                {
+                    "limit": _limit("Most engines to return (default 100).", 100, 500),
+                    "next_token": _NEXT_TOKEN,
+                }
             ),
             read_only=True,
             tags=("agentcore", "policy engine", "list", "aws", "bedrock"),
@@ -182,7 +201,8 @@ class BedrockAgentCoreToolkit(_AwsToolkit):
             "name, status, enforcement mode (ACTIVE or LOG_ONLY), ARN, region, createdAt and "
             "updatedAt, across every policy engine or just one (policy_engine_id). "
             "include_definitions adds each policy's statement text. updatedAt is the version "
-            "marker: re-read a policy when it changes.",
+            "marker: re-read a policy when it changes. While has_more is true, pass next_token "
+            "back (with the same policy_engine_id) for the rest.",
             _schema(
                 {
                     "policy_engine_id": {
@@ -195,6 +215,7 @@ class BedrockAgentCoreToolkit(_AwsToolkit):
                         "description": "Include each policy's definition text.",
                     },
                     "limit": _limit("Most policies to return (default 100).", 100, 500),
+                    "next_token": _NEXT_TOKEN,
                 }
             ),
             read_only=True,
@@ -243,15 +264,15 @@ class BedrockAgentCoreToolkit(_AwsToolkit):
         self, cfg: CrossAccountConfig, args: dict[str, Any]
     ) -> ToolResult:
         limit = _bounded(args, "limit", 100, 500)
-        session = self._session(cfg)
-        items: list[dict[str, Any]] = []
-        for region in cfg.regions:
-            control = agentcore.client(session, region)
-            for engine in agentcore.iter_policy_engines(control):
-                items.append(agentcore.engine_summary(engine, region))
-                if len(items) > limit:
-                    return ToolResult.ok({"items": items[:limit], "has_more": True})
-        return ToolResult.ok({"items": items, "has_more": False})
+        start = agentcore.decode_next_token(
+            args.get("next_token"), kind="engines", regions=cfg.regions
+        )
+        items, after = agentcore.engines_page(
+            self._controls(cfg), cfg.regions, limit=limit, start=start
+        )
+        return ToolResult.ok(
+            _page(items, agentcore.encode_next_token("engines", after))
+        )
 
     def _list_policies(
         self, cfg: CrossAccountConfig, args: dict[str, Any]
@@ -259,28 +280,27 @@ class BedrockAgentCoreToolkit(_AwsToolkit):
         limit = _bounded(args, "limit", 100, 500)
         only = _resource_id(args, "policy_engine_id", required=False)
         include = bool(args.get("include_definitions", False))
+        start = agentcore.decode_next_token(
+            args.get("next_token"),
+            kind="policies",
+            regions=cfg.regions,
+            engine_filter=only,
+        )
+        items, after = agentcore.policies_page(
+            self._controls(cfg),
+            cfg.regions,
+            limit=limit,
+            only=only,
+            include_definitions=include,
+            start=start,
+        )
+        token = agentcore.encode_next_token("policies", after, engine_filter=only)
+        return ToolResult.ok(_page(items, token))
+
+    def _controls(self, cfg: CrossAccountConfig) -> agentcore.ControlFor:
+        """Each region's AgentCore client, on one assumed-role session."""
         session = self._session(cfg)
-        items: list[dict[str, Any]] = []
-        for region in cfg.regions:
-            control = agentcore.client(session, region)
-            for engine in agentcore.iter_policy_engines(control):
-                engine_id = str(engine.get("policyEngineId", ""))
-                if only is not None and engine_id != only:
-                    continue
-                for listed in agentcore.iter_policies(control, engine_id):
-                    policy = (
-                        agentcore.with_definition(control, listed)
-                        if include
-                        else listed
-                    )
-                    items.append(
-                        agentcore.policy_record(
-                            policy, region, include_definition=include
-                        )
-                    )
-                    if len(items) > limit:
-                        return ToolResult.ok({"items": items[:limit], "has_more": True})
-        return ToolResult.ok({"items": items, "has_more": False})
+        return lambda region: agentcore.client(session, region)
 
     def _get_policy(self, cfg: CrossAccountConfig, args: dict[str, Any]) -> ToolResult:
         engine_id = str(_resource_id(args, "policy_engine_id", required=True))

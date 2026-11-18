@@ -4,6 +4,12 @@
 checked against the configured prefix first: a caller may narrow the prefix,
 never leave it. Each object carries its version markers: ``ETag``,
 ``LastModified`` and, in a versioned bucket, ``VersionId``.
+
+``version`` is the one marker to compare: the ``VersionId``, else the ``ETag``.
+An object stored before versioning was enabled, or written while it is
+suspended, has the ``VersionId`` ``"null"``. In a suspended bucket each write
+replaces that null version, so the id stays ``"null"`` across edits: it counts
+as no version id, and such an object's ``version`` is its ``ETag``.
 """
 
 from __future__ import annotations
@@ -155,15 +161,37 @@ def object_metadata(
     content_type = response.get("ContentType") or ""
     if not content_type or content_type == "binary/octet-stream":
         content_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
+    etag = _etag(response.get("ETag"))
+    version_id = real_version_id(response.get("VersionId"))
     return {
         "bucket": location.bucket,
         "key": key,
-        "etag": _etag(response.get("ETag")),
+        "etag": etag,
         "last_modified": iso(response.get("LastModified")),
-        "version_id": response.get("VersionId"),
+        "version_id": version_id,
+        "version": version_marker(version_id, etag),
         "size": response.get("ContentLength"),
         "content_type": content_type,
     }
+
+
+#: The ``VersionId`` of an object stored before versioning was enabled or
+#: written while it is suspended. It names no particular write, so it is not a
+#: version marker.
+NULL_VERSION_ID = "null"
+
+
+def real_version_id(value: Any) -> str | None:
+    """``value`` as a version id, or ``None`` for none (absent, empty, ``"null"``)."""
+    if value is None:
+        return None
+    text = str(value)
+    return None if text in ("", NULL_VERSION_ID) else text
+
+
+def version_marker(version_id: str | None, etag: str | None) -> str:
+    """The marker that changes when the object does: its version id, else its ETag."""
+    return version_id or etag or ""
 
 
 def _etag(value: Any) -> str | None:

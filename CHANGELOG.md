@@ -26,10 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `version` = `updatedAt`.
   - `s3-source`: one envelope per object under the configured bucket and
     prefix (`ListObjectsV2`, every page; `GetObject`). Its `version` is the
-    `VersionId`, else the `ETag`.
+    `VersionId`, else the `ETag`. A `VersionId` of `"null"` (a bucket whose
+    versioning is suspended) counts as none, so the `ETag` is used.
   - Toolkits `bedrock_agentcore` (`LIST_POLICY_ENGINES`, `LIST_POLICIES`,
     `GET_POLICY`) and `s3` (`LIST_OBJECTS`, `GET_OBJECT`, `HEAD_OBJECT`). All
-    their tools are read-only, with strict schemas.
+    their tools are read-only, with strict schemas. Both AgentCore list
+    tools page with an opaque `next_token` (region, engine and AgentCore's
+    `nextToken`), so every engine and policy is reachable past `limit`.
   - Pull params and tool arguments only narrow what the blob allows (a
     prefix inside the configured one, one engine, a time filter). Neither
     can name an account, role, region, bucket or credential.

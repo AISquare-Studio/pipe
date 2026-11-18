@@ -6,7 +6,9 @@ carries a version marker in its metadata (``version``), so a caller can re-read
 a document when it changes:
 
 - a policy: its ``updatedAt`` (ISO 8601);
-- an S3 object: its ``VersionId`` in a versioned bucket, else its ``ETag``.
+- an S3 object: its ``VersionId`` in a versioned bucket, else its ``ETag``
+  (a ``VersionId`` of ``"null"``, from a bucket whose versioning is suspended,
+  counts as none).
 
 Pull params come from callers, so none of them can name an account, role,
 region, bucket or credential. Each source takes only filters that narrow what
@@ -217,7 +219,8 @@ class S3Source(_AwsSource):
     ``data`` is the object's bytes (objects over ``max_object_bytes``, 25 MiB
     by default, are skipped and logged). ``metadata`` holds the bucket, key,
     ``etag``, ``last_modified``, ``version_id`` and ``version`` (the version
-    id when the bucket is versioned, else the ETag).
+    id when the bucket is versioned, else the ETag; a ``"null"`` version id
+    counts as none).
     """
 
     name = "s3-source"
@@ -287,8 +290,7 @@ class S3Source(_AwsSource):
                 )
                 continue
             data, meta = s3.get_object(client, location, key, max_bytes=max_bytes)
-            marker = meta.get("version_id") or meta.get("etag") or ""
-            metadata = {**meta, "account_id": cfg.account_id, "version": marker}
+            metadata = {**meta, "account_id": cfg.account_id}
             content_type = str(metadata.pop("content_type"))
             yield DataEnvelope(
                 content_type=content_type,

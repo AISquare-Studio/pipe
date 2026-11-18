@@ -121,6 +121,61 @@ def test_the_version_marker_is_the_etag_or_the_version_id(bucket, assume_calls):
     assert edited.metadata["etag"] != meta["etag"]
 
 
+def test_a_null_version_id_is_no_version_id_so_the_marker_is_the_etag(
+    bucket, assume_calls, monkeypatch
+):
+    # In a bucket whose versioning is suspended, S3 stores each write as the
+    # "null" version and returns VersionId "null" every time (moto returns no
+    # VersionId there), so the marker must be the ETag, which does change.
+    bucket.put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Suspended"}
+    )
+    real = s3.client
+
+    def as_s3_does(session: Any, location: Any) -> Any:
+        client = real(session, location)
+
+        def null_version(parsed: dict, **_: Any) -> None:
+            parsed["VersionId"] = "null"
+
+        for op in ("GetObject", "HeadObject"):
+            client.meta.events.register(f"after-call.s3.{op}", null_version)
+        return client
+
+    monkeypatch.setattr(s3, "client", as_s3_does)
+    key = "rulebooks/policy-0.md"
+    kit = S3Toolkit()
+
+    def read() -> tuple[dict, dict, dict]:
+        (envelope,) = _pull(blob(), max_objects=1)
+        head = kit.call_tool("S3_HEAD_OBJECT", {"key": key}, blob())
+        got = kit.call_tool("S3_GET_OBJECT", {"key": key}, blob())
+        assert head.successful and got.successful, (head.error, got.error)
+        return envelope.metadata, head.data, got.data
+
+    before = read()
+    bucket.put_object(Bucket=BUCKET, Key=key, Body=b"# Rule book 0, edited\n")
+    after = read()
+    for old, new in zip(before, after, strict=True):
+        assert new.get("version_id") is None  # "null" is no version id
+        assert old["version"] == old["etag"] and new["version"] == new["etag"]
+        assert new["version"] != old["version"]  # the edit shows
+
+
+@pytest.mark.parametrize(
+    ("version_id", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("null", None),
+        ("3HL4kqtJlcpXroDTDmJ", "3HL4kqtJlcpXroDTDmJ"),
+    ],
+)
+def test_real_version_id(version_id, expected):
+    assert s3.real_version_id(version_id) == expected
+    assert s3.version_marker(expected, "etag1") == (expected or "etag1")
+
+
 def test_modified_after_filters_and_max_object_bytes_skips(bucket, assume_calls):
     future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
     past = (datetime.now(UTC) - timedelta(days=1)).isoformat()

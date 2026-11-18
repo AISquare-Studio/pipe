@@ -7,6 +7,8 @@ is moto, so the assumed role and its credentials are real moto ones.
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -346,24 +348,293 @@ def test_toolkit_lists_engines_and_policies_and_reads_one(control):
     control.drained()
 
 
-def test_toolkit_paging_follows_next_token_to_the_limit(control):
-    control.engines("us-east-1", [[_engine(0)]])
-    control.policies(
+def test_toolkit_paging_walks_past_the_limit_with_next_token(control):
+    # The reopen's case: one engine, 600 policies over six AgentCore pages.
+    # limit=500 reads five pages; next_token resumes at AgentCore's sixth.
+    def policies_page(n: int, token: str | None) -> None:
+        expected: dict[str, Any] = {"policyEngineId": eid(0), "maxResults": 100}
+        if n:
+            expected["nextToken"] = f"{eid(0)}-{n}"
+        response: dict[str, Any] = {
+            "policies": [_policy(eid(0), j) for j in range(n * 100, n * 100 + 100)]
+        }
+        if token:
+            response["nextToken"] = token
+        control.add("us-east-1", "list_policies", response, expected)
+
+    control.add(
         "us-east-1",
-        eid(0),
-        [
-            [_policy(eid(0), j) for j in range(100)],
-            [_policy(eid(0), j) for j in range(100, 130)],
-        ],
+        "list_policy_engines",
+        {"policyEngines": [_engine(0)]},
+        {"maxResults": agentcore.PAGE_SIZE},
     )
-    result = BedrockAgentCoreToolkit().call_tool(
+    for n in range(5):
+        policies_page(n, f"{eid(0)}-{n + 1}")
+    control.add(  # the second call finds its engine again, then reads page six
+        "us-east-1",
+        "list_policy_engines",
+        {"policyEngines": [_engine(0)]},
+        {"maxResults": agentcore.PAGE_SIZE},
+    )
+    policies_page(5, None)
+    kit, config = BedrockAgentCoreToolkit(), blob()
+
+    first = kit.call_tool(
         "BEDROCK_AGENTCORE_LIST_POLICIES",
-        {"limit": 120, "include_definitions": True},
-        blob(),
+        {"limit": 500, "include_definitions": True},
+        config,
     )
-    assert result.successful, result.error
-    assert len(result.data["items"]) == 120 and result.data["has_more"] is True
-    assert result.data["items"][0]["definition"] == CEDAR
+    assert first.successful, first.error
+    assert len(first.data["items"]) == 500 and first.data["has_more"] is True
+    token = first.data["next_token"]
+    assert isinstance(token, str) and f"{eid(0)}-5" not in token  # opaque
+    assert first.data["items"][0]["definition"] == CEDAR
+
+    rest = kit.call_tool(
+        "BEDROCK_AGENTCORE_LIST_POLICIES",
+        {"limit": 500, "include_definitions": True, "next_token": token},
+        config,
+    )
+    assert rest.successful, rest.error
+    assert len(rest.data["items"]) == 100
+    assert rest.data["has_more"] is False and rest.data["next_token"] is None
+    ids = [p["policy_id"] for p in first.data["items"] + rest.data["items"]]
+    assert ids == [pid(eid(0), j) for j in range(600)]
+    control.drained()
+
+
+# -- paging over a model-checked fake ------------------------------------------------
+
+
+class FakeControl:
+    """One region's bedrock-agentcore-control, serving engines and policies from
+    data. It honours maxResults and hands out opaque nextTokens, so a listing
+    can stop anywhere; every request is validated against AWS's own model."""
+
+    _model = None
+
+    def __init__(self, engines: dict[str, int], calls: list) -> None:
+        self.engines = engines  # engine id -> number of policies, in order
+        self.calls = calls
+
+    @classmethod
+    def _validate(cls, operation: str, params: dict) -> None:
+        import botocore.session
+        from botocore.validate import ParamValidator
+
+        if cls._model is None:
+            cls._model = botocore.session.get_session().get_service_model(
+                agentcore.SERVICE
+            )
+        shape = cls._model.operation_model(operation).input_shape
+        report = ParamValidator().validate(params, shape)
+        assert not report.has_errors(), report.generate_report()
+
+    @staticmethod
+    def _slice(items: list, params: dict) -> tuple[list, dict]:
+        start = int(params["nextToken"].split(".")[1]) if "nextToken" in params else 0
+        end = start + params.get("maxResults", 10)
+        more = {"nextToken": f"opaque.{end}.x"} if end < len(items) else {}
+        return items[start:end], more
+
+    def list_policy_engines(self, **params: Any) -> dict:
+        self._validate("ListPolicyEngines", params)
+        self.calls.append(("ListPolicyEngines", params))
+        ids = list(self.engines)
+        page, more = self._slice(ids, params)
+        return {
+            "policyEngines": [
+                {**_engine(0), "policyEngineId": e, "name": e.split("-")[0]}
+                for e in page
+            ],
+            **more,
+        }
+
+    def list_policies(self, **params: Any) -> dict:
+        self._validate("ListPolicies", params)
+        self.calls.append(("ListPolicies", params))
+        engine_id = params["policyEngineId"]
+        policies = [_policy(engine_id, j) for j in range(self.engines[engine_id])]
+        page, more = self._slice(policies, params)
+        return {"policies": page, **more}
+
+
+@pytest.fixture
+def fake_regions(monkeypatch, aws, assume_calls):
+    """region -> {engine id -> policy count}; agentcore.client serves them."""
+    regions: dict[str, dict[str, int]] = {}
+    calls: list = []
+
+    def build(session: Any, region: str) -> FakeControl:
+        return FakeControl(regions.get(region, {}), calls)
+
+    monkeypatch.setattr(agentcore, "client", build)
+    regions["calls"] = calls  # type: ignore[assignment]
+    return regions
+
+
+def _walk(tool: str, arguments: dict, config: dict) -> list[list[dict]]:
+    """Every page of a listing, following next_token to the end."""
+    kit, pages, token = BedrockAgentCoreToolkit(), [], None
+    for _ in range(1000):
+        args = {**arguments, **({"next_token": token} if token else {})}
+        result = kit.call_tool(tool, args, config)
+        assert result.successful, result.error
+        pages.append(result.data["items"])
+        token = result.data["next_token"]
+        assert result.data["has_more"] is (token is not None)
+        if token is None:
+            return pages
+    raise AssertionError("the listing never ended")
+
+
+# us-east-1: 103 engines over two ListPolicyEngines pages (one empty engine, one
+# with 230 policies over three pages); eu-west-1: one engine; ap-south-1: none.
+WALK_REGIONS = {
+    "us-east-1": {
+        eid(i): (230 if i == 0 else 0 if i == 5 else i % 4) for i in range(103)
+    },
+    "eu-west-1": {eid(900): 7},
+    "ap-south-1": {},
+}
+
+
+def _all_policies() -> list[tuple[str, str]]:
+    return [
+        (region, pid(e, j))
+        for region, engines in WALK_REGIONS.items()
+        for e, n in engines.items()
+        for j in range(n)
+    ]
+
+
+@pytest.mark.parametrize("limit", [1, 7, 100, 101, 230, 500])
+def test_list_policies_next_token_walks_every_policy_once(fake_regions, limit):
+    fake_regions.update(WALK_REGIONS)
+    config = blob(regions=list(WALK_REGIONS))
+    pages = _walk("BEDROCK_AGENTCORE_LIST_POLICIES", {"limit": limit}, config)
+
+    got = [(p["region"], p["policy_id"]) for page in pages for p in page]
+    assert got == _all_policies()  # all of them, in order, none twice
+    assert all(len(page) == limit for page in pages[:-1])  # only the last is short
+    assert len(pages[-1]) <= limit
+    # Every AgentCore call asked for no more than the call still wanted.
+    assert all(
+        params["maxResults"] <= min(limit, agentcore.PAGE_SIZE)
+        for op, params in fake_regions["calls"]
+        if op == "ListPolicies"
+    )
+
+
+@pytest.mark.parametrize(
+    ("regions", "limit", "sizes"),
+    [
+        (["us-east-1", "eu-west-1"], 100, [100, 100, 30]),
+        # Filled exactly at the engine's last policy, in the last region: done,
+        # with no empty extra page.
+        (["us-east-1"], 115, [115, 115]),
+    ],
+)
+def test_list_policies_next_token_walks_one_engine(fake_regions, regions, limit, sizes):
+    fake_regions.update(WALK_REGIONS)
+    config = blob(regions=regions)
+    pages = _walk(
+        "BEDROCK_AGENTCORE_LIST_POLICIES",
+        {"limit": limit, "policy_engine_id": eid(0)},
+        config,
+    )
+    assert [len(page) for page in pages] == sizes
+    got = [p["policy_id"] for page in pages for p in page]
+    assert got == [pid(eid(0), j) for j in range(230)]
+
+
+@pytest.mark.parametrize("limit", [1, 3, 100, 103, 104, 500])
+def test_list_policy_engines_next_token_walks_every_engine_once(fake_regions, limit):
+    fake_regions.update(WALK_REGIONS)
+    config = blob(regions=list(WALK_REGIONS))
+    pages = _walk("BEDROCK_AGENTCORE_LIST_POLICY_ENGINES", {"limit": limit}, config)
+    got = [(e["region"], e["policy_engine_id"]) for page in pages for e in page]
+    assert got == [(r, e) for r, engines in WALK_REGIONS.items() for e in engines]
+    assert all(len(page) == limit for page in pages[:-1])
+
+
+def _token_for(kind: str, region: str, **position: Any) -> str:
+    token = agentcore.encode_next_token(
+        kind, agentcore.Position(region, **position), engine_filter=None
+    )
+    assert token is not None
+    return token
+
+
+def _crafted(**body: Any) -> str:
+    raw = json.dumps({"v": 1, "r": "us-east-1", "e": None, **body}).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        # Not a token this tool issued.
+        ("BEDROCK_AGENTCORE_LIST_POLICIES", {"next_token": "not-a-token"}),
+        ("BEDROCK_AGENTCORE_LIST_POLICIES", {"next_token": "x" * 9000}),
+        # A region the credential blob doesn't list: a token can't widen the blob.
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICIES",
+            {"next_token": _token_for("policies", "eu-central-1")},
+        ),
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICY_ENGINES",
+            {"next_token": _token_for("engines", "eu-central-1")},
+        ),
+        # One tool's token in the other tool.
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICIES",
+            {"next_token": _token_for("engines", "us-east-1")},
+        ),
+        # Policies' fields, but marked as the other tool's.
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICIES",
+            {"next_token": _crafted(k="engines", i=None, p=None, f=None)},
+        ),
+        # A token made without an engine filter, used with one.
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICIES",
+            {
+                "next_token": _token_for("policies", "us-east-1"),
+                "policy_engine_id": eid(0),
+            },
+        ),
+        # A policies token whose engine id is not AWS's shape.
+        (
+            "BEDROCK_AGENTCORE_LIST_POLICIES",
+            {"next_token": _token_for("policies", "us-east-1", engine_id="../etc")},
+        ),
+    ],
+)
+def test_a_bad_next_token_is_refused_before_any_aws_call(
+    tool, arguments, aws, assume_calls
+):
+    result = BedrockAgentCoreToolkit().call_tool(tool, arguments, blob())
+    assert not result.successful and result.error_code == "invalid_arguments", (
+        result.error
+    )
+    assert "next_token" in result.error
+    assert assume_calls == []  # refused before the role is even assumed
+
+
+def test_a_next_token_whose_engine_is_gone_is_stale(fake_regions):
+    fake_regions["us-east-1"] = {eid(0): 150, eid(1): 1}
+    kit, config = BedrockAgentCoreToolkit(), blob()
+    first = kit.call_tool("BEDROCK_AGENTCORE_LIST_POLICIES", {"limit": 100}, config)
+    assert first.successful and first.data["has_more"] is True
+    del fake_regions["us-east-1"][eid(0)]  # deleted between the two calls
+    stale = kit.call_tool(
+        "BEDROCK_AGENTCORE_LIST_POLICIES",
+        {"limit": 100, "next_token": first.data["next_token"]},
+        config,
+    )
+    assert not stale.successful and stale.error_code == "invalid_arguments"
+    assert "stale" in stale.error
 
 
 def test_toolkit_without_a_blob_is_not_connected():
