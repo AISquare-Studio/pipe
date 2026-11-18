@@ -91,6 +91,9 @@ class TestPull:
         }
         assert envelopes[1].metadata["exported"] is True
         assert envelopes[1].metadata["source_mime_type"] == DOC
+        # Drive has no MD5 for a Google-native Doc, Sheet or Slides deck: no
+        # md5_checksum, so a re-check keys on modified_time there.
+        assert all("md5_checksum" not in e.metadata for e in envelopes[1:])
         assert all(e.source_id == "googledrive-source" for e in envelopes)
 
     def test_listing_follows_page_tokens(self):

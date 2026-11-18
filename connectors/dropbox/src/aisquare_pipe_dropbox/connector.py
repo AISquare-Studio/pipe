@@ -36,6 +36,31 @@ def _has_valid_auth_keys(config: dict[str, Any]) -> bool:
     return all(k in config for k in ("app_key", "app_secret", "refresh_token"))
 
 
+def _describe(delivered: Any, listed: dropbox.files.FileMetadata) -> tuple[str, dict[str, Any]]:
+    """The envelope's content type and metadata, from the download's own
+    metadata (the same response as the bytes), else the listing's. So the
+    size and the version markers (``rev``, ``server_modified``,
+    ``content_hash``) describe the bytes delivered, even when the file was
+    edited after the listing. A ``content_hash`` Dropbox does not send is
+    left out, never set to "" (two empty markers would compare equal and
+    hide an edit). ``server_modified`` is the SDK's naive UTC datetime in
+    ISO form: no ``Z``, so it does not equal Dropbox's wire value.
+    """
+    meta = delivered if isinstance(delivered, dropbox.files.FileMetadata) else listed
+    mime_type, _ = mimetypes.guess_type(meta.name)  # Dropbox sends no MIME type
+    metadata: dict[str, Any] = {
+        "filename": meta.name,
+        "path": meta.path_lower,
+        "size": meta.size,
+        "dropbox_id": meta.id,
+        "rev": meta.rev,
+        "server_modified": meta.server_modified.isoformat(),
+    }
+    if isinstance(meta.content_hash, str) and meta.content_hash:
+        metadata["content_hash"] = meta.content_hash
+    return mime_type or "application/octet-stream", metadata
+
+
 class DropboxSource(SourceConnector):
     """Pull files from Dropbox."""
 
@@ -51,9 +76,16 @@ class DropboxSource(SourceConnector):
         "size": MetaField(type=int, required=True, description="File size in bytes"),
         "rev": MetaField(type=str, required=False, description="Dropbox revision ID"),
         "server_modified": MetaField(
-            type=str, required=False, description="ISO timestamp of last modification"
+            type=str,
+            required=False,
+            description="ISO timestamp of last modification, naive UTC (no 'Z')",
         ),
         "dropbox_id": MetaField(type=str, required=False, description="Dropbox file ID"),
+        "content_hash": MetaField(
+            type=str,
+            required=False,
+            description="Dropbox's content hash: changes only when the file's bytes do",
+        ),
     }
 
     def pull(
@@ -94,22 +126,13 @@ class DropboxSource(SourceConnector):
             if limit is not None and count >= limit:
                 return
 
-            # MIME type from filename
-            mime_type, _ = mimetypes.guess_type(entry.name)
-            content_type = mime_type or "application/octet-stream"
-
-            metadata = {
-                "filename": entry.name,
-                "path": entry.path_lower,
-                "size": entry.size,
-                "rev": entry.rev,
-                "server_modified": entry.server_modified.isoformat(),
-                "dropbox_id": entry.id,
-            }
-
-            # Stream large files, buffer small ones
+            # Stream large files, buffer small ones. The listing picks what to
+            # pull and whether to stream. The envelope describes the bytes
+            # delivered (_describe): a file edited since the listing has a
+            # newer rev and size than the listing's.
             if entry.size > stream_threshold:
-                _, stream = client.download_stream(entry.path_lower)
+                delivered, stream = client.download_stream(entry.path_lower)
+                content_type, metadata = _describe(delivered, entry)
                 yield DataEnvelope(
                     content_type=content_type,
                     data=b"",
@@ -118,7 +141,8 @@ class DropboxSource(SourceConnector):
                     metadata=metadata,
                 )
             else:
-                _, content = client.download(entry.path_lower)
+                delivered, content = client.download(entry.path_lower)
+                content_type, metadata = _describe(delivered, entry)
                 yield DataEnvelope(
                     content_type=content_type,
                     data=content,

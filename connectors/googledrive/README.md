@@ -267,6 +267,10 @@ for every tab), Slides → PDF, Drawings → PNG, Apps Script → JSON. Folders,
 shortcuts, Forms and Sites are skipped. Metadata per envelope: `filename`,
 `file_id`, `mime_type`, `path`, `name`, `source_mime_type`, `exported`,
 `size`, `modified_time`, `web_view_link`, `drive_id`, `md5_checksum`.
+For a scheduled re-check, `md5_checksum` (Drive's MD5 of the stored bytes)
+changes only with the content. Google-native Docs, Sheets and Slides have no
+MD5, so their envelopes have no `md5_checksum`: key re-checks on
+`modified_time` there (it also moves on a rename).
 
 A rejected token raises `ConfigValidationError` (reconnect); other Drive
 failures raise `PipelineError`. `validate_config` is an offline shape check.
