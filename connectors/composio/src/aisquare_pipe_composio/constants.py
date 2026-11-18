@@ -31,5 +31,8 @@ CURSOR_FILENAME = "composio-cursor.json"
 # Pre-0.1.1 default, kept only as a one-time migration source.
 LEGACY_CURSOR_PATH = "/tmp/composio-pipe-cursor.json"
 DEFAULT_TRIGGER_PAGE_LIMIT = 100
+# SDK retries asked for on the trigger-log read (a POST): composio-client
+# 2.x gives a POST none by default; 1.x retried every method this often.
+TRIGGER_LOG_SDK_RETRIES = 2
 MAX_TRIGGER_PAGES_PER_POLL = 10
 SEEN_IDS_MAX = 500

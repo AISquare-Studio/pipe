@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import MagicMock
 
-from aisquare.pipe.core.envelope import PullParams
+import pytest
 
+from aisquare.pipe.core.envelope import PullParams
+from aisquare.pipe.errors import ConfigValidationError
+
+from aisquare_pipe_composio.client import ComposioSDKShapeError
 from aisquare_pipe_composio.triggers import ComposioTriggersSource
 
 from tests.helpers import make_event
@@ -301,6 +306,96 @@ class TestLoopBehaviour:
             )
         )
         assert sleeps == [42]
+
+
+class TestNonRetryableErrors:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ComposioSDKShapeError("no trigger-log resource"),
+            ConfigValidationError("Composio auth failed: 401 provider says bad key"),
+        ],
+        ids=["sdk-shape", "auth"],
+    )
+    def test_stop_polling_with_one_error_line_and_no_traceback(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, caplog, error
+    ):
+        """Raised on cycle 1. One ERROR line says why, without the message
+        (it may carry Composio's response text) or a traceback: both travel
+        with the raised error, which the caller logs once."""
+        mock_triggers_client.list_trigger_events.side_effect = error
+        params = PullParams(params={"max_polls": 5, "sleep": lambda _: None})
+        with (
+            caplog.at_level(logging.DEBUG, logger="aisquare.pipe.composio"),
+            pytest.raises(type(error)),
+        ):
+            config = _config(composio_config, tmp_cursor_path)
+            list(ComposioTriggersSource().pull(config, params))
+
+        assert mock_triggers_client.list_trigger_events.call_count == 1
+        (logged,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert logged.exc_info is None
+        assert "trigger polling stopped" in logged.getMessage()
+        assert str(error) not in logged.getMessage()
+
+
+class TestMalformedEvents:
+    """list_trigger_events returns a malformed entry as an event with
+    ``skipped`` set (and only its id and time)."""
+
+    BASE = 1_700_000_000_000
+
+    @staticmethod
+    def _skipped(event_id, ts_ms):
+        return {
+            "id": event_id,
+            "timestamp": None,
+            "timestamp_ms": ts_ms,
+            "skipped": "malformed trigger-log entry (its meta is a str, not an object)",
+        }
+
+    def test_skipped_event_is_recorded_and_paged_past(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, caplog
+    ):
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([self._skipped("evt_bad", self.BASE + 9000)], "cur_2"),
+            ([make_event("evt_ok", ts_ms=self.BASE + 1000)], None),
+        ]
+        with caplog.at_level(logging.WARNING, logger="aisquare.pipe.composio"):
+            envelopes = _pull_once(
+                ComposioTriggersSource(),
+                _config(composio_config, tmp_cursor_path),
+                since=self.BASE,
+            )
+
+        assert [e.metadata["composio_event_id"] for e in envelopes] == ["evt_ok"]
+        second = mock_triggers_client.list_trigger_events.call_args_list[1].kwargs
+        assert second["cursor"] == "cur_2"
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            saved = json.load(fd)
+        assert saved["seen_ids"] == ["evt_bad", "evt_ok"]
+        assert saved["last_ts_ms"] == self.BASE + 9000
+        assert ["evt_bad" in r.getMessage() for r in caplog.records] == [True]
+
+    def test_skipped_event_without_an_id_is_warned_about_not_recorded(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, caplog
+    ):
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([self._skipped(None, None)], "cur_2"),
+            ([make_event("evt_ok", ts_ms=self.BASE + 1000)], None),
+        ]
+        with caplog.at_level(logging.WARNING, logger="aisquare.pipe.composio"):
+            envelopes = _pull_once(
+                ComposioTriggersSource(),
+                _config(composio_config, tmp_cursor_path),
+                since=self.BASE,
+            )
+
+        assert [e.metadata["composio_event_id"] for e in envelopes] == ["evt_ok"]
+        with open(tmp_cursor_path, encoding="utf-8") as fd:
+            assert json.load(fd)["seen_ids"] == ["evt_ok"]
+        (warned,) = caplog.records
+        assert warned.levelno == logging.WARNING and "(no id)" in warned.getMessage()
 
 
 class TestValidateAndResources:
