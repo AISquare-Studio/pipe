@@ -414,9 +414,12 @@ def validate_installed_only(
         eps = groups[key]
         dist_name = eps[0].dist_name or key
         not_installed = [d for d in eps if d.missing_requirements]
+        # A connector inside aisquare-pipe is its extra; any other plugin
+        # (an aisquare-pipe-<x> of its own included) is its distribution.
+        inside = _connector_key(eps[0]) and dist_name == hyg.FRAMEWORK_DIST
         report = ConnectorReport(
             name=key.removeprefix("aisquare-pipe-") or key,
-            dist_name=f"{dist_name}[{key}]" if _connector_key(eps[0]) else dist_name,
+            dist_name=f"{dist_name}[{key}]" if inside else dist_name,
             install_state=hyg.INSTALL_MISSING if not_installed else hyg.INSTALL_OK,
             entry_points=[d.ep_name for d in eps],
         )

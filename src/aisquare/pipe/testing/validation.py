@@ -26,7 +26,7 @@ from typing import Any
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
 from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, OAuthSpec
-from aisquare.pipe.core.registry import missing_requirements, slug_prefix_conflicts
+from aisquare.pipe.core.registry import not_installed, slug_prefix_conflicts
 from aisquare.pipe.core.tools import (
     CARD_FIELDS,
     CATEGORIES,
@@ -184,8 +184,7 @@ def _discover_entry_points(group: str) -> list[DiscoveredConnector]:
             cls = ep.load()
         except Exception as e:  # noqa: BLE001 — any load failure is the finding
             load_error = f"{type(e).__name__}: {e}"
-            if isinstance(e, ImportError):
-                missing = tuple(missing_requirements(ep))
+            missing = tuple(not_installed(ep, e))
         discovered.append(
             DiscoveredConnector(
                 ep_name=ep.name,

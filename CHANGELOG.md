@@ -9,6 +9,215 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **AWS connectors** (`connectors/aws`, module `aisquare_pipe_aws`, extra
+  `aisquare-pipe[aws]`, in `[full]` and `[toolkits]`): read-only access to a
+  customer's AWS account through one cross-account IAM role.
+  - `aisquare_pipe_aws.credentials`: the shared credential. STS `AssumeRole`
+    runs with the server-issued `ExternalId`, and reads use the role's
+    refreshable temporary credentials. A role in the service's own account is
+    refused, as is one in an account listed in `PIPE_AWS_REFUSED_ACCOUNT_IDS`.
+    So are a role outside the commercial partition and an external ID
+    shorter than 32 characters. No customer client is built from ambient,
+    default or empty credentials. The blob is
+    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`. The
+    README's registration checklist covers `sts:TagSession` (EKS Pod
+    Identity's session tags are transitive), KMS `Decrypt` and
+    `DescribeKey` under `kms:ViaService`, and the order of the two sides'
+    steps. Prod's customer trusts both prod principals from day one: the ECS
+    task role `ais-studio-pipe-task-role-prod` and the EKS Pod Identity role
+    of pipe-service's cutover runbook.
+  - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
+    AgentCore policy, in every configured region (`ListPolicyEngines` →
+    `ListPolicies`, every page; `GetPolicy` only for a policy listed without
+    its definition). Each envelope carries the definition text, with the
+    name, ids, ARN, status, enforcement mode and timestamps as metadata, and
+    `version` = `updatedAt`.
+  - `s3-source`: one envelope per object under the configured bucket and
+    prefix (`ListObjectsV2`, every page; `GetObject`). Its `version` is the
+    `VersionId`, else the `ETag`. A `VersionId` of `"null"` (a bucket whose
+    versioning is suspended) counts as none, so the `ETag` is used.
+  - Toolkits `bedrock_agentcore` (`LIST_POLICY_ENGINES`, `LIST_POLICIES`,
+    `GET_POLICY`) and `s3` (`LIST_OBJECTS`, `GET_OBJECT`, `HEAD_OBJECT`). All
+    their tools are read-only, with strict schemas. Both AgentCore list
+    tools page with an opaque `next_token` (region, engine and AgentCore's
+    `nextToken`), so every engine and policy is reachable past `limit`.
+  - Pull params and tool arguments only narrow what the blob allows (a
+    prefix inside the configured one, one engine, a time filter). Neither
+    can name an account, role, region, bucket or credential.
+  - AWS's refusals map to tool error codes: a body-less S3 `403` is
+    `forbidden`; `ValidationException`, `InvalidArgument` and a body-less S3
+    `400` are `invalid_arguments`.
+  - The `[aws]` extra is `boto3`/`botocore` >= 1.43.32, < 2. The AgentCore
+    Policy GA model arrived in 1.42.60, but a policy's `enforcementMode` only
+    in 1.43.32. The tests' AWS fake, `moto[s3,sts]`, is in `[dev]`.
+- **Glean connector** (`connectors/glean`, module `aisquare_pipe_glean`, extra
+  `aisquare-pipe[glean]`, in `[full]` and `[toolkits]`). It is read-only over
+  Glean's Client API.
+  - **Toolkit `glean`**: `GLEAN_SEARCH` (`pipe:primary`) and `GLEAN_GET_DOCUMENT`.
+  - **Source `glean-source`**: a saved query or document ids, read as
+    `text/plain` envelopes. Each carries exactly one version marker: the
+    document's `update_time`, or `content_sha256` (the SHA-256 of the text)
+    when Glean sends no update time. Those documents are counted in one INFO
+    line, and a search that stops at the 50-page cap while Glean still has
+    results logs one WARNING (counts only).
+  - **Auth**: a Glean-issued token, held in a per-tenant credential blob
+    `{host, token, token_kind: user|global, act_as?, allowed_hosts?}`. No
+    OAuthSpec. pipe-as-service runs `glean-source` with this blob; it does not
+    serve the `GLEAN_*` tools yet.
+    - A global token always sends `X-Glean-ActAs`; a user token never does.
+    - `host` must match `<instance>-be.glean.com` or the blob's own
+      `allowed_hosts`. IP addresses are refused in both. Redirects are not
+      followed.
+    - `token` and `act_as` must be ASCII (they are sent as headers).
+    - Neither tool arguments nor pull params can set any credential key.
+    - Without a usable blob it fails closed (`not_connected` /
+      `GleanNotConfigured`) before any request.
+  - The extra is empty: HTTP goes through `requests`, which core already
+    requires.
+- **Google Cloud Storage connector** (`connectors/gcs`, module `aisquare_pipe_gcs`, extra
+  `aisquare-pipe[gcs]`, in `[full]` and `[toolkits]`): the read-only toolkit `gcs`
+  (`GCS_GET_OBJECT`, primary; `GCS_LIST_OBJECTS`) and the source `gcs-source`, over ONE bucket
+  and an optional prefix from the tenant's credential blob
+  `{service_account_json, bucket, prefix?}`. Tokens are minted from the service account key
+  (scope `devstorage.read_only`; `google-auth>=2.20,<3`, the extra's only dependency) and never
+  from Application Default Credentials. Each object carries its version markers `generation`,
+  `md5_hash` and `updated`. A missing or malformed blob fails closed ("Google Cloud Storage is
+  not configured", no request); a bucket, key or out-of-prefix name from a caller is refused.
+  The configured prefix must end with `/`. The prefix is enforced by the connector, not by
+  Google: the README's checklist recommends a dedicated bucket and says CMEK needs no KMS grant.
+  - A token is minted with one POST, without hidden retries. Only a key Google refuses is
+    `unauthorized`; Google's `invalid_grant` for the assertion's times (this host's clock is off)
+    is `upstream_error`. A token endpoint that times out is `timeout`; one that is unreachable or
+    answers 5xx is `upstream_error`. A token Cloud Storage rejects is dropped from the cache, and a
+    call whose cached token was rejected retries once.
+  - A tool call fits inside the host's `timeout_seconds`: every request, the token POST included,
+    gets the time remaining, a download checks it between chunks, and a call with none left fails
+    `timeout`.
+  - A download that breaks off midway, or a key that can't sign (an EC key), comes out as a typed
+    error: `GcsAPIError` (`timeout`/`upstream_error`) or `GcsNotConfigured`.
+  - `gcs-source` takes `start_offset`. A pull cut short by `max_objects` or the listing-page cap
+    marks its last envelope (`truncated`, `next_start_offset`) and logs a warning. One cut short
+    before any envelope came out raises `GcsPullTruncated` (a `ValueError`) with
+    `next_start_offset`, so a `modified_after` sync over a big prefix still advances.
+  Setup and the exact secret: `connectors/gcs/README.md`.
+- **Google BigQuery connector** (`connectors/bigquery`, module `aisquare_pipe_bigquery`, extra
+  `aisquare-pipe[bigquery]`, in `[full]` and `[toolkits]`): the read-only toolkit `bigquery`
+  (`BIGQUERY_RUN_SELECT`, primary; `BIGQUERY_READ_TABLE_ROWS`, `BIGQUERY_GET_TABLE_SCHEMA`,
+  `BIGQUERY_LIST_TABLES`, `BIGQUERY_LIST_DATASETS`) and the source `bigquery-query-source`, on the tenant's
+  credential blob `{service_account_json, project_id, location?, max_bytes_billed?}`. It is the native
+  replacement for Composio's `googlebigquery` (a distinct name; the README maps the tools). Tokens are minted
+  from the service account key (scope `bigquery.readonly`; `google-auth>=2.20,<3`) and never from Application
+  Default Credentials; a missing or malformed blob fails closed ("BigQuery is not configured", no request).
+  - SQL is SELECT-only, refused before any request otherwise: a lexer that reads GoogleSQL's quoting and
+    comments and a sqlglot parse (`sqlglot>=26.25,<28`, BigQuery dialect) must both find ONE `SELECT`/`WITH`
+    statement with no write, DDL or scripting keyword or node. The dry run's `statementType` must be `SELECT`.
+    The lexer ends `--` and `#` comments at a CR or an LF (a bare CR too, as BigQuery does), refuses a CR or LF
+    inside a one-line string or backtick identifier, and refuses a `/*` inside a `/* */` comment. The floor is
+    sqlglot 26.25 because 25.3 to 26.24 read BigQuery comments as nested, and CI runs every suite whose extra names
+    sqlglot at that floor too (`scripts/dep_floor.py`).
+  - Caps: a dry run refuses a query over `max_bytes_processed` (default 1 GiB, never above the tenant's
+    `max_bytes_billed` ceiling, default 10 GiB) before it runs, and the job carries the same cap as
+    `maximumBytesBilled`; `max_rows` and a JSON byte cap on the rows returned (`truncated` says which); the job
+    deadline (the host's time budget left, 60 s without one, `job_timeout_seconds` for the source) is sent as
+    `jobTimeoutMs`, and polling stops there.
+  - BigQuery's rate-limit and quota 403s are `rate_limited`; its error `reason` picks the code.
+  - `bigquery-query-source` pulls a `table` (tabledata.list, no job) or one `sql` SELECT, one envelope per row
+    batch. Each carries `result_sha256` (order-independent) and the table's `lastModifiedTime`
+    (`table_last_modified`, read before the rows; for a query the latest over the tables it names), combined as
+    `version`. A pull cut at `max_rows` or `max_result_bytes` says `truncated`, and a table pull
+    `next_start_index`.
+  Setup, the registration checklist and the exact secret: `connectors/bigquery/README.md`.
+- **Snowflake connector** (`connectors/snowflake`, module `aisquare_pipe_snowflake`, extra
+  `aisquare-pipe[snowflake]`, in `[full]` and `[toolkits]`): the read-only toolkit `snowflake`
+  (`SNOWFLAKE_RUN_SELECT`, primary; `SNOWFLAKE_DESCRIBE_TABLE`, `SNOWFLAKE_SHOW_TABLES`,
+  `SNOWFLAKE_SHOW_SCHEMAS`, `SNOWFLAKE_SHOW_DATABASES`) and the source `snowflake-query-source`, over
+  Snowflake's SQL API (`/api/v2/statements`, HTTPS + JSON via `requests`; no
+  `snowflake-connector-python`). It replaces Composio's `snowflake` stop-gap under the same toolkit
+  name, keeping Composio's SHOW slugs and argument names.
+  - Credential blob `{account, user, auth: keypair|oauth_client, private_key_pem (+passphrase) |
+    client_id + client_secret + token_url (+scope), role, warehouse, database?, schema?}`. Key-pair
+    JWT (RS256, signed with `cryptography>=42,<60`) is the default; `oauth_client` is a client
+    credentials grant at the customer's identity provider (External OAuth). `account` must be a
+    Snowflake account identifier (`<orgname>-<account_name>`, or a legacy locator with a known region
+    or a region and the cloud `aws`/`gcp`/`azure`), so every call goes to
+    `https://<account>.snowflakecomputing.com`.
+    Ambient `SNOWFLAKE_*` settings and `connections.toml` are never read; a missing or malformed
+    blob fails closed ("Snowflake is not configured", no request).
+  - SQL is SELECT-only, refused before any request otherwise: a lexer (strings, quoted identifiers
+    and comments blanked, with and without backslash escapes; a `--`/`//` comment ends at a CR or an
+    LF, one ended by a bare CR is refused, and so is a `/*` inside a `/* */` comment) and a sqlglot
+    parse (`sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and CI runs this
+    suite at that floor too, `scripts/dep_floor.py`; Snowflake dialect) must both find ONE
+    `SELECT`/`WITH` with no write, DDL, session or scripting
+    keyword or node, no `$`, `@` or `->>`, and no table function but FLATTEN, SPLIT_TO_TABLE,
+    STRTOK_SPLIT_TO_TABLE or GENERATOR (a stored procedure can be called as one). Every statement is
+    sent with `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and
+    warehouse, which no tool argument or pull param can change.
+  - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
+    tool call, at most 64 MiB for the source; partitions are read only while they fit), and the
+    statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
+    `timeout`; polling stops there and the statement is cancelled. Snowflake's error codes pick the
+    canonical code (`002003` not_found, `003001`/`000606` forbidden, `000630` timeout, ...).
+  - `snowflake-query-source` pulls a `table` (its own SELECT, names quoted; `columns`, `order_by`,
+    `start_index`) or one `sql` SELECT, one envelope per row batch. Each carries `result_sha256`
+    (order-independent) and `INFORMATION_SCHEMA.TABLES.LAST_ALTERED` (`table_last_altered`, read
+    before the rows; for a query the latest over the base tables it names), combined as `version`. A
+    pull cut at `max_rows` or `max_result_bytes` says `truncated`, and an ordered table pull
+    `next_start_index`.
+  - Not built: stage file listing and reading (GoodRx hasn't said policies live in stages).
+  Setup, the registration checklist and the exact secret: `connectors/snowflake/README.md`.
+- **Amazon Redshift connector** (module `aisquare_pipe_aws.redshift` in `connectors/aws`; extra
+  `aisquare-pipe[redshift]`, an alias of `[aws]`, which now also brings `sqlglot>=26.25,<28`): the
+  read-only toolkit `redshift` (`REDSHIFT_RUN_SELECT`, primary; `REDSHIFT_LIST_SCHEMAS`,
+  `REDSHIFT_LIST_TABLES`, `REDSHIFT_DESCRIBE_TABLE`) and the source `redshift-query-source`, for a
+  provisioned cluster or a Serverless workgroup, through the Redshift Data API. They read the tenant
+  secret `redshift`: the AWS blob plus `redshift: {cluster_identifier | workgroup_name, database,
+  db_user | secret_arn, region?}` (neither user key: the role's own `IAMR:` user, through
+  `GetClusterCredentialsWithIAM` or Serverless `GetCredentials`).
+  - It lives in `aisquare_pipe_aws` because it assumes the role through
+    `aisquare_pipe_aws.credentials` and one connector never imports another; the toolkit and source
+    subclass `_AwsToolkit` and `_AwsSource`, so the session, the service principal and the refusals
+    are the S3 and AgentCore connectors' own.
+  - SQL is SELECT-only, refused before any AWS call (not even `sts:AssumeRole`) otherwise: a lexer
+    and a sqlglot parse (Redshift dialect) must both find ONE `SELECT`/`WITH` statement with no
+    write, DDL, session or side-effect word or node (`SELECT ... INTO`, `UNLOAD`, `COPY`, `SET`,
+    `PG_TERMINATE_BACKEND`, ...). The lexer ends `--` comments at a CR or an LF, refuses a `/*`
+    inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
+    and control characters outside quotes, `U&` Unicode escapes, and the side-effect functions
+    in double quotes. It reads a number whole, exponent included, before any word, as Redshift
+    does, so `SELECT 1e5INTO t` is refused as `INTO`.
+    Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
+    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so the guard
+    parses inside `aisquare.pipe.core.sql.quiet_sqlglot()` (the parsing thread or task only, no
+    global switch). Python's last-resort stderr handler doesn't see them either.
+  - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
+    (paged) inside one deadline: the host's time budget, else 60 s (the source's
+    `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
+    inside what is left when it goes out, because a client is rebuilt with shorter timeouts as
+    the deadline nears (and with longer ones when they are under half of what a request may use:
+    the first result page after the polls), and botocore never retries. A slice of the deadline
+    (a fifth, 0.2 s to 3 s) is kept back to cancel a statement still running: polling stops
+    there, the statement is cancelled on a client of its own sized to all of what is left, and
+    the call fails with `timeout`. A statement the cancel misses is stopped by the database user's
+    `statement_timeout` (at least 600000 ms), which the checklist has the customer set.
+    Caps: `max_rows` and a JSON byte cap (`truncated` says which).
+    The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
+  - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
+    `version` = `result_sha256` (order-independent).
+  - CI runs the AWS suite at the sqlglot floor too: `scripts/dep_floor.py` and validate.yml's
+    "SQL guards at the sqlglot floor" step, byte for byte #37's, so the branches merge cleanly.
+  Setup, the registration checklist (the role's `redshift-data` and credential permissions, the
+  read-only database user and its `statement_timeout`, the secret JSON, and how AISquare stores
+  the `redshift` secret on ECS and on EKS) and the exact secret: `connectors/aws/README.md`,
+  "Amazon Redshift".
+- `aisquare.pipe.core.sql.quiet_sqlglot()`: the one helper every connector's SQL guard parses inside.
+  sqlglot logs pieces of the SQL while it parses ("Invalid JSON path syntax ... <path>" at WARNING for a
+  JSON key with a dash, in statements the guards admit); a ContextVar-gated filter on the `sqlglot`
+  logger drops them in that context only, before any handler, so `logging.lastResort` never prints
+  them either. Nothing is disabled globally. `sqlglot_at_least()` lets a guard refuse every statement
+  below its extra's floor (BigQuery, Snowflake and Redshift do, at 26.25).
+- `aisquare.pipe.testing.host.host_answer(exc)`: the HTTP status pipe-as-service answers a source's
+  exception with, for connector tests.
 - **Databricks connector** (`connectors/databricks`, module `aisquare_pipe_databricks`, extra
   `aisquare-pipe[databricks]`, in `[full]` and `[toolkits]`): the read-only toolkit `databricks`
   (`DATABRICKS_READ_FILE`, primary; `DATABRICKS_LIST_FILES`; `DATABRICKS_RUN_SELECT`;
@@ -16,11 +225,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unity Catalog volumes (Files API) and DBFS, on the tenant's blob
   `{workspace_url, auth: pat|oauth_m2m, token | client_id+client_secret, warehouse_id?}`.
   `workspace_url` must be a Databricks host (cloud.databricks.com, azuredatabricks.net,
-  gcp.databricks.com). SQL runs only if a parser (sqlglot, `sqlglot>=25,<28`, the extra's only
+  gcp.databricks.com). SQL runs only if a parser (sqlglot, `sqlglot>=26.25,<28`, the extra's only
   dependency) and a lexer both accept ONE SELECT/WITH, checked before any HTTP call, with a row cap,
   a 16 MiB byte cap and a deadline after which the statement is cancelled. Files carry version
   markers `modified_time`, `etag`, `sha256`. A missing or malformed blob fails closed ("Databricks is
   not configured", no request). Setup and the exact secret: `connectors/databricks/README.md`.
+
+### Changed
+
+- `PipelineError` takes an optional `retry_after` (seconds). It is what a source raises for an upstream
+  or transient failure: pipe-as-service answers it 502 `upstream_error`, by its exact type.
+- The BigQuery, Cloud Storage, Glean, Snowflake, S3, Bedrock AgentCore and Redshift sources no longer
+  raise their connector's API error (a bare `Exception` or `PipeError` subclass, which pipe-as-service
+  answered 500 with the provider's text in its log). An upstream or transient failure is a
+  `PipelineError` (502, `retry_after` from the provider's `Retry-After`); what the caller can fix is a
+  `ValueError` subclass (422: `BigQueryRequestError`, `GcsRequestError`, `GleanRequestError`,
+  `SnowflakeRequestError`, `AwsRequestError`, `RedshiftRequestError`). Redshift's `StatementTimeout` is
+  a `PipelineError`, and a `StatementFailed` is a `RedshiftRequestError` (its SQL, a missing relation)
+  or a `PipelineError` (a grant, an abort). Neither carries the provider's own error text (a database
+  error can echo the caller's values); the toolkits still show it. `AwsNotConfiguredError` is a
+  `ValueError` first (422). Non-mapping pull params are a `ValueError`.
+- BigQuery, Snowflake and Redshift sources fit a 512 MiB pod: pages and partitions are let go before the next is
+  read (BigQuery pages hold at most 50,000 cells), rows convert one at a time and are kept as their
+  canonical JSON (the envelopes and hashes are unchanged, byte for byte), and a batch's rows are let go
+  once its envelope is built. `max_result_bytes` is at most 64 MiB (was 100 MiB). Peaks (tracemalloc,
+  every envelope kept): BigQuery 21 MiB at the defaults (was 149) and 103 MiB at the caps; Snowflake
+  47 MiB (was 65) and 93-104 MiB (was 367 MiB at 100 MiB); Redshift 16 MiB (was 29) and 96 MiB
+  (was 277 MiB at 100 MiB, seq 13894). The READMEs' "Memory" sections have the numbers.
+- BigQuery: "Custom quota exceeded" is `forbidden` with when it resets, not `rate_limited`; a job error
+  inside a 200 maps by its reason (`accessDenied` is `forbidden`); `WWW-Authenticate` reaches
+  `error_code_for_status` (`insufficient_scope`); Drive-backed external tables are listed as not
+  supported.
+- `scripts/dep_floor.py --connectors` exits 1 when no connector suite matches, and validate.yml's floor
+  step fails when it ran none (it used to pass having tested nothing).
+- S3: an object that grew past `max_object_bytes` between the listing and the read is skipped, not
+  raised mid-pull.
+- BigQuery, Snowflake and Redshift sources cut a batch at `batch_size` rows or `max_batch_bytes` bytes of
+  envelope data, whichever comes first (`aisquare.pipe.core.batches.batch_bounds`). The default, 256 KiB, is
+  what pipe-as-service returns inline in a sync pull: before, a default 500-row batch of 1 KiB rows was about
+  500 KiB, and a sync pull without a blob store answered 400 at the first envelope (all three, measured through
+  the host's `from_envelope`); now the same pull is 200, 8 envelopes of at most 261,816 bytes.
+- GCS source memory: a download accumulates in one buffer (no chunk list and join), the source drops each
+  object before the next download, and it holds an envelope back for a truncated pull's marker only when
+  every object after it could still be skipped at download (unknown size, or stored gzip). `max_bytes`
+  for the source is at most 64 MiB (was 100 MiB; tools keep 100 MiB). Peak (tracemalloc, three objects):
+  25 MiB objects 50 MiB (was 100), 64 MiB objects 129 MiB (was 192 truncated), and 400 MiB at the old
+  100 MiB cap before.
 
 ## [0.5.0] - 2026-11-04
 
@@ -32,6 +282,19 @@ published, so 0.5.0 also carries everything under 0.4.0 and 0.3.0 below.
 `aisquare.pipe.core.search` is new in it, so a host that needs it
 (pipe-as-service's `/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`.
 Publish steps: RELEASING.md, "The 0.5.0 release".
+
+### Upgrading from `aisquare-pipe-<x>`
+
+In an environment that has an old per-connector package (`aisquare-pipe-onedrive`
+0.1.0, say), **uninstall it first**, then install the extra:
+`pip uninstall -y aisquare-pipe-onedrive && pip install "aisquare-pipe[onedrive]>=0.5.0"`.
+The old package and `aisquare-pipe` 0.5.0 install the same files, so pip
+removing the old one (`pip install -U aisquare-pipe-<x>`, or a later `pip
+uninstall aisquare-pipe-<x>`) deletes the connector. If you already upgraded
+in place, never uninstall the old package without running `pip install
+--force-reinstall --no-deps aisquare-pipe` afterwards; the same command
+repairs a broken environment. Fresh environments are not affected. Details:
+README.md, "Upgrading from `aisquare-pipe-<x>`".
 
 ### Changed
 
@@ -48,8 +311,16 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
     graphify. `[toolkits]` is `aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]`.
   - **Not installed.** A connector whose extra isn't installed counts as not
     installed: discovery leaves it out with one info line naming the extra
-    (`registry.missing_requirements`, `registry.connector_extra`), instead of a
-    load-error warning.
+    (`registry.not_installed`, `registry.missing_requirements`,
+    `registry.connector_extra`), instead of a load-error warning. That takes
+    a missing third-party module (a `ModuleNotFoundError`, or an error raised
+    from one) and a missing requirement of the connector's own extra, counted
+    only where its env marker applies. Anything else stays a broken-plugin
+    warning, even with the extra missing: a missing `aisquare.*` or
+    `aisquare_pipe_*` module (a half-removed install), or `cannot import
+    name`. `pipe validate` reads load failures the same way, and labels a
+    plugin in its own `aisquare-pipe-<x>` distribution by that distribution,
+    not as an extra.
   - **Per-connector pyprojects.** `connectors/<name>/pyproject.toml` keeps only
     the suite's pytest/ruff settings. No connector builds on its own. The ten
     that were PyPI projects (composio, docusign, dropbox, gateway, github,
@@ -73,6 +344,14 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
     `pipe validate aisquare-pipe[<name>]` selects that connector.
   - **Development** is one editable install, `pip install -e ".[full,dev]"`.
     `scripts/dev_install_toolkits.sh` runs `pip install -e "<checkout>[toolkits]"`.
+  - **Dependency floors** that Dependabot raised in the old per-connector
+    pyprojects now live in the root: `requests>=2.34.2` (core),
+    `azure-identity>=1.27.0` (`[onedrive]`), `graphifyy==0.9.106`
+    (`[graphify-engine]`), `pytest>=9.2.0` (`[dev]`) and `setuptools>=84.2.1`
+    (build). Dependabot watches only the root `pyproject.toml`.
+  - **graphify** remediation messages name
+    `aisquare-pipe[graphify,graphify-engine]`, not
+    `aisquare-pipe-graphify[engine]`.
 - **Publishing** (`publish.yml`, new `scripts/release_packages.py`). A run can
   no longer pass without uploading.
   - A version already on PyPI is skipped by an explicit lookup and listed in
@@ -82,7 +361,8 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
   - A release tag must be `v<version>`, and nothing ever creates a PyPI project.
   - Every PR (and Run workflow, which defaults to a dry run) builds the
     distribution, checks that its wheel's RECORD holds every module of
-    `src/` and `connectors/*/src`, and runs `twine check --strict`.
+    `src/` and `connectors/*/src`, and runs `twine check --strict`. A PR
+    builds and checks the ten shims too.
   - Run workflow with target `shims` builds and checks the ten shims, and
     publishes them once `aisquare-pipe` 0.5.0 is on PyPI.
 

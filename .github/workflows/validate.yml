@@ -38,6 +38,34 @@ jobs:
           set -o pipefail
           pipe validate --json | tee validate-report.json
 
+      # The install above resolves the newest sqlglot; a host may hold any
+      # version the extras allow. So every suite whose extra names sqlglot
+      # (the SQL guards) also runs at the floor. The script fails when two
+      # extras give sqlglot different specifiers, and when no suite matches;
+      # the list is read into a variable first, so that failure stops the
+      # step (a failing $(...) in a for list would not), and the step checks
+      # that the floor is what got installed and that a suite ran.
+      - name: SQL guards at the sqlglot floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin="$(python scripts/dep_floor.py sqlglot)"
+          dirs="$(python scripts/dep_floor.py sqlglot --connectors)"
+          pip install "$pin"
+          python - "$pin" <<'PY'
+          import sys, sqlglot
+          want = sys.argv[1].split("==", 1)[1]
+          print("sqlglot", sqlglot.__version__)
+          assert sqlglot.__version__.startswith(want), (sqlglot.__version__, want)
+          PY
+          ran=0
+          for dir in $dirs; do
+            (cd "$dir" && python -m pytest tests -q --no-header -p no:cacheprovider)
+            ran=$((ran + 1))
+          done
+          echo "ran $ran SQL guard suite(s) at $pin"
+          test "$ran" -gt 0
+
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v7
