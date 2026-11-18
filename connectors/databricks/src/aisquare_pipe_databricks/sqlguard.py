@@ -99,14 +99,15 @@ differ, and adds the statement's structure.
    an unparsed ``Command``, ...) or a call of a side-effect function. Text it
    can't tokenize or parse is refused.
 
+   It tokenizes and parses through
+   :func:`aisquare.pipe.core.sql.parse_statements`, as every SQL guard does.
    sqlglot logs pieces of the SQL while it parses ("Invalid JSON path
    syntax. ... <the path>" at WARNING for a JSON key with a dash, in
-   statements this guard admits). So it tokenizes and parses inside
-   :func:`aisquare.pipe.core.sql.quiet_sqlglot`, the helper every SQL guard
-   shares: nothing sqlglot logs then gets out, in this context only.
-   A sqlglot older than the extra's floor (:data:`SQLGLOT_FLOOR`: 25.0 to
-   25.2 don't nest Spark's block comments; another package can bring an old
-   one in) refuses every statement.
+   statements this guard admits), so nothing it logs then gets out (in this
+   context only; nothing is disabled globally), any exception refuses, and a
+   sqlglot older than core's :data:`~aisquare.pipe.core.sql.SQLGLOT_FLOOR`
+   (the extras' floor; 25.0 to 25.2 don't nest Spark's block comments, and
+   another package can bring an old one in) refuses every statement.
 
 Behind these, Databricks itself: the principal should hold only ``USE`` and
 ``SELECT`` grants (see the README), so a write that got past both checks
@@ -116,18 +117,20 @@ would still be refused.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
-import sqlglot
-from aisquare.pipe.core.sql import quiet_sqlglot, sqlglot_at_least
+from aisquare.pipe.core.sql import (
+    SQLGLOT_FLOOR,
+    SqlglotTooOld,
+    Unparsable,
+    parse_statements,
+)
 from sqlglot import exp
-from sqlglot.dialects.dialect import Dialect
-from sqlglot.errors import SqlglotError
+from sqlglot.dialects.databricks import Databricks
 from sqlglot.tokens import Token, TokenType
 
 MAX_SQL_CHARS = 20_000
-#: The oldest sqlglot the guard runs on: the ``[databricks]`` extra's floor.
-SQLGLOT_FLOOR = (26, 25)
 
 # Statement roots that read.
 _QUERY_ROOTS: tuple[type[exp.Expression], ...] = tuple(
@@ -289,13 +292,6 @@ class NotReadOnly(ValueError):
 def check_select_only(sql: str) -> str:
     """``sql`` stripped, if it is ONE read-only query (both checks pass);
     else :class:`NotReadOnly`."""
-    if not sqlglot_at_least(str(getattr(sqlglot, "__version__", "")), SQLGLOT_FLOOR):
-        raise NotReadOnly(
-            "the SQL guard needs sqlglot "
-            + ".".join(map(str, SQLGLOT_FLOOR))
-            + " or later and this host has an older one, so no statement may run; "
-            "the host must install aisquare-pipe[databricks] as declared"
-        )
     if not isinstance(sql, str) or not sql.strip():
         raise NotReadOnly("the statement is empty")
     if len(sql) > MAX_SQL_CHARS:
@@ -354,18 +350,37 @@ _COMMENT_OPEN = "/*"
 _JINJA_COMMENT = "{#"
 
 
-def _tokens(sql: str) -> list[Token]:
-    """sqlglot's tokens of ``sql`` (Databricks dialect), silently."""
-    with quiet_sqlglot():
-        return list(Dialect.get_or_raise("databricks").tokenize(sql))
+_DIALECT = Databricks()
+_UNPARSABLE = "it does not parse as Databricks SQL"
 
 
-def _parse(sql: str, tokens: list[Token]) -> list[exp.Expression]:
-    """Every statement in ``tokens`` (sqlglot, Databricks dialect, silently:
-    nothing sqlglot logs while it parses gets out)."""
-    with quiet_sqlglot():
-        parser = Dialect.get_or_raise("databricks").parser()
-        return [s for s in parser.parse(tokens, sql) if s is not None]
+class _ReadUnlikeSpark(Exception):
+    """Raised from :func:`_spark_check`'s check of the tokens, before they
+    are parsed: the reason the parser refuses."""
+
+
+def _spark_check(sql: str) -> Callable[[list[Token]], None]:
+    """``parse_statements``' ``check_tokens`` for ``sql``: raises
+    :class:`_ReadUnlikeSpark` where sqlglot's tokens and Spark's lexer read
+    the text apart (and for any exception reading them: it refuses, never
+    admits)."""
+
+    def check(tokens: list[Token]) -> None:
+        try:
+            problem = _read_unlike_spark(sql, tokens)
+        except Exception:  # noqa: BLE001 — a bug reading the tokens refuses
+            problem = _UNPARSABLE
+        if problem is not None:
+            raise _ReadUnlikeSpark(problem)
+
+    return check
+
+
+def _statements(sql: str) -> list[exp.Expression]:
+    """Every statement in ``sql`` (sqlglot, Databricks dialect, through
+    :func:`~aisquare.pipe.core.sql.parse_statements`, its tokens checked
+    against Spark's reading before they are parsed)."""
+    return parse_statements(sql, _DIALECT, check_tokens=_spark_check(sql)).statements
 
 
 def _function_name(node: exp.Expression) -> str:
@@ -380,15 +395,15 @@ def _parsed(sql: str) -> str | None:
     if _SUBSTITUTION in sql:
         return "it has ${...}, which Spark substitutes before it reads the SQL"
     try:
-        tokens = _tokens(sql)
-        problem = _read_unlike_spark(sql, tokens)
-        if problem is not None:
-            return problem
-        statements = _parse(sql, tokens)
-    except SqlglotError:
-        return "it does not parse as Databricks SQL"
-    except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
-        return "it does not parse as Databricks SQL"
+        statements = _statements(sql)
+    except SqlglotTooOld as old:
+        raise NotReadOnly(
+            f"{old}; the host must install aisquare-pipe[databricks] as declared"
+        ) from None
+    except _ReadUnlikeSpark as apart:
+        return str(apart)
+    except Unparsable:
+        return _UNPARSABLE
     if len(statements) != 1:
         return "it is more than one statement" if statements else "it is empty"
     (root,) = statements

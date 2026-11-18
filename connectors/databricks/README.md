@@ -116,9 +116,10 @@ Spark's differ, and adds the statement's structure (a `FOR SHARE` lock, text tha
      `MERGE`, `CREATE`, `DROP`, `ALTER`, `SELECT ... INTO`, `SET`, `USE`, `COPY`, `CACHE`, `REFRESH`,
      `GRANT`, a `FOR SHARE`/`FOR UPDATE` lock, `TRANSFORM ... USING`, unparsed commands, ...).
    - Text it can't tokenize or parse is refused.
-   - sqlglot tokenizes and parses inside core's `quiet_sqlglot()`: what it logs meanwhile (a JSON path it can't
-     read is logged, path and all, at WARNING) never gets out. A sqlglot older than 26.25 refuses every
-     statement.
+   - sqlglot tokenizes and parses through core's `parse_statements()`, as every SQL guard does, with the
+     token check above run between the two: what sqlglot logs meanwhile (a JSON path it can't read is
+     logged, path and all, at WARNING) never gets out, any exception refuses, and a sqlglot older than core's
+     `SQLGLOT_FLOOR` (26.25, the extras' floor) refuses every statement.
 
 Both refuse calls of the functions with side effects outside the query: `http_request` and `remote_query`
 (a Unity Catalog connection can write there), `read_kafka`, `read_kinesis`, `read_pubsub` and `read_pulsar`

@@ -429,6 +429,20 @@ def test_a_hint_is_read_as_tokens():
     assert "names DELETE" in (sqlguard._lexical("SELECT /*+ DELETE */ 1") or "")
 
 
+def test_a_bug_reading_the_tokens_refuses(monkeypatch):
+    """The parser's check of sqlglot's tokens runs inside core's
+    parse_statements (its check_tokens); an exception in it refuses, never
+    admits."""
+
+    def broken(sql, tokens):
+        raise IndexError("a bug")
+
+    monkeypatch.setattr(sqlguard, "_read_unlike_spark", broken)
+    assert sqlguard._parsed("SELECT 1") == "it does not parse as Databricks SQL"
+    with pytest.raises(NotReadOnly):
+        check_select_only("SELECT 1")
+
+
 def test_below_the_sqlglot_floor_nothing_runs(monkeypatch):
     """sqlglot 25.0 to 25.2 don't nest Spark's block comments (FAIL 2): a host
     with an older sqlglot than the extra's floor runs nothing."""

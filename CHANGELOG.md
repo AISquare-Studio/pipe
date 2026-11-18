@@ -257,8 +257,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `read_kafka`/`read_kinesis`/`read_pubsub`/`read_pulsar`, `reflect`/`java_method`, `secret`,
     `list_secrets`, `vector_search`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`,
     naming the function by its canonical name only. Tests pin what only one layer catches (none of it a
-    write in Spark's reading), so dropping either fails the suite. The parser runs inside core's
-    `quiet_sqlglot()`, so no SQL reaches a log, and below sqlglot 26.25 nothing runs.
+    write in Spark's reading), so dropping either fails the suite. The parser parses through core's
+    `parse_statements()` (its token check runs between tokenizing and parsing), so no SQL reaches a log,
+    and below core's `SQLGLOT_FLOOR` (26.25) nothing runs.
   - The statement deadline (`timeout_seconds` up to 120, or the host's budget) bounds every request. Up to
     55 s left, one synchronous call with `on_wait_timeout: CANCEL`, so the warehouse cancels it even when
     its answer is lost: `wait_timeout` 5 s under what is left and a read timeout 5 s over it, or, under
@@ -344,11 +345,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
   document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
   `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
-- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor)` is how every SQL guard parses (BigQuery,
-  Snowflake, Redshift): the sqlglot floor check, a quiet tokenize and parse, and any exception a refusal, in one
-  place. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it differs from the floor
-  `scripts/dep_floor.py` reads from the pyproject, and when a connector module that imports sqlglot parses,
-  tokenizes or checks the floor itself, or keeps its own floor (#46 review seq 14088 m2).
+- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor, check_tokens)` is how every SQL guard parses
+  (BigQuery, Snowflake, Redshift, Databricks): the sqlglot floor check, a quiet tokenize and parse, and any
+  exception a refusal, in one place. `check_tokens` sees the tokens before they are parsed and refuses by raising
+  (Databricks' check of where sqlglot's tokens read unlike Spark's), so that refusal keeps its reason when the
+  text wouldn't parse either. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it
+  differs from the floor `scripts/dep_floor.py` reads from the pyproject, and when a connector module that
+  imports sqlglot parses, tokenizes or checks the floor itself, or keeps its own floor. Names are resolved
+  through import aliases, and a reference counts as much as a call (`maybe_parse`, `from sqlglot import
+  parse_one as po`, `_p = sqlglot.parse_one`, a dialect's `parser()`, a subclass of an aliased `Parser`, a
+  `floor=` handed to `parse_statements`); mutations fed to it in memory pin each (#46 review seq 14088 m2,
+  re-review seq 14138 nit c).
 - `scripts/dep_floor.py --connectors` also exits 1 when an extra that names the dependency has no
   `connectors/<extra>` directory (it was skipped silently while another suite matched); an aggregate extra (one
   that names the project itself, as `[full]` does) needs none (#46 review seq 14088 n3).
