@@ -9,27 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.0] - 2026-11-04
 
-The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`
-extra are new in it, so a host that needs either (pipe-as-service's
-`/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`; 0.4.0 has neither.
-Toolkit packages in the same run, each now requiring `aisquare-pipe>=0.5.0`
-(their `pipe:primary` tags are a ranking marker only from 0.5.0; 0.4.0's
-ranker would read them as text): `aisquare-pipe-gmail`,
-`-googlecalendar` and `-slack` 0.2.0, `aisquare-pipe-googledrive` and
-`-onedrive` 0.4.0. `aisquare-pipe-github` is unchanged at 0.3.0. Publish
-order: RELEASING.md, "The 0.5.0 release (tool router)".
+The tool-router release, and the first release as **one distribution**
+(D8): `aisquare-pipe` now carries the framework and every connector, and
+each connector's third-party deps are its `aisquare-pipe[<name>]` extra.
+It is the first PyPI release of the framework since 0.1.1. 0.4.0 was never
+published, so 0.5.0 also carries everything under 0.4.0 and 0.3.0 below.
+`aisquare.pipe.core.search` is new in it, so a host that needs it
+(pipe-as-service's `/v1/pipe/*` router) requires `aisquare-pipe>=0.5.0`.
+Publish steps: RELEASING.md, "The 0.5.0 release".
+
+### Changed
+
+- **One distribution, every connector inside.** The `aisquare-pipe` wheel
+  carries all 14 connector modules (`aisquare_pipe_composio` …
+  `aisquare_pipe_slack`) with unchanged import paths, and the root
+  `pyproject.toml` declares every entry point (auto-registration is
+  unchanged).
+  - **Extras.** Each connector's third-party deps are an extra named after
+    it: `[composio]`, `[docusign]`, `[dropbox]`, `[onedrive]` (azure-identity),
+    `[salesforce]`, `[graphify]` (tiktoken; the engine is `[graphify-engine]`),
+    and empty extras for the rest. `requests` and `urllib3` move into core.
+  - **Bundles.** `[full]` is now every connector, including gateway, n8n and
+    graphify. `[toolkits]` is `aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]`.
+  - **Not installed.** A connector whose extra isn't installed counts as not
+    installed: discovery leaves it out with one info line naming the extra
+    (`registry.missing_requirements`, `registry.connector_extra`), instead of a
+    load-error warning.
+  - **Per-connector pyprojects.** `connectors/<name>/pyproject.toml` keeps only
+    the suite's pytest/ruff settings. No connector builds on its own. The ten
+    that were PyPI projects (composio, docusign, dropbox, gateway, github,
+    graphify, local, n8n, onedrive, salesforce) get a code-free 0.5.0 shim
+    requiring `aisquare-pipe[<name>]>=0.5.0`, published once (RELEASING.md,
+    "The shims"). googledrive, slack, gmail and googlecalendar were never on
+    PyPI and get none.
+  - **Connector versions.** A connector class's `version` is the connector's
+    own contract version, independent of the distribution's.
+    `hygiene.version-sync` now checks that one connector's classes agree.
+  - **`pipe validate`.** Hygiene checks the root packaging instead of a
+    per-connector `[project]`:
+    - `hygiene.packaged`, `hygiene.extra-declared` and
+      `hygiene.not-a-package` are new;
+    - `hygiene.tier-listed` (now: in `[full]`) is an error;
+    - `hygiene.package-name`, `hygiene.framework-dep` and
+      `hygiene.requires-python` are gone.
+
+    Install-state covers a missing extra and entry points that are declared
+    but not installed. `--install` runs one `pip install -e ".[full,dev]"`.
+    `pipe validate aisquare-pipe[<name>]` selects that connector.
+  - **Development** is one editable install, `pip install -e ".[full,dev]"`.
+    `scripts/dev_install_toolkits.sh` runs `pip install -e "<checkout>[toolkits]"`.
+- **Publishing** (`publish.yml`, new `scripts/release_packages.py`). A run can
+  no longer pass without uploading.
+  - A version already on PyPI is skipped by an explicit lookup and listed in
+    the run summary.
+  - The upload runs without `skip-existing`, and a `verify` job checks every
+    uploaded file's sha256 on PyPI.
+  - A release tag must be `v<version>`, and nothing ever creates a PyPI project.
+  - Every PR (and Run workflow, which defaults to a dry run) builds the
+    distribution, checks that its wheel's RECORD holds every module of
+    `src/` and `connectors/*/src`, and runs `twine check --strict`.
+  - Run workflow with target `shims` builds and checks the ten shims, and
+    publishes them once `aisquare-pipe` 0.5.0 is on PyPI.
+
+  Why: on 2026-07-10 the v0.2.0 release failed because new PyPI projects had
+  no pending trusted publisher yet, and its framework job went green after
+  silently skipping a re-upload of 0.1.1.
+- `validate.yml` installs `.[full,dev]` once and declares
+  `permissions: contents: read`.
 
 ### Added
 
-- **`aisquare-pipe[toolkits]`**: every package that registers an
-  `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
-  googledrive, onedrive, slack), each floored at a release that ships its
-  toolkit (and, for the five above, its `pipe:primary` markers).
-  `scripts/check_toolkits_extra.py` (CI) fails when a toolkit package
-  is missing from it or an entry has no toolkit;
-  `scripts/dev_install_toolkits.sh` editable-installs the framework and every
-  toolkit into another venv. Publish the toolkits before the `aisquare-pipe`
-  release whose extra names them (RELEASING.md).
+- **`aisquare-pipe[toolkits]`**: the deps of every connector that registers
+  an `aisquare_pipe.toolkits` entry point (github, gmail, googlecalendar,
+  googledrive, onedrive, slack). `scripts/check_toolkits_extra.py` (CI)
+  fails when a toolkit connector is missing from it or an entry has no
+  toolkit. `scripts/dev_install_toolkits.sh` editable-installs the checkout
+  with `[toolkits]` into another venv.
 - **Tool and connector search index** (`aisquare.pipe.core.search`): BM25F
   in pure Python, no new dependency, no network, no model.
   - `ToolIndex.build(connector, tools, card=None)` indexes one catalogue
@@ -152,15 +207,12 @@ order: RELEASING.md, "The 0.5.0 release (tool router)".
   `aisquare.pipe.core.search` (never exported from `aisquare.pipe`). Use
   `aisquare.pipe.core.search.analyze_query` and its `STOPWORDS`.
 
-## [0.4.0] - 2026-10-31
+## [0.4.0] - 2026-10-31 [NOT PUBLISHED]
 
-The first PyPI release of the framework since 0.1.1; it includes 0.2.0 and
-0.3.0. PyPI goes from `aisquare-pipe` 0.1.1 straight to 0.4.0, and 0.1.1 has
-no Toolkit API at all, so everything under 0.3.0 below is new on PyPI too.
-First PyPI releases in the same run: `aisquare-pipe-googledrive` 0.3.0,
-`-slack`, `-gmail` and `-googlecalendar` 0.1.0. Also uploaded:
-`aisquare-pipe-github` and `-onedrive` 0.3.0, and `aisquare-pipe-graphify`
-0.2.1.
+Never published to PyPI and never tagged: 0.5.0 replaced it as the first
+release after 0.1.1, as one distribution. Its changes first ship on PyPI in
+0.5.0 above. Package versions below are the per-connector ones it was
+planned with.
 
 ### Added
 

@@ -26,7 +26,7 @@ from typing import Any
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
 from aisquare.pipe.core.envelope import DataEnvelope, MetaField, PushResult
 from aisquare.pipe.core.oauth import FLOW_AUTHORIZE_PARAMS, OAuthSpec
-from aisquare.pipe.core.registry import slug_prefix_conflicts
+from aisquare.pipe.core.registry import missing_requirements, slug_prefix_conflicts
 from aisquare.pipe.core.tools import (
     CARD_FIELDS,
     CATEGORIES,
@@ -163,6 +163,10 @@ class DiscoveredConnector:
     cls: type | None
     load_error: str | None
     group: str = ENTRY_POINT_GROUP
+    #: When the load failed because the connector's ``aisquare-pipe[<name>]``
+    #: extra isn't installed: that extra's missing requirements (the entry
+    #: point is then not installed, rather than broken).
+    missing_requirements: tuple[str, ...] = ()
 
     @property
     def is_toolkit(self) -> bool:
@@ -175,10 +179,13 @@ def _discover_entry_points(group: str) -> list[DiscoveredConnector]:
         dist = getattr(ep, "dist", None)
         cls: type | None = None
         load_error: str | None = None
+        missing: tuple[str, ...] = ()
         try:
             cls = ep.load()
         except Exception as e:  # noqa: BLE001 — any load failure is the finding
             load_error = f"{type(e).__name__}: {e}"
+            if isinstance(e, ImportError):
+                missing = tuple(missing_requirements(ep))
         discovered.append(
             DiscoveredConnector(
                 ep_name=ep.name,
@@ -188,6 +195,7 @@ def _discover_entry_points(group: str) -> list[DiscoveredConnector]:
                 cls=cls,
                 load_error=load_error,
                 group=group,
+                missing_requirements=missing,
             )
         )
     return sorted(discovered, key=lambda d: d.ep_name)

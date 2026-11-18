@@ -206,15 +206,14 @@ def _installed_toolkits(discovered: list[DiscoveredConnector]) -> dict[str, type
 
 
 def _contract_layer(
-    discovered: list[DiscoveredConnector],
-    dist_name: str | None,
-    installed: dict[str, type] | None = None,
+    entries: list[DiscoveredConnector],
+    installed: dict[str, type],
 ) -> LayerReport:
-    if installed is None:
-        installed = _installed_toolkits(discovered)
+    """Contract checks for ``entries`` (one connector's entry points);
+    ``installed`` is every loaded toolkit, for the cross-toolkit checks."""
     checks: list[CheckResult] = []
-    for d in discovered:
-        if d.dist_name != dist_name or d.cls is None:
+    for d in entries:
+        if d.cls is None:
             continue
         if d.is_toolkit:
             found = run_toolkit_contract_checks(d.cls, d.ep_name, installed=installed)
@@ -227,6 +226,16 @@ def _contract_layer(
     if not checks:
         return LayerReport(status=STATUS_NA)
     return LayerReport(status=_status_from_checks(checks), checks=checks)
+
+
+def _connector_key(d: DiscoveredConnector) -> str | None:
+    """The connector an entry point belongs to: ``aisquare_pipe_<name>`` →
+    ``<name>`` (with ``_`` as ``-``, as its directory is named). None for the
+    framework's own entry points (the mocks) and other modules."""
+    module = hyg.owner_module(d.ep_value)
+    if not module.startswith("aisquare_pipe_") or module == "aisquare_pipe_":
+        return None
+    return module.removeprefix("aisquare_pipe_").replace("_", "-")
 
 
 def _live_layer(cdir_path: Path, run_live: bool, timeout: int) -> LayerReport:
@@ -249,9 +258,9 @@ def _live_layer(cdir_path: Path, run_live: bool, timeout: int) -> LayerReport:
 # --------------------------------------------------------------------------
 
 
-def _install_connector(cdir_path: Path) -> tuple[bool, str]:
+def _install_repo(repo_root: Path, extras: str) -> tuple[bool, str]:
     proc = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", str(cdir_path), "--quiet"],
+        [sys.executable, "-m", "pip", "install", "-e", f"{repo_root}[{extras}]", "--quiet"],
         capture_output=True,
         text=True,
     )
@@ -261,8 +270,11 @@ def _install_connector(cdir_path: Path) -> tuple[bool, str]:
 def install_missing_connectors(
     repo_root: Path, only: str | None = None, echo=click.echo
 ) -> int:
-    """``pip install -e`` every connector dir that is missing, broken, or has
-    stale editable metadata. Returns the number of installs attempted.
+    """``pip install -e "<repo>[full,dev]"`` once when any connector is
+    missing (its extra isn't installed), broken, stale (entry points declared
+    but not installed), or the installed ``aisquare-pipe`` is another
+    checkout or another version. With ``only``, that connector's extra
+    instead of ``[full]``. Returns the number of installs attempted (0 or 1).
 
     The caller must re-exec validation in a fresh interpreter afterwards:
     editable installs register their import hooks via ``.pth`` files, which
@@ -272,23 +284,22 @@ def install_missing_connectors(
     if only is not None:
         cdirs = [c for c in cdirs if c.dir_name == only]
     discovered = _discover_entry_points()
-    installed = 0
-    for cdir in cdirs:
-        dist = hyg.load_dist_info(cdir.dist_name, discovered)
-        pyproject_version = (cdir.pyproject or {}).get("project", {}).get("version")
-        stale = (
-            dist.found
-            and pyproject_version is not None
-            and dist.version != pyproject_version
-        )
-        if hyg.classify_install_state(cdir, dist) != hyg.INSTALL_OK or stale:
-            echo(f"Installing {cdir.dist_name} (pip install -e {cdir.path}) ...")
-            ok, error = _install_connector(cdir.path)
-            installed += 1
-            if not ok:
-                echo(f"  install failed: {error}", err=True)
+    needs = [
+        c.dir_name
+        for c in cdirs
+        if hyg.classify_install_state(c, hyg.load_dist_info(c, discovered)) != hyg.INSTALL_OK
+    ]
+    stale = bool(hyg.check_framework_install(repo_root))
+    if not needs and not stale:
+        return 0
+    extras = f"{only},dev" if only is not None else "full,dev"
+    why = ", ".join(needs) if needs else f"stale {hyg.FRAMEWORK_DIST} metadata"
+    echo(f"Installing {hyg.FRAMEWORK_DIST}[{extras}] (pip install -e {repo_root}) for: {why} ...")
+    ok, error = _install_repo(repo_root, extras)
+    if not ok:
+        echo(f"  install failed: {error}", err=True)
     importlib.invalidate_caches()
-    return installed
+    return 1
 
 
 def validate_repo(
@@ -306,18 +317,20 @@ def validate_repo(
         cdirs = [c for c in cdirs if c.dir_name == only]
 
     discovered = _discover_entry_points()
+    installed = _installed_toolkits(discovered)
     reports: list[ConnectorReport] = []
 
     for index, cdir in enumerate(cdirs, start=1):
-        dist = hyg.load_dist_info(cdir.dist_name, discovered)
+        dist = hyg.load_dist_info(cdir, discovered)
         state = hyg.classify_install_state(cdir, dist)
-        loaded = hyg.load_entry_point_classes_for_dist(cdir.dist_name, discovered)
+        loaded = hyg.load_entry_point_classes(cdir, discovered)
+        own = [d for d in discovered if hyg.owner_module(d.ep_value) == cdir.module_name]
 
         report = ConnectorReport(
             name=cdir.dir_name,
             dist_name=cdir.dist_name,
             install_state=state,
-            entry_points=[d.ep_name for d in discovered if d.dist_name == cdir.dist_name],
+            entry_points=[d.ep_name for d in own],
             install_checks=hyg.check_install_state(cdir, dist),
         )
 
@@ -333,7 +346,7 @@ def validate_repo(
         )
 
         if state == hyg.INSTALL_OK:
-            report.contract = _contract_layer(discovered, cdir.dist_name)
+            report.contract = _contract_layer(own, installed)
             if not skip_tests:
                 echo(f"[{index}/{len(cdirs)}] {cdir.dir_name}: running unit suite ...")
                 report.unit = _unit_report(cdir.path, timeout)
@@ -361,13 +374,21 @@ def _framework_report(
     timeout: int,
     echo=click.echo,
 ) -> ConnectorReport:
+    own = [
+        d for d in discovered if d.dist_name == hyg.FRAMEWORK_DIST and _connector_key(d) is None
+    ]
     report = ConnectorReport(
         name=FRAMEWORK_ROW,
         dist_name=hyg.FRAMEWORK_DIST,
         install_state=hyg.INSTALL_OK,
-        entry_points=[d.ep_name for d in discovered if d.dist_name == hyg.FRAMEWORK_DIST],
+        entry_points=[d.ep_name for d in own],
     )
-    report.contract = _contract_layer(discovered, hyg.FRAMEWORK_DIST)
+    report.contract = _contract_layer(own, _installed_toolkits(discovered))
+    framework_checks = hyg.check_framework_install(repo_root)
+    if framework_checks:
+        report.hygiene = LayerReport(
+            status=_status_from_checks(framework_checks), checks=framework_checks
+        )
     if not skip_tests:
         echo("[framework] running root test suite ...")
         report.unit = _unit_report(repo_root, timeout)
@@ -377,19 +398,26 @@ def _framework_report(
 def validate_installed_only(
     *, live: bool = False, echo=click.echo
 ) -> list[ConnectorReport]:
-    """Outside a repo checkout: Layer A only, grouped by distribution."""
+    """Outside a repo checkout: Layer A only, one row per connector (the
+    connectors inside ``aisquare-pipe`` by module, any other plugin by its
+    distribution). A connector whose extra isn't installed is reported as
+    not installed, not as a failure: the host chose not to install it."""
     discovered = _discover_entry_points()
-    by_dist: dict[str, list[DiscoveredConnector]] = {}
+    installed = _installed_toolkits(discovered)
+    groups: dict[str, list[DiscoveredConnector]] = {}
     for d in discovered:
-        by_dist.setdefault(d.dist_name or "(unknown dist)", []).append(d)
+        key = _connector_key(d) or d.dist_name or "(unknown dist)"
+        groups.setdefault(key, []).append(d)
 
     reports: list[ConnectorReport] = []
-    for dist_name in sorted(by_dist):
-        eps = by_dist[dist_name]
+    for key in sorted(groups):
+        eps = groups[key]
+        dist_name = eps[0].dist_name or key
+        not_installed = [d for d in eps if d.missing_requirements]
         report = ConnectorReport(
-            name=dist_name.removeprefix("aisquare-pipe-") or dist_name,
-            dist_name=dist_name,
-            install_state=hyg.INSTALL_OK,
+            name=key.removeprefix("aisquare-pipe-") or key,
+            dist_name=f"{dist_name}[{key}]" if _connector_key(eps[0]) else dist_name,
+            install_state=hyg.INSTALL_MISSING if not_installed else hyg.INSTALL_OK,
             entry_points=[d.ep_name for d in eps],
         )
         load_failures = [
@@ -399,9 +427,9 @@ def validate_installed_only(
                 message=f"entry point failed to load: {d.load_error}",
             )
             for d in eps
-            if d.load_error
+            if d.load_error and not d.missing_requirements
         ]
-        report.contract = _contract_layer(eps, dist_name, _installed_toolkits(discovered))
+        report.contract = _contract_layer(eps, installed)
         if load_failures:
             report.contract.checks.extend(load_failures)
             report.contract.status = STATUS_FAIL
