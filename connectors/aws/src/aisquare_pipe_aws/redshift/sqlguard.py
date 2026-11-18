@@ -20,7 +20,13 @@
      on or off, an ``E''`` string or not); if not, it is refused;
    - a ``$`` outside quotes is refused (``$$...$$`` and ``$tag$...$tag$``
      dollar quoting, ``$1`` parameters), and so are a backslash outside
-     quotes and control characters other than tab, CR, LF and form feed.
+     quotes and control characters other than tab, CR, LF and form feed;
+   - a ``U&`` right before a quote is refused (``U&'...'``, ``U&"..."``):
+     PostgreSQL 8.4+ decodes ``U&"pg_terminate_backen\\0064"`` to
+     ``pg_terminate_backend``, a name the word check can't see;
+   - a number is read as Redshift reads it, exponent included, before any
+     word: ``1e5INTO`` is the number ``1e5``, then ``INTO`` (PostgreSQL
+     before 15 splits it there), not the word ``e5INTO``.
 
 2. **The parser** (sqlglot, Redshift dialect): the text parses into exactly
    ONE statement whose root is a query (``SELECT``, ``WITH ... SELECT``, a
@@ -171,7 +177,15 @@ _WRITE_KEYWORDS = frozenset(
     }
 )
 _FIRST_KEYWORDS = frozenset({"SELECT", "WITH"})
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: A number or a word, in one left-to-right scan, as Redshift's lexer
+#: (PostgreSQL 8.0's) splits them: a number (``{integer}``, ``{decimal}`` or
+#: ``{real}``: ``1``, ``1.5``, ``.5``, ``1.``, ``1e5``, ``1.5E-3``) is taken
+#: whole before a word can start, so ``1e5INTO`` gives the number ``1e5``
+#: and the word ``INTO`` (seq 13894 m1). A word holds digits after its first
+#: letter, so ``col1e5into`` is one word, as it is one identifier there.
+_NUMBER_OR_WORD = re.compile(
+    r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|([A-Za-z_][A-Za-z0-9_]*)"
+)
 _QUOTES = "'\""
 #: Control characters a statement may hold: tab, LF, CR and form feed.
 _ALLOWED_CONTROLS = frozenset("\t\n\r\f")
@@ -278,7 +292,7 @@ def _lex(sql: str) -> _Lexed:
         statement = sql[:last]
         text = text[:last]
     statement = statement.strip()
-    words = [w.upper() for w in _WORD.findall(text)]
+    words = [w.upper() for w in _NUMBER_OR_WORD.findall(text) if w]
     if not words:
         return _Lexed(statement, "it is empty")
     if words[0] not in _FIRST_KEYWORDS:
@@ -331,8 +345,8 @@ def _blank(sql: str, *, quoted_names: list[str] | None = None) -> tuple[str, lis
     them. Each ``"..."`` identifier's name (``""`` read as ``"``) is appended
     to ``quoted_names``. :class:`_Unreadable` when a quote or block comment never closes,
     a quoted token's end depends on how backslashes are read, a block
-    comment holds a ``/*``, or a ``$``, a backslash or a control character
-    is outside quotes."""
+    comment holds a ``/*``, a ``U&`` opens a quote, or a ``$``, a backslash
+    or a control character is outside quotes."""
     for ch in sql:
         if ch < " " and ch not in _ALLOWED_CONTROLS:
             raise _Unreadable("it has a control character")
@@ -348,6 +362,12 @@ def _blank(sql: str, *, quoted_names: list[str] | None = None) -> tuple[str, lis
     while i < n:
         ch = sql[i]
         if ch in _QUOTES:
+            if i >= 2 and sql[i - 1] == "&" and sql[i - 2] in "uU":
+                # U&'...' / U&"...": \XXXX escapes the word check can't see
+                # through (U&"pg_terminate_backen\0064", seq 13894 n1).
+                raise _Unreadable(
+                    "it has a U& Unicode escape (U&'...' or U&\"...\" is refused)"
+                )
             plain = _quoted_end(sql, i, backslash_escapes=False)
             escaped = _quoted_end(sql, i, backslash_escapes=True)
             if plain != escaped:

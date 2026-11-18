@@ -117,7 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     write, DDL, session or side-effect word or node (`SELECT ... INTO`, `UNLOAD`, `COPY`, `SET`,
     `PG_TERMINATE_BACKEND`, ...). The lexer ends `--` comments at a CR or an LF, refuses a `/*`
     inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
-    and control characters outside quotes, and the side-effect functions in double quotes.
+    and control characters outside quotes, `U&` Unicode escapes, and the side-effect functions
+    in double quotes. It reads a number whole, exponent included, before any word, as Redshift
+    does, so `SELECT 1e5INTO t` is refused as `INTO`.
     Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
     warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so a filter on
     the `sqlglot` logger drops its records in the parsing thread or task only (no global
@@ -126,17 +128,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (paged) inside one deadline: the host's time budget, else 60 s (the source's
     `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
     inside what is left when it goes out, because a client is rebuilt with shorter timeouts as
-    the deadline nears, and botocore never retries. A slice of the deadline (a fifth, 0.2 s to
-    3 s) is kept back to cancel a statement still running: polling stops there, the statement is
-    cancelled on a client of its own sized to all of what is left, and the call fails with
-    `timeout`. Caps: `max_rows` and a JSON byte cap (`truncated` says which).
+    the deadline nears (and with longer ones when they are under half of what a request may use:
+    the first result page after the polls), and botocore never retries. A slice of the deadline
+    (a fifth, 0.2 s to 3 s) is kept back to cancel a statement still running: polling stops
+    there, the statement is cancelled on a client of its own sized to all of what is left, and
+    the call fails with `timeout`. A statement the cancel misses is stopped by the database user's
+    `statement_timeout` (at least 600000 ms), which the checklist has the customer set.
+    Caps: `max_rows` and a JSON byte cap (`truncated` says which).
     The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
   - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
     `version` = `result_sha256` (order-independent).
   - CI runs the AWS suite at the sqlglot floor too: `scripts/dep_floor.py` and validate.yml's
     "SQL guards at the sqlglot floor" step, byte for byte #37's, so the branches merge cleanly.
   Setup, the registration checklist (the role's `redshift-data` and credential permissions, the
-  read-only database user, the secret JSON) and the exact secret: `connectors/aws/README.md`,
+  read-only database user and its `statement_timeout`, the secret JSON, and how AISquare stores
+  the `redshift` secret on ECS and on EKS) and the exact secret: `connectors/aws/README.md`,
   "Amazon Redshift".
 
 ## [0.5.0] - 2026-11-04

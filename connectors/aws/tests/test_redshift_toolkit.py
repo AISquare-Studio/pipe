@@ -417,6 +417,61 @@ def test_every_request_fits_while_paging_slowly(data_api, clock):
     _assert_every_request_fit(data_api, started, 10)
 
 
+@pytest.mark.parametrize("polls", [8, 9, 10])
+def test_the_first_page_gets_a_client_sized_to_what_is_left(data_api, clock, polls):
+    """seq 13894 m2 (13883 a): with a 10 s budget, 0.1 s polls and 9 STARTED
+    before FINISHED, the first GetStatementResult went out with 3.35 s left
+    on the last poll's 0.72 s client. A 0.8 s page read-timed out, and the
+    rows of a query that had run were lost. The polls' client is sized to
+    what is left less the cancel's slice; the result's requests keep nothing
+    back, so the first page gets a new client sized to what is left (half
+    of it, as every new client)."""
+    data_api.latency = 0.1  # each request but the page
+    data_api.latencies = {"GetStatementResult": 0.8}
+    fakes.submit(data_api, SQL)
+    for _ in range(polls):
+        fakes.describe(data_api, "STARTED")
+    fakes.describe(data_api, "FINISHED", ResultRows=1)
+    fakes.result(data_api, [fakes.record(1)], total=1)
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 10})
+    assert result.successful, result.error
+    assert result.data["rows"] == [{"id": 1, "title": "rule 1", "active": True}]
+    data_api.assert_drained()
+    operations = data_api.operations()
+    page = operations.index("GetStatementResult")
+    last_poll = page - 1
+    assert operations[last_poll] == "DescribeStatement"
+    left = started + 10 - data_api.times[page]
+    # The page's client is half of what is left (none of it kept back now),
+    # not the last poll's, which was too short for a 0.8 s page.
+    assert data_api.timeouts[page] == pytest.approx(left / 2)
+    assert data_api.timeouts[page] > 0.8
+    if polls >= 9:
+        assert data_api.timeouts[last_poll] < 0.8
+    if polls == 9:  # the reviewer's numbers
+        assert left == pytest.approx(3.35)
+        assert data_api.timeouts[last_poll] == pytest.approx(0.725)
+    _assert_every_request_fit(data_api, started, 10)
+
+
+def test_a_client_at_the_most_is_kept_for_every_page(data_api, clock):
+    """A client is rebuilt for being short only while it is under the most a
+    client gets: a 25 s one is kept once the cancel's slice is freed, so a
+    call with time to spare pages on one client, not one per request."""
+    data_api.latency = 0.05
+    fakes.finished_query(data_api, SQL, [[fakes.record(n)] for n in range(6)])
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 60})
+    assert result.successful, result.error
+    assert result.data["row_count"] == 6
+    # One client for the statement (25 s fits under 60 s less the slice),
+    # none rebuilt for the pages: 25 s is the most a client ever gets.
+    assert len(data_api.clients) == 1
+    assert set(data_api.timeouts) == {
+        dataapi.MAX_CONNECT_TIMEOUT + dataapi.MAX_READ_TIMEOUT
+    }
+
+
 def test_a_hung_describe_times_out_inside_the_deadline_and_cancels(data_api, clock):
     """A DescribeStatement that never answers ends at its own read timeout,
     inside the deadline, and the statement is cancelled in the time kept
