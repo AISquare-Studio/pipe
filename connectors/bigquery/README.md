@@ -178,8 +178,10 @@ later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones 
 | 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
 | `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
 
-A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`); rows of 50,000 cells or more page
-one at a time, and `max_result_bytes` stops those within about 700.
+A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`). A row of more than 25,000 cells
+(every column's, a `REPEATED` column's every element) pages alone (`PAGE_CELLS` // its cells is 1), and
+`max_result_bytes` stops a run of such rows within about 1,350 pages at its 64 MiB cap (1,342 measured, for rows of
+25,001 one-digit integers: the fewest bytes such a row holds).
 
 ## Security
 

@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -177,17 +177,29 @@ def quiet_parser_class(dialect: Any) -> type:
 
 
 def parse_statements(
-    sql: str, dialect: Any, *, floor: tuple[int, ...] | None = None
+    sql: str,
+    dialect: Any,
+    *,
+    floor: tuple[int, ...] | None = None,
+    check_tokens: Callable[[list[Any]], None] | None = None,
 ) -> ParsedSQL:
     """``sql`` read by sqlglot in ``dialect`` (a sqlglot ``Dialect``), the
     one way a guard parses:
 
     1. the installed sqlglot must be at least ``floor`` (default
        :data:`SQLGLOT_FLOOR`), else :class:`SqlglotTooOld`;
-    2. tokenize and parse inside :func:`quiet_sqlglot`, with
+    2. tokenize, then parse, inside :func:`quiet_sqlglot`, with
        :func:`quiet_parser_class`'s parser;
     3. any exception from either is :class:`Unparsable` (raised from None:
        sqlglot's messages quote the SQL).
+
+    ``check_tokens``, when given, is called with the tokens after step 2
+    tokenizes and before it parses, for a guard whose first check reads
+    sqlglot's tokens (Databricks: where they and Spark's lexer read the text
+    apart), so a text refused there is refused for that reason even when it
+    would not parse either. It refuses by raising; what it raises propagates
+    as it is (never as :class:`Unparsable`), and nothing is parsed then. It is
+    not called when tokenizing fails.
 
     sqlglot is imported here, not at the top: core does not depend on it."""
     import sqlglot
@@ -198,7 +210,13 @@ def parse_statements(
         raise SqlglotTooOld(installed, wanted)
     try:
         with quiet_sqlglot():
-            tokens = dialect.tokenize(sql)
+            tokens = list(dialect.tokenize(sql))
+    except Exception:  # noqa: BLE001 — a tokenizer bug refuses, never admits
+        raise Unparsable("sqlglot could not parse it") from None
+    if check_tokens is not None:
+        check_tokens(list(tokens))  # a copy: what is parsed stays sqlglot's
+    try:
+        with quiet_sqlglot():
             parser = quiet_parser_class(dialect)(dialect=dialect)
             statements = [s for s in parser.parse(tokens, sql) if s is not None]
     except Exception:  # noqa: BLE001 — a parser bug refuses, never admits
