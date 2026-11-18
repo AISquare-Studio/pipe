@@ -15,9 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `aisquare_pipe_aws.credentials`: the shared credential. STS `AssumeRole`
     runs with the server-issued `ExternalId`, and reads use the role's
     refreshable temporary credentials. A role in the service's own account is
-    refused. No customer client is built from ambient, default or empty
-    credentials. The blob is
-    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`.
+    refused, as is one in an account listed in `PIPE_AWS_REFUSED_ACCOUNT_IDS`.
+    So are a role outside the commercial partition and an external ID
+    shorter than 32 characters. No customer client is built from ambient,
+    default or empty credentials. The blob is
+    `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`. The
+    README's registration checklist covers `sts:TagSession` (EKS Pod
+    Identity's session tags are transitive) and KMS `Decrypt` and
+    `DescribeKey` under `kms:ViaService`.
   - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
     AgentCore policy, in every configured region (`ListPolicyEngines` →
     `ListPolicies`, every page; `GetPolicy` only for a policy listed without
@@ -36,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pull params and tool arguments only narrow what the blob allows (a
     prefix inside the configured one, one engine, a time filter). Neither
     can name an account, role, region, bucket or credential.
+  - AWS's refusals map to tool error codes: a body-less S3 `403` is
+    `forbidden`; `ValidationException`, `InvalidArgument` and a body-less S3
+    `400` are `invalid_arguments`.
   - The `[aws]` extra is `boto3`/`botocore` >= 1.43.32, < 2. The AgentCore
     Policy GA model arrived in 1.42.60, but a policy's `enforcementMode` only
     in 1.43.32. The tests' AWS fake, `moto[s3,sts]`, is in `[dev]`.

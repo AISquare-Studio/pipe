@@ -238,11 +238,15 @@ def decode_next_token(
     try:
         raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
         body = json.loads(raw)
-    except (binascii.Error, ValueError):
+    except (binascii.Error, ValueError, RecursionError):
+        # RecursionError: deeply nested JSON (e.g. "[[[[..."), which json
+        # can't parse without recursing past the interpreter's limit.
         raise ValueError(_BAD_TOKEN) from None
     if (
         not isinstance(body, dict)
         or set(body) != _TOKEN_KEYS[kind]
+        # exactly the int 1: not True or 1.0, which compare equal to it
+        or type(body["v"]) is not int
         or body["v"] != _TOKEN_VERSION
         or body["k"] != kind
     ):

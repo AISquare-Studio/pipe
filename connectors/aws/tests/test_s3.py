@@ -6,12 +6,14 @@ assumed role, so it lives in the customer account, where the code must reach it.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from aisquare.pipe import PullParams
 from aisquare.pipe.errors import ConfigValidationError
+from botocore.awsrequest import AWSResponse
 
 from aisquare_pipe_aws import s3
 from aisquare_pipe_aws.connector import S3Source
@@ -286,6 +288,115 @@ def test_toolkit_refuses_keys_outside_the_prefix_and_server_keys(
     assert not result.successful and result.error_code == "invalid_arguments", (
         result.error
     )
+
+
+class _Raw:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def stream(self, **_: Any) -> Iterator[bytes]:
+        yield self._body
+
+
+def _s3_answers(
+    monkeypatch: pytest.MonkeyPatch, operation: str, status: int, body: bytes = b""
+) -> None:
+    """Every S3 client the code builds gets this raw HTTP answer to
+    ``operation``, parsed by botocore's own parser as S3's would be. (botocore
+    still hands the request to moto's handler too, and keeps the first answer.)"""
+    real = s3.client
+
+    def build(session: Any, location: Any) -> Any:
+        client = real(session, location)
+
+        def answer(request: Any, **_: Any) -> AWSResponse:
+            return AWSResponse(request.url, status, {}, _Raw(body))
+
+        client.meta.events.register_first(f"before-send.s3.{operation}", answer)
+        return client
+
+    monkeypatch.setattr(s3, "client", build)
+
+
+def _s3_error(code: str, message: str) -> bytes:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Error><Code>{code}</Code><Message>{message}</Message>"
+        "<RequestId>R1</RequestId></Error>"
+    ).encode()
+
+
+def test_toolkit_a_denied_head_is_forbidden(bucket, assume_calls, monkeypatch):
+    # S3 answers a HEAD without a body, so botocore's error code is the bare
+    # HTTP status, "403", not AccessDenied.
+    _s3_answers(monkeypatch, "HeadObject", 403)
+    result = S3Toolkit().call_tool(
+        "S3_HEAD_OBJECT", {"key": "rulebooks/policy-0.md"}, blob()
+    )
+    assert not result.successful and result.error_code == "forbidden", result.error
+    assert "(403)" in result.error
+
+
+def test_toolkit_a_bad_version_id_on_head_is_invalid_arguments(bucket, assume_calls):
+    # moto, like S3, answers a HEAD for a malformed version id with a
+    # body-less 400.
+    result = S3Toolkit().call_tool(
+        "S3_HEAD_OBJECT", {"key": "rulebooks/policy-0.md", "version_id": "nope"}, blob()
+    )
+    assert not result.successful and result.error_code == "invalid_arguments", (
+        result.error
+    )
+
+
+def _assert_rejected_argument(result: Any, aws_message: str) -> None:
+    assert not result.successful and result.error_code == "invalid_arguments", (
+        result.error
+    )
+    assert "InvalidArgument" in result.error
+    assert aws_message not in result.error  # AWS's code, never its message
+
+
+def test_toolkit_a_continuation_token_s3_rejects_is_invalid_arguments(
+    bucket, assume_calls, monkeypatch
+):
+    # A token S3 issued but no longer takes (moto only takes its own, so the
+    # request carries a real one and S3's refusal is answered over it).
+    kit = S3Toolkit()
+    first = kit.call_tool("S3_LIST_OBJECTS", {"limit": 1}, blob())
+    token = first.data["next_continuation_token"]
+    assert first.successful and token
+    aws_message = "The continuation token provided is incorrect"
+    _s3_answers(
+        monkeypatch, "ListObjectsV2", 400, _s3_error("InvalidArgument", aws_message)
+    )
+    result = kit.call_tool("S3_LIST_OBJECTS", {"continuation_token": token}, blob())
+    _assert_rejected_argument(result, aws_message)
+
+
+def test_toolkit_a_version_id_s3_rejects_on_get_is_invalid_arguments(
+    bucket, assume_calls, monkeypatch
+):
+    aws_message = "Invalid version id specified"
+    _s3_answers(
+        monkeypatch, "GetObject", 400, _s3_error("InvalidArgument", aws_message)
+    )
+    result = S3Toolkit().call_tool(
+        "S3_GET_OBJECT", {"key": "rulebooks/policy-0.md", "version_id": "nope"}, blob()
+    )
+    _assert_rejected_argument(result, aws_message)
+
+
+def test_toolkit_list_items_carry_the_etag_and_say_head_has_the_version(
+    bucket, assume_calls
+):
+    # ListObjectsV2 returns no VersionId: a list item's etag is not a version
+    # marker in a versioned bucket, and the item says where the marker is.
+    listed = S3Toolkit().call_tool("S3_LIST_OBJECTS", {"limit": 1}, blob())
+    assert listed.successful, listed.error
+    (item,) = listed.data["items"]
+    assert item["etag"] and "version" not in item and "version_id" not in item
+    tool = next(t for t in S3Toolkit().tools() if t.slug == "S3_LIST_OBJECTS")
+    assert "S3_HEAD_OBJECT" in tool.description and "version" in tool.description
 
 
 def test_toolkit_without_s3_is_not_connected():

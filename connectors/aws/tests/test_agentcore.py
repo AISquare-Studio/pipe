@@ -622,6 +622,79 @@ def test_a_bad_next_token_is_refused_before_any_aws_call(
     assert assume_calls == []  # refused before the role is even assumed
 
 
+@pytest.mark.parametrize(
+    "tool", ["BEDROCK_AGENTCORE_LIST_POLICIES", "BEDROCK_AGENTCORE_LIST_POLICY_ENGINES"]
+)
+def test_a_deeply_nested_next_token_is_invalid_arguments_not_a_crash(
+    tool, aws, assume_calls
+):
+    token = base64.urlsafe_b64encode(b"[" * 6000).decode()
+    assert len(token) <= agentcore.NEXT_TOKEN_MAX  # the schema lets it through
+    with pytest.raises(RecursionError):  # what json makes of it
+        json.loads(base64.urlsafe_b64decode(token))
+    result = BedrockAgentCoreToolkit().call_tool(tool, {"next_token": token}, blob())
+    assert not result.successful and result.error_code == "invalid_arguments", (
+        result.error
+    )
+    assert "next_token" in result.error
+    assert assume_calls == []
+
+
+@pytest.mark.parametrize("version", [True, 1.0, 2, "1", None])
+def test_a_next_token_version_must_be_exactly_1(version):
+    regions = ("us-east-1",)
+    good = _crafted(k="engines")
+    assert agentcore.decode_next_token(
+        good, kind="engines", regions=regions
+    ) == agentcore.Position("us-east-1")
+    with pytest.raises(ValueError, match="next_token"):
+        agentcore.decode_next_token(
+            _crafted(k="engines", v=version), kind="engines", regions=regions
+        )
+
+
+def test_a_token_agentcore_rejects_is_invalid_arguments(monkeypatch, aws, assume_calls):
+    # The inner nextToken passes our shape check but AgentCore refuses it.
+    real = agentcore.client
+    stubs: list[Stubber] = []
+
+    def build(session: Any, region: str) -> Any:
+        client = real(session, region)
+        stub = Stubber(client)
+        stub.add_response(
+            "list_policy_engines", {"policyEngines": [_engine(0)]}, {"maxResults": 100}
+        )
+        stub.add_client_error(
+            "list_policies",
+            service_error_code="ValidationException",
+            service_message="Invalid nextToken provided",
+            http_status_code=400,
+            expected_params={
+                "policyEngineId": eid(0),
+                "maxResults": 100,
+                "nextToken": "forged-inner-token",
+            },
+        )
+        stub.activate()
+        stubs.append(stub)
+        return client
+
+    monkeypatch.setattr(agentcore, "client", build)
+    token = _token_for(
+        "policies", "us-east-1", engine_id=eid(0), policies_token="forged-inner-token"
+    )
+    result = BedrockAgentCoreToolkit().call_tool(
+        "BEDROCK_AGENTCORE_LIST_POLICIES", {"next_token": token}, blob()
+    )
+    assert not result.successful and result.error_code == "invalid_arguments", (
+        result.error
+    )
+    assert "ValidationException" in result.error
+    assert "Invalid nextToken provided" not in result.error
+    for stub in stubs:
+        stub.assert_no_pending_responses()
+
+
 def test_a_next_token_whose_engine_is_gone_is_stale(fake_regions):
     fake_regions["us-east-1"] = {eid(0): 150, eid(1): 1}
     kit, config = BedrockAgentCoreToolkit(), blob()

@@ -23,7 +23,8 @@ AMBIENT_KEY = "AKIAAMBIENTSERVICEKEY"
 OWN_ACCOUNT = "123456789012"
 CUSTOMER_ACCOUNT = "210987654321"
 ROLE_ARN = f"arn:aws:iam::{CUSTOMER_ACCOUNT}:role/AISquareReadOnly"
-EXTERNAL_ID = "aisq-ext-7f3c9b2e"
+#: At least 32 characters, like every external ID AISquare issues.
+EXTERNAL_ID = "aisq-ext-7f3c9b2e5d81a04c6e29b73f"
 
 
 def blob(**overrides: Any) -> dict[str, Any]:
@@ -49,6 +50,7 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def ambient_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Iterator[None]:
     for name in (
+        credentials.REFUSED_ACCOUNTS_ENV,
         "AWS_PROFILE",
         "AWS_SESSION_TOKEN",
         "AWS_SECURITY_TOKEN",

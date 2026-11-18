@@ -361,7 +361,9 @@ class S3Toolkit(_AwsToolkit):
             "S3_LIST_OBJECTS",
             "List objects (files) in the configured Amazon S3 bucket, under its configured prefix "
             "or a narrower prefix inside it, one page at a time: key, size, etag, last_modified. "
-            "Pass next_continuation_token as continuation_token for the next page.",
+            "Listing returns no version id, so in a versioned bucket an item's etag is not the "
+            "version marker: S3_HEAD_OBJECT gives an object's version. Pass "
+            "next_continuation_token as continuation_token for the next page.",
             _schema(
                 {
                     "prefix": {
