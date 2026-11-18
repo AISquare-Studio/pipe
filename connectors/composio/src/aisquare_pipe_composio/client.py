@@ -138,6 +138,23 @@ def _map_composio_errors(func):  # type: ignore[no-untyped-def]
     return wrapper
 
 
+def is_transient_error(exc: BaseException) -> bool:
+    """Whether a failed Composio call can succeed as is when tried again:
+    Composio answered HTTP 429 or 5xx, or didn't answer (a connection error
+    or timeout), after the SDK's and our own retries. Read from the SDK error
+    ``_map_composio_errors`` chained as the ``PipelineError``'s cause. A 4xx
+    (a request Composio won't take, an expired page cursor's included), an
+    SDK shape error and anything else are not."""
+    if not isinstance(exc, PipelineError) or isinstance(exc, ComposioSDKShapeError):
+        return False
+    cause = exc.__cause__
+    if isinstance(cause, (RateLimitError, APIConnectionError)):
+        return True  # a timeout is an APIConnectionError
+    if isinstance(cause, APIStatusError):
+        return cause.status_code >= 500
+    return False
+
+
 def _retry_on_rate_limit(func):  # type: ignore[no-untyped-def]
     """Retry with exponential backoff on HTTP 429."""
 
@@ -572,7 +589,17 @@ class TriggerCursor:
     polls: when one poll cycle hits its page cap before draining the event
     log, the next cycle resumes from the saved page cursor instead of
     re-reading (or worse, skipping) the remainder. The watermark only
-    advances once a window is fully drained.
+    advances once a window is fully drained. ``seen_ids`` is every entry id
+    read (the ones the config's filters drop included), oldest first.
+
+    Host contract (exported in ``aisquare_pipe_composio.__all__``, pinned by
+    ``tests/test_trigger_cursor_contract.py``): a host that keeps the position
+    itself (pipe-as-service keeps it in its own store) writes it with
+    ``save_trigger_cursor`` to the ``cursor_path`` of a one-cycle ``pull``
+    (``max_polls=1``) and reads it back with ``load_trigger_cursor``. A host
+    copies every field both ways, so a field added here is a contract change.
+    A cursor with ``last_ts_ms == 0`` and no ``seen_ids`` is a first run: the
+    pull starts at its ``since`` param.
     """
 
     last_ts_ms: int = 0
@@ -615,7 +642,8 @@ def load_trigger_cursor(path: str) -> TriggerCursor:
 
 
 def save_trigger_cursor(path: str, state: TriggerCursor) -> None:
-    """Atomically persist the trigger cursor, trimming the dedup ring."""
+    """Atomically persist the trigger cursor, trimming the dedup ring to its
+    newest ``SEEN_IDS_MAX`` ids."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")

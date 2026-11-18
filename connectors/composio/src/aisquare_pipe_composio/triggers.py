@@ -9,9 +9,14 @@ the events they produce.
 Incremental position is a timestamp watermark plus a bounded ring of seen
 event ids (the event log is time-windowed rather than strictly cursored
 across polls), persisted atomically to a JSON cursor file. When one poll
-cycle hits its page cap before draining a window, the page cursor is saved
-and the watermark held back, so the next cycle resumes mid-window — events
-are delivered at least once, never silently skipped.
+cycle hits its page cap before draining a window, or a page fails to read
+for a reason a retry can fix (HTTP 429/5xx, no answer), the page cursor is
+saved and the watermark held back, so the next cycle resumes mid-window —
+events are delivered at least once, never silently skipped.
+
+A host can keep the position itself: ``TriggerCursor``,
+``save_trigger_cursor`` and ``load_trigger_cursor`` are its public contract
+(``aisquare_pipe_composio.__all__``; see ``TriggerCursor``).
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from aisquare_pipe_composio.client import (
     TriggerCursor,
     _epoch_ms,
     default_cursor_path,
+    is_transient_error,
     load_trigger_cursor,
     migrate_legacy_cursor,
     save_trigger_cursor,
@@ -161,6 +167,11 @@ class ComposioTriggersSource(SourceConnector):
             since (str | int): initial watermark when no cursor file exists —
                 ISO timestamp or epoch ms (default: now, i.e. only new events)
             limit (int): event-log page size (default 100)
+            on_cycle_error (callable): called with the exception of a failed
+                cycle, after the cycle's progress is saved (default: none).
+                A host that runs one cycle per pull learns from it that the
+                read failed, which the pull itself doesn't raise. An
+                exception it raises ends the pull.
 
         A failed cycle is logged and retried next cycle, except two errors
         no retry can fix, which end this pull (raised): ``ComposioSDKShapeError``
@@ -168,14 +179,20 @@ class ComposioTriggersSource(SourceConnector):
         refused the API key: HTTP 401/403). That is per pull: a host that
         calls ``pull`` again gets the same error each time, so stopping or
         backing off is the host's (pipe-as-service backs the subscription
-        off).
+        off). A failed cycle saves what it read: the ids, and on a failure a
+        retry can fix (``is_transient_error``: HTTP 429/5xx, no answer) the
+        page it stopped on, so the next cycle resumes there. Any other
+        failure drops a saved page cursor (it may be the cause), and the
+        next cycle reads the window again from the held watermark.
 
         A malformed event is skipped with a warning, so it can't stall the
         poller. Its id is recorded in the cursor: later cycles, and later
-        pulls on the same ``cursor_path``, step past it silently. A host that
-        gives each pull a fresh cursor (pipe-as-service: one pull per poll,
-        ``max_polls=1``) sees the warning on every pull while the entry is in
-        its window, and so does an entry with no id (it can't be recorded).
+        pulls on the same ``cursor_path``, step past it silently. So do
+        later pulls of a host that hands each pull the position the last one
+        saved (pipe-as-service). A host that gives each pull an empty cursor
+        sees the warning on every pull while the entry is in its window, and
+        an entry with no id is warned about on every cycle (it can't be
+        recorded).
 
         An event time more than ``MAX_EVENT_CLOCK_SKEW_MS`` past this host's
         clock never moves the watermark, and a stored watermark past it is
@@ -199,6 +216,7 @@ class ComposioTriggersSource(SourceConnector):
 
         max_polls: int | None = params.get("max_polls", None)
         sleep = params.get("sleep", time.sleep)
+        on_cycle_error = params.get("on_cycle_error", None)
         limit = int(params.get("limit", DEFAULT_TRIGGER_PAGE_LIMIT))
         since_ms = _epoch_ms(params.get("since"))
 
@@ -211,6 +229,8 @@ class ComposioTriggersSource(SourceConnector):
                     since_ms if since_ms is not None else int(time.time() * 1000)
                 )
             reset = _reset_future_watermark(state, int(time.time() * 1000))
+            before = (list(state.seen_ids), state.pending_cursor, state.pending_max_ts)
+            failure: Exception | None = None
 
             try:
                 changed = yield from self._poll_once(
@@ -231,19 +251,29 @@ class ComposioTriggersSource(SourceConnector):
                     else "Composio refused the API key",
                 )
                 raise
-            except Exception:
+            except Exception as e:
                 logger.exception("composio: trigger poll cycle failed")
-                changed = False
-                if state.pending_cursor is not None:
-                    # A stale resume cursor could fail every cycle forever —
-                    # drop it so the next cycle rescans the window from the
-                    # held watermark (the seen-id ring absorbs the replays).
+                failure = e
+                if not is_transient_error(e) and state.pending_cursor is not None:
+                    # Not a failure a retry fixes: the resume cursor may be
+                    # what fails (expired), and would fail every cycle. Drop
+                    # it, so the next cycle rescans the window from the held
+                    # watermark (the seen-id ring absorbs the replays). On a
+                    # transient one, _poll_once left the page it stopped on.
                     state.pending_cursor = None
                     state.pending_max_ts = 0
-                    changed = True
+                # The ids this cycle read (and yielded) before it failed, and
+                # where it stopped: saved, so they aren't read as new again.
+                changed = before != (
+                    state.seen_ids,
+                    state.pending_cursor,
+                    state.pending_max_ts,
+                )
 
             if changed or reset:
                 save_trigger_cursor(cursor_path, state)
+            if failure is not None and on_cycle_error is not None:
+                on_cycle_error(failure)
 
             polls += 1
             if max_polls is None or polls < max_polls:
@@ -258,7 +288,11 @@ class ComposioTriggersSource(SourceConnector):
         limit: int,
     ) -> Generator[DataEnvelope, None, bool]:
         """One poll cycle: page through new events, yield unseen ones, and
-        advance the watermark in ``state``. Returns whether state changed."""
+        advance the watermark in ``state``. Returns whether state changed.
+        A page that fails to read raises, with ``state`` holding the ids read
+        so far and, as its pending window, the page that failed and the
+        newest time read before it (``pull`` keeps that only when a retry can
+        fix the failure)."""
         trigger_slugs = {
             str(s).upper() for s in (config.get("trigger_slugs") or [])
         }
@@ -274,16 +308,33 @@ class ComposioTriggersSource(SourceConnector):
         ceiling_ms = int(time.time() * 1000) + MAX_EVENT_CLOCK_SKEW_MS
         exhausted = False
         for _ in range(MAX_TRIGGER_PAGES_PER_POLL):
-            events, next_cursor = client.list_trigger_events(
-                user_id=user_id,
-                from_ms=state.last_ts_ms or None,
-                cursor=cursor,
-                limit=limit,
-            )
+            try:
+                events, next_cursor = client.list_trigger_events(
+                    user_id=user_id,
+                    from_ms=state.last_ts_ms or None,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            except Exception:
+                if cursor is not None:
+                    # Mid-window: resume on this page, not from its start.
+                    state.pending_cursor = cursor
+                    state.pending_max_ts = max_ts
+                raise
 
             for event in events:
                 event_id = str(event.get("id") or "")
                 if event_id and event_id in state.seen_ids:
+                    # Read again: the API's `from` is inclusive, a window can
+                    # be rescanned, and an entry dated past the ceiling is
+                    # read on every poll (it never moves the watermark). Its
+                    # id moves to the ring's newest end, so newer reads don't
+                    # push it out while it can still be read, which would
+                    # deliver it again.
+                    if state.seen_ids[-1] != event_id:
+                        state.seen_ids.remove(event_id)
+                        state.seen_ids.append(event_id)
+                        changed = True
                     continue
                 skipped = event.get("skipped") or (
                     None if event_id else "the entry has no id"

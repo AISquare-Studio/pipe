@@ -672,3 +672,77 @@ def test_auth_configs_list_takes_toolkit_slug():
     from composio_client.types.auth_config_list_params import AuthConfigListParams
 
     assert "toolkit_slug" in AuthConfigListParams.__annotations__
+
+
+# -- a failed page keeps its place only when a retry can fix it (#48) --------
+
+
+@pytest.mark.parametrize(
+    "answer, kept",
+    [
+        ((500, {"error": {"message": "boom"}}), True),
+        ((503, {"error": {"message": "busy"}}), True),
+        ((429, {"error": {"message": "slow down"}}), True),
+        ("timeout", True),
+        ((400, {"error": {"message": "bad cursor"}}), False),
+        ((404, {"error": {"message": "no such cursor"}}), False),
+    ],
+    ids=["500", "503", "429", "timeout", "400", "404"],
+)
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+def test_a_failed_resumed_page_keeps_its_cursor_only_if_transient(
+    composio_http, tmp_path, answer, kept
+):
+    """The real SDK's errors, after its own retries: a 5xx, a 429 or no answer
+    keeps the saved page cursor (the next poll resumes on it); a 4xx drops it
+    (an expired cursor would fail every poll). Before: dropped on all."""
+    from aisquare_pipe_composio.client import (
+        TriggerCursor,
+        load_trigger_cursor,
+        save_trigger_cursor,
+    )
+    from aisquare_pipe_composio.triggers import ComposioTriggersSource
+
+    def respond(request: httpx.Request, _body: dict) -> tuple[int, Any]:
+        if answer == "timeout":
+            raise httpx.ReadTimeout("no answer", request=request)
+        return answer
+
+    composio_http.respond = respond
+    cursor = str(tmp_path / "cursor.json")
+    held = _epoch_ms("2026-11-14T22:13:00Z")
+    save_trigger_cursor(
+        cursor,
+        TriggerCursor(
+            last_ts_ms=held, pending_cursor="cur_11", pending_max_ts=held + 9
+        ),
+    )
+    heard: list[Exception] = []
+    params = PullParams(
+        params={
+            "max_polls": 1,
+            "sleep": lambda _s: None,
+            "on_cycle_error": heard.append,
+        }
+    )
+
+    assert (
+        list(
+            ComposioTriggersSource().pull(
+                {**OFFLINE_CONFIG, "cursor_path": cursor}, params
+            )
+        )
+        == []
+    )
+
+    saved = load_trigger_cursor(cursor)
+    assert saved.last_ts_ms == held
+    if kept:
+        assert (saved.pending_cursor, saved.pending_max_ts) == ("cur_11", held + 9)
+    else:
+        assert (saved.pending_cursor, saved.pending_max_ts) == (None, 0)
+    [error] = heard
+    assert isinstance(error, PipelineError)
+    assert all(
+        json.loads(r.content)["cursor"] == "cur_11" for r in composio_http.requests
+    )

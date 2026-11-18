@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from unittest.mock import MagicMock
 
 import pytest
 
 from aisquare.pipe.core.envelope import PullParams
-from aisquare.pipe.errors import ConfigValidationError
+from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_composio.client import ComposioSDKShapeError
 from aisquare_pipe_composio.triggers import ComposioTriggersSource
@@ -25,6 +26,26 @@ def _pull_once(source, config, client_unused=None, **extra_params):
 
 def _config(composio_config, tmp_cursor_path, **overrides):
     return {**composio_config, "cursor_path": tmp_cursor_path, **overrides}
+
+
+def _api_error(status: int) -> PipelineError:
+    """What ComposioClient raises when Composio answers ``status``: a
+    PipelineError chained to the SDK's own status error."""
+    import httpx
+    from composio_client import APIStatusError
+
+    request = httpx.Request("POST", "https://composio.invalid/api/v3.1/internal/trigger/logs")
+    cause = APIStatusError(
+        f"HTTP {status}", response=httpx.Response(status, request=request), body=None
+    )
+    error = PipelineError(f"Composio API error: HTTP {status}")
+    error.__cause__ = cause
+    return error
+
+
+def _saved(path):
+    with open(path, encoding="utf-8") as fd:
+        return json.load(fd)
 
 
 class TestPolling:
@@ -262,6 +283,126 @@ class TestPageCap:
         assert saved["pending_cursor"] is None
         assert saved["pending_max_ts"] == 0
         assert saved["last_ts_ms"] == self.BASE  # watermark untouched
+
+
+    def test_a_transient_failure_resumes_on_the_page_it_stopped_on(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        """A 503 on the second page of a resumed window: the cursor keeps
+        that page and the ids read before it, and the next pull reads on from
+        there. Before: the page cursor was dropped, and the next pull
+        rescanned the whole window from the held watermark (with 1500 entries
+        and the old 500-id ring, 500 of them were delivered twice)."""
+        from aisquare_pipe_composio.client import TriggerCursor, save_trigger_cursor
+
+        save_trigger_cursor(
+            tmp_cursor_path,
+            TriggerCursor(
+                last_ts_ms=self.BASE, seen_ids=["evt_0"], pending_cursor="cur_9",
+                pending_max_ts=self.BASE + 900,
+            ),
+        )
+        config = _config(composio_config, tmp_cursor_path)
+        source = ComposioTriggersSource()
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event("evt_a", ts_ms=self.BASE + 1000)], "cur_10"),
+            _api_error(503),
+        ]
+
+        first = _pull_once(source, config)
+
+        assert [e.metadata["composio_event_id"] for e in first] == ["evt_a"]
+        assert _saved(tmp_cursor_path) == {
+            "last_ts_ms": self.BASE,  # held: the window isn't drained
+            "seen_ids": ["evt_0", "evt_a"],
+            "pending_cursor": "cur_10",
+            "pending_max_ts": self.BASE + 1000,
+        }
+
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event("evt_b", ts_ms=self.BASE + 2000)], None)
+        ]
+        second = _pull_once(source, config)
+        kwargs = mock_triggers_client.list_trigger_events.call_args.kwargs
+        assert (kwargs["cursor"], kwargs["from_ms"]) == ("cur_10", self.BASE)
+        assert [e.metadata["composio_event_id"] for e in second] == ["evt_b"]
+        assert _saved(tmp_cursor_path)["last_ts_ms"] == self.BASE + 2000
+
+    def test_a_transient_failure_mid_window_saves_the_ids_read(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        """No window was pending: page 1 is read, page 2 times out. Before,
+        nothing was saved, so a host that keeps the position itself saw no
+        trace of page 1's ids."""
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event("evt_1", ts_ms=self.BASE + 1000)], "cur_2"),
+            _api_error(500),
+        ]
+
+        _pull_once(ComposioTriggersSource(), _config(composio_config, tmp_cursor_path), since=self.BASE)
+
+        assert _saved(tmp_cursor_path) == {
+            "last_ts_ms": self.BASE,
+            "seen_ids": ["evt_1"],
+            "pending_cursor": "cur_2",
+            "pending_max_ts": self.BASE + 1000,
+        }
+
+    @pytest.mark.parametrize("status", [400, 404, 422])
+    def test_a_request_composio_refuses_drops_the_page_cursor(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, status
+    ):
+        """A 4xx on the resumed page (an expired cursor) would fail every
+        cycle: the cursor is dropped and the window rescanned, as before."""
+        from aisquare_pipe_composio.client import TriggerCursor, save_trigger_cursor
+
+        save_trigger_cursor(
+            tmp_cursor_path,
+            TriggerCursor(last_ts_ms=self.BASE, pending_cursor="cur_stale", pending_max_ts=9),
+        )
+        mock_triggers_client.list_trigger_events.side_effect = _api_error(status)
+
+        _pull_once(ComposioTriggersSource(), _config(composio_config, tmp_cursor_path))
+
+        saved = _saved(tmp_cursor_path)
+        assert (saved["pending_cursor"], saved["pending_max_ts"]) == (None, 0)
+        assert saved["last_ts_ms"] == self.BASE
+
+    def test_on_cycle_error_hears_of_a_failed_cycle_after_its_save(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        """A one-cycle pull doesn't raise a failed read; ``on_cycle_error``
+        tells the host, once the cycle's progress is on disk."""
+        error = _api_error(502)
+        mock_triggers_client.list_trigger_events.side_effect = [
+            ([make_event("evt_1", ts_ms=self.BASE + 1000)], "cur_2"),
+            error,
+        ]
+        heard: list[tuple[Exception, dict]] = []
+
+        envelopes = _pull_once(
+            ComposioTriggersSource(),
+            _config(composio_config, tmp_cursor_path),
+            since=self.BASE,
+            on_cycle_error=lambda e: heard.append((e, _saved(tmp_cursor_path))),
+        )
+
+        assert len(envelopes) == 1
+        [(got, on_disk)] = heard
+        assert got is error
+        assert on_disk["pending_cursor"] == "cur_2" and on_disk["seen_ids"] == ["evt_1"]
+
+    def test_on_cycle_error_is_not_called_for_a_good_cycle(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        mock_triggers_client.list_trigger_events.return_value = ([], None)
+        heard: list[Exception] = []
+        _pull_once(
+            ComposioTriggersSource(),
+            _config(composio_config, tmp_cursor_path),
+            on_cycle_error=heard.append,
+        )
+        assert heard == []
 
 
 class TestLoopBehaviour:
@@ -514,6 +655,51 @@ class TestFutureTimestamps:
             saved = json.load(fd)
         assert saved["last_ts_ms"] == from_ms and saved["pending_max_ts"] == 0
         assert "reset to now" in caplog.text
+
+
+class TestSeenRing:
+    def test_an_entry_read_on_every_poll_stays_in_the_ring(
+        self, mock_triggers_client, composio_config, tmp_cursor_path, monkeypatch
+    ):
+        """An entry dated past the ceiling never moves the watermark, so every
+        poll reads it again. Each read moves its id to the ring's newest end.
+        Before: it was skipped without that, newer reads pushed it out of the
+        ring, and it was delivered again (here on poll 3 with a 4-id ring)."""
+        from aisquare_pipe_composio import client as client_module
+
+        monkeypatch.setattr(client_module, "SEEN_IDS_MAX", 4)
+        now_ms = int(time.time() * 1000)
+        future = make_event("evt_future", ts_ms=TestFutureTimestamps.FAR_FUTURE)
+        config = _config(composio_config, tmp_cursor_path)
+        source = ComposioTriggersSource()
+        delivered: list[str] = []
+        for poll in range(5):
+            new = [make_event(f"evt_{poll}_{n}", ts_ms=now_ms - 60_000 + poll * 10 + n) for n in range(3)]
+            mock_triggers_client.list_trigger_events.return_value = ([*new, future], None)
+            envelopes = _pull_once(source, config, since=now_ms - 120_000)
+            delivered += [e.metadata["composio_event_id"] for e in envelopes]
+
+        assert delivered.count("evt_future") == 1
+        assert len(delivered) == 16
+        assert _saved(tmp_cursor_path)["seen_ids"][-1] == "evt_future"
+
+    def test_reading_the_newest_id_again_is_no_change(
+        self, mock_triggers_client, composio_config, tmp_cursor_path
+    ):
+        """The inclusive ``from`` returns the last entry on every quiet poll:
+        already the newest id, so the cursor isn't rewritten for it."""
+        mock_triggers_client.list_trigger_events.return_value = (
+            [make_event("evt_1", ts_ms=TestPageCap.BASE + 1)],
+            None,
+        )
+        config = _config(composio_config, tmp_cursor_path)
+        _pull_once(ComposioTriggersSource(), config, since=TestPageCap.BASE)
+        written = os.stat(tmp_cursor_path).st_mtime_ns
+        os.utime(tmp_cursor_path, ns=(0, 0))
+
+        _pull_once(ComposioTriggersSource(), config)
+
+        assert written and os.stat(tmp_cursor_path).st_mtime_ns == 0  # not saved again
 
 
 class TestValidateAndResources:

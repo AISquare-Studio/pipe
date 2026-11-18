@@ -35,8 +35,15 @@ DEFAULT_TRIGGER_PAGE_LIMIT = 100
 # 2.x gives a POST none by default; 1.x retried every method this often.
 TRIGGER_LOG_SDK_RETRIES = 2
 MAX_TRIGGER_PAGES_PER_POLL = 10
-SEEN_IDS_MAX = 500
+# The trigger cursor's ring of read entry ids, newest last (save keeps the
+# newest). Two whole pulls (2 x MAX_TRIGGER_PAGES_PER_POLL pages of
+# DEFAULT_TRIGGER_PAGE_LIMIT): a window read again (the API's ``from`` is
+# inclusive, a page cursor dropped after an error, an entry dated past the
+# ceiling) is still recognised, not delivered twice. 500 was half of one pull.
+# Part of the host contract (``aisquare_pipe_composio.__all__``).
+SEEN_IDS_MAX = 2000
 # How far past this host's clock an event's time may be and still move the
 # watermark (clock skew between Composio and us). A later time is no real
-# event's: a watermark there would read nothing until that time came.
+# event's: a watermark there would read nothing until that time came. Part
+# of the host contract (``aisquare_pipe_composio.__all__``).
 MAX_EVENT_CLOCK_SKEW_MS = 5 * 60 * 1000

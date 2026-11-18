@@ -120,10 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     longer stops the triggers source. It is skipped with a WARNING and its
     time moves the watermark, so one bad event can't crash-loop the poller.
     Its id is recorded in the cursor: later cycles, and later pulls on the
-    same `cursor_path`, step past it silently. A pull on a fresh cursor
-    (pipe-as-service's poller: one `pull(max_polls=1)` per poll, each on a
-    temp file) warns again on every pull while the entry is in its window, and
-    an entry with no id warns on every cycle (it can't be recorded). A readable
+    same `cursor_path`, step past it silently. So do later pulls of a host
+    that writes the position the last pull saved into each pull's cursor
+    (pipe-as-service's poller: one `pull(max_polls=1)` per poll, on a temp
+    file holding its stored position). A pull on an empty cursor warns again
+    on every pull while the entry is in its window, and an entry with no id
+    warns on every cycle (it can't be recorded). A readable
     entry with no id is now skipped with that warning too (it was dropped
     without one), and its time moves the watermark (it didn't). A timestamp
     that isn't a finite number reads as no time.
@@ -162,6 +164,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     every push to `main` and on `workflow_dispatch`.
   - `list_trigger_events` reads the SDK method's signature once (it read it
     twice: once for `request_options`, once to bind the call).
+- **Composio triggers: no event delivered twice by the seen-id ring, and the
+  trigger cursor is a public host contract** (pipe-as-service review seq 14039).
+  - `TriggerCursor`, `save_trigger_cursor`, `load_trigger_cursor`,
+    `SEEN_IDS_MAX`, `MAX_EVENT_CLOCK_SKEW_MS`, `MAX_TRIGGER_PAGES_PER_POLL`
+    and `is_transient_error` are exported from `aisquare_pipe_composio`
+    (`__all__`, listed in `TRIGGER_CURSOR_API`). pipe-as-service's poller keeps
+    the position in its own store and round-trips it through these.
+    `connectors/composio/tests/test_trigger_cursor_contract.py` pins the
+    names, the four fields, a lossless save/load of every field, the newest
+    ids kept, and the first-run rule (`last_ts_ms == 0` and no `seen_ids`
+    start at `since`). Adding a field is a contract change: the host copies
+    every field.
+  - The ring (`SEEN_IDS_MAX`) is 2000 ids, was 500: two whole pulls (10
+    pages of 100). With 500, a window read again (a rescan, the inclusive
+    `from`) redelivered whatever had been pushed out of the ring.
+  - A page that fails to read for a reason a retry can fix (HTTP 429/5xx,
+    or no answer) no longer drops the saved page cursor. The cycle saves the
+    page it stopped on and the ids it read before it, and the next cycle
+    resumes on that page. Before, it rescanned the whole window from the held
+    watermark, and a window longer than the ring was delivered twice (1500
+    entries, a 500 on page 11: 500 ids twice). Any other failure (a 4xx such
+    as an expired cursor, or a non-Composio error) still drops the cursor.
+  - An entry read again moves its id to the ring's newest end. An entry dated
+    past the clock-skew ceiling is read on every poll (it never moves the
+    watermark); its id used to be pushed out by newer reads, and the entry
+    was then delivered again.
+  - `PullParams` `on_cycle_error`: called with a failed cycle's exception,
+    after its progress is saved. A host running one cycle per pull learns
+    the read failed, which the pull doesn't raise.
 
 ## [0.5.0] - 2026-11-04
 
