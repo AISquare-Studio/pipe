@@ -89,18 +89,21 @@ Publish steps: RELEASING.md, "The 0.5.0 release".
 ### Upgrading from `aisquare-pipe-<x>`
 
 In an environment that has an old per-connector package (`aisquare-pipe-onedrive`
-0.1.0, say), **uninstall it first**, then install the extra:
+0.1.0, say; before 0.5.0, `aisquare-pipe[popular]` and `[full]` installed
+several), **uninstall every old package first**, then install the extras:
 `pip uninstall -y aisquare-pipe-onedrive && pip install "aisquare-pipe[onedrive]>=0.5.0"`.
 The old package and `aisquare-pipe` 0.5.0 install the same files, so pip
 removing the old one (`pip install -U aisquare-pipe-<x>`, or a later `pip
 uninstall aisquare-pipe-<x>`) deletes the connector. If you already upgraded
-in place, the repair is `pip install --force-reinstall --no-deps
-aisquare-pipe`: run it right after a `pip install -U aisquare-pipe-<x>` over
-an old release, which breaks the connector at once, and if you installed
-`aisquare-pipe[<x>]` over the old package, never uninstall it without running
-it afterwards. The same command repairs a broken environment. Fresh
-environments are not affected. Details: README.md, "Upgrading from
-`aisquare-pipe-<x>`".
+in place, the repair reinstalls the `aisquare-pipe` version you have:
+`pip install --force-reinstall --no-deps "aisquare-pipe==$(python -c 'from importlib.metadata import version; print(version("aisquare-pipe"))')"`.
+Keep the pin: unpinned, pip would install the newest release and skip its new
+dependencies. Run the repair right after a `pip install -U aisquare-pipe-<x>`
+over an old release, which breaks the connector at once. If you installed or
+upgraded `aisquare-pipe` (any extras, `[popular]` too) while an old package
+was installed, run the repair after every later `pip uninstall
+aisquare-pipe-<x>`. Fresh environments are not affected. Details: README.md,
+"Upgrading from `aisquare-pipe-<x>`".
 
 ### Changed
 

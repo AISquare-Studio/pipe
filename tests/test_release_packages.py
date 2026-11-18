@@ -11,6 +11,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import shlex
+import subprocess
 import sys
 import textwrap
 import tomllib
@@ -459,34 +461,69 @@ def test_shim_sources_have_no_code_and_one_requirement():
     assert data["project"]["dependencies"] == ["aisquare-pipe[onedrive]>=0.5.0"]
     assert data["tool"]["setuptools"] == {"packages": [], "py-modules": []}
     assert 'pip install "aisquare-pipe[onedrive]"' in files["README.md"]
-    assert "--force-reinstall --no-deps aisquare-pipe" in files["README.md"]
-    # Uninstall-first comes before the install of the extra.
+    assert rp.REPAIR_COMMAND in files["README.md"]
+    # Uninstall-first, of every old package, comes before the install of the extra.
     readme = files["README.md"]
+    assert "**Uninstall every old package first** (`pip list` shows them)" in readme
+    assert "`aisquare-pipe[popular]` and `[full]`" in readme
     upgrade = readme.index("pip uninstall -y aisquare-pipe-onedrive\n")
     assert readme.index('pip install "aisquare-pipe[onedrive]>=0.5.0"') > upgrade
 
 
 def _readme_in_place_upgrade() -> str:
     """README.md's "If you already upgraded in place" text: the repair
-    command and its two cases, up to the paragraph after the list."""
+    command, its two cases and the symptom, through "never affected"."""
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     start = readme.index("**If you already upgraded in place**")
-    return readme[start : readme.index("\n\n", readme.index("\n- ", start)) + 1]
+    end = readme.index("is never affected.\n", start)
+    return readme[start : end + len("is never affected.\n")]
 
 
 def test_readme_splits_the_two_in_place_upgrades():
-    """`pip install -U aisquare-pipe-<x>` breaks the connector at once; the
-    extra installed over the old package breaks only at a later uninstall."""
+    """`pip install -U aisquare-pipe-<x>` breaks the connector at once; any
+    aisquare-pipe >= 0.5.0 (any extras) installed over the old package breaks
+    only at a later uninstall."""
     text = _readme_in_place_upgrade()
-    assert "pip install --force-reinstall --no-deps aisquare-pipe\n" in text
+    assert f"```bash\n{rp.REPAIR_COMMAND}\n```" in text
     immediate, later = (line for line in text.splitlines() if line.startswith("- "))
     assert immediate.startswith("- `pip install -U aisquare-pipe-<x>`")
     assert "at once" in immediate and "right after" in immediate
     assert immediate.index("at once") < immediate.index("right after")
     assert later.startswith(
-        "- If you installed `aisquare-pipe[<x>]` over the old package"
+        "- If you installed or upgraded `aisquare-pipe` to 0.5.0 or later (with any "
+        'extras, e.g. `pip install -U "aisquare-pipe[popular]"`) while the old '
+        "package was installed"
     )
     assert "never `pip uninstall aisquare-pipe-<x>`" in later and "afterwards" in later
+    # The symptom. pip removes the whole aisquare_pipe_<x>/ when 0.5.0 adds
+    # no file to it (dropbox: the import fails), else only the old files
+    # (onedrive: .connector fails, the import still succeeds).
+    assert (
+        "No module named 'aisquare_pipe_<x>'` (or `'aisquare_pipe_<x>.connector'`)"
+        in text
+    )
+    assert "Don't rely on `import aisquare_pipe_<x>`" in text
+    assert "any broken environment" not in text and "fails to import" not in text
+
+
+def test_repair_command_pins_the_installed_version():
+    """Unpinned, --force-reinstall takes the newest aisquare-pipe on the index
+    and --no-deps skips its new dependencies: the command must reinstall the
+    version that is installed. Run through sh, with ``pip`` echoed."""
+    if sys.platform == "win32":
+        pytest.skip("the command is POSIX shell")
+    from importlib.metadata import version
+
+    assert rp.REPAIR_COMMAND.startswith("pip install --force-reinstall --no-deps ")
+    command = rp.REPAIR_COMMAND.replace("pip ", "echo ", 1).replace(
+        "$(python ", f"$({shlex.quote(sys.executable)} ", 1
+    )
+    out = subprocess.run(
+        ["sh", "-c", command], capture_output=True, text=True, check=True
+    ).stdout
+    assert out == (
+        f"install --force-reinstall --no-deps aisquare-pipe=={version('aisquare-pipe')}\n"
+    )
 
 
 @pytest.mark.parametrize("name", sorted(rp.SHIM_PROJECTS))

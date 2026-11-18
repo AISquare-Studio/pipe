@@ -60,25 +60,27 @@ Before 0.5.0 some connectors were separate PyPI packages (`aisquare-pipe-dropbox
 
 ### Upgrading from `aisquare-pipe-<x>`
 
-This applies to an environment that has one of the old per-connector packages: `aisquare-pipe-composio`, `-docusign`, `-dropbox`, `-gateway`, `-github`, `-graphify`, `-local`, `-n8n`, `-onedrive` or `-salesforce` before 0.5.0. The old package and `aisquare-pipe` 0.5.0 install the same files (`aisquare_pipe_<x>/…`), so when pip removes the old package, it deletes the connector `aisquare-pipe` just installed.
+This applies to an environment that has one of the old per-connector packages: `aisquare-pipe-composio`, `-docusign`, `-dropbox`, `-gateway`, `-github`, `-graphify`, `-local`, `-n8n`, `-onedrive` or `-salesforce` before 0.5.0. The old `aisquare-pipe[popular]` and `[full]` installed several of them. The old package and `aisquare-pipe` 0.5.0 install the same files (`aisquare_pipe_<x>/…`), so when pip removes the old package, it deletes the connector `aisquare-pipe` just installed.
 
-**Uninstall the old package first**, then install the extra:
+**Uninstall every old package first** (`pip list` shows them), then install the extras:
 
 ```bash
 pip uninstall -y aisquare-pipe-onedrive
 pip install "aisquare-pipe[onedrive]>=0.5.0"
 ```
 
-**If you already upgraded in place**, this command restores the files:
+**If you already upgraded in place**, this command restores the files of the `aisquare-pipe` version you have:
 
 ```bash
-pip install --force-reinstall --no-deps aisquare-pipe
+pip install --force-reinstall --no-deps "aisquare-pipe==$(python -c 'from importlib.metadata import version; print(version("aisquare-pipe"))')"
 ```
 
-- `pip install -U aisquare-pipe-<x>` over an old release breaks the connector at once. Run the command right after.
-- If you installed `aisquare-pipe[<x>]` over the old package, never `pip uninstall aisquare-pipe-<x>` without running the command afterwards.
+Keep the pin (without a POSIX shell, put the version `pip show aisquare-pipe` prints after `==`): unpinned, pip would install the newest release, and `--no-deps` would skip its new dependencies.
 
-The same command repairs any broken environment. The symptom is a warning such as `Failed to load toolkit onedrive: No module named 'aisquare_pipe_onedrive.constants'`, while `pip check` reports nothing wrong. A fresh environment (a Docker build, CI) is never affected.
+- `pip install -U aisquare-pipe-<x>` over an old release breaks the connector at once. Run the command right after.
+- If you installed or upgraded `aisquare-pipe` to 0.5.0 or later (with any extras, e.g. `pip install -U "aisquare-pipe[popular]"`) while the old package was installed, never `pip uninstall aisquare-pipe-<x>` without running the command afterwards.
+
+The command repairs an environment broken this way. The symptom is a warning such as `Failed to load connector …: No module named 'aisquare_pipe_<x>'` (or `'aisquare_pipe_<x>.connector'`), while `pip check` reports nothing wrong. Don't rely on `import aisquare_pipe_<x>`: for some connectors it still succeeds. A fresh environment (a Docker build, CI) is never affected.
 
 Third-party connectors in their own distribution (any package declaring the `aisquare_pipe.connectors` entry-point group) are auto-discovered after install.
 
