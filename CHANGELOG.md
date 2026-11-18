@@ -244,6 +244,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   below its extra's floor (BigQuery, Snowflake and Redshift do, at 26.25).
 - `aisquare.pipe.testing.host.host_answer(exc)`: the HTTP status pipe-as-service answers a source's
   exception with, for connector tests.
+- **Databricks connector** (`connectors/databricks`, module `aisquare_pipe_databricks`, extra
+  `aisquare-pipe[databricks]`, in `[full]` and `[toolkits]`): the read-only toolkit `databricks`
+  (`DATABRICKS_READ_FILE`, primary; `DATABRICKS_LIST_FILES`; `DATABRICKS_RUN_SELECT`;
+  `DATABRICKS_LIST_CATALOGS`/`_SCHEMAS`/`_TABLES`) and the source `databricks-files-source`, over
+  Unity Catalog volumes (Files API) and, when the blob says `"dbfs": true`, DBFS, on the tenant's blob
+  `{workspace_url, auth: pat|oauth_m2m, token | client_id+client_secret, warehouse_id?, dbfs?}`.
+  `workspace_url` must be a Databricks workspace host (cloud.databricks.com, azuredatabricks.net,
+  gcp.databricks.com; not the `accounts.` consoles). Files carry version markers `modified_time`, `etag`,
+  `sha256`. A missing or malformed blob fails closed ("Databricks is not configured", no request). DBFS
+  has no Unity Catalog grants (its root and mounts are readable by every workspace user), so a `dbfs:/`
+  path is refused (`forbidden`; 422 in the source) before any request unless the blob enables it. Setup,
+  the exact secret and how it reaches the service on ECS and EKS: `connectors/databricks/README.md`.
+  - SQL runs only if a lexer and a parser (sqlglot, `sqlglot>=26.25,<28`, the extra's only dependency,
+    the specifier every sqlglot extra shares; CI runs the suite at the floor) both accept ONE SELECT/WITH,
+    before any HTTP call. Each refuses every write on its own: a fuzz runs each layer alone against a
+    reference reading of Spark's lexer. The lexer reads the text as Spark does and refuses where readers
+    disagree: a comment ending in a backslash (Spark continues a `--` comment past one at its line break),
+    a bare CR ending one, a `/*` inside a block comment (Spark nests them), a quoted token whose end
+    depends on backslash escapes (Spark takes them in `'...'` and `"..."`, never in backticks), `${`, `$`
+    outside quotes (Databricks reads `$$...$$` as text in places), and non-ASCII outside quotes. Hint
+    contents are read as tokens. The parser first refuses where sqlglot's tokens read unlike Spark's: a
+    comment ending in a backslash, a comment holding `/*` up to its closer's `*` (sqlglot nests
+    comments unlike Spark; a `--` comment holding `/*` or ending in `/` too), a `/*+` that is not a
+    plain hint right after SELECT (sqlglot reads one elsewhere as a comment), `{#` (a Jinja comment to
+    sqlglot), `*` right before `/` (one token in Spark), a `"..."` string whose end depends on escapes,
+    `${`, non-ASCII outside quotes. Both layers refuse calls of `http_request`, `remote_query`,
+    `read_kafka`/`read_kinesis`/`read_pubsub`/`read_pulsar`, `reflect`/`java_method`, `secret`,
+    `list_secrets`, `vector_search`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`,
+    naming the function by its canonical name only. Tests pin what only one layer catches (none of it a
+    write in Spark's reading), so dropping either fails the suite. The parser parses through core's
+    `parse_statements()` (its token check runs between tokenizing and parsing), so no SQL reaches a log,
+    and below core's `SQLGLOT_FLOOR` (26.25) nothing runs.
+  - The statement deadline (`timeout_seconds` up to 120, or the host's budget) bounds every request. Up to
+    55 s left, one synchronous call with `on_wait_timeout: CANCEL`, so the warehouse cancels it even when
+    its answer is lost: `wait_timeout` 5 s under what is left and a read timeout 5 s over it, or, under
+    10 s, `wait_timeout` 5 s and a read timeout of what is left (a host budget under 6 s included, so a
+    lost answer still ends 5 s after the submit). Beyond 55 s, an asynchronous submit (`0s`) returns the
+    `statement_id` at once, and polling cancels at the deadline, a failed poll included. A row cap and an
+    8 MiB byte cap.
+  - The host's budget bounds file reads too: every request (the OAuth token's, each 1 MB DBFS read)
+    gets at most the time left and none is sent once it is spent, and a volume download is read one
+    socket read at a time (urllib3 2's `read1`), each with the time left as its socket timeout (between
+    64 KiB chunks on urllib3 1.26).
+  - The source raises `PipelineError` (502) for upstream and transient failures and
+    `DatabricksRequestError` (a `ValueError`, 422) for a missing path or a 400, without Databricks's text.
+    It holds about two files at a time (one buffer per download), with `max_bytes` at most 64 MiB:
+    129 MiB peak at the cap (tracemalloc; README "Memory").
 
 ### Fixed
 
@@ -421,11 +468,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
   document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
   `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
-- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor)` is how every SQL guard parses (BigQuery,
-  Snowflake, Redshift): the sqlglot floor check, a quiet tokenize and parse, and any exception a refusal, in one
-  place. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it differs from the floor
-  `scripts/dep_floor.py` reads from the pyproject, and when a connector module that imports sqlglot parses,
-  tokenizes or checks the floor itself, or keeps its own floor (#46 review seq 14088 m2).
+- `aisquare.pipe.core.sql.parse_statements(sql, dialect, *, floor, check_tokens)` is how every SQL guard parses
+  (BigQuery, Snowflake, Redshift, Databricks): the sqlglot floor check, a quiet tokenize and parse, and any
+  exception a refusal, in one place. `check_tokens` sees the tokens before they are parsed and refuses by raising
+  (Databricks' check of where sqlglot's tokens read unlike Spark's), so that refusal keeps its reason when the
+  text wouldn't parse either. `SQLGLOT_FLOOR` lives in core only; `tests/test_sql_guards.py` fails when it
+  differs from the floor `scripts/dep_floor.py` reads from the pyproject, and when a connector module that
+  imports sqlglot parses, tokenizes or checks the floor itself, or keeps its own floor. Names are resolved
+  through import aliases, and a reference counts as much as a call (`maybe_parse`, `from sqlglot import
+  parse_one as po`, `_p = sqlglot.parse_one`, a dialect's `parser()`, a subclass of an aliased `Parser`, a
+  `floor=` handed to `parse_statements`); mutations fed to it in memory pin each (#46 review seq 14088 m2,
+  re-review seq 14138 nit c).
 - `scripts/dep_floor.py --connectors` also exits 1 when an extra that names the dependency has no
   `connectors/<extra>` directory (it was skipped silently while another suite matched); an aggregate extra (one
   that names the project itself, as `[full]` does) needs none (#46 review seq 14088 n3).

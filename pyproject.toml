@@ -87,6 +87,14 @@ composio = [
     "composio>=0.13.1,<2.0",
     "composio-client>=1.39,<3.0",
 ]
+# Databricks: sqlglot parses SQL so only one SELECT is ever sent (HTTP via
+# requests, in core). Every extra naming sqlglot gives it this same specifier
+# (from 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested, and
+# 25.0 to 25.2 don't nest Spark's); CI runs their suites at its floor
+# (scripts/dep_floor.py).
+databricks = [
+    "sqlglot>=26.25,<28",
+]
 docusign = [
     "docusign-esign>=4.0",
 ]
@@ -136,11 +144,11 @@ snowflake = [
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,aws,bigquery,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,redshift,salesforce,slack,snowflake]"]
+full = ["aisquare-pipe[popular,aws,bigquery,composio,databricks,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,redshift,salesforce,slack,snowflake]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[aws,bigquery,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack,snowflake]"]
+toolkits = ["aisquare-pipe[aws,bigquery,databricks,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack,snowflake]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -155,6 +163,7 @@ bigquery-query-source = "aisquare_pipe_bigquery.connector:BigQueryQuerySource"
 composio-source = "aisquare_pipe_composio.connector:ComposioSource"
 composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
 composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
+databricks-files-source = "aisquare_pipe_databricks.connector:DatabricksFilesSource"
 docusign-source = "aisquare_pipe_docusign.connector:DocusignSource"
 docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
 dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
@@ -186,6 +195,7 @@ bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
 s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
 redshift = "aisquare_pipe_aws.redshift.toolkit:RedshiftToolkit"
 bigquery = "aisquare_pipe_bigquery.toolkit:BigQueryToolkit"
+databricks = "aisquare_pipe_databricks.toolkit:DatabricksToolkit"
 gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
@@ -203,6 +213,7 @@ where = [
     "connectors/aws/src",
     "connectors/bigquery/src",
     "connectors/composio/src",
+    "connectors/databricks/src",
     "connectors/docusign/src",
     "connectors/dropbox/src",
     "connectors/gateway/src",

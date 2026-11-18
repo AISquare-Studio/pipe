@@ -81,9 +81,9 @@ REPEATED_CELLS = 1_000
 PAGE_BYTES = 4 * 1024 * 1024
 #: A next page asks for at most this many times the rows the last page held,
 #: so a page that came back short (by its bytes, its cells, or BigQuery's page
-#: limit) grows back a step at a time: after one row of 50,000 cells or more
-#: (a page of one), narrow rows are back at :data:`PAGE_ROWS` a page within
-#: 14 pages.
+#: limit) grows back a step at a time: after a row of more than 25,000 cells
+#: (a page of one: :data:`PAGE_CELLS` // its cells is 1), narrow rows are
+#: back at :data:`PAGE_ROWS` a page within 14 pages.
 PAGE_GROWTH = 2
 #: The most one page's body may hold, counted as it is read and before it is
 #: parsed (:class:`~aisquare_pipe_bigquery.client.PageCap`): bytes of JSON,
@@ -100,8 +100,11 @@ READ_BYTES = 2 * PAGE_BYTES
 READ_CELLS = 2 * PAGE_CELLS
 #: Pages read at most for one result, whatever the page token says (a
 #: dropped page asked for again counts once); rows left then are
-#: ``truncated`` ``max_pages``. Rows of 50,000 cells or more page one at a
-#: time, and ``max_result_bytes`` stops those within about 700 pages.
+#: ``truncated`` ``max_pages``. Rows of more than 25,000 cells (every
+#: column's, a ``REPEATED`` one's every element) page one at a time, and
+#: ``max_result_bytes`` stops those within about 1,350 pages at its 64 MiB
+#: cap (rows of 25,001 one-digit integers, the fewest bytes such a row holds:
+#: 1,342 row pages measured).
 MAX_PAGES = 5_000
 #: Table types tabledata.list reads. Views, materialized views and external
 #: tables are read with a query.
