@@ -127,6 +127,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `version`. A pull cut at `max_rows` or `max_result_bytes` says `truncated`, and a table pull
     `next_start_index`.
   Setup, the registration checklist and the exact secret: `connectors/bigquery/README.md`.
+- **Snowflake connector** (`connectors/snowflake`, module `aisquare_pipe_snowflake`, extra
+  `aisquare-pipe[snowflake]`, in `[full]` and `[toolkits]`): the read-only toolkit `snowflake`
+  (`SNOWFLAKE_RUN_SELECT`, primary; `SNOWFLAKE_DESCRIBE_TABLE`, `SNOWFLAKE_SHOW_TABLES`,
+  `SNOWFLAKE_SHOW_SCHEMAS`, `SNOWFLAKE_SHOW_DATABASES`) and the source `snowflake-query-source`, over
+  Snowflake's SQL API (`/api/v2/statements`, HTTPS + JSON via `requests`; no
+  `snowflake-connector-python`). It replaces Composio's `snowflake` stop-gap under the same toolkit
+  name, keeping Composio's SHOW slugs and argument names.
+  - Credential blob `{account, user, auth: keypair|oauth_client, private_key_pem (+passphrase) |
+    client_id + client_secret + token_url (+scope), role, warehouse, database?, schema?}`. Key-pair
+    JWT (RS256, signed with `cryptography>=42,<60`) is the default; `oauth_client` is a client
+    credentials grant at the customer's identity provider (External OAuth). `account` must be a
+    Snowflake account identifier (`<orgname>-<account_name>`, or a legacy locator with a known region
+    or a region and the cloud `aws`/`gcp`/`azure`), so every call goes to
+    `https://<account>.snowflakecomputing.com`.
+    Ambient `SNOWFLAKE_*` settings and `connections.toml` are never read; a missing or malformed
+    blob fails closed ("Snowflake is not configured", no request).
+  - SQL is SELECT-only, refused before any request otherwise: a lexer (strings, quoted identifiers
+    and comments blanked, with and without backslash escapes; a `--`/`//` comment ends at a CR or an
+    LF, one ended by a bare CR is refused, and so is a `/*` inside a `/* */` comment) and a sqlglot
+    parse (`sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and CI runs this
+    suite at that floor too, `scripts/dep_floor.py`; Snowflake dialect) must both find ONE
+    `SELECT`/`WITH` with no write, DDL, session or scripting
+    keyword or node, no `$`, `@` or `->>`, and no table function but FLATTEN, SPLIT_TO_TABLE,
+    STRTOK_SPLIT_TO_TABLE or GENERATOR (a stored procedure can be called as one). Every statement is
+    sent with `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and
+    warehouse, which no tool argument or pull param can change.
+  - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
+    tool call, at most 100 MiB for the source; partitions are read only while they fit), and the
+    statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
+    `timeout`; polling stops there and the statement is cancelled. Snowflake's error codes pick the
+    canonical code (`002003` not_found, `003001`/`000606` forbidden, `000630` timeout, ...).
+  - `snowflake-query-source` pulls a `table` (its own SELECT, names quoted; `columns`, `order_by`,
+    `start_index`) or one `sql` SELECT, one envelope per row batch. Each carries `result_sha256`
+    (order-independent) and `INFORMATION_SCHEMA.TABLES.LAST_ALTERED` (`table_last_altered`, read
+    before the rows; for a query the latest over the base tables it names), combined as `version`. A
+    pull cut at `max_rows` or `max_result_bytes` says `truncated`, and an ordered table pull
+    `next_start_index`.
+  - Not built: stage file listing and reading (GoodRx hasn't said policies live in stages).
+  Setup, the registration checklist and the exact secret: `connectors/snowflake/README.md`.
 
 ## [0.5.0] - 2026-11-04
 
