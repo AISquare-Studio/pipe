@@ -451,11 +451,13 @@ class BigQueryClient:
         *,
         page_size: int,
         page_token: str | None = None,
+        start_index: int | None = None,
         wait_ms: int | None = None,
         cap: PageCap | None = None,
     ) -> dict[str, Any]:
         """jobs.getQueryResults for the job ``start_query`` started (its
-        ``jobReference``): the job's state, then its pages."""
+        ``jobReference``): the job's state, then its pages, from
+        ``page_token`` or else from row ``start_index``."""
         job_id = job.get("jobId") if isinstance(job, dict) else None
         if not isinstance(job_id, str) or not _JOB_ID.match(job_id):
             raise BigQueryAPIError("BigQuery answered without a usable job reference")
@@ -468,6 +470,8 @@ class BigQueryClient:
             params["location"] = location
         if page_token:
             params["pageToken"] = page_token
+        elif start_index:
+            params["startIndex"] = start_index
         if wait_ms is not None:
             params["timeoutMs"] = wait_ms
         url = f"{self._project_url()}/queries/{_segment(job_id)}"

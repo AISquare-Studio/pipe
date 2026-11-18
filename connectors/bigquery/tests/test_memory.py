@@ -364,21 +364,21 @@ def test_a_page_is_sized_from_the_last_page_s_bytes_and_grows_a_step_at_a_time()
     # 500 rows came back in 10 MB (BigQuery's page limit cut them short): the
     # next page asks for what fits PAGE_BYTES at 20 KB a row.
     assert query.page_rows(
-        fields, 10_000, seen=1, last_rows=500, last_bytes=10_000_000
+        fields, 10_000, last_cells=1, last_rows=500, last_bytes=10_000_000
     ) == (query.PAGE_BYTES * 500 // 10_000_000)
     # 10 small rows came back: the next page asks for at most PAGE_GROWTH times
     # as many, not the 10,000 their bytes would fit.
     assert (
-        query.page_rows(fields, 10_000, seen=1, last_rows=10, last_bytes=1_000)
+        query.page_rows(fields, 10_000, last_cells=1, last_rows=10, last_bytes=1_000)
         == query.PAGE_GROWTH * 10
     )
     # Neither bound grows a page past the cells', and an empty page says nothing.
     assert query.page_rows(
-        fields, 10_000, seen=1, last_rows=10_000, last_bytes=1
+        fields, 10_000, last_cells=1, last_rows=10_000, last_bytes=1
     ) == min(query.PAGE_ROWS, query.PAGE_CELLS)
-    assert query.page_rows(fields, 10_000, seen=1, last_rows=0, last_bytes=99) == (
-        query.PAGE_ROWS
-    )
+    assert query.page_rows(
+        fields, 10_000, last_cells=1, last_rows=0, last_bytes=99
+    ) == (query.PAGE_ROWS)
 
 
 class SkewedGoogle(PagedGoogle):
@@ -699,3 +699,42 @@ def test_long_arrays_keep_a_table_read_under_the_pod_share():
         _LONG_FIELDS, 1_000, skew_at=0, before=row, after=row, limit=TABLE_PAGE_LIMIT
     )
     _long_peak(google, {"table": "sales.big"}, "defaults")
+
+
+# -- the worst page the read cap admits (#46 review seq 14088 n1) --------------------
+
+
+class Utf8SkewedGoogle(SkewedGoogle):
+    """SkewedGoogle sending non-ASCII as raw UTF-8, as Google does (not
+    ``\\uXXXX`` escapes): a page's text then decodes to what Python holds."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        rows = [
+            {"f": [{"v": v} for v in cells]}
+            for cells in (kwargs["before"], kwargs["after"])
+        ]
+        self.row_bytes = [json.dumps(r, ensure_ascii=False).encode() for r in rows]
+
+
+def test_the_worst_page_the_read_cap_admits_stays_under_the_bar_at_the_caps():
+    """Rows of 99,002 cells in 7.7 MB of JSON (right under READ_CELLS and
+    READ_BYTES), an emoji in every cell, so Python holds the page's text at
+    4 bytes a character: one row a page. The worst shape measured: 160.4 MiB
+    at the caps (120.7 at the defaults), the README's number."""
+    from aisquare_pipe_bigquery import query
+
+    row = [_elements(99_000, lambda j: "\U0001f600" + "x" * 58 + f"{j:05d}"), "1"]
+    google = Utf8SkewedGoogle(
+        [field_("tags", "STRING", "REPEATED"), field_("id", "INT64")],
+        40,
+        skew_at=0,
+        before=row,
+        after=row,
+        limit=QUERY_PAGE_LIMIT,
+    )
+    assert len(google.row_bytes[1]) <= query.READ_BYTES
+    assert google.row_cells[1] <= query.READ_CELLS
+    peak, rows = _warm_peak(google, {"sql": SQL, **_CAPS}, warm_bytes=4 * MIB)
+    assert rows >= 8  # max_result_bytes: 64 MiB of 7.7 MB rows
+    assert peak < POD_SHARE, peak / MIB

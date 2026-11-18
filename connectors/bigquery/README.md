@@ -82,9 +82,9 @@ Also in `metadata`: `kind` (`table` or `query`), `table` or `query_sha256` (the 
 `batch_index`, `batch_count`, `first_row`, `row_count`, `batch_sha256`, `result_row_count`, `total_rows`, and for
 `sql` `job_id` and `total_bytes_processed`.
 
-**A pull that stops early says so.** At `max_rows` or `max_result_bytes`, every envelope carries `truncated`
-(`max_rows` or `max_result_bytes`), and a `table` pull also `next_start_index`: pass it as `start_index` and repeat
-until a pull is not truncated. Nothing is skipped or repeated while the table doesn't change. A truncated `sql` pull
+**A pull that stops early says so.** At `max_rows`, `max_result_bytes` or 5,000 pages read, every envelope carries
+`truncated` (`max_rows`, `max_result_bytes` or `max_pages`), and a `table` pull also `next_start_index`: pass it as
+`start_index` and repeat until a pull is not truncated. Nothing is skipped or repeated while the table doesn't change. A truncated `sql` pull
 can't be continued: narrow the query or raise the caps. `result_sha256` then covers the rows read only.
 
 **How a pull fails** (pipe-as-service answers by the exception's type; neither message carries BigQuery's own error
@@ -122,25 +122,39 @@ at most the rows that fit 4 MiB of JSON at its bytes a row (`PAGE_BYTES`; long v
 (`PAGE_GROWTH`; a page that came back short grows back a step at a time). Each page is let go before the next is
 read, rows are converted one at a time, and the source keeps each row as its canonical JSON (about a fifth of the
 memory a row object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once
-its envelope is built. So a pull peaks at about 1.35 times the rows' JSON plus 20-40 MiB, and at most about 85 MiB at
-the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
+its envelope is built. So a pull of ordinary rows peaks at about 1.35 times the rows' JSON plus 20-40 MiB (82 MiB at
+the caps); the worst page the read cap admits adds up to about 90 MiB (below), so the worst measured pull is 160 MiB
+at the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
 response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod.
 
 **What bounds a page is the read cap, not its sizing.** A page's body (every one: tabledata.list's, a query's first
 page in jobs.query's answer, and getQueryResults') is streamed, and its bytes and its cells (its `"v":` keys: a
 `REPEATED` column's every element and a `RECORD`'s every field included) are counted as they arrive, before any of
 it is parsed. A page over 8 MiB of JSON (`READ_BYTES`) or 100,000 cells (`READ_CELLS`) is dropped, and asked for
-again with fewer rows: half, or fewer when what was read of it says fewer fit 4 MiB and 50,000 cells (BigQuery's own
+again from its first row (`startIndex`, which tabledata.list and getQueryResults both document; not its page token
+sent again with a smaller `maxResults`, which BigQuery doesn't document) with fewer rows: half, or fewer when what was read of it says fewer fit 4 MiB and 50,000 cells (BigQuery's own
 page limit answers a page of long rows with as many as fit, whatever was asked, so halving alone would drop page
 after page). A query's dropped first page is asked for again from the job jobs.query's answer named. Down to one
 row: a single row over either cap is **refused**, `RowTooLarge` (422), which says the row's index and the size of
-the page that holds it alone (its bytes and values) and nothing of its values. So parsing a page costs at most about
-25 MiB of objects on top of its 8 MiB of JSON, however long its arrays are. A dropped page costs a request and at
+the page that holds it alone (its bytes and values) and nothing of its values. A dropped page costs a request and at
 most 8 MiB read.
+
+So a page parsed holds at most 100,000 cells from at most 8 MiB of JSON, however long its arrays are. What parsing it
+costs depends on its text: Python holds a string with one astral character (an emoji, say) at 4 bytes a character.
+The worst shapes measured (`tests/test_memory.py`; one row a page, 99,002 cells in 7.4-7.7 MB of JSON, right under
+both read caps; every envelope kept, a process per pull):
+
+| Each cell (a `REPEATED STRING` element) | Peak at the defaults | Peak at the caps |
+|---|---|---|
+| 64 ASCII characters | 63.1 MiB | 102.2 MiB |
+| 64 characters, one row's first cell with an emoji | 99.2 MiB | 143.5 MiB |
+| 64 characters, each with an emoji | 120.7 MiB | **160.4 MiB** (the worst) |
 
 A `REPEATED` column's schema can't say how many elements a row holds: the FIRST page guesses 1,000 a column
 (`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the most cells a row
-has held so far. Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
+of the LAST page held, never the most of the whole pull: one wide row would hold every later page to a row. After a
+page of one wide row (60,000 elements, then 20,000 rows of one), pages double back up (1, 2, 4, ... 4,096) and the
+default 10,000 rows come back in 15 requests (5,001 when the pull's widest row sized every page). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
 elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
 and 10 MB for a table; 1,000 rows, so both stop at `max_result_bytes`):
 
@@ -164,8 +178,8 @@ later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones 
 | 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
 | `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
 
-A pull follows at most 5,000 pages (`MAX_PAGES`); rows of 50,000 cells or more page one at a time, and
-`max_result_bytes` stops those within about 700.
+A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`); rows of 50,000 cells or more page
+one at a time, and `max_result_bytes` stops those within about 700.
 
 ## Security
 

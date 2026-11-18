@@ -488,7 +488,7 @@ class FakeGoogle:
         if canned.error is not None:
             return _error(*canned.error)
         size = self.result_page_rows or int(params.get("maxResults") or 100)
-        start = int(params.get("pageToken") or 0)
+        start = int(params.get("pageToken") or params.get("startIndex") or 0)
         page = canned.rows[start : start + size]
         body = {
             "kind": "bigquery#getQueryResultsResponse",

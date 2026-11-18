@@ -149,12 +149,14 @@ def test_a_finished_poll_over_the_cap_is_read_again_from_the_job(small_caps):
 
 
 @pytest.mark.parametrize("path", ["sql", "table"])
-def test_rows_that_grow_midway_are_asked_for_again_with_the_same_token(
+def test_rows_that_grow_midway_are_asked_for_again_from_their_first_row(
     small_caps, path
 ):
     """[] for 100 rows, then 300 elements: the page that reaches them is
-    dropped and the same page token asked for again; nothing skipped or
-    repeated."""
+    dropped and asked for again from its first row (startIndex, documented
+    for tabledata.list and getQueryResults), not with its page token sent
+    again with a smaller maxResults (undocumented: review seq 14088 n2).
+    Nothing skipped or repeated."""
     lengths = [0] * 100 + [300] * 30
     if path == "sql":
         google = _query_google(lengths)
@@ -163,8 +165,14 @@ def test_rows_that_grow_midway_are_asked_for_again_with_the_same_token(
         google = _table_google(lengths)
         envelopes = _pull(google, {"table": "sales.o"})
     assert _ids(envelopes) == list(range(130))
-    tokens = [c["params"].get("pageToken") for c in _row_pages(google)[1:]]
-    assert len(tokens) > len(set(tokens))  # a token asked for twice
+    params = [c["params"] for c in _row_pages(google)[1:]]
+    tokens = [p["pageToken"] for p in params if "pageToken" in p]
+    assert len(tokens) == len(set(tokens))  # no token sent twice
+    again = [p for p in params if "startIndex" in p]
+    assert again and all("pageToken" not in p for p in again)
+    for p in again:
+        # The dropped page's token named the same row.
+        assert str(p["startIndex"]) in tokens
 
 
 def test_a_page_of_wide_rows_over_the_cap_costs_one_dropped_read(small_caps):
@@ -335,3 +343,84 @@ def test_a_row_page_that_breaks_off_midway_is_a_502(small_caps, error, says):
     assert host_answer(raised.value).status == 502
     assert says in str(raised.value)
     assert "reset" not in str(raised.value)
+
+
+# -- one wide row does not shrink the rest of the pull (#46 review seq 14088 M1) -----
+
+
+#: Row-page requests a pull of one wide row then narrow rows may take: the
+#: wide row's page, one row after it, then pages that double back up to
+#: PAGE_ROWS (1, 2, 4, ... 8,192: 14), and the rest.
+WIDE_ROW_BUDGET = 20
+
+
+@pytest.mark.parametrize("path", ["sql", "table"])
+def test_one_wide_row_then_narrow_rows_all_come_back_in_a_few_requests(path):
+    """At the real caps: row 0 holds 60,000 elements (more than PAGE_CELLS,
+    under READ_CELLS), then 20,000 rows of one. Pages are sized from the LAST
+    page's widest row, so the pull asks for one row after the wide one and
+    grows back by PAGE_GROWTH: the default max_rows (10,000) all come back,
+    in order, cut by max_rows, within WIDE_ROW_BUDGET row pages."""
+    lengths = [60_000] + [1] * 20_000
+    if path == "sql":
+        google = _query_google(lengths)
+        envelopes = _pull(google, {"sql": SQL})
+    else:
+        google = _table_google(lengths)
+        envelopes = _pull(google, {"table": "sales.o"})
+    assert _ids(envelopes) == list(range(10_000))
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_rows"}
+    if path == "table":
+        assert envelopes[-1].metadata["next_start_index"] == 10_000
+    asked = _asked(google)
+    assert len(asked) <= WIDE_ROW_BUDGET, asked
+    # It grew back: the last pages are far past one row.
+    assert max(asked[-3:]) >= 1_000
+
+
+def test_a_wide_row_midway_costs_a_few_requests_not_the_rest_of_the_pull():
+    """max_rows 100,000; a 30,000-element row at row 5,000 of 100,000 rows of
+    one element: every row comes back."""
+    lengths = [1] * 100_000
+    lengths[5_000] = 30_000
+    google = _query_google(lengths)
+    envelopes = _pull(google, {"sql": SQL, "max_rows": 100_000})
+    ids = _ids(envelopes)
+    assert ids == list(range(100_000))
+    assert "truncated" not in envelopes[-1].metadata
+    assert len(_asked(google)) <= 2 * WIDE_ROW_BUDGET, _asked(google)
+
+
+@pytest.mark.parametrize("path", ["sql", "table"])
+def test_a_pull_stopped_by_max_pages_says_max_pages(path, monkeypatch):
+    """MAX_PAGES pages read, rows left: truncated is max_pages (not
+    max_rows), no page past MAX_PAGES is asked for, and a table pull's
+    next_start_index continues after the last row read."""
+    monkeypatch.setattr(query, "MAX_PAGES", 3)
+    monkeypatch.setattr(query, "PAGE_ROWS", 10)
+    lengths = [1] * 100
+    if path == "sql":
+        google = _query_google(lengths)
+        envelopes = _pull(google, {"sql": SQL})
+    else:
+        google = _table_google(lengths)
+        envelopes = _pull(google, {"table": "sales.o"})
+    assert _ids(envelopes) == list(range(30))
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_pages"}
+    assert len(_asked(google)) == 3
+    if path == "table":
+        assert envelopes[-1].metadata["next_start_index"] == 30
+
+
+def test_page_rows_sizes_from_the_last_page_and_grows_back():
+    fields = [field_("orders", "INT64", "REPEATED")]
+    # The last page's widest row held 60,000 cells: one row.
+    assert (
+        query.page_rows(fields, 10_000, last_cells=60_000, last_rows=1, last_bytes=9)
+        == 1
+    )
+    # Then a page of one 1-cell row: twice that (PAGE_GROWTH), not one again.
+    assert query.page_rows(fields, 10_000, last_cells=1, last_rows=1, last_bytes=9) == 2
+    assert query.page_rows(
+        fields, 10_000, last_cells=1, last_rows=4_096, last_bytes=9
+    ) == (8_192)

@@ -49,9 +49,10 @@ plus ``batch_index``, ``batch_count``, ``first_row``, ``row_count``,
 ``job_id`` and ``total_bytes_processed``. A result with no rows is one
 envelope with no rows, so its markers still come out.
 
-A result cut short by ``max_rows`` or ``max_result_bytes`` says so on every
-envelope: ``truncated`` (``max_rows`` or ``max_result_bytes``), and for a
-table ``next_start_index``. Its ``result_sha256`` covers the rows read only.
+A result cut short by ``max_rows``, ``max_result_bytes`` or the page limit
+(5,000 pages) says so on every envelope: ``truncated`` (``max_rows``,
+``max_result_bytes`` or ``max_pages``), and for a table
+``next_start_index``. Its ``result_sha256`` covers the rows read only.
 
 A param naming a credential key is refused, and so is SQL that is not one
 SELECT. Logs carry no SQL, no table names and no row values.
@@ -269,7 +270,9 @@ class BigQueryQuerySource(SourceConnector):
         "truncated": MetaField(
             type=str,
             required=False,
-            description="When a cap cut the result: max_rows or max_result_bytes",
+            description=(
+                "When a cap cut the result: max_rows, max_result_bytes or max_pages"
+            ),
         ),
         "next_start_index": MetaField(
             type=int,
