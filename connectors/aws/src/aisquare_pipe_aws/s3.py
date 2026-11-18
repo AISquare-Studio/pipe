@@ -167,12 +167,18 @@ def _read(body: Any, amount: int) -> bytes:
     outside :func:`~aisquare_pipe_aws.credentials.call`, so a read that fails
     there (a timeout, a dropped connection, a short body) is mapped here the
     same way: an :class:`AwsAccessError` naming the error's type only (its
-    text names the bucket and key)."""
+    text names the bucket and key).
+
+    botocore's ``StreamingBody`` maps only urllib3's read timeout and protocol
+    errors to its own; the rest of urllib3's (an ``SSLError`` for a TLS record
+    that fails mid-body, a ``DecodeError``) and a bare ``OSError`` come
+    through as they are, so they are caught here too, as GCS's stream does."""
     from botocore.exceptions import BotoCoreError
+    from urllib3.exceptions import HTTPError as Urllib3Error
 
     try:
         return bytes(body.read(amount))
-    except BotoCoreError as e:
+    except (BotoCoreError, Urllib3Error, OSError) as e:
         raise AwsAccessError(
             f"AWS s3:GetObject failed while reading the object ({type(e).__name__})",
             code="upstream_error",

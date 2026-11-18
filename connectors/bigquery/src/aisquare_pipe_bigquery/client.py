@@ -176,6 +176,8 @@ class BigQueryClient:
         self._token_from_cache = False
         #: Every token this client sent: redacted from any error text.
         self._sent_tokens: set[str] = set()
+        #: The bytes of the last JSON body read (a row page is sized from them).
+        self.last_body_bytes = 0
 
     def __enter__(self) -> Self:
         return self
@@ -459,6 +461,8 @@ class BigQueryClient:
         body: Any = None,
     ) -> dict[str, Any]:
         resp = self._call(method, url, params, body)
+        content = getattr(resp, "content", None)
+        self.last_body_bytes = len(content) if isinstance(content, bytes) else 0
         try:
             try:
                 data = resp.json()

@@ -7,6 +7,7 @@ Never a bare PipeError or Exception (500), and never AWS's message text (the
 from __future__ import annotations
 
 import io
+import ssl
 from typing import Any
 
 import boto3
@@ -22,6 +23,7 @@ from botocore.exceptions import (
 )
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
+from urllib3.response import HTTPResponse
 
 from aisquare_pipe_aws import agentcore, connector, s3
 from aisquare_pipe_aws.connector import (
@@ -299,6 +301,28 @@ class _BrokenRaw:
         pass
 
 
+class _BadRecordSocket(io.RawIOBase):
+    """A socket file whose next read is a TLS record that fails its MAC."""
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, _: Any) -> int:
+        raise ssl.SSLError(1, _BAD_MAC)
+
+
+_BAD_MAC = (
+    "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"
+)
+
+
+def _tls_failing_body() -> HTTPResponse:
+    """What botocore streams from: urllib3's response, not yet read. urllib3
+    turns the ``ssl.SSLError`` into its own ``SSLError``, which botocore's
+    ``StreamingBody`` passes through (#46 reopen seq 13987, FAIL 1)."""
+    return HTTPResponse(body=_BadRecordSocket(), preload_content=False)
+
+
 _KEY_URL = f"https://{BUCKET}.s3.amazonaws.com/rulebooks/{LEAK}.pdf"
 
 
@@ -313,16 +337,21 @@ _KEY_URL = f"https://{BUCKET}.s3.amazonaws.com/rulebooks/{LEAK}.pdf"
             ResponseStreamingError(error=OSError(_KEY_URL)), id="ResponseStreamingError"
         ),
         pytest.param(None, id="IncompleteReadError"),
+        pytest.param(_tls_failing_body, id="urllib3-SSLError"),
+        pytest.param(ConnectionResetError(_KEY_URL), id="OSError"),
     ],
 )
 def test_a_body_read_that_fails_is_a_502_without_the_key(stubbed, error):
     """GetObject answered, then reading its body failed (#46 reopen seq 13961,
-    FAIL 1): botocore's error names the bucket and key, and it was a 500."""
+    FAIL 1): botocore's error names the bucket and key, and it was a 500. The
+    same for urllib3's own errors and a bare ``OSError``, which botocore does
+    not wrap (#46 reopen seq 13987, FAIL 1)."""
     listed = {
         "Contents": [{"Key": f"rulebooks/{LEAK}.pdf", "Size": 10, "ETag": '"e"'}],
         "IsTruncated": False,
     }
-    body = StreamingBody(_BrokenRaw(error), 10)
+    raw = error() if callable(error) else _BrokenRaw(error)
+    body = StreamingBody(raw, 10)
     stubbed["s3"] += [
         ("list_objects_v2", listed),
         ("get_object", {"Body": body, "ContentLength": 10, "ETag": '"e"'}),
@@ -334,4 +363,5 @@ def test_a_body_read_that_fails_is_a_502_without_the_key(stubbed, error):
     assert host_answer(e).status == 502
     assert "s3:GetObject" in str(e)
     assert LEAK not in str(e)
+    assert "DECRYPTION_FAILED" not in str(e)
     assert e.__cause__ is None and e.__suppress_context__

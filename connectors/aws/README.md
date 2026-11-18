@@ -134,8 +134,9 @@ type, so the AWS error classes themselves would be a 500):
 
 The message is the table's: the operation and AWS's error code. An S3 object that grew past `max_object_bytes`
 between the listing and the read is skipped, as one the listing already shows too large is. An object body that
-breaks off while it is read (a read timeout, a dropped connection, a body shorter than its `Content-Length`) is a
-502 naming only the error's type: botocore's own message names the bucket and key.
+breaks off while it is read (a read timeout, a dropped connection, a TLS record that fails mid-body, a body shorter
+than its `Content-Length`) is a 502 naming only the error's type: botocore's own message names the bucket and key,
+and urllib3's errors, which botocore passes through as they are, carry the TLS library's text.
 
 ## Customer setup (registration checklist)
 

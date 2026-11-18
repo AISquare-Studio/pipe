@@ -56,13 +56,28 @@ PAGE_ROWS = 10_000
 PAGE_CELLS = 50_000
 #: Rows per page while the schema is unknown (a dry run that gave none).
 UNKNOWN_SCHEMA_PAGE_ROWS = 1_000
-#: What a ``REPEATED`` column is first guessed to hold (its elements, each a
-#: cell): until a page has come back, a schema can't say how long its
-#: arrays are. After that, each next page is sized from the most cells a
-#: row has held so far (:func:`page_rows`'s ``seen``).
+#: What a ``REPEATED`` column is guessed to hold (its elements, each a cell):
+#: a schema can't say how long its arrays are. The guess is a floor for
+#: every page, not just the first: rows that held fewer elements so far say
+#: nothing about the next ones (a column added later leaves older rows
+#: ``[]``; an ``ORDER BY`` array length puts the long ones last), so they
+#: can't make a page longer. Rows that held more make it shorter
+#: (:func:`page_rows`'s ``seen``).
 REPEATED_CELLS = 1_000
-#: Pages followed at most for one result, whatever the page token says.
-MAX_PAGES = 1000
+#: JSON bytes a page is sized to hold at most once one has come back: the next
+#: page asks for the rows that fit at the last page's bytes a row. A cell's
+#: cost is about 250 bytes of objects plus its text, so long values are
+#: bounded by bytes as short ones are by :data:`PAGE_CELLS`. BigQuery's own
+#: page limit is about 10 MB (tabledata.list) and 20 MB (jobs.getQueryResults).
+PAGE_BYTES = 4 * 1024 * 1024
+#: A next page asks for at most this many times the rows the last page held,
+#: so a page that came back short (by its bytes, or BigQuery's page limit)
+#: grows back a step at a time.
+PAGE_GROWTH = 2
+#: Pages followed at most for one result, whatever the page token says. At
+#: the floor, rows with two ``REPEATED`` columns page 24 at a time, so the
+#: source's 100,000-row cap takes about 4,200 pages.
+MAX_PAGES = 5_000
 #: Table types tabledata.list reads. Views, materialized views and external
 #: tables are read with a query.
 READABLE_TABLE_TYPES = frozenset({"TABLE", "SNAPSHOT"})
@@ -106,20 +121,39 @@ def cells_per_row(fields: list[dict[str, Any]]) -> int:
 
 
 def page_rows(
-    fields: list[dict[str, Any]] | None, wanted: int, *, seen: int = 0
+    fields: list[dict[str, Any]] | None,
+    wanted: int,
+    *,
+    seen: int = 0,
+    last_rows: int = 0,
+    last_bytes: int = 0,
 ) -> int:
     """Rows to ask for in one page: at most ``wanted``, :data:`PAGE_ROWS`
-    and :data:`PAGE_CELLS` cells. A row's cells are ``seen``, the most any
-    row of an earlier page held, once a page has come back; before that,
-    the schema's guess (:func:`cells_per_row`), or
-    :data:`UNKNOWN_SCHEMA_PAGE_ROWS` rows without a schema."""
-    if seen > 0:
-        by_cells = PAGE_CELLS // seen
-    elif fields:
-        by_cells = PAGE_CELLS // cells_per_row(fields)
-    else:
-        by_cells = UNKNOWN_SCHEMA_PAGE_ROWS
-    return max(1, min(PAGE_ROWS, by_cells, wanted))
+    and :data:`PAGE_CELLS` cells.
+
+    A row's cells are the schema's guess (:func:`cells_per_row`, which counts
+    a ``REPEATED`` column as :data:`REPEATED_CELLS` elements), or ``seen``
+    (the most any row of an earlier page held) when that is more: the guess
+    is a floor. Without a schema, ``seen``, else
+    :data:`UNKNOWN_SCHEMA_PAGE_ROWS` rows.
+
+    Once a page has come back (``last_rows`` rows in ``last_bytes`` bytes of
+    JSON), also at most the rows that fit :data:`PAGE_BYTES` at its bytes a
+    row, and :data:`PAGE_GROWTH` times its rows."""
+    per_row = max(seen, cells_per_row(fields) if fields else 0)
+    by_cells = PAGE_CELLS // per_row if per_row > 0 else UNKNOWN_SCHEMA_PAGE_ROWS
+    size = min(PAGE_ROWS, by_cells, wanted)
+    if last_rows > 0 and last_bytes > 0:
+        size = min(size, PAGE_GROWTH * last_rows, PAGE_BYTES * last_rows // last_bytes)
+    return max(1, size)
+
+
+def _page_shape(answer: dict[str, Any], client: BigQueryClient) -> tuple[int, int, int]:
+    """(most cells a row held, rows, bytes of JSON) of the page ``answer``,
+    the client's last response."""
+    rows = answer.get("rows")
+    count = len(rows) if isinstance(rows, list) else 0
+    return most_cells(rows), count, client.last_body_bytes
 
 
 @dataclass
@@ -338,7 +372,8 @@ def run_select(
     _plan(result, batching)
     seen = 0
     for _ in range(MAX_PAGES):
-        seen = max(seen, most_cells(answer.get("rows")))
+        most, last_rows, last_bytes = _page_shape(answer, client)
+        seen = max(seen, most)
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(result.fields, answer.get("rows"))
@@ -354,7 +389,13 @@ def run_select(
         del page
         answer = client.query_results(
             job,
-            page_size=page_rows(result.fields, max_rows - result.count, seen=seen),
+            page_size=page_rows(
+                result.fields,
+                max_rows - result.count,
+                seen=seen,
+                last_rows=last_rows,
+                last_bytes=last_bytes,
+            ),
             page_token=token,
         )
     result.truncated = result.truncated or TRUNCATED_MAX_ROWS
@@ -407,11 +448,17 @@ def read_table_rows(
     )
     _plan(result, batching)
     token: str | None = None
-    seen = 0
+    seen = last_rows = last_bytes = 0
     for page_number in range(MAX_PAGES):
         answer = client.list_rows(
             ref,
-            page_size=page_rows(fields, max_rows - result.count, seen=seen),
+            page_size=page_rows(
+                fields,
+                max_rows - result.count,
+                seen=seen,
+                last_rows=last_rows,
+                last_bytes=last_bytes,
+            ),
             page_token=token,
             start_index=start_index if page_number == 0 else None,
             selected_fields=[f["name"] for f in fields] if selected_fields else None,
@@ -419,7 +466,8 @@ def read_table_rows(
         total = _int(answer.get("totalRows"))
         if total is not None:
             result.total_rows = total
-        seen = max(seen, most_cells(answer.get("rows")))
+        most, last_rows, last_bytes = _page_shape(answer, client)
+        seen = max(seen, most)
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(fields, answer.get("rows"))
@@ -441,7 +489,9 @@ def read_table_rows(
 
 
 __all__ = [
+    "PAGE_BYTES",
     "PAGE_CELLS",
+    "PAGE_GROWTH",
     "PAGE_ROWS",
     "READABLE_TABLE_TYPES",
     "TRUNCATED_MAX_RESULT_BYTES",
