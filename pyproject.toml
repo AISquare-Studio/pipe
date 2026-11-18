@@ -61,9 +61,13 @@ dev = [
 # ListPolicyEngines / ListPolicies / GetPolicy) is in botocore's model from
 # 1.42.60 (GA), but a policy's enforcementMode only from 1.43.32: botocore
 # drops response members its model lacks, so an older one silently loses it.
+# sqlglot: Amazon Redshift (aisquare_pipe_aws.redshift) parses SQL so only one
+# SELECT is ever sent; >=26.25,<28 is the one specifier every extra naming
+# sqlglot shares (BigQuery #37, Databricks #34).
 aws = [
     "boto3>=1.43.32,<2",
     "botocore>=1.43.32,<2",
+    "sqlglot>=26.25,<28",
 ]
 # BigQuery: google-auth signs the service account key into tokens (explicit
 # credentials only, never Application Default Credentials); sqlglot parses
@@ -111,6 +115,11 @@ n8n = []
 onedrive = [
     "azure-identity>=1.27.0",
 ]
+# Amazon Redshift ships in the AWS connector (aisquare_pipe_aws.redshift: it
+# assumes the role through aisquare_pipe_aws.credentials, and one connector
+# never imports another), so its deps are [aws]'s. This name is the install
+# line its README gives.
+redshift = ["aisquare-pipe[aws]"]
 salesforce = [
     "simple-salesforce>=1.12",
 ]
@@ -118,7 +127,7 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,aws,bigquery,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,aws,bigquery,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,redshift,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
@@ -132,6 +141,7 @@ mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
 mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
 bedrock-agentcore-policies-source = "aisquare_pipe_aws.connector:BedrockAgentCorePoliciesSource"
 s3-source = "aisquare_pipe_aws.connector:S3Source"
+redshift-query-source = "aisquare_pipe_aws.redshift.connector:RedshiftQuerySource"
 bigquery-query-source = "aisquare_pipe_bigquery.connector:BigQueryQuerySource"
 composio-source = "aisquare_pipe_composio.connector:ComposioSource"
 composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
@@ -164,6 +174,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
 bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
 s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
+redshift = "aisquare_pipe_aws.redshift.toolkit:RedshiftToolkit"
 bigquery = "aisquare_pipe_bigquery.toolkit:BigQueryToolkit"
 gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
