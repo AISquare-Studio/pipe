@@ -133,7 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SNOWFLAKE_SHOW_SCHEMAS`, `SNOWFLAKE_SHOW_DATABASES`) and the source `snowflake-query-source`, over
   Snowflake's SQL API (`/api/v2/statements`, HTTPS + JSON via `requests`; no
   `snowflake-connector-python`). It replaces Composio's `snowflake` stop-gap under the same toolkit
-  name, keeping Composio's SHOW slugs and argument names.
+  name, keeping Composio's SHOW slugs and argument names (`in_scope` included).
   - Credential blob `{account, user, auth: keypair|oauth_client, private_key_pem (+passphrase) |
     client_id + client_secret + token_url (+scope), role, warehouse, database?, schema?}`. Key-pair
     JWT (RS256, signed with `cryptography>=42,<60`) is the default; `oauth_client` is a client
@@ -143,16 +143,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `https://<account>.snowflakecomputing.com`.
     Ambient `SNOWFLAKE_*` settings and `connections.toml` are never read; a missing or malformed
     blob fails closed ("Snowflake is not configured", no request).
-  - SQL is SELECT-only, refused before any request otherwise: a lexer (strings, quoted identifiers
-    and comments blanked, with and without backslash escapes; a `--`/`//` comment ends at a CR or an
-    LF, one ended by a bare CR is refused, and so is a `/*` inside a `/* */` comment) and a sqlglot
-    parse (`sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and CI runs this
-    suite at that floor too, `scripts/dep_floor.py`; Snowflake dialect) must both find ONE
-    `SELECT`/`WITH` with no write, DDL, session or scripting
-    keyword or node, no `$`, `@` or `->>`, and no table function but FLATTEN, SPLIT_TO_TABLE,
-    STRTOK_SPLIT_TO_TABLE or GENERATOR (a stored procedure can be called as one). Every statement is
-    sent with `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and
-    warehouse, which no tool argument or pull param can change.
+  - SQL is SELECT-only, refused before any request otherwise. Two checks must both find ONE
+    `SELECT`/`WITH`:
+    - A lexer blanks strings, quoted identifiers and comments. It reads backslashes as Snowflake
+      does (an escape in `'...'` only), and the three other ways must blank exactly the same
+      spans. A `--`/`//` comment ends at a CR or an LF, one ended by a bare CR is refused, and so
+      is a `/*` inside a `/* */` comment.
+    - A sqlglot parse: `sqlglot>=26.25,<28`, the same specifier as every extra naming sqlglot, and
+      CI runs this suite at that floor too (`scripts/dep_floor.py`); Snowflake dialect, tokens and
+      tree.
+
+    The lexer refuses every write, DDL, session or scripting keyword, and the parser every such
+    node. Both refuse `$` (in any name too, quoted or not), `@` stages, `$$` strings, `->` and
+    `->>` (sqlglot reads them as JSON operators), a number that runs into a sign (`1e5-`), a
+    model's methods, `IDENTIFIER(...)` and Cortex AI calls (`SNOWFLAKE.CORTEX.*`, `AI_*`: AI
+    credits no warehouse limit bounds), and a default schema `CORTEX` is refused too. The only
+    table functions allowed are FLATTEN, SPLIT_TO_TABLE, STRTOK_SPLIT_TO_TABLE and GENERATOR,
+    unqualified, in `TABLE(...)`, `LATERAL` or a bare `FROM`: a stored procedure can be called as
+    one. Every statement is sent with
+    `MULTI_STATEMENT_COUNT` 1 and `QUERY_TAG` `aisquare-pipe`, as the blob's role and warehouse,
+    which no tool argument or pull param can change.
   - Caps: `max_rows` (sent as `ROWS_PER_RESULTSET`), a JSON byte cap on the rows returned (4 MiB per
     tool call, at most 64 MiB for the source; partitions are read only while they fit), and the
     statement deadline (the host's budget left, or a lower `timeout`), sent as the statement's
