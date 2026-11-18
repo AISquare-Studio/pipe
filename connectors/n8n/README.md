@@ -1,4 +1,4 @@
-# aisquare-pipe-n8n
+# aisquare-pipe[n8n]
 
 n8n source connector for [aisquare.pipe](../../README.md). Polls n8n's
 Executions API and emits one TraceBatch envelope per execution emission:
@@ -7,9 +7,17 @@ emission once the run finishes.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[n8n]` extra:
+
 ```bash
-cd connectors/n8n
-pip install -e ".[dev]"
+pip install "aisquare-pipe[n8n]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/n8n && pytest tests
 ```
 
 ## Configuration

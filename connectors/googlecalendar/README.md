@@ -1,4 +1,4 @@
-# aisquare-pipe-googlecalendar
+# aisquare-pipe[googlecalendar]
 
 Google Calendar for [aisquare.pipe](../../README.md), over the Calendar v3
 REST API (plain `requests`, no Google SDK). The package ships one thing:
@@ -9,9 +9,17 @@ REST API (plain `requests`, no Google SDK). The package ships one thing:
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[googlecalendar]` extra:
+
 ```bash
-pip install aisquare-pipe-googlecalendar             # or: pip install "aisquare-pipe[full]"
-cd connectors/googlecalendar && pip install -e ".[dev]"   # development
+pip install "aisquare-pipe[googlecalendar]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/googlecalendar && pytest tests
 ```
 
 ## Connecting (OAuth)

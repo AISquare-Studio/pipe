@@ -1,4 +1,4 @@
-# aisquare-pipe-onedrive
+# aisquare-pipe[onedrive]
 
 Microsoft OneDrive for [aisquare.pipe](../../README.md), over the Microsoft Graph API:
 
@@ -7,9 +7,17 @@ Microsoft OneDrive for [aisquare.pipe](../../README.md), over the Microsoft Grap
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[onedrive]` extra:
+
 ```bash
-cd connectors/onedrive
-pip install -e ".[dev]"
+pip install "aisquare-pipe[onedrive]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/onedrive && pytest tests
 ```
 
 ## Toolkit

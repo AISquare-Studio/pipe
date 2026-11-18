@@ -1,18 +1,20 @@
-# aisquare-pipe-dropbox
+# aisquare-pipe[dropbox]
 
 Dropbox source and sink connectors for [aisquare.pipe](../../README.md).
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[dropbox]` extra:
+
 ```bash
-pip install aisquare-pipe-dropbox
+pip install "aisquare-pipe[dropbox]"   # or "aisquare-pipe[full]": every connector
 ```
 
-Or for development (from the repo root):
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-cd connectors/dropbox
-pip install -e ".[dev]"
+pip install -e ".[full,dev]"
+cd connectors/dropbox && pytest tests
 ```
 
 ## Configuration

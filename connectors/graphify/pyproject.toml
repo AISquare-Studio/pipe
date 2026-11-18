@@ -1,32 +1,7 @@
-[build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "aisquare-pipe-graphify"
-version = "0.2.1"
-description = "Graphify knowledge-graph transform for aisquare.pipe (repo checkout -> GRAPH_REPORT.md + graph.json)"
-requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
-authors = [{name = "A-Square"}]
-dependencies = [
-    "aisquare-pipe>=0.1.0",
-    "requests>=2.31",
-    "tiktoken>=0.7",
-]
-
-[project.optional-dependencies]
-engine = ["graphifyy==0.9.106"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
-
-[project.entry-points."aisquare_pipe.connectors"]
-graphify-source = "aisquare_pipe_graphify.connector:GraphifySource"
-
-[project.entry-points."aisquare_pipe.converters"]
-graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# Tool settings only (pytest, ruff) for running this connector's suite from
+# its own directory. This connector isn't a separate package: it ships inside
+# the `aisquare-pipe` distribution, packaged by the root pyproject.toml (its
+# entry points, and its third-party deps as the `[graphify]` extra).
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
