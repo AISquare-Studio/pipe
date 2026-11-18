@@ -7,8 +7,9 @@
    session or side-effect words (``INSERT``, ``UPDATE``, ``DELETE``,
    ``MERGE``, ``CREATE``, ``DROP``, ``ALTER``, ``TRUNCATE``, ``COPY``,
    ``UNLOAD``, ``INTO``, ``GRANT``, ``CALL``, ``SET``, ``PG_TERMINATE_BACKEND``,
-   ...). Where two readers could disagree on where a token ends, it refuses
-   rather than pick one:
+   ...), nor names a side-effect function even in double quotes
+   (``"pg_terminate_backend"(1)``). Where two readers could disagree on where
+   a token ends, it refuses rather than pick one:
 
    - a ``--`` comment ends at a CR or an LF (a bare CR too: Redshift's
      PostgreSQL lexer has ``newline [\\n\\r]``);
@@ -29,8 +30,16 @@
    call of a side-effect function. Text it can't parse is refused.
 
 Either one refusing refuses the statement (:class:`NotReadOnly`, whose
-message says why and never echoes the SQL). Neither ever logs: sqlglot's
-"unsupported syntax" warning, which quotes the SQL, is switched off.
+message says why and never echoes the SQL). Neither logs any of the SQL.
+sqlglot does log pieces of it while it parses: its "unsupported syntax"
+warning (switched off in :class:`_QuietParser`), and "Invalid JSON path
+syntax. ... <the path>" at WARNING for a JSON path it can't read (a key with
+a dash, a space or an open bracket, in ``JSON_EXTRACT``,
+``JSON_EXTRACT_SCALAR`` or ``JSONB_EXISTS``), for statements this guard
+admits. So while this module parses, a filter on the "sqlglot" logger (every
+sqlglot module logs through that one logger) drops its records, in this
+context only: they reach no handler, and not Python's ``lastResort`` either.
+Nothing is disabled globally, and sqlglot logs as usual everywhere else.
 
 Behind these, Redshift itself: the database user the blob names should hold
 only ``USAGE`` and ``SELECT`` grants (see the README), so a write that got
@@ -39,7 +48,11 @@ past both checks would still be refused by the database.
 
 from __future__ import annotations
 
+import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 from sqlglot import exp
@@ -179,6 +192,39 @@ class _QuietParser(Redshift.Parser):
 
 _DIALECT = Redshift()
 
+# sqlglot logs pieces of the SQL it parses ("Invalid JSON path syntax. ...
+# <the path>" at WARNING, for statements this guard admits). Every sqlglot
+# module logs through the one "sqlglot" logger, and a logger's filter runs
+# before any handler, Python's lastResort included. This filter drops its
+# records while THIS module parses, in this context only (a ContextVar: another
+# thread or task logging through sqlglot meanwhile is untouched). Nothing is
+# disabled globally.
+_SQLGLOT_LOGGER = logging.getLogger("sqlglot")
+_PARSING: ContextVar[bool] = ContextVar(
+    "aisquare_pipe_aws_redshift_sqlguard_parsing", default=False
+)
+
+
+class _DropWhileParsing(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _PARSING.get()
+
+
+_QUIET_WHILE_PARSING = _DropWhileParsing()
+
+
+@contextmanager
+def _sqlglot_silenced() -> Iterator[None]:
+    # Re-attached on every parse: a host that resets the logger's filters
+    # doesn't bring the leak back.
+    if _QUIET_WHILE_PARSING not in _SQLGLOT_LOGGER.filters:
+        _SQLGLOT_LOGGER.addFilter(_QUIET_WHILE_PARSING)
+    token = _PARSING.set(True)
+    try:
+        yield
+    finally:
+        _PARSING.reset(token)
+
 
 def check_select_only(sql: str) -> str:
     """The statement to send, if ``sql`` is ONE read-only query (both checks
@@ -218,8 +264,9 @@ class _Unreadable(Exception):
 
 
 def _lex(sql: str) -> _Lexed:
+    quoted_names: list[str] = []
     try:
-        text, separators = _blank(sql)
+        text, separators = _blank(sql, quoted_names=quoted_names)
     except _Unreadable as unreadable:
         return _Lexed(sql, str(unreadable))
     statement = sql
@@ -243,6 +290,11 @@ def _lex(sql: str) -> _Lexed:
             f"it names {written[0]} (quote a column or table with that name in double "
             "quotes)",
         )
+    # A "..." name the word check can't see: "pg_terminate_backend"(1) and
+    # pg_catalog."pg_terminate_backend"(1) end a session as surely.
+    called = sorted({n.upper() for n in quoted_names} & _SIDE_EFFECT_FUNCTIONS)
+    if called:
+        return _Lexed(statement, f"it names {called[0]}")
     return _Lexed(statement, None)
 
 
@@ -273,10 +325,11 @@ def _quoted_end(sql: str, start: int, *, backslash_escapes: bool) -> int:
     raise _Unreadable("it has an unterminated string or quoted identifier")
 
 
-def _blank(sql: str) -> tuple[str, list[int]]:
+def _blank(sql: str, *, quoted_names: list[str] | None = None) -> tuple[str, list[int]]:
     """``sql`` with quoted text and comments replaced by spaces (same
     length, so positions line up), and the positions of the ``;`` outside
-    them. :class:`_Unreadable` when a quote or block comment never closes,
+    them. Each ``"..."`` identifier's name (``""`` read as ``"``) is appended
+    to ``quoted_names``. :class:`_Unreadable` when a quote or block comment never closes,
     a quoted token's end depends on how backslashes are read, a block
     comment holds a ``/*``, or a ``$``, a backslash or a control character
     is outside quotes."""
@@ -302,6 +355,8 @@ def _blank(sql: str) -> tuple[str, list[int]]:
                     "a backslash in a string or quoted identifier makes where it ends "
                     "depend on the reader (double a quote to escape it)"
                 )
+            if ch == '"' and quoted_names is not None:
+                quoted_names.append(sql[i + 1 : plain - 1].replace('""', '"'))
             blank(i, plain)
             i = plain
         elif sql.startswith("--", i):
@@ -340,10 +395,12 @@ def _blank(sql: str) -> tuple[str, list[int]]:
 
 
 def _parse(sql: str) -> list[exp.Expression]:
-    """Every statement in ``sql`` (sqlglot, Redshift dialect, silently)."""
-    tokens = _DIALECT.tokenize(sql)
-    parser = _QuietParser(dialect=_DIALECT)
-    return [s for s in parser.parse(tokens, sql) if s is not None]
+    """Every statement in ``sql`` (sqlglot, Redshift dialect, silently:
+    nothing sqlglot logs while it parses gets out)."""
+    with _sqlglot_silenced():
+        tokens = _DIALECT.tokenize(sql)
+        parser = _QuietParser(dialect=_DIALECT)
+        return [s for s in parser.parse(tokens, sql) if s is not None]
 
 
 def _function_name(node: exp.Expression) -> str:

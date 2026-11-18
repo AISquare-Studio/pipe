@@ -450,8 +450,9 @@ refuse anything else before any AWS call (not even `sts:AssumeRole`), with
    of `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `COPY`,
    `UNLOAD`, `INTO` (`SELECT ... INTO` makes a table), `GRANT`, `REVOKE`, `CALL`, `EXECUTE`,
    `PREPARE`, `SET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `LOCK`, `VACUUM`, `ANALYZE`, `FETCH`,
-   `PG_TERMINATE_BACKEND`, `PG_CANCEL_BACKEND`, `SET_CONFIG`, ... Where two readers could
-   split the text differently, it refuses rather than guess (the lessons of the BigQuery
+   `PG_TERMINATE_BACKEND`, `PG_CANCEL_BACKEND`, `SET_CONFIG`, ..., and names none of those
+   three functions in double quotes either (`"pg_terminate_backend"(1)`). Where two readers
+   could split the text differently, it refuses rather than guess (the lessons of the BigQuery
    guard, seq 13647):
    - a `--` comment ends at a CR or an LF, a bare CR too, as in PostgreSQL's lexer;
    - a `/*` inside a `/* */` comment is refused: PostgreSQL and sqlglot nest comments, a
@@ -466,6 +467,14 @@ refuse anything else before any AWS call (not even `sts:AssumeRole`), with
    (`SELECT ... INTO`, `FOR UPDATE` and unparsed commands included) and no call of the
    functions above.
 
+Neither check logs the SQL, and nothing sqlglot logs while the guard parses gets out. sqlglot
+does log pieces of it: "Invalid JSON path syntax. ... <the path>" at WARNING for a JSON path
+it can't read (a key with a dash, a space or an open bracket in `JSON_EXTRACT`,
+`JSON_EXTRACT_SCALAR` or `JSONB_EXISTS`, in queries the guard admits), and its "unsupported
+syntax" warning. While the guard parses, a filter on the `sqlglot` logger drops those records
+in that thread or task only, so no handler sees them, Python's last-resort stderr handler
+included. Nothing is disabled globally, and sqlglot logs as usual everywhere else.
+
 A column named like a keyword is written in double quotes (`"comment"`, `"update"`).
 Redshift adds its own layer behind these: the Data API runs a single statement only, and the
 database user should hold `SELECT` and nothing else (the checklist below).
@@ -475,9 +484,20 @@ database user should hold `SELECT` and nothing else (the checklist below).
 - A tool call fits the host's time budget (`config["timeout_seconds"]`), or 60 s without one.
   The source's deadline is `timeout_seconds` (default 120, at most 600, never above the host's
   budget).
-- Polling backs off from 50 ms to 1 s and stops at the deadline. The statement is then
-  cancelled (`CancelStatement`) and the call fails with `timeout`. Each request's connect and
-  read timeouts fit inside what is left, and botocore tries a request at most twice.
+- Each Data API request goes out on a client whose connect timeout plus read timeout fits
+  inside what is left of the deadline at that moment: 5 s + 20 s at most, shorter as the deadline
+  nears. The read timeout bounds each wait for data. A new client is built (no AWS call) when
+  the current one's timeouts no longer fit. It gets half of what is left, so a call builds a
+  handful. Fewer than 0.2 s left: no request is sent, and the call fails with `timeout`.
+- botocore never retries, because a retry would have to fit too. A throttled or dropped request
+  fails the call with its code (`rate_limited`, `upstream_error`).
+- While the statement runs, a fifth of the deadline (at least 0.2 s, at most 3 s) is kept back
+  for `CancelStatement`. Polling backs off from 50 ms to 1 s and stops where that slice starts,
+  or when a request times out. The statement is cancelled in that slice, and the call fails with
+  `timeout`, saying whether the cancel was accepted. A poll that AWS refuses cancels it too. An
+  `ExecuteStatement` that times out leaves no statement id to cancel.
+- The deadline covers the Data API requests. The AssumeRole before them is the shared helper's,
+  on botocore's own timeouts, and the time it takes counts against the deadline.
 - Paging `GetStatementResult` stops at `max_rows`, at the byte cap or at the deadline.
 
 ### `redshift-query-source`
@@ -505,7 +525,11 @@ Each envelope is one batch: `data` is `{"columns": [...], "rows": [{...}]}`
 - `truncated` (`max_rows` or `max_result_bytes`) on every envelope of a pull cut short; its
   `result_sha256` then covers the rows read only.
 
-A result with no rows is one envelope with no rows. Logs carry no SQL, names or values.
+A result with no rows is one envelope with no rows. The connector's own logs carry no SQL,
+names or values at any level, and nothing sqlglot logs while the guard parses gets out (see
+[SELECT only](#select-only)). botocore's own DEBUG log of each request ("Making request for ...
+with params") does hold the request body, SQL included. It is off unless the host sets the
+`botocore` logger to DEBUG, which a host handling health data should not do.
 
 Values: `isNull` → `null`, booleans, integers (`longValue`), floats (`NaN` and the infinities
 as strings), `NUMERIC`/`DECIMAL`, dates and timestamps as the strings Redshift sends, bytes as

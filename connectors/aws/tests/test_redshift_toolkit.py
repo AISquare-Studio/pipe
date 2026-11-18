@@ -37,6 +37,40 @@ def run(slug: str, args: dict[str, Any], config: dict[str, Any] | None = None) -
     return RedshiftToolkit().call_tool(slug, args, blob() if config is None else config)
 
 
+@pytest.fixture
+def every_record(caplog):
+    """Every log record at DEBUG and up: root (caplog) and a handler on the
+    "sqlglot" logger itself."""
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sqlglot_logger = logging.getLogger("sqlglot")
+    keep = Keep(level=logging.DEBUG)
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlglot")
+    sqlglot_logger.addHandler(keep)
+    try:
+        yield records
+    finally:
+        sqlglot_logger.removeHandler(keep)
+
+
+#: Admitted, and sqlglot logs its path while parsing it (seq 13800).
+JSON_PATH_SQL = (
+    "SELECT JSON_EXTRACT(payload, 'member.ssn-123-45-6789') AS v FROM claims"
+)
+
+
+def _no_record_carries_the_path(caplog, records) -> None:
+    assert [r.getMessage() for r in records] == []
+    for record in caplog.records:
+        assert not record.name.startswith("sqlglot"), record.getMessage()
+        assert "ssn-123-45-6789" not in record.getMessage(), record.name
+
+
 # -- REDSHIFT_RUN_SELECT -------------------------------------------------------------
 
 
@@ -198,6 +232,18 @@ def test_an_aborted_statement(data_api):
     assert "aborted in Redshift" in result.error
 
 
+def test_a_json_path_query_runs_and_nothing_logs_its_path(
+    data_api, caplog, every_record
+):
+    fakes.finished_query(data_api, JSON_PATH_SQL, [[fakes.record(1)]])
+    result = run("REDSHIFT_RUN_SELECT", {"sql": JSON_PATH_SQL})
+    assert result.successful, result.error
+    assert data_api.operations()[0] == "ExecuteStatement"
+    assert data_api.calls[0][1]["Sql"] == JSON_PATH_SQL
+    data_api.assert_drained()
+    _no_record_carries_the_path(caplog, every_record)
+
+
 # -- the deadline ---------------------------------------------------------------------
 
 
@@ -209,16 +255,18 @@ def test_polling_stops_at_the_hosts_budget_and_cancels(data_api, clock):
     started = clock.now
     result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 3})
     assert result.error_code == ERROR_TIMEOUT
-    assert "within 3 s" in result.error and "cancelled" in result.error
+    assert result.error.endswith("within 3 s; the statement was cancelled")
     assert data_api.operations()[-1] == "CancelStatement"
+    data_api.assert_drained()  # the cancel got its own response
     assert clock.now - started <= 3.0 + 1e-9
-    # No DescribeStatement goes out once the deadline has passed.
+    # Polling stops where the cancel's slice of the deadline starts.
+    reserve = dataapi.Deadline(3).cancel_reserve()
     polls = [
         t
-        for (op, _), t in zip(data_api.calls, data_api.times)
+        for (op, _), t in zip(data_api.calls, data_api.times, strict=True)
         if op == "DescribeStatement"
     ]
-    assert polls and max(polls) < started + 3.0
+    assert polls and max(polls) <= started + 3.0 - reserve - dataapi.MIN_REQUEST_SECONDS
     assert max(clock.slept) <= dataapi.POLL_MAX
     assert "GetStatementResult" not in data_api.operations()
 
@@ -231,7 +279,11 @@ def test_without_a_budget_the_deadline_is_the_default(data_api, clock):
     started = clock.now
     result = run("REDSHIFT_RUN_SELECT", {"sql": SQL})
     assert result.error_code == ERROR_TIMEOUT
-    assert DEFAULT_TIMEOUT_SECONDS - 1 < clock.now - started <= DEFAULT_TIMEOUT_SECONDS
+    assert f"within {DEFAULT_TIMEOUT_SECONDS:g} s" in result.error
+    reserve = dataapi.Deadline(DEFAULT_TIMEOUT_SECONDS).cancel_reserve()
+    assert reserve == dataapi.CANCEL_RESERVE_MAX
+    last_poll = DEFAULT_TIMEOUT_SECONDS - reserve - dataapi.MIN_REQUEST_SECONDS
+    assert last_poll - dataapi.POLL_MAX < clock.now - started <= last_poll + 1e-9
 
 
 def test_a_cancel_that_fails_still_times_out(data_api):
@@ -241,6 +293,8 @@ def test_a_cancel_that_fails_still_times_out(data_api):
     data_api.error("cancel_statement", "ValidationException")
     result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 2})
     assert result.error_code == ERROR_TIMEOUT
+    assert result.error.endswith("within 2 s; cancelling the statement failed")
+    data_api.assert_drained()
 
 
 def test_paging_stops_at_the_deadline(data_api):
@@ -256,17 +310,192 @@ def test_paging_stops_at_the_deadline(data_api):
         )
     result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 4})
     assert result.error_code == ERROR_TIMEOUT
+    assert "cancel" not in result.error  # it had finished: nothing to cancel
     assert data_api.operations().count("GetStatementResult") < 5
+    assert "CancelStatement" not in data_api.operations()
 
 
-def test_request_timeouts_fit_inside_the_budget(data_api):
+def _assert_every_request_fit(data_api, started: float, seconds: float) -> None:
+    """Each request's connect plus read timeout fit inside what was left of
+    the deadline when it went out: less the cancel's slice for the
+    statement's own requests, all of what was left for the cancel and the
+    result pages. No client retries."""
+    at = started + seconds
+    reserve = dataapi.Deadline(seconds).cancel_reserve()
+    assert data_api.calls
+    for (op, _), sent, timeouts in zip(
+        data_api.calls, data_api.times, data_api.timeouts, strict=True
+    ):
+        kept_back = reserve if op in ("ExecuteStatement", "DescribeStatement") else 0.0
+        assert timeouts <= at - kept_back - sent + 1e-9, (op, sent - started, timeouts)
+    for client, _ in data_api.clients:
+        assert client.meta.config.retries["total_max_attempts"] == 1
+
+
+def test_every_request_fits_inside_what_is_left(data_api, clock):
+    """seq 13800 item 2: with a 60 s budget and a statement that never
+    finishes, the last DescribeStatement went out with 0.45 s left on a
+    client with 5 s + 20 s timeouts, retried once."""
+    fakes.submit(data_api, SQL)
+    for _ in range(200):
+        fakes.describe(data_api, "STARTED")
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 60})
+    assert result.error_code == ERROR_TIMEOUT
+    assert result.error.endswith("the statement was cancelled")
+    data_api.assert_drained()
+    _assert_every_request_fit(data_api, started, 60)
+    # The last poll's client is a short one, not the first 25 s one.
+    polls = [
+        timeouts
+        for (op, _), timeouts in zip(data_api.calls, data_api.timeouts, strict=True)
+        if op == "DescribeStatement"
+    ]
+    assert polls[0] == dataapi.MAX_CONNECT_TIMEOUT + dataapi.MAX_READ_TIMEOUT
+    assert polls[-1] < 1.0
+    # A handful of clients, not one per request.
+    assert len(data_api.clients) <= 12 < len(data_api.calls)
+
+
+def test_every_request_fits_while_paging_slowly(data_api, clock):
+    data_api.latency = 0.7
+    fakes.submit(data_api, SQL)
+    fakes.describe(data_api, "FINISHED", ResultRows=900)
+    for n in range(20):
+        fakes.result(
+            data_api,
+            [fakes.record(n)],
+            token_in=f"page-{n}" if n else None,
+            token_out=f"page-{n + 1}",
+        )
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 10})
+    assert result.error_code == ERROR_TIMEOUT
+    assert clock.now - started <= 10
+    _assert_every_request_fit(data_api, started, 10)
+
+
+def test_a_hung_describe_times_out_inside_the_deadline_and_cancels(data_api, clock):
+    """A DescribeStatement that never answers ends at its own read timeout,
+    inside the deadline, and the statement is cancelled in the time kept
+    back (seq 13800: one hung request could run ~50 s past a 60 s budget)."""
+    data_api.latencies = {"DescribeStatement": 1000.0}
+    fakes.submit(data_api, SQL)
+    fakes.describe(data_api, "STARTED")  # never delivered
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 60})
+    assert result.error_code == ERROR_TIMEOUT
+    assert result.error.endswith("the statement was cancelled")
+    assert data_api.operations() == [
+        "ExecuteStatement",
+        "DescribeStatement",
+        "CancelStatement",
+    ]
+    data_api.assert_drained()
+    assert clock.now - started <= 60
+    _assert_every_request_fit(data_api, started, 60)
+
+
+def test_a_describe_that_crosses_the_deadline_cancels(data_api, clock):
+    """seq 13800 3a: a DescribeStatement answers within its timeouts, but
+    past the last point a poll could go out: the statement is cancelled."""
+    data_api.latencies = {"DescribeStatement": 3.9}
+    fakes.submit(data_api, SQL)
+    fakes.describe(data_api, "STARTED")
+    fakes.describe(data_api, "STARTED")
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 10})
+    assert result.error_code == ERROR_TIMEOUT
+    assert result.error.endswith("the statement was cancelled")
+    assert data_api.operations() == [
+        "ExecuteStatement",
+        "DescribeStatement",
+        "DescribeStatement",
+        "CancelStatement",
+    ]
+    data_api.assert_drained()
+    # The second answer came back after the last poll's start time.
+    reserve = dataapi.Deadline(10).cancel_reserve()
+    assert clock.now - started > 10 - reserve - dataapi.MIN_REQUEST_SECONDS
+    _assert_every_request_fit(data_api, started, 10)
+
+
+def test_an_execute_that_times_out_has_nothing_to_cancel(data_api, clock):
+    data_api.latencies = {"ExecuteStatement": 1000.0}
+    fakes.submit(data_api, SQL)
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 8})
+    assert result.error_code == ERROR_TIMEOUT
+    assert result.error == "REDSHIFT_RUN_SELECT did not finish within 8 s"
+    assert data_api.operations() == ["ExecuteStatement"]
+    assert clock.now - started <= 8
+    _assert_every_request_fit(data_api, started, 8)
+
+
+def test_a_failed_poll_cancels_the_statement(data_api):
+    fakes.submit(data_api, SQL)
+    data_api.error("describe_statement", "ThrottlingException")
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL})
+    assert result.error_code == ERROR_RATE_LIMITED
+    assert data_api.operations() == [
+        "ExecuteStatement",
+        "DescribeStatement",  # no botocore retry
+        "CancelStatement",
+    ]
+    data_api.assert_drained()
+
+
+@pytest.mark.parametrize("seconds", [0.1, 0.3])
+def test_a_budget_too_short_for_any_request_sends_none(data_api, assume_calls, seconds):
+    """seq 13800: max(left, 1.0) gave a 0.3 s budget 1 s timeouts. Now no
+    request goes out that could not fit, the cancel's slice included."""
+    fakes.submit(data_api, SQL)
+    result = run(
+        "REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": seconds}
+    )
+    assert result.error_code == ERROR_TIMEOUT
+    assert data_api.calls == [] and data_api.clients == []
+
+
+def test_a_short_budget_gets_short_timeouts(data_api, clock):
     fakes.finished_query(data_api, SQL, [[fakes.record(1)]])
-    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 4})
+    started = clock.now
+    result = run("REDSHIFT_RUN_SELECT", {"sql": SQL}, {**blob(), "timeout_seconds": 1})
     assert result.successful, result.error
-    ((client, _),) = data_api.clients
-    config = client.meta.config
-    assert config.read_timeout <= 4 and config.connect_timeout <= 4
-    assert config.retries["total_max_attempts"] == 2
+    _assert_every_request_fit(data_api, started, 1)
+    assert max(data_api.timeouts) <= 1 - dataapi.Deadline(1).cancel_reserve()
+
+
+def test_the_cancel_still_goes_out_when_nothing_is_left(data_api, clock):
+    """Should a request overrun (a response trickling in past its read
+    timeout), the cancel still goes out, on a 0.2 s client, rather than
+    being skipped: a running statement holds the customer's cluster."""
+    import boto3
+
+    from aisquare_pipe_aws.redshift.config import RedshiftConfig
+
+    target = RedshiftConfig.from_config(blob()).target
+    deadline = dataapi.Deadline(5)
+    api = dataapi.client(boto3.Session(), target, deadline)
+    data_api.add("cancel_statement", {"Status": True}, {"Id": STATEMENT_ID})
+    clock.now += 6  # past the deadline
+    assert api.cancel(STATEMENT_ID) is True
+    assert data_api.operations() == ["CancelStatement"]
+    assert data_api.timeouts == [pytest.approx(dataapi.MIN_REQUEST_SECONDS)]
+    data_api.assert_drained()
+
+
+def test_the_metadata_tools_fit_inside_the_budget(data_api, clock):
+    data_api.add("list_schemas", {"Schemas": ["policies"]})
+    started = clock.now
+    result = run("REDSHIFT_LIST_SCHEMAS", {}, {**blob(), "timeout_seconds": 4})
+    assert result.successful, result.error
+    _assert_every_request_fit(data_api, started, 4)
+    assert data_api.timeouts == [2.0]  # half of what is left: one 2 s client
 
 
 # -- the metadata tools -----------------------------------------------------------------

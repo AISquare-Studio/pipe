@@ -36,6 +36,54 @@ def body(envelope: Any) -> dict[str, Any]:
     return json.loads(envelope.data)
 
 
+@pytest.fixture
+def every_record(caplog):
+    """Every log record at DEBUG and up: root (caplog) and a handler on the
+    "sqlglot" logger itself."""
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    sqlglot_logger = logging.getLogger("sqlglot")
+    keep = Keep(level=logging.DEBUG)
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlglot")
+    sqlglot_logger.addHandler(keep)
+    try:
+        yield records
+    finally:
+        sqlglot_logger.removeHandler(keep)
+
+
+#: Admitted, and sqlglot logs its path while parsing it (seq 13800).
+JSON_PATH_SQL = (
+    "SELECT JSON_EXTRACT(payload, 'member.ssn-123-45-6789') AS v FROM claims"
+)
+
+
+def _no_record_carries_the_path(caplog, records) -> None:
+    assert [r.getMessage() for r in records] == []
+    for record in caplog.records:
+        assert not record.name.startswith("sqlglot"), record.getMessage()
+        assert "ssn-123-45-6789" not in record.getMessage(), record.name
+
+
+def test_a_json_path_query_pulls_and_nothing_logs_its_path(
+    data_api, caplog, every_record
+):
+    fakes.finished_query(data_api, JSON_PATH_SQL, [[fakes.record(1)]])
+    envelopes = pull({"sql": JSON_PATH_SQL})
+    assert sum(e.metadata["row_count"] for e in envelopes) == 1
+    assert data_api.calls[0] == (
+        "ExecuteStatement",
+        {**data_api.calls[0][1], "Sql": JSON_PATH_SQL},
+    )
+    data_api.assert_drained()
+    _no_record_carries_the_path(caplog, every_record)
+
+
 def test_a_query_in_batches_with_version_markers(data_api, assume_calls):
     records = [fakes.record(i) for i in range(5)]
     fakes.finished_query(data_api, SQL, [records[:3], records[3:]])

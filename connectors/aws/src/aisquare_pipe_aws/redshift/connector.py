@@ -32,7 +32,10 @@ envelope with no rows, so its markers still come out. A result cut short by
 ``max_rows`` or ``max_result_bytes`` says so on every envelope
 (``truncated``); its ``result_sha256`` covers the rows read only.
 
-Logs carry no SQL, no table names and no row values.
+The connector's own logs carry no SQL, no table names and no row values, and
+nothing sqlglot logs while the guard parses gets out
+(:mod:`aisquare_pipe_aws.redshift.sqlguard`). botocore's DEBUG request log,
+off unless a host turns it on, does hold the SQL.
 """
 
 from __future__ import annotations

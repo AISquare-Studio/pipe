@@ -8,10 +8,12 @@ clock that moves only when the code sleeps (the ``clock`` fixture).
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from botocore.exceptions import ReadTimeoutError
 from botocore.stub import ANY, Stubber
 
 from aisquare_pipe_aws.redshift import dataapi
@@ -59,8 +61,11 @@ class Clock:
 
 
 class DataApi:
-    """Queue Data API responses; every redshift-data client the code builds
-    gets them (a ``Stubber`` checking each request against AWS's model)."""
+    """Queue Data API responses; the redshift-data clients the code builds
+    answer them in order (a ``Stubber`` on each, checking every request
+    against AWS's model). A call builds a new client when its deadline no
+    longer covers the current one's timeouts, so all of a test's stubs read
+    ONE queue: botocore's ``Stubber`` keeps its responses in ``_queue``."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, clock: Clock) -> None:
         self.queue: list[tuple[str, str, Any, Any]] = []
@@ -68,14 +73,23 @@ class DataApi:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         #: The fake clock's time at each request, in the order of ``calls``.
         self.times: list[float] = []
+        #: The connect timeout plus read timeout of the client each request
+        #: went out on, in the order of ``calls``.
+        self.timeouts: list[float] = []
         self.clock = clock
-        #: Advance the fake clock by this much on every request.
+        #: How long each request takes (fake seconds), unless ``latencies``
+        #: names its operation. One that takes longer than its client's
+        #: connect plus read timeout raises ReadTimeoutError at that point,
+        #: as botocore would.
         self.latency = 0.0
-        real = dataapi.client
+        self.latencies: dict[str, float] = {}
+        shared: deque[Any] = deque()
+        real = dataapi.build_client
 
-        def build(session: Any, target: Any, deadline: Any) -> Any:
-            client = real(session, target, deadline)
+        def build(session: Any, region: str, seconds: float) -> Any:
+            client = real(session, region, seconds)
             stub = Stubber(client)
+            stub._queue = shared
             for kind, method, payload, expected in self.queue:
                 if kind == "ok":
                     stub.add_response(method, payload, expected)
@@ -91,16 +105,29 @@ class DataApi:
             self.queue.clear()
 
             def record(params: dict[str, Any], model: Any, **_: Any) -> None:
+                config = client.meta.config
+                if model.name == "CancelStatement":
+                    # A test queues more polls than the deadline allows: the
+                    # ones the code never made are dropped, so the cancel
+                    # gets the response queued for it.
+                    while shared and shared[0]["operation_name"] == "DescribeStatement":
+                        shared.popleft()
+                timeouts = config.connect_timeout + config.read_timeout
                 self.calls.append((model.name, dict(params)))
                 self.times.append(self.clock.now)
-                self.clock.now += self.latency
+                self.timeouts.append(timeouts)
+                took = self.latencies.get(model.name, self.latency)
+                if took > timeouts:
+                    self.clock.now += timeouts
+                    raise ReadTimeoutError(endpoint_url=client.meta.endpoint_url)
+                self.clock.now += took
 
             client.meta.events.register("provide-client-params.redshift-data.*", record)
             stub.activate()
             self.clients.append((client, stub))
             return client
 
-        monkeypatch.setattr(dataapi, "client", build)
+        monkeypatch.setattr(dataapi, "build_client", build)
 
     def add(self, method: str, response: dict[str, Any], expected: Any = None) -> None:
         self.queue.append(("ok", method, response, expected))

@@ -56,13 +56,13 @@ def run_select(
     statement_sql = check_select_only(sql)
     session = open_session()
     api = dataapi.client(session, target, deadline)
-    statement = dataapi.execute(api, target, statement_sql, deadline)
+    statement = dataapi.execute(api, target, statement_sql)
     cols: list[dict[str, Any]] = []
     out: list[dict[str, Any]] = []
     size = 0
     total = statement.result_rows
     truncated: str | None = None
-    for page in dataapi.result_pages(api, statement, deadline):
+    for page in dataapi.result_pages(api, statement):
         if not cols:
             cols = rows.columns(page.get("ColumnMetadata"))
         if total is None and isinstance(page.get("TotalNumRows"), int):

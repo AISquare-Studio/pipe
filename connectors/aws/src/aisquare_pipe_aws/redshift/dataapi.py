@@ -2,11 +2,27 @@
 
 A query is asynchronous: ``ExecuteStatement`` submits it,
 ``DescribeStatement`` is polled until it is ``FINISHED`` (or ``FAILED`` /
-``ABORTED``), and ``GetStatementResult`` pages its rows. Everything happens
-before one :class:`Deadline`: polling stops there, the statement is cancelled
-(``CancelStatement``, best effort) and the call fails with ``timeout``. Each
-request's own connect and read timeouts fit inside what is left, and
-botocore retries at most once.
+``ABORTED``), and ``GetStatementResult`` pages its rows. The whole call fits
+inside one :class:`Deadline`:
+
+- Each request goes out on a client whose connect timeout plus read timeout
+  fits inside what is left of the deadline when it is sent (:class:`Api`
+  builds a client with shorter ones when the current client's don't fit; the
+  read timeout bounds each wait for data). botocore never retries: a retry
+  would have to fit too. A throttled or dropped request fails the call with
+  its code. With less than :data:`MIN_REQUEST_SECONDS` left, no request is
+  sent and the call fails with ``timeout``.
+- While a statement runs, a slice of the deadline is kept back for
+  ``CancelStatement`` (:data:`CANCEL_SHARE` of it, at most
+  :data:`CANCEL_RESERVE_MAX` seconds, at least :data:`MIN_REQUEST_SECONDS`).
+  Polling stops where that slice starts, and the statement is cancelled
+  inside it (best effort) before the call fails with ``timeout``. A request
+  that fails or times out while the statement runs cancels it the same way.
+  An ``ExecuteStatement`` that times out leaves no statement id to cancel.
+
+The deadline covers the Data API requests. The AssumeRole before them is the
+shared helper's (:mod:`aisquare_pipe_aws.credentials`, #31), on botocore's
+own timeouts; the time it takes counts against the deadline.
 
 The metadata tools use the Data API's own synchronous ``ListSchemas``,
 ``ListTables`` and ``DescribeTable``: no SQL text is built from a caller's
@@ -39,9 +55,15 @@ logger = logging.getLogger("aisquare.pipe.redshift")
 SERVICE = "redshift-data"
 #: What ListStatements and CloudTrail in the customer's account show.
 STATEMENT_NAME = "aisquare-pipe"
-#: The longest one request may wait for a response.
-MAX_READ_TIMEOUT = 20.0
+#: The longest one request waits to connect, and for each read.
 MAX_CONNECT_TIMEOUT = 5.0
+MAX_READ_TIMEOUT = 20.0
+#: No request is sent with less of the deadline left than this.
+MIN_REQUEST_SECONDS = 0.2
+#: Kept back for CancelStatement while a statement runs: this share of the
+#: deadline, at most CANCEL_RESERVE_MAX seconds (at least MIN_REQUEST_SECONDS).
+CANCEL_SHARE = 0.2
+CANCEL_RESERVE_MAX = 3.0
 #: DescribeStatement polling: first wait, growth, longest wait.
 POLL_FIRST = 0.05
 POLL_FACTOR = 2.0
@@ -66,7 +88,26 @@ sleep: Callable[[float], None] = time.sleep
 
 
 class StatementTimeout(PipeError):
-    """The deadline passed before the statement finished (it was cancelled)."""
+    """The deadline passed before the call finished. ``cancelled`` says what
+    happened to a statement that was still running: True (cancelled), False
+    (CancelStatement failed), or None (none was: it had finished, or the
+    ExecuteStatement itself timed out)."""
+
+    def __init__(self, *, cancelled: bool | None = None) -> None:
+        self.cancelled = cancelled
+        super().__init__(
+            "the call did not finish before its deadline" + cancel_note(cancelled)
+        )
+
+
+def cancel_note(cancelled: bool | None) -> str:
+    """What a timeout message adds about the statement (``cancelled`` as on
+    :class:`StatementTimeout`)."""
+    if cancelled is None:
+        return ""
+    if cancelled:
+        return "; the statement was cancelled"
+    return "; cancelling the statement failed"
 
 
 class StatementFailed(PipeError):
@@ -92,26 +133,88 @@ class Deadline:
     def left(self) -> float:
         return self.at - monotonic()
 
-    def check(self) -> None:
-        if self.left() <= 0:
-            raise StatementTimeout()
+    def cancel_reserve(self) -> float:
+        """What is kept back for CancelStatement while a statement runs."""
+        return max(
+            MIN_REQUEST_SECONDS, min(CANCEL_RESERVE_MAX, self.seconds * CANCEL_SHARE)
+        )
 
 
-def client(session: Any, target: RedshiftTarget, deadline: Deadline) -> Any:
-    """A redshift-data client on ``session`` (the assumed role's), in the
-    target's region, with request timeouts inside the deadline."""
+def build_client(session: Any, region: str, seconds: float) -> Any:
+    """A redshift-data client on ``session`` (the assumed role's) in
+    ``region``, whose connect timeout plus read timeout is ``seconds`` (at
+    most :data:`MAX_CONNECT_TIMEOUT` + :data:`MAX_READ_TIMEOUT`, split in that
+    ratio), and which never retries."""
     from botocore.config import Config
 
-    left = max(deadline.left(), 1.0)
+    seconds = min(seconds, MAX_CONNECT_TIMEOUT + MAX_READ_TIMEOUT)
+    connect = seconds * MAX_CONNECT_TIMEOUT / (MAX_CONNECT_TIMEOUT + MAX_READ_TIMEOUT)
     return session.client(
         SERVICE,
-        region_name=target.region,
+        region_name=region,
         config=Config(
-            connect_timeout=min(MAX_CONNECT_TIMEOUT, left),
-            read_timeout=min(MAX_READ_TIMEOUT, left),
-            retries={"total_max_attempts": 2, "mode": "standard"},
+            connect_timeout=connect,
+            read_timeout=seconds - connect,
+            retries={"total_max_attempts": 1, "mode": "standard"},
         ),
     )
+
+
+class Api:
+    """The redshift-data requests of one call, inside its deadline: each goes
+    out on a client whose connect plus read timeout fits inside what is left
+    when it is sent. A client is built (no AWS call) only for a first
+    request, or when what is left no longer covers the current one's
+    timeouts; the new one gets half of what is left (all of it near the end),
+    so a call builds a handful at most."""
+
+    def __init__(self, session: Any, target: RedshiftTarget, deadline: Deadline):
+        self._session = session
+        self._region = target.region
+        self.deadline = deadline
+        self._client: Any = None
+        #: The current client's connect timeout plus read timeout.
+        self._timeouts = 0.0
+
+    def request(
+        self, operation: str, *, what: str, reserve: float = 0.0, **params: Any
+    ) -> Any:
+        """One request (``operation`` is the client method), with ``reserve``
+        seconds of the deadline kept back. :class:`StatementTimeout` without
+        sending it when less than :data:`MIN_REQUEST_SECONDS` would be left."""
+        budget = self.deadline.left() - reserve
+        if budget < MIN_REQUEST_SECONDS:
+            raise StatementTimeout()
+        return _call(getattr(self._within(budget), operation), what=what, **params)
+
+    def cancel(self, statement_id: str) -> bool:
+        """CancelStatement, best effort, in what is left (the slice kept back
+        for it): whether it was accepted. A failure is logged (no SQL), never
+        raised."""
+        budget = max(self.deadline.left(), MIN_REQUEST_SECONDS)
+        try:
+            self._within(budget).cancel_statement(Id=statement_id)
+        except Exception as e:  # noqa: BLE001 — the caller is already failing
+            logger.info("redshift: CancelStatement failed (%s)", type(e).__name__)
+            return False
+        return True
+
+    def _within(self, budget: float) -> Any:
+        if self._client is None or self._timeouts > budget:
+            half = budget / 2
+            seconds = min(
+                MAX_CONNECT_TIMEOUT + MAX_READ_TIMEOUT,
+                half if half >= MIN_REQUEST_SECONDS else budget,
+            )
+            self._client = build_client(self._session, self._region, seconds)
+            self._timeouts = seconds
+        return self._client
+
+
+def client(session: Any, target: RedshiftTarget, deadline: Deadline) -> Api:
+    """The redshift-data requests of one call on ``session`` (the assumed
+    role's), in the target's region, inside ``deadline`` (:class:`Api`)."""
+    return Api(session, target, deadline)
 
 
 def _call(fn: Callable[..., Any], *, what: str, **kwargs: Any) -> Any:
@@ -151,30 +254,44 @@ class Statement:
     duration_ns: int | None = None
 
 
-def execute(
-    api: Any, target: RedshiftTarget, sql: str, deadline: Deadline
-) -> Statement:
+def execute(api: Api, target: RedshiftTarget, sql: str) -> Statement:
     """Submit ``sql`` (already checked SELECT-only) and wait for it to
-    finish. :class:`StatementTimeout` (after cancelling it) when the
-    deadline passes first; :class:`StatementFailed` when it fails."""
-    deadline.check()
-    submitted = _call(
-        api.execute_statement,
+    finish, keeping the cancel's slice of the deadline back throughout.
+    :class:`StatementTimeout` (after cancelling it) when the deadline comes
+    first; :class:`StatementFailed` when it fails; an
+    :class:`~aisquare_pipe_aws.credentials.AwsAccessError` from a polling
+    request after cancelling it."""
+    reserve = api.deadline.cancel_reserve()
+    submitted = api.request(
+        "execute_statement",
         what="redshift-data:ExecuteStatement",
+        reserve=reserve,
         Sql=sql,
         StatementName=STATEMENT_NAME,
         ClientToken=uuid.uuid4().hex,
         **target.connection(),
     )
     statement = Statement(id=str(submitted["Id"]))
+    try:
+        _wait(api, statement, reserve)
+    except StatementTimeout:
+        raise StatementTimeout(cancelled=api.cancel(statement.id)) from None
+    except AwsAccessError:
+        api.cancel(statement.id)
+        raise
+    return statement
+
+
+def _wait(api: Api, statement: Statement, reserve: float) -> None:
+    """Poll DescribeStatement until ``statement`` is FINISHED (filled in) or
+    fails, while more than ``reserve`` (plus one request) is left."""
     wait = POLL_FIRST
+    last = False
     while True:
-        if deadline.left() <= 0:
-            cancel(api, statement.id)
-            raise StatementTimeout()
-        described = _call(
-            api.describe_statement,
+        described = api.request(
+            "describe_statement",
             what="redshift-data:DescribeStatement",
+            reserve=reserve,
             Id=statement.id,
         )
         statement.status = str(described.get("Status") or "")
@@ -186,14 +303,16 @@ def execute(
             )
             duration = described.get("Duration")
             statement.duration_ns = duration if isinstance(duration, int) else None
-            return statement
+            return
         if statement.status in ("FAILED", "ABORTED"):
             raise _failed(statement.status, described.get("Error"))
-        left = deadline.left()
-        if left <= 0:
-            cancel(api, statement.id)
+        # Sleep only into time a next poll can still use. A sleep cut short
+        # leads to the last poll.
+        spare = api.deadline.left() - reserve - MIN_REQUEST_SECONDS
+        if last or spare <= 0:
             raise StatementTimeout()
-        sleep(min(wait, left))
+        last = spare <= wait
+        sleep(min(wait, spare))
         wait = min(wait * POLL_FACTOR, POLL_MAX)
 
 
@@ -214,29 +333,19 @@ def _failed(status: str, error: Any) -> StatementFailed:
     return StatementFailed(f"{message}: {text}" if text else message, code=code)
 
 
-def cancel(api: Any, statement_id: str) -> None:
-    """CancelStatement, best effort: a failure is logged (no SQL), never raised."""
-    try:
-        api.cancel_statement(Id=statement_id)
-    except Exception as e:  # noqa: BLE001 — the caller is already failing with timeout
-        logger.info("redshift: CancelStatement failed (%s)", type(e).__name__)
-
-
-def result_pages(
-    api: Any, statement: Statement, deadline: Deadline
-) -> Iterator[dict[str, Any]]:
+def result_pages(api: Api, statement: Statement) -> Iterator[dict[str, Any]]:
     """Each GetStatementResult page of a finished statement, while the
-    deadline lasts (:class:`StatementTimeout` once it passes)."""
+    deadline lasts (:class:`StatementTimeout` once too little is left for a
+    request)."""
     if not statement.has_result_set:
         return
     token: str | None = None
     while True:
-        deadline.check()
         kwargs: dict[str, Any] = {"Id": statement.id}
         if token:
             kwargs["NextToken"] = token
-        page = _call(
-            api.get_statement_result, what="redshift-data:GetStatementResult", **kwargs
+        page = api.request(
+            "get_statement_result", what="redshift-data:GetStatementResult", **kwargs
         )
         yield page
         token = page.get("NextToken") or None
@@ -248,7 +357,7 @@ def result_pages(
 
 
 def list_schemas(
-    api: Any,
+    api: Api,
     target: RedshiftTarget,
     *,
     pattern: str | None,
@@ -260,11 +369,11 @@ def list_schemas(
         kwargs["SchemaPattern"] = pattern
     if next_token:
         kwargs["NextToken"] = next_token
-    return dict(_call(api.list_schemas, what="redshift-data:ListSchemas", **kwargs))
+    return dict(api.request("list_schemas", what="redshift-data:ListSchemas", **kwargs))
 
 
 def list_tables(
-    api: Any,
+    api: Api,
     target: RedshiftTarget,
     *,
     schema_pattern: str | None,
@@ -279,11 +388,11 @@ def list_tables(
         kwargs["TablePattern"] = table_pattern
     if next_token:
         kwargs["NextToken"] = next_token
-    return dict(_call(api.list_tables, what="redshift-data:ListTables", **kwargs))
+    return dict(api.request("list_tables", what="redshift-data:ListTables", **kwargs))
 
 
 def describe_table(
-    api: Any,
+    api: Api,
     target: RedshiftTarget,
     *,
     schema: str,
@@ -299,4 +408,6 @@ def describe_table(
     }
     if next_token:
         kwargs["NextToken"] = next_token
-    return dict(_call(api.describe_table, what="redshift-data:DescribeTable", **kwargs))
+    return dict(
+        api.request("describe_table", what="redshift-data:DescribeTable", **kwargs)
+    )

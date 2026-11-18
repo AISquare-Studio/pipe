@@ -117,11 +117,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     write, DDL, session or side-effect word or node (`SELECT ... INTO`, `UNLOAD`, `COPY`, `SET`,
     `PG_TERMINATE_BACKEND`, ...). The lexer ends `--` comments at a CR or an LF, refuses a `/*`
     inside a comment, a string whose end depends on whether `\` escapes, `$` (dollar quoting)
-    and control characters outside quotes.
+    and control characters outside quotes, and the side-effect functions in double quotes.
+    Nothing sqlglot logs while the guard parses gets out: its "Invalid JSON path syntax"
+    warning quotes a path such as `JSON_EXTRACT(p, 'member.ssn-123-45-6789')`, so a filter on
+    the `sqlglot` logger drops its records in the parsing thread or task only (no global
+    switch). Python's last-resort stderr handler doesn't see them either.
   - `ExecuteStatement` → `DescribeStatement` (polled, 50 ms to 1 s) → `GetStatementResult`
     (paged) inside one deadline: the host's time budget, else 60 s (the source's
-    `timeout_seconds`, default 120, at most 600). At the deadline the statement is cancelled and
-    the call fails with `timeout`. Caps: `max_rows` and a JSON byte cap (`truncated` says which).
+    `timeout_seconds`, default 120, at most 600). Each request's connect plus read timeout fits
+    inside what is left when it goes out, because a client is rebuilt with shorter timeouts as
+    the deadline nears, and botocore never retries. A slice of the deadline (a fifth, 0.2 s to
+    3 s) is kept back to cancel a statement still running: polling stops there, the statement is
+    cancelled, and the call fails with `timeout`. Caps: `max_rows` and a JSON byte cap
+    (`truncated` says which).
     The metadata tools use the Data API's `ListSchemas`, `ListTables` and `DescribeTable`, paged.
   - `redshift-query-source` pulls one `sql` SELECT or a `table`, one envelope per row batch, with
     `version` = `result_sha256` (order-independent).

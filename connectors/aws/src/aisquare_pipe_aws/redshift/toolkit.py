@@ -309,9 +309,10 @@ class RedshiftToolkit(_AwsToolkit):
             raise ToolError(str(e), code=e.code) from None
         except NotReadOnly as e:
             raise ToolError(str(e), code=ERROR_INVALID_ARGUMENTS) from None
-        except dataapi.StatementTimeout:
+        except dataapi.StatementTimeout as e:
             raise ToolError(
-                f"{tool.slug} did not finish within {budget:g} s; the statement was cancelled",
+                f"{tool.slug} did not finish within {budget:g} s"
+                + dataapi.cancel_note(e.cancelled),
                 code=ERROR_TIMEOUT,
             ) from None
         except dataapi.StatementFailed as e:
@@ -321,7 +322,7 @@ class RedshiftToolkit(_AwsToolkit):
 
     # -- the session: always #31's AssumeRole (_AwsToolkit._session) ------------------
 
-    def _api(self, cfg: RedshiftConfig, deadline: dataapi.Deadline) -> Any:
+    def _api(self, cfg: RedshiftConfig, deadline: dataapi.Deadline) -> dataapi.Api:
         return dataapi.client(self._session(cfg.aws), cfg.target, deadline)
 
     # -- tools ---------------------------------------------------------------------------
@@ -408,7 +409,6 @@ class RedshiftToolkit(_AwsToolkit):
         listed: list[dict[str, Any]] = []
         token: str | None = None
         while True:
-            deadline.check()
             page = dataapi.describe_table(
                 api,
                 cfg.target,
