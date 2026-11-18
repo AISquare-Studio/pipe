@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Google Cloud Storage connector** (`connectors/gcs`, module `aisquare_pipe_gcs`, extra
+  `aisquare-pipe[gcs]`, in `[full]` and `[toolkits]`): the read-only toolkit `gcs`
+  (`GCS_GET_OBJECT`, primary; `GCS_LIST_OBJECTS`) and the source `gcs-source`, over ONE bucket
+  and an optional prefix from the tenant's credential blob
+  `{service_account_json, bucket, prefix?}`. Tokens are minted from the service account key
+  (scope `devstorage.read_only`; `google-auth>=2.20,<3`, the extra's only dependency) and never
+  from Application Default Credentials. Each object carries its version markers `generation`,
+  `md5_hash` and `updated`. A missing or malformed blob fails closed ("Google Cloud Storage is
+  not configured", no request); a bucket, key or out-of-prefix name from a caller is refused.
+  Setup and the exact secret: `connectors/gcs/README.md`.
+
 ## [0.5.0] - 2026-11-04
 
 The tool-router release: `aisquare.pipe.core.search` and the `[toolkits]`

@@ -64,6 +64,11 @@ dropbox = [
     "dropbox>=12.0",
 ]
 gateway = []
+# Google Cloud Storage: the service account key is signed into tokens by
+# google-auth (explicit credentials only, never Application Default Credentials).
+gcs = [
+    "google-auth>=2.20,<3",
+]
 github = []
 gmail = []
 googlecalendar = []
@@ -85,11 +90,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,composio,docusign,gateway,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,composio,docusign,gateway,gcs,github,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[github,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[gcs,github,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -105,6 +110,7 @@ docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
 dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
 dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
 aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
+gcs-source = "aisquare_pipe_gcs.connector:GcsSource"
 github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
 googledrive-source = "aisquare_pipe_googledrive.connector:GoogleDriveSource"
 googledrive-sink = "aisquare_pipe_googledrive.connector:GoogleDriveSink"
@@ -124,6 +130,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
+gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
 googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
@@ -139,6 +146,7 @@ where = [
     "connectors/docusign/src",
     "connectors/dropbox/src",
     "connectors/gateway/src",
+    "connectors/gcs/src",
     "connectors/github/src",
     "connectors/gmail/src",
     "connectors/googlecalendar/src",
