@@ -102,14 +102,21 @@ salesforce = [
     "simple-salesforce>=1.12",
 ]
 slack = []
+# Snowflake (SQL API over requests, core): cryptography signs the key-pair
+# JWT with the tenant's RSA key; sqlglot parses SQL so only one SELECT is
+# ever sent (the same bound as [bigquery] and [databricks], so they agree).
+snowflake = [
+    "cryptography>=42,<60",
+    "sqlglot>=25,<28",
+]
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack,snowflake]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[aws,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[aws,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack,snowflake]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -141,6 +148,7 @@ onedrive-sink = "aisquare_pipe_onedrive.connector:OneDriveSink"
 salesforce-source = "aisquare_pipe_salesforce.connector:SalesforceSource"
 salesforce-sink = "aisquare_pipe_salesforce.connector:SalesforceSink"
 slack-message-sink = "aisquare_pipe_slack.connector:SlackMessageSink"
+snowflake-query-source = "aisquare_pipe_snowflake.connector:SnowflakeQuerySource"
 
 [project.entry-points."aisquare_pipe.converters"]
 mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
@@ -158,6 +166,7 @@ googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
 googledrive = "aisquare_pipe_googledrive.toolkit:GoogleDriveToolkit"
 onedrive = "aisquare_pipe_onedrive.toolkit:OneDriveToolkit"
 slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
+snowflake = "aisquare_pipe_snowflake.toolkit:SnowflakeToolkit"
 [tool.setuptools.packages.find]
 # The framework, then every connector's src dir. Each connector keeps its
 # own directory (code, tests, README); only this file packages it.
@@ -180,6 +189,7 @@ where = [
     "connectors/onedrive/src",
     "connectors/salesforce/src",
     "connectors/slack/src",
+    "connectors/snowflake/src",
 ]
 
 [tool.setuptools.package-data]
