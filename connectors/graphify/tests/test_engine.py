@@ -221,10 +221,12 @@ class TestSanityGates:
 
 
 class TestArtifacts:
-    def test_stats_tokens_and_version(self, stub, checkout):
+    def test_stats_tokens_and_version(self, stub, checkout, offline_tokenizer):
         art = _engine(stub).build(checkout)
         assert (art.nodes, art.edges, art.communities) == (12, 34, 3)
-        assert art.token_count > 0
+        # The report's o200k_base count (conftest's offline stand-in: one per word).
+        assert art.token_count == len(art.report_md.split()) > 0
+        assert offline_tokenizer and set(offline_tokenizer) == {"o200k_base"}
         assert "0.8.36-fake" in art.graphify_version
         assert art.report_md.startswith("# Graph report")
         assert '"nodes"' in art.graph_json

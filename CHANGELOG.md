@@ -75,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The extra is empty: HTTP goes through `requests`, which core already
     requires.
 
+### Fixed
+
+- **Composio: composio-client 2.x** (supersedes Dependabot #60). The `[composio]`
+  extra now allows `composio-client>=1.39,<3.0`, which resolves composio 0.33.0
+  with composio-client 2.1.33. 2.x moved the trigger log from
+  `client.logs.triggers` to `client._internal.logs.triggers`.
+  `ComposioClient.list_trigger_events` now uses whichever the installed SDK has.
+  Before this, 2.x raised `AttributeError`, and `composio-triggers-source`
+  logged it and polled on forever, emitting nothing.
+  - An SDK shape the connector doesn't know is a `ComposioSDKShapeError`, a
+    `PipelineError`. That covers a resource that is gone and an `AttributeError`
+    from any client call. A trigger-log `list()` that rejects its arguments
+    counts too.
+  - The triggers source logs that error at ERROR level and raises it instead of
+    polling on.
+  - `connectors/composio/tests/test_sdk_compat.py` runs against the REAL
+    installed composio classes, with sockets blocked. An autospec of the real
+    trigger-log `list` makes a call that doesn't bind to the installed SDK fail.
+    It passes on composio 0.22.0 + client 1.43.0 and on 0.33.0 + 2.1.33.
+
 ## [0.5.0] - 2026-11-04
 
 The tool-router release, and the first release as **one distribution**
