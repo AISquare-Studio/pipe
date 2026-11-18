@@ -154,7 +154,9 @@ policy").
    }
    ```
 
-   `sts:GetCallerIdentity` needs no permission.
+   `sts:GetCallerIdentity` needs no permission. Where pipe-service still runs on ECS (prod, as
+   of 2026-11-17: no EKS release there yet), the principal is its ECS task role instead. Give
+   that role the same policy. ECS adds no session tags, so `sts:TagSession` is harmless there.
 
    **Why `sts:TagSession`:** EKS Pod Identity tags our session (cluster, namespace, service
    account), and those tags are transitive. STS passes them on our `AssumeRole` into the
@@ -226,7 +228,7 @@ when both are in the same account, twice otherwise.
 
 `sts:TagSession` lets our session's EKS tags pass through (see step 2 above). On its own it
 grants nothing: the role can still only be assumed with the external ID. EKS's own
-cross-account example splits the two statements the same way.
+target-role example that uses an external ID splits the two statements the same way.
 
 **2. Attach a read-only permissions policy**, keeping only the statements they use:
 
