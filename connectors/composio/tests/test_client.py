@@ -13,6 +13,7 @@ from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_composio.client import (
     ComposioClient,
+    ComposioSDKShapeError,
     TriggerCursor,
     _to_plain,
     default_cursor_path,
@@ -142,6 +143,29 @@ class TestRetry:
             with pytest.raises(PipelineError, match="rate limit"):
                 client.list_toolkits()
         assert sleep.call_count == MAX_RETRIES - 1
+
+
+class TestSDKShape:
+    def test_a_missing_sdk_method_is_a_shape_error(self, mock_sdk, composio_config):
+        del mock_sdk.return_value.tools.execute
+        client = ComposioClient(composio_config)
+        with pytest.raises(ComposioSDKShapeError, match=r"no tools\.execute\(\)"):
+            client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1")
+
+    def test_execute_returning_a_non_dict_is_a_shape_error(
+        self, mock_sdk, composio_config
+    ):
+        mock_sdk.return_value.tools.execute.return_value = "not a dict"
+        client = ComposioClient(composio_config)
+        with pytest.raises(ComposioSDKShapeError, match="returned a str"):
+            client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1")
+
+    def test_execute_accepts_a_model_response(self, mock_sdk, composio_config):
+        model = MagicMock()
+        model.model_dump.return_value = {"successful": True, "data": {"id": "m_1"}}
+        mock_sdk.return_value.tools.execute.return_value = model
+        client = ComposioClient(composio_config)
+        assert client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1") == {"id": "m_1"}
 
 
 class TestNormalisation:
