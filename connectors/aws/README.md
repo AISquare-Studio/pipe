@@ -261,9 +261,12 @@ A blob names one role, so it reads one AWS account:
   them in one account, or picks the account to read.
 - **S3** (secret `s3`): one bucket and prefix, in one account. It may be the AgentCore account
   or another one.
+- **Redshift** (secret `redshift`): one cluster or Serverless workgroup and one database, in
+  the role's account (a `secret_arn` must be in that account too). It may be the AgentCore or
+  S3 account, or another one. See the [Redshift registration checklist](#redshift-registration-checklist).
 
-The customer creates the role (steps 1 and 2 below) in each account the secrets name: once
-when both are in the same account, twice otherwise.
+The customer creates the role (steps 1 and 2 below) once in each account the secrets name,
+so one role serves every secret whose resources share an account.
 
 ### In the customer's account (the customer)
 
@@ -421,6 +424,10 @@ The toolkit `redshift` and the source `redshift-query-source` read the same tena
 |---|---|
 | `PIPE_SECRET__<TENANT>__REDSHIFT__JSON` | `<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/redshift` |
 
+Every environment runs the env backend today, so the blob reaches the service as
+`PIPE_SECRET__<TENANT>__REDSHIFT__JSON`. How it gets there, on ECS and on EKS: step 6 of the
+[registration checklist](#redshift-registration-checklist).
+
 It is the [credential blob](#the-credential-blob) above plus a `redshift` section, one of
 these four shapes:
 
@@ -472,7 +479,12 @@ is) refuse anything else before any AWS call (not even `sts:AssumeRole`), with
    - a quoted string or identifier must end at the same place whether `\` escapes or not
      (`standard_conforming_strings`, `E'...'`). Escape a quote by doubling it;
    - `$` outside quotes is refused (`$$...$$` and `$tag$` quoting, `$1`), and so are `\`
-     outside quotes and control characters other than tab, CR, LF and form feed.
+     outside quotes and control characters other than tab, CR, LF and form feed;
+   - `U&` right before a quote is refused (`U&'...'`, `U&"..."`): PostgreSQL decodes
+     `U&"pg_terminate_backen\0064"` to `pg_terminate_backend`. To `&` a column whose name ends
+     in `u` with a quoted name, put a space before the quote;
+   - numbers are read as Redshift reads them, exponent included, before any word: `1e5INTO`
+     is the number `1e5` and then `INTO`, as in PostgreSQL before 15, so it is refused.
 2. **A parser** (sqlglot, Redshift dialect, `sqlglot>=26.25,<28`): exactly one statement
    whose root is a query (`SELECT`, `WITH ... SELECT`, `UNION`/`INTERSECT`/`EXCEPT`, a
    parenthesised query), with no write, DDL, session or transaction node at any depth
@@ -511,8 +523,18 @@ database user should hold `SELECT` and nothing else (the checklist below).
   whose connect plus read timeout is all of what is left (never the last poll's shorter one), and
   the call fails with `timeout`, saying whether the cancel was accepted. A poll that AWS refuses
   cancels it too. An `ExecuteStatement` that times out leaves no statement id to cancel.
+- The cancel is best effort. A statement it misses runs on in the customer's warehouse: an
+  `ExecuteStatement` that timed out after Redshift had accepted it (no id comes back to cancel),
+  or a `CancelStatement` that failed or timed out. What stops such a statement is the database's
+  own bound, which the customer sets on AISquare's database user (`statement_timeout`, step 3
+  of the [checklist](#redshift-registration-checklist)). Without it, the statement runs to its
+  end, and a model writes the SQL.
 - The deadline covers the Data API requests. The AssumeRole before them is the shared helper's,
   on botocore's own timeouts, and the time it takes counts against the deadline.
+- The polls keep the cancel's slice back, so the last poll's client can be short. Once the
+  statement has finished nothing is kept back: a client whose timeouts are under half of what
+  a request may use is replaced, so the first result page gets one sized to what is left, not
+  the last poll's.
 - Paging `GetStatementResult` stops at `max_rows`, at the byte cap or at the deadline.
 
 ### `redshift-query-source`
@@ -698,8 +720,33 @@ GRANT USAGE ON SCHEMA policies TO "IAMR:AISquareReadOnly";
 GRANT SELECT ON ALL TABLES IN SCHEMA policies TO "IAMR:AISquareReadOnly";
 -- tables created later in the schema (run as the user who creates them):
 ALTER DEFAULT PRIVILEGES IN SCHEMA policies GRANT SELECT ON TABLES TO "IAMR:AISquareReadOnly";
+
+-- the database's own bound on each statement: 600000 ms (10 min), on the same user
+ALTER USER "IAMR:AISquareReadOnly" SET statement_timeout TO 600000;
 ```
 
+- **Set the `statement_timeout`.** Our cancel is best effort (see
+  [Deadline and caps](#deadline-and-caps)). A statement it misses runs on until the database
+  stops it. The SQL comes from a model, so it can be a query that never ends: an unbounded
+  join, say. `statement_timeout` (milliseconds) stops any statement of that user that runs
+  longer, counting planning, the WLM queue and execution.
+  - Never set it under 600000 (10 min), the longest deadline of `redshift-query-source`. A
+    lower one stops statements that AISquare still waits for, and they fail as
+    `the statement failed in Redshift: …`. A tool call's deadline is the host's budget (60 s by
+    default).
+  - `ALTER USER ... SET` is the user's default for its next sessions. Each Data API statement
+    opens one, so it applies from the next call. To check it:
+    `SELECT usename, useconfig FROM pg_user WHERE usename = 'IAMR:AISquareReadOnly';` shows
+    `statement_timeout=600000`.
+  - On a cluster, the WLM timeout of the user's queue also applies, and the lower of the two
+    wins. A WLM query monitoring rule (`query_execution_time`, action `abort`) on that queue
+    does the same job.
+  - On Serverless, set it too, but AWS documents no per-user `statement_timeout` there. Add the
+    workgroup's own bound as well: the query limit `max_query_execution_time`, or, if the
+    workgroup uses query queues, a rule with `query_execution_time` and action `abort`. Either
+    one applies to every query in the workgroup (a queue's rule, to the queue's queries). With
+    no bound, a runaway statement runs up to Serverless's own maximum of 86,399 s (24 h), and
+    the customer pays for the RPU time it uses all along.
 - Grant only the schemas AISquare may read: they are its scope. Grant no `INSERT`,
   `UPDATE`, `DELETE`, `CREATE` or `TEMP`, no ownership and no superuser.
 - Redshift grants `PUBLIC` `CREATE` on schema `public` and `TEMP` on a database by default.
@@ -725,8 +772,97 @@ policy of that name; the policy above names the secret instead.
 **5. The customer sends AISquare:** the role ARN, the region, the cluster identifier or the
 workgroup name, the database, and the `db_user` name or the secret's ARN if they use one.
 
-**6. AISquare stores the blob** under the `redshift` secret name ([above](#the-redshift-secret)),
-after adding the role ARN to our role's policy ([as for S3](#aisquare-stores-the-blob)).
+**6. AISquare stores the blob.** First add the customer's role ARN to our role's policy, on
+every AISquare role they trust (step 1 of [AISquare stores the blob](#aisquare-stores-the-blob)).
+Then build the [credential blob](#the-credential-blob) with its
+[`redshift` section](#the-redshift-secret), save it as a local `blob.json`, and store it as the
+tenant secret `redshift` in each environment that serves the tenant:
+
+| `<secret>` | Env var `<ENV_VAR>` | `<GH_SECRET>` for `stg` (EKS) | `<GH_SECRET>` for `dev` (EKS) |
+|---|---|---|---|
+| `redshift` | `PIPE_SECRET__<TENANT>__REDSHIFT__JSON` | `REDSHIFT_<TENANT>_JSON` | `DEV_REDSHIFT_<TENANT>_JSON` |
+
+`<TENANT>` is the tenant id in upper case. Every run of characters other than A-Z and 0-9
+becomes one `_`, and any `_` at either end is dropped (`acme-corp.eu` gives `ACME_CORP_EU`).
+Use one `<GH_SECRET>` per environment in every step, so `dev` never reads or writes stg's.
+
+Every environment runs the env secrets backend (`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS
+`deploy/values.yaml` and both ECS task definitions in pipe-as-service). The blob reaches the
+service only as `<ENV_VAR>`, read when a pod or task starts, so turning Redshift on for a
+tenant is a deploy. Store the value first, then add the entry that reads it. **Never switch the
+backend to `aws` for Redshift**: that moves every secret the service reads, the shared Composio
+key included, and a missing secret reads as no key.
+
+Production runs on ECS only (no prod pipe-service in aisquare-releases yet). `stg` runs on ECS
+and on EKS until its cutover, so turn the tenant on in both. `dev` runs on EKS only.
+
+- **ECS** (production, and `stg` until the cutover):
+  1. Create the secret in the task definition's region (prod `us-east-2`, stg `us-east-1`; the
+     task execution role reads only `ais-pipe-service/<env>/*` in its own region):
+     `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/redshift-<tenant> --secret-string file://blob.json`
+  2. Add an entry to the `secrets:` of `deploy/ecs/<env>/task-definition-pipe-service.json` in
+     pipe-as-service, in the same ARN form as the entries already there:
+
+     ```json
+     {
+       "name": "PIPE_SECRET__<TENANT>__REDSHIFT__JSON",
+       "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/redshift-<tenant>"
+     }
+     ```
+
+  3. Merge it, then deploy:
+     `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`.
+     The workflow builds the image from pipe-as-service `main`, so it also ships everything
+     merged there since the last deploy. Check what that is first, above all in production.
+- **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand. aisquare-infra's
+  `secrets-nonprod` workflow fills it from the GitHub environment `nonprod-secrets` and
+  overwrites a hand edit at the next sync.
+  1. `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`
+  2. In aisquare-infra, one PR adds the entry to `live/nonprod/data/supplied-secrets.json`:
+
+     ```json
+     {
+       "nonprod/<env>/pipe-service/redshift-<tenant>": {
+         "github_secret": "<GH_SECRET>",
+         "description": "PIPE_SECRET__<TENANT>__REDSHIFT__JSON of the <env> pipe service: the Redshift blob of <tenant>"
+       }
+     }
+     ```
+
+     and its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
+     `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}`. Merge it only after step 1: a listed secret
+     with no GitHub value stops the sync for every secret. Check that `apply-nonprod` and
+     `secrets-nonprod` both ran green.
+  3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml` (never
+     `values.yaml`, which pipe-as-service's build overwrites):
+
+     ```yaml
+     secretEnv:
+       PIPE_SECRET__<TENANT>__REDSHIFT__JSON: { from: pipe-service/redshift-<tenant> }
+     ```
+
+     A code owner merging it is the deploy: Argo CD syncs the ExternalSecret `pipe`, then the
+     Deployment.
+
+Then delete `blob.json`.
+
+- **A new value** (role, external ID, region, cluster or database). Pods and tasks read the
+  value only when they start, so store it, then restart:
+  - ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/redshift-<tenant> --secret-string file://blob.json`,
+    then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+  - EKS, in this order: `gh secret set <GH_SECRET>` as in step 1; run
+    `gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra` and wait for
+    that run to end green; only then refresh the ExternalSecret
+    (`kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`) and
+    check that its `status.refreshTime` is later than the run's end; then
+    `kubectl -n <env> rollout restart deployment/pipe-service`. A refresh before the sync ends
+    copies the old blob.
+- **Offboarding**: remove the entry that reads the secret first (the task definition's
+  `secrets:` entry and a deploy; the `secretEnv` line), then the secret (ECS `delete-secret`;
+  EKS, the PR that removes the `supplied-secrets.json` entry and the sync line, then
+  `gh secret delete`). The other order stops the task from starting or fails the
+  ExternalSecret. The customer revokes the database user's grants (or drops it) and removes
+  AISquare's principals from the role's trust policy.
 
 | Error | Check |
 |---|---|

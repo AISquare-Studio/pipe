@@ -52,6 +52,10 @@ ADMITTED = [
     "SELECT * FROM #temp_rules",
     "SELECT TOP 10 * FROM t ORDER BY id",
     "SELECT listagg(title, ',') WITHIN GROUP (ORDER BY id) FROM t",
+    # Numbers, exponents included, beside words that are no keyword.
+    "SELECT 1e5 AS big, 1.5E-3 AS small, .5e+2 AS half, 2.e1 FROM t",
+    "SELECT col1e5into, x2e3 FROM t",  # one identifier each, digits and all
+    "SELECT t.a1, 3.14 FROM t",
 ]
 
 
@@ -118,6 +122,18 @@ REFUSED = {
     "quoted-set-config": """SELECT "set_config"('search_path', 'private', false)""",
     "unquoted-keyword-column": "SELECT update FROM t",
     "for-update": "SELECT * FROM t FOR UPDATE",
+    # A keyword glued to a number's exponent (seq 13894 m1): Redshift's lexer
+    # (PostgreSQL 8.0's) reads 1e5INTO as the number 1e5, then INTO.
+    "exponent-glued-into": "SELECT 1e5INTO t FROM x",
+    "exponent-glued-into-temp": "SELECT 1e5INTO TEMP t FROM x",
+    "decimal-exponent-glued-into-table": "SELECT 1.5e3INTO TABLE t",
+    "dot-exponent-glued-into-unlogged": "SELECT .5E1INTO UNLOGGED t",
+    "signed-exponent-glued-into": "SELECT 1e-5INTO t FROM x",
+    # A Unicode-escaped name (seq 13894 n1): PostgreSQL 8.4+ decodes
+    # U&"pg_terminate_backen\0064" to pg_terminate_backend.
+    "unicode-escaped-terminate": 'SELECT U&"pg_terminate_backen\\0064"(1)',
+    "unicode-escaped-lowercase-u": 'SELECT u&"pg_terminate_backen\\0064"(1)',
+    "unicode-escaped-string": "SELECT U&'\\0041' AS a",
     "unterminated-string": "SELECT 'abc",
     "unterminated-identifier": 'SELECT "abc',
     "unterminated-comment": "SELECT 1 /* never closed",
@@ -165,6 +181,14 @@ LEXER_REFUSES = [
     "quoted-set-config",
     "for-update",
     "unquoted-keyword-column",
+    "exponent-glued-into",
+    "exponent-glued-into-temp",
+    "decimal-exponent-glued-into-table",
+    "dot-exponent-glued-into-unlogged",
+    "signed-exponent-glued-into",
+    "unicode-escaped-terminate",
+    "unicode-escaped-lowercase-u",
+    "unicode-escaped-string",
 ]
 
 

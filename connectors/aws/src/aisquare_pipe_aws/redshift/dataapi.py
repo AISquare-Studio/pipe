@@ -7,11 +7,14 @@ inside one :class:`Deadline`:
 
 - Each request goes out on a client whose connect timeout plus read timeout
   fits inside what is left of the deadline when it is sent (:class:`Api`
-  builds a client with shorter ones when the current client's don't fit; the
-  read timeout bounds each wait for data). botocore never retries: a retry
-  would have to fit too. A throttled or dropped request fails the call with
-  its code. With less than :data:`MIN_REQUEST_SECONDS` left, no request is
-  sent and the call fails with ``timeout``.
+  builds a client with shorter ones when the current client's don't fit, and
+  with longer ones when they are under half of what the request may use: the
+  first result page, once the cancel's slice is no longer kept back, gets a
+  client sized to what is left (half of it, as every new client), not the
+  last poll's; the read timeout bounds each wait for data). botocore never
+  retries: a retry would have to fit too. A throttled or dropped request
+  fails the call with its code. With less than :data:`MIN_REQUEST_SECONDS`
+  left, no request is sent and the call fails with ``timeout``.
 - While a statement runs, a slice of the deadline is kept back for
   ``CancelStatement`` (:data:`CANCEL_SHARE` of it, at most
   :data:`CANCEL_RESERVE_MAX` seconds, at least :data:`MIN_REQUEST_SECONDS`).
@@ -22,6 +25,11 @@ inside one :class:`Deadline`:
   on the last poll's, which is sized for a poll. A request that fails or
   times out while the statement runs cancels it the same way. An
   ``ExecuteStatement`` that times out leaves no statement id to cancel.
+- The cancel is best effort: a statement it misses (an ``ExecuteStatement``
+  that timed out after Redshift accepted it, a ``CancelStatement`` that
+  failed) runs on until the database stops it. That bound is the
+  customer's: the ``statement_timeout`` of AISquare's database user (the
+  README's registration checklist, step 3; seq 13894 m4).
 
 The deadline covers the Data API requests. The AssumeRole before them is the
 shared helper's (:mod:`aisquare_pipe_aws.credentials`, #31), on botocore's
@@ -174,10 +182,17 @@ class Api:
     """The redshift-data requests of one call, inside its deadline: each goes
     out on a client whose connect plus read timeout fits inside what is left
     when it is sent. A client is built (no AWS call) only for a first
-    request, or when what is left no longer covers the current one's
-    timeouts; the new one gets half of what is left (all of it near the end),
-    so a call builds a handful at most. The cancel always gets a client of
-    its own (:meth:`cancel`)."""
+    request, when what the request may use no longer covers the current
+    one's timeouts, or when those are under half of it (and under the most a
+    client gets); the new one gets half of what the request may use (all of
+    it near the end), so a call builds a handful at most. The cancel always
+    gets a client of its own (:meth:`cancel`).
+
+    The last case is the result's first page (seq 13894 m2): the polls
+    before it keep the cancel's slice back and run the deadline down, so
+    the last poll's client can be 0.7 s with 3.35 s left. A page slower than
+    that read-timed out on it, and the rows of a query that had run were
+    lost."""
 
     def __init__(self, session: Any, target: RedshiftTarget, deadline: Deadline):
         self._session = session
@@ -220,12 +235,13 @@ class Api:
         return True
 
     def _within(self, budget: float) -> Any:
-        if self._client is None or self._timeouts > budget:
-            half = budget / 2
-            seconds = min(
-                MAX_CONNECT_TIMEOUT + MAX_READ_TIMEOUT,
-                half if half >= MIN_REQUEST_SECONDS else budget,
-            )
+        """The client for a request that may use ``budget`` seconds."""
+        most = MAX_CONNECT_TIMEOUT + MAX_READ_TIMEOUT
+        half = budget / 2
+        too_long = self._timeouts > budget
+        too_short = self._timeouts < min(half, most)
+        if self._client is None or too_long or too_short:
+            seconds = min(most, half if half >= MIN_REQUEST_SECONDS else budget)
             self._client = build_client(self._session, self._region, seconds)
             self._timeouts = seconds
         return self._client
