@@ -1,20 +1,20 @@
-# aisquare-pipe-salesforce
+# aisquare-pipe[salesforce]
 
 Salesforce source and sink connectors for [aisquare.pipe](https://github.com/AISquare-Studio/pipe). Ships with the `aisquare-pipe[full]` extras bundle.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[salesforce]` extra:
+
 ```bash
-pip install aisquare-pipe-salesforce
+pip install "aisquare-pipe[salesforce]"   # or "aisquare-pipe[full]": every connector
 ```
 
-`aisquare-pipe` is pulled in transitively — you don't need to install it separately.
-
-For development (from the addon directory):
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-cd connectors/salesforce
-pip install -e ".[dev]"
+pip install -e ".[full,dev]"
+cd connectors/salesforce && pytest tests
 ```
 
 ## Configuration

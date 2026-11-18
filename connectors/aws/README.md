@@ -1,7 +1,10 @@
-# aisquare-pipe-aws
+# aisquare_pipe_aws: Bedrock AgentCore policies and S3 (read-only, cross-account role)
 
 Read-only access to a customer's AWS account for [aisquare.pipe](../../README.md), through one
-cross-account IAM role. The package ships:
+cross-account IAM role. It ships inside the `aisquare-pipe` distribution:
+`pip install "aisquare-pipe[aws]"` (or `[full]`, or `[toolkits]`). The extra adds `boto3` and
+`botocore` (see [Install](#install)); without it, these connectors and toolkits count as not
+installed. It provides:
 
 | What | Registered as | Use it for |
 |---|---|---|
@@ -157,19 +160,25 @@ AISquare's side:
 ## Install
 
 ```bash
-cd connectors/aws
-pip install -e ".[dev]"
-pytest
+pip install "aisquare-pipe[aws]"
 ```
 
-This needs `boto3`/`botocore` >= 1.43.32:
+For development, from the repository root (as CI does; `[dev]` brings moto, the tests' AWS fake):
+
+```bash
+pip install -e ".[full,dev]"
+pipe validate            # every connector, as CI runs it
+cd connectors/aws && pytest
+```
+
+The `[aws]` extra needs `boto3`/`botocore` >= 1.43.32:
 - the AgentCore Policy model (`ListPolicyEngines`, `ListPolicies` and `GetPolicy`, with
   paginators) is there from 1.42.60, its GA release;
 - a policy's `enforcementMode` arrives only in 1.43.32. botocore drops response fields its
   model lacks, so an older release silently loses that field.
 
-No stubbed client is needed. Under D8 (single distribution) this package becomes the extra
-`aisquare-pipe[aws]`.
+No stubbed client is needed: the real `bedrock-agentcore-control` client is used, from botocore's
+own model.
 
 ## Tests
 

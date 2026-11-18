@@ -1,20 +1,20 @@
-# aisquare-pipe-docusign
+# aisquare-pipe[docusign]
 
 DocuSign source and sink connectors for [aisquare.pipe](https://github.com/AISquare-Studio/pipe). Ships with the `aisquare-pipe[full]` extras bundle.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[docusign]` extra:
+
 ```bash
-pip install aisquare-pipe-docusign
+pip install "aisquare-pipe[docusign]"   # or "aisquare-pipe[full]": every connector
 ```
 
-`aisquare-pipe` is pulled in transitively — no separate install needed.
-
-For development:
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-cd connectors/docusign
-pip install -e ".[dev]"
+pip install -e ".[full,dev]"
+cd connectors/docusign && pytest tests
 ```
 
 ## Configuration

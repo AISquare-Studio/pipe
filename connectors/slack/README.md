@@ -1,4 +1,4 @@
-# aisquare-pipe-slack
+# aisquare-pipe[slack]
 
 Slack for [aisquare.pipe](../../README.md): `SlackToolkit`, registered as toolkit
 `slack` (`aisquare_pipe.toolkits`). It has 111 LLM-callable tools over Slack's Web API —
@@ -21,9 +21,17 @@ host's business.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[slack]` extra:
+
 ```bash
-cd connectors/slack
-pip install -e ".[dev]"
+pip install "aisquare-pipe[slack]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/slack && pytest tests
 ```
 
 ## Quick start
