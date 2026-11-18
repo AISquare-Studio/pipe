@@ -16,6 +16,14 @@ credential's own host, ``https://<account>.snowflakecomputing.com``:
   mean "still running".
 * ``GET /api/v2/statements/{handle}?partition=N`` for later partitions, read
   only while under the row and byte caps.
+
+A result's body (the status answer that carries partition 0, and each later
+partition) is never parsed whole: Snowflake decides how large a partition
+is. It is streamed and split a row at a time
+(:class:`~aisquare_pipe_snowflake.stream.Body`), and reading stops at the
+row or byte cap. A single row over
+:data:`~aisquare_pipe_snowflake.stream.ROW_BYTES` of JSON is
+:class:`RowTooLarge`.
 * ``POST /api/v2/statements/{handle}/cancel`` when the deadline passes.
 
 Every request carries the bearer (a key-pair JWT or an OAuth token) and
@@ -43,10 +51,12 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import TracebackType
 from typing import Any, Self
 from urllib.parse import quote
 
 import requests
+import urllib3.exceptions
 from aisquare.pipe.core.batches import BatchPlan
 
 from aisquare_pipe_snowflake._http import retry_after_seconds, timed_out
@@ -59,7 +69,19 @@ from aisquare_pipe_snowflake.credentials import (
     bearer_token,
     forget_token,
 )
-from aisquare_pipe_snowflake.rows import canonical, columns_of, encoded_batch, iter_rows
+from aisquare_pipe_snowflake.rows import (
+    canonical,
+    columns_of,
+    convert_row,
+    encoded_batch,
+)
+from aisquare_pipe_snowflake.stream import (
+    READ_CHUNK,
+    ROW_BYTES,
+    BadBody,
+    Body,
+    RowOverCap,
+)
 
 STATEMENTS_PATH = "/api/v2/statements"
 DEFAULT_TIMEOUT = 30.0
@@ -114,6 +136,24 @@ class SnowflakeAPIError(Exception):
         self.retry_after = retry_after
         self.timed_out = timed_out
         self.credential_refused = credential_refused
+
+
+class RowTooLarge(ValueError):
+    """One row of the result is over :data:`ROW_BYTES` of JSON: more than
+    a row may be, so nothing is returned. A ``ValueError``, so
+    pipe-as-service answers 422 (the toolkit: ``invalid_arguments``): the
+    caller can select fewer or shorter columns. ``row`` is its 0-based
+    index in the result. The message carries none of its values."""
+
+    def __init__(self, row: int, read: int, limit: int = ROW_BYTES) -> None:
+        self.row = row
+        self.read = read
+        self.limit = limit
+        super().__init__(
+            f"row {row} of the result is too large to read: it is over "
+            f"{limit:,} bytes of JSON, the most one row may be; select fewer or "
+            "shorter columns (LEFT(col, n), or one path of a VARIANT)"
+        )
 
 
 @dataclass
@@ -283,12 +323,15 @@ class SnowflakeClient:
         if bindings:
             body["bindings"] = {k: dict(v) for k, v in bindings.items()}
         params = {"async": "true", "nullable": "true", "requestId": str(uuid.uuid4())}
-        status, answer = self._json("POST", STATEMENTS_PATH, params, body=body)
+        status, answer = self._respond(
+            "POST", STATEMENTS_PATH, params, body=body, stream=True
+        )
+        known: str | None = None
         # The first status read goes out at once (most reads finish in well
         # under a second), then the pauses double up to POLL_MAX_SECONDS.
         delay, next_delay = 0.0, POLL_FIRST_SECONDS
         while status != 200:
-            handle = _handle(answer)
+            handle = known = _handle(answer)
             now = self._monotonic()
             if now >= deadline:
                 self._cancel(handle)
@@ -312,11 +355,16 @@ class SnowflakeClient:
             if pause > 0:
                 self._sleep(pause)
             delay, next_delay = next_delay, min(next_delay * 2, POLL_MAX_SECONDS)
-            status, answer = self._json(
-                "GET", f"{STATEMENTS_PATH}/{quote(handle, safe='')}", {}, polling=True
+            status, answer = self._respond(
+                "GET",
+                f"{STATEMENTS_PATH}/{quote(handle, safe='')}",
+                {},
+                polling=True,
+                stream=True,
             )
         return self._collect(
             answer,
+            handle=known,
             row_limit=row_limit,
             byte_limit=byte_limit,
             encoded=encoded,
@@ -325,21 +373,81 @@ class SnowflakeClient:
 
     def _collect(
         self,
-        answer: dict[str, Any],
+        answer: Any,
         *,
+        handle: str | None = None,
         row_limit: int,
         byte_limit: int,
         encoded: bool = False,
         batching: tuple[int, int] | None = None,
     ) -> StatementResult:
-        meta = answer.get("resultSetMetaData")
+        """The result of the status answer ``answer`` (the open response;
+        ``handle``: the statement's, when the polls named it), then its later
+        partitions, each read a row at a time within the caps."""
+        head: dict[str, Any] = {}
+        result: StatementResult | None = None
+        again = cut = False
+        with _Reading(self, answer) as body:
+            try:
+                for key in body.members():
+                    if key != "data":
+                        head[key] = body.value()
+                        continue
+                    if not isinstance(head.get("resultSetMetaData"), dict):
+                        # Rows before the columns: read through, keeping none,
+                        # and read partition 0 again once the columns are known.
+                        body.skip_rows()
+                        again = True
+                        continue
+                    result = self._result(head, handle, encoded, batching)
+                    rows = body.rows()
+                    cut = self._take(
+                        result, rows, row_limit=row_limit, byte_limit=byte_limit
+                    )
+                    if cut and result.query_id is not None:
+                        break  # the rest is never read
+                    if cut:
+                        # The handle comes after the rows: read through to it.
+                        for _ in rows:
+                            pass
+            except RowOverCap as over:
+                raise RowTooLarge(body.rows_read - 1, over.read, over.limit) from None
+        if result is None:
+            result = self._result(head, handle, encoded, batching)
+            again = again and bool(result.columns)
+        elif result.query_id is None:
+            result.query_id = _usable_handle(head.get("statementHandle"))
+        meta = head.get("resultSetMetaData")
+        info = meta.get("partitionInfo") if isinstance(meta, dict) else None
+        partitions = [p for p in info or [] if isinstance(p, dict)]
+        index = 0 if again else 1
+        while not cut and index < max(len(partitions), 1 if again else 0):
+            if index >= MAX_PARTITIONS:
+                break
+            if result.query_id is None:
+                raise SnowflakeAPIError(
+                    "the SQL API answered more partitions without a usable statementHandle"
+                )
+            cut = self._partition(
+                result, index, row_limit=row_limit, byte_limit=byte_limit
+            )
+            index += 1
+        return result
+
+    def _result(
+        self,
+        head: dict[str, Any],
+        handle: str | None,
+        encoded: bool,
+        batching: tuple[int, int] | None,
+    ) -> StatementResult:
+        """The (empty) result an answer's keys describe."""
+        meta = head.get("resultSetMetaData")
         meta = meta if isinstance(meta, dict) else {}
         columns = columns_of(meta.get("rowType"))
-        handle = answer.get("statementHandle")
-        handle = handle if isinstance(handle, str) and _HANDLE.match(handle) else None
         num_rows = meta.get("numRows")
         result = StatementResult(
-            query_id=handle,
+            query_id=handle or _usable_handle(head.get("statementHandle")),
             columns=columns,
             num_rows=num_rows if isinstance(num_rows, int) and num_rows >= 0 else None,
             encoded=[] if encoded else None,
@@ -354,44 +462,47 @@ class SnowflakeClient:
                 closing=2,
             )
             result.result_bytes = result.plan.total
-        partitions = [p for p in meta.get("partitionInfo") or [] if isinstance(p, dict)]
-        # Taken out of the answer (its caller still holds it), so each parsed
-        # partition goes before the next one is read.
-        page: Any = answer.pop("data", None)
-        index = 0
-        while True:
-            cut = self._take(result, page, row_limit=row_limit, byte_limit=byte_limit)
-            page = None
-            if cut:
-                break
-            index += 1
-            if index >= len(partitions) or index >= MAX_PARTITIONS:
-                break
-            if handle is None:
-                raise SnowflakeAPIError(
-                    "the SQL API answered more partitions without a usable statementHandle"
-                )
-            if result.result_bytes + _size(partitions[index]) > byte_limit:
-                result.truncated = TRUNCATED_MAX_RESULT_BYTES
-                break
-            _, more = self._json(
-                "GET",
-                f"{STATEMENTS_PATH}/{quote(handle, safe='')}",
-                {"partition": index},
-            )
-            page = more.pop("data", None)
-            del more
         return result
+
+    def _partition(
+        self, result: StatementResult, index: int, *, row_limit: int, byte_limit: int
+    ) -> bool:
+        """Partition ``index``'s rows into ``result``, read a row at a time
+        and no further than the caps; True when a cap stopped it."""
+        handle = result.query_id or ""
+        _, answer = self._respond(
+            "GET",
+            f"{STATEMENTS_PATH}/{quote(handle, safe='')}",
+            {"partition": index},
+            stream=True,
+        )
+        first = result.count
+        with _Reading(self, answer) as body:
+            try:
+                for key in body.members():
+                    if key != "data":
+                        body.value()
+                    elif self._take(
+                        result, body.rows(), row_limit=row_limit, byte_limit=byte_limit
+                    ):
+                        return True
+            except RowOverCap as over:
+                raise RowTooLarge(
+                    first + body.rows_read - 1, over.read, over.limit
+                ) from None
+        return False
 
     @staticmethod
     def _take(
-        result: StatementResult, page: Any, *, row_limit: int, byte_limit: int
+        result: StatementResult, rows: Any, *, row_limit: int, byte_limit: int
     ) -> bool:
-        """Add ``page``'s rows within the caps; True when a cap stopped it."""
-        for row in iter_rows(result.columns, page):
+        """Add ``rows``' rows (``jsonv2`` lists, one at a time) within the
+        caps; True when a cap stopped it."""
+        for cells in rows:
             if result.count >= row_limit:
                 result.truncated = TRUNCATED_MAX_ROWS
                 return True
+            row = convert_row(result.columns, cells)
             encoded = canonical(row)
             if result.plan is not None:
                 cost = result.plan.cost(len(encoded))
@@ -436,7 +547,14 @@ class SnowflakeClient:
             "X-Snowflake-Authorization-Token-Type": self._creds.token_type,
         }
 
-    def _send(self, method: str, path: str, params: dict[str, Any], body: Any) -> Any:
+    def _send(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any],
+        body: Any,
+        stream: bool = False,
+    ) -> Any:
         headers = {
             "Accept": "application/json",
             "User-Agent": USER_AGENT,
@@ -454,16 +572,11 @@ class SnowflakeClient:
                 headers=headers,
                 timeout=self._request_timeout(),
                 allow_redirects=False,
+                stream=stream,
                 **kwargs,
             )
         except requests.RequestException as e:
-            if timed_out(e):
-                raise SnowflakeAPIError(
-                    "Snowflake did not answer in time", timed_out=True
-                ) from e
-            raise SnowflakeAPIError(
-                f"could not complete the request to Snowflake ({type(e).__name__})"
-            ) from e
+            raise _request_failure(e) from e
 
     def _json(
         self,
@@ -476,7 +589,23 @@ class SnowflakeClient:
     ) -> tuple[int, dict[str, Any]]:
         """``(status, JSON object)`` for a 200 or 202 (and, while
         ``polling``, a 429: still running). Anything else raises."""
-        resp = self._send(method, path, params, body)
+        status, answer = self._respond(method, path, params, body=body, polling=polling)
+        return status, answer
+
+    def _respond(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any],
+        *,
+        body: Any = None,
+        polling: bool = False,
+        stream: bool = False,
+    ) -> tuple[int, Any]:
+        """:meth:`_json`, but with ``stream`` a 200's answer is the open
+        response, its body not read yet (a result: :meth:`_collect` reads it
+        a row at a time, then closes it)."""
+        resp = self._send(method, path, params, body, stream)
         if resp.status_code == 401 and self._token_from_cache:
             # An OAuth token from the cache that Snowflake no longer takes
             # (revoked, or the integration changed): drop it and retry once
@@ -488,7 +617,8 @@ class SnowflakeClient:
             self._token = None
             if method == "POST" and "requestId" in params:
                 params = {**params, "retry": "true"}
-            resp = self._send(method, path, params, body)
+            resp = self._send(method, path, params, body, stream)
+        keep = False
         try:
             status = resp.status_code
             if status == 401:
@@ -502,6 +632,20 @@ class SnowflakeClient:
             if status == 429 and polling:
                 hint = retry_after_seconds((resp.headers or {}).get("Retry-After"))
                 return 429, {"_retry_after": hint, **self._handle_of(params, path)}
+            if status == 200 and stream:
+                keep = True
+                return 200, resp
+            if stream:
+                # Any other answer (a 202, an error) is small: read it now, so
+                # a body that breaks off is the transport failure it is.
+                try:
+                    resp.content  # noqa: B018 — reads the streamed body
+                except (
+                    requests.RequestException,
+                    urllib3.exceptions.HTTPError,
+                    OSError,
+                ) as e:
+                    raise _request_failure(e) from e
             try:
                 data = resp.json()
             except (ValueError, requests.RequestException):
@@ -515,7 +659,8 @@ class SnowflakeClient:
                 return status, data
             raise self._failure(status, data, resp)
         finally:
-            resp.close()
+            if not keep:
+                resp.close()
 
     @staticmethod
     def _handle_of(params: dict[str, Any], path: str) -> dict[str, Any]:
@@ -574,9 +719,60 @@ def _handle(answer: dict[str, Any]) -> str:
     return handle
 
 
-def _size(partition: dict[str, Any]) -> int:
-    value = partition.get("uncompressedSize")
-    return value if isinstance(value, int) and value >= 0 else 0
+def _usable_handle(value: Any) -> str | None:
+    return value if isinstance(value, str) and _HANDLE.match(value) else None
+
+
+class _Reading:
+    """``with _Reading(client, answer) as body``: the :class:`Body` of an
+    open response (closed on exit), its transport failures and a body not
+    of the SQL API's shape raised as :class:`SnowflakeAPIError`. A plain
+    JSON object (an answer that was not streamed) is read the same way."""
+
+    def __init__(self, client: SnowflakeClient, answer: Any) -> None:
+        self._answer = answer
+        if isinstance(answer, dict):
+            chunks: Any = iter([json.dumps(answer).encode()])
+        else:
+            chunks = _chunks(answer)
+        self.body = Body(chunks)
+
+    def __enter__(self) -> Body:
+        return self.body
+
+    def __exit__(
+        self,
+        kind: type[BaseException] | None,
+        error: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        close = getattr(self._answer, "close", None)
+        if callable(close):
+            close()
+        if isinstance(error, BadBody):
+            raise SnowflakeAPIError(
+                f"Snowflake answered with a body the connector can't read ({error})",
+                status=200,
+            ) from None
+
+
+def _request_failure(e: BaseException) -> SnowflakeAPIError:
+    """A transport failure, sending or reading a body: a timeout stays a
+    timeout."""
+    if timed_out(e):
+        return SnowflakeAPIError("Snowflake did not answer in time", timed_out=True)
+    return SnowflakeAPIError(
+        f"could not complete the request to Snowflake ({type(e).__name__})"
+    )
+
+
+def _chunks(resp: Any) -> Any:
+    """``resp``'s body, :data:`READ_CHUNK` bytes at a time; a transport
+    failure while it is read is a :class:`SnowflakeAPIError`."""
+    try:
+        yield from resp.iter_content(READ_CHUNK)
+    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
+        raise _request_failure(e) from None
 
 
 __all__ = [
@@ -584,6 +780,7 @@ __all__ = [
     "STATEMENTS_PATH",
     "TRUNCATED_MAX_RESULT_BYTES",
     "TRUNCATED_MAX_ROWS",
+    "RowTooLarge",
     "SnowflakeAPIError",
     "SnowflakeClient",
     "StatementResult",

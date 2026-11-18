@@ -395,7 +395,10 @@ def test_the_result_byte_cap_cuts_the_result_and_says_so():
     assert len(json.dumps(result.data["rows"])) <= MAX_RESULT_BYTES
 
 
-def test_a_partition_past_the_byte_cap_is_never_downloaded():
+def test_a_partition_is_read_only_up_to_the_byte_cap():
+    """Rows are read one at a time (#46 review seq 14088 M2), so a partition
+    whose rows don't all fit is read up to the cap, not skipped whole (that
+    returned 2 rows here, not 3), and no partition after it is asked for."""
     fake = _fake()
     big = "y" * (1024 * 1024)
     fake.add(
@@ -404,10 +407,12 @@ def test_a_partition_past_the_byte_cap_is_never_downloaded():
     )
     result = _call(fake, "SNOWFLAKE_RUN_SELECT", {"statement": "SELECT * FROM blobs"})
     assert result.data["truncated"] == "max_result_bytes"
+    assert result.data["row_count"] == 3
+    assert len(json.dumps(result.data["rows"])) <= MAX_RESULT_BYTES
     partitions = [
         r["params"].get("partition") for r in fake.api_calls() if r["method"] == "GET"
     ]
-    assert partitions == [None]  # partition 1 would pass the cap: not read
+    assert partitions == [None, 1]  # partition 1 up to the cap; 2 and 3 never
 
 
 # -- server keys and bad arguments ---------------------------------------------------

@@ -2,10 +2,13 @@
 maxima, so a pull fits a 512 MiB pod (the #37 review's m1, checked here too).
 
 The fake serves each result partition as fresh JSON bytes, as the network
-would: what is measured is the source's own work (each partition parsed,
-its rows converted and kept, the envelopes built). Snowflake, not the
-connector, sizes the partitions; these use 10,000 rows. The README's
-"Memory" table has the numbers.
+would: what is measured is the source's own work (each partition read a row
+at a time, its rows converted and kept, the envelopes built). Snowflake, not
+the connector, sizes the partitions: PartitionedSnowflake uses 10,000 rows
+and builds each answer whole (its copy counts in the peak); SizedSnowflake
+takes any sizes and hands an answer out a chunk at a time, as the network
+does (#46 review seq 14088 M2). The README's "Memory" table has the numbers
+(SizedSnowflake's, a process per pull).
 
 What the consumer holds, the same model in every source's memory test: as
 pipe-as-service's pull loop does, it converts each envelope as it arrives
@@ -256,3 +259,236 @@ def test_max_result_bytes_counts_every_envelope_s_columns_header():
     )
     assert sum(len(e.data) for e in envelopes) <= cap
     assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
+
+
+# -- partitions Snowflake sizes: read a row at a time (#46 review seq 14088 M2) -------
+
+
+class StreamedResponse(FakeResponse):
+    """A 200 whose body is ``parts`` (bytes made outside the measurement),
+    given out as the network does: ``iter_content`` makes a fresh copy of
+    each chunk, never of the whole body. ``content`` (what a client that
+    reads the whole body holds) joins them. ``consumed``: the bytes given
+    out so far."""
+
+    def __init__(self, parts: list[bytes]) -> None:
+        super().__init__(200, None)
+        self.parts = parts
+        self.consumed = 0
+        self.headers = {"Content-Type": "application/json"}
+
+    @property  # type: ignore[override]
+    def content(self) -> bytes:
+        self.consumed = sum(len(p) for p in self.parts)
+        return b"".join(self.parts)
+
+    @content.setter
+    def content(self, value: bytes) -> None:
+        pass
+
+    def json(self) -> Any:
+        return json.loads(self.content)
+
+    def iter_content(self, chunk_size: int = 1):
+        for part in self.parts:
+            view = memoryview(part)
+            for start in range(0, len(part), chunk_size):
+                chunk = bytes(view[start : start + chunk_size])
+                self.consumed += len(chunk)
+                yield chunk
+
+
+class SizedSnowflake(PartitionedSnowflake):
+    """PartitionedSnowflake whose partitions hold ``sizes`` rows (the last
+    size repeats), and whose answers stream (:class:`StreamedResponse`).
+    ``served`` has each answer with rows: (partition, its response)."""
+
+    def __init__(self, columns, total, cell, sizes: list[int]) -> None:
+        super().__init__(columns, total, cell)
+        self.sizes = sizes
+        self.served: list[tuple[int, StreamedResponse]] = []
+
+    def _sizes(self, handle: str) -> list[int]:
+        cap = int(self._statements[handle]["cap"])
+        left, out = min(self.total, cap), []
+        while left > 0:
+            n = min(self.sizes[min(len(out), len(self.sizes) - 1)], left)
+            out.append(n)
+            left -= n
+        return out
+
+    def _poll(self, handle):
+        if self._statements[handle]["canned"].columns is not self.columns:
+            return super()._poll(handle)
+        sizes = self._sizes(handle)
+        head = {
+            "code": "090001",
+            "statementHandle": handle,
+            "sqlState": "00000",
+            "resultSetMetaData": {
+                "numRows": sum(sizes),
+                "format": "jsonv2",
+                "rowType": self.columns,
+                "partitionInfo": [
+                    {"rowCount": n, "uncompressedSize": len(self.part(n))}
+                    for n in sizes
+                ],
+            },
+        }
+        response = StreamedResponse(
+            [json.dumps(head).encode()[:-1], b',"data":', self.part(sizes[0]), b"}"]
+        )
+        self.served.append((0, response))
+        return response
+
+    def _partition(self, handle, index):
+        response = StreamedResponse(
+            [b'{"data":', self.part(self._sizes(handle)[index]), b"}"]
+        )
+        self.served.append((index, response))
+        return response
+
+
+def _sized_peak(fake: SizedSnowflake, params: dict[str, Any]) -> tuple[int, int, int]:
+    """(peak bytes, rows, data bytes) of one pull, every envelope kept; every
+    partition's bytes made first (outside the measurement)."""
+    config = blob()
+    list(
+        SnowflakeQuerySource(session=fake).pull(
+            config, PullParams({"sql": SQL, "max_rows": 1})
+        )
+    )
+    cap = params.get("max_rows", DEFAULT_MAX_ROWS) + 1
+    left, i = min(fake.total, cap), 0
+    while left > 0:
+        n = min(fake.sizes[min(i, len(fake.sizes) - 1)], left)
+        fake.part(n)
+        left, i = left - n, i + 1
+    fake.served.clear()
+    gc.collect()
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        kept = list(SnowflakeQuerySource(session=fake).pull(config, PullParams(params)))
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    rows = sum(e.metadata["row_count"] for e in kept)
+    return peak, rows, sum(len(e.data) for e in kept)
+
+
+_SF_CAPS = {
+    "max_rows": MAX_ROWS,
+    "max_result_bytes": MAX_RESULT_BYTES,
+    "batch_size": MAX_BATCH_SIZE,
+}
+_NUMBERS = [col(f"C{i:02d}", "fixed") for i in range(50)]
+_WIDE = [col(f"S{i}", "text") for i in range(4)]
+
+
+@pytest.mark.parametrize(
+    ("columns", "cell", "sizes", "params", "bound"),
+    [
+        # 417.9 MiB at 1a8b64e (review seq 14088 M2; 380.0 in this harness, now
+        # 74.1): partition 0, in the
+        # status answer, 100,000 rows of 50 NUMBER columns (52.5 MiB), was
+        # never checked and parsed whole.
+        pytest.param(
+            _NUMBERS,
+            _int_cell,
+            [100_000],
+            _SF_CAPS,
+            POD_SHARE / 2,
+            id="one-100k-partition",
+        ),
+        # 467.0 MiB (376.8 here, now 74.1): 1,000 rows, then a 99,000-row
+        # partition (~52 MiB) that
+        # was fetched because its uncompressedSize fit the bytes left.
+        pytest.param(
+            _NUMBERS,
+            _int_cell,
+            [1_000, 99_000],
+            _SF_CAPS,
+            POD_SHARE / 2,
+            id="1k-then-99k",
+        ),
+        # 229.2 MiB (135.5 here, now 71.3): 4 wide TEXT columns, 60,000 rows
+        # in one 58 MiB partition.
+        pytest.param(
+            _WIDE,
+            _wide_cell,
+            [60_000],
+            _SF_CAPS,
+            POD_SHARE / 2,
+            id="wide-60k-partition",
+        ),
+        # 43.6 MiB (35.3 here, now 7.9) at the defaults, the 2-partition shape.
+        pytest.param(
+            _NUMBERS,
+            _int_cell,
+            [1_000, 99_000],
+            {},
+            POD_SHARE / 8,
+            id="defaults-1k-then-99k",
+        ),
+    ],
+)
+def test_a_partition_snowflake_sized_large_is_read_a_row_at_a_time(
+    columns, cell, sizes, params, bound
+):
+    fake = SizedSnowflake(columns, 2 * MAX_ROWS, cell, sizes)
+    peak, rows, data = _sized_peak(fake, {"sql": SQL, **params})
+    assert rows > 1_000
+    assert data <= params.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES)
+    assert peak < bound, peak / MIB
+
+
+def test_reading_stops_at_the_cap_inside_a_partition():
+    """max_result_bytes 1 MiB of a 100,000-row partition 0 (52.5 MiB): about
+    that much is read, not the partition, and no later partition is asked
+    for."""
+    fake = SizedSnowflake(_NUMBERS, 2 * MAX_ROWS, _int_cell, [100_000])
+    envelopes = list(
+        SnowflakeQuerySource(session=fake).pull(
+            blob(),
+            PullParams({"sql": SQL, "max_rows": MAX_ROWS, "max_result_bytes": MIB}),
+        )
+    )
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
+    assert sum(len(e.data) for e in envelopes) <= MIB
+    assert [index for index, _ in fake.served] == [0]
+    ((_, answer),) = fake.served
+    assert answer.consumed <= MIB + 2 * 64 * 1024
+    assert len(fake.part(100_000)) > 50 * MIB
+
+
+class Utf8SizedSnowflake(SizedSnowflake):
+    """SizedSnowflake sending non-ASCII as raw UTF-8 (not ``\\uXXXX``
+    escapes): a row's text then decodes to what Python holds."""
+
+    def part(self, n: int) -> bytes:
+        if n not in self._parts:
+            rows = (
+                json.dumps([self.cell(c, i) for c in self.columns], ensure_ascii=False)
+                for i in range(n)
+            )
+            self._parts[n] = ("[" + ",".join(rows) + "]").encode()
+        return self._parts[n]
+
+
+def test_the_largest_row_read_stays_under_the_bar_at_the_caps():
+    """Rows of 4 TEXT cells of 2 MiB, an emoji in each (so Python holds each
+    cell, and the row's text, at 4 bytes a character): just under ROW_BYTES
+    of JSON, the largest row read. The worst shape measured: 177.1 MiB at
+    the caps (136.6 at the defaults; 320.0 at 1a8b64e), the README's
+    number."""
+    from aisquare_pipe_snowflake.stream import ROW_BYTES
+
+    def cell(column: dict[str, Any], i: int) -> str:
+        return "\U0001f600" + "x" * (2 * MIB - 40) + f"{i:06d}"
+
+    fake = Utf8SizedSnowflake(_WIDE, 12, cell, [5])
+    assert ROW_BYTES - 1_000 < len(fake.part(1)) - 2 <= ROW_BYTES
+    peak, rows, _data = _sized_peak(fake, {"sql": SQL, **_SF_CAPS})
+    assert rows == 7  # max_result_bytes: 64 MiB of 8 MiB rows
+    assert peak < POD_SHARE, peak / MIB

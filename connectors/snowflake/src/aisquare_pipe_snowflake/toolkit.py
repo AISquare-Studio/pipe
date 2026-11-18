@@ -45,6 +45,7 @@ from aisquare.pipe import (
 from aisquare.pipe.errors import PipelineError
 
 from aisquare_pipe_snowflake.client import (
+    RowTooLarge,
     SnowflakeAPIError,
     SnowflakeClient,
     StatementResult,
@@ -698,6 +699,8 @@ class SnowflakeToolkit(Toolkit):
                 return call(client)
             except SnowflakeAPIError as e:
                 return failure(e, creds)
+            except RowTooLarge as e:
+                return ToolResult.fail(str(e), code=ERROR_INVALID_ARGUMENTS)
 
     # Each handler checks its arguments and returns the call to make.
 

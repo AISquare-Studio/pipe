@@ -111,38 +111,54 @@ raise the caps. `result_sha256` then covers the rows read only.
 **How a pull fails** (pipe-as-service answers by the exception's type; neither message carries Snowflake's own error
 text, which can quote the SQL and name objects, because hosts log these):
 - **422**, a `ValueError`: the secret is missing or malformed (`SnowflakeNotConfigured`); a bad param or name; SQL
-  that is not one SELECT (`NotReadOnly`); and what Snowflake refused that the caller can fix, as
-  `SnowflakeRequestError` (with Snowflake's `status`, `code` and `sql_state`): a statement that does not compile
-  (with Snowflake's "line L at position P"), an object that does not exist or the role can't see, a value that
-  can't be converted.
+  that is not one SELECT (`NotReadOnly`); a row over 8 MiB of JSON (`RowTooLarge`: its index, none of its values;
+  select fewer or shorter columns); and what Snowflake refused that the caller can fix, as `SnowflakeRequestError`
+  (with Snowflake's `status`, `code` and `sql_state`): a statement that does not compile (with Snowflake's "line L at
+  position P"), an object that does not exist or the role can't see, a value that can't be converted.
 - **502** `upstream_error`, a `PipelineError` with `retry_after` when Snowflake sent `Retry-After` (a 503): a key or
-  OAuth client Snowflake refused, a missing grant or warehouse, throttling, the statement's deadline, a 5xx or the
-  network. The message says which, and what to fix, as the table below does.
+  OAuth client Snowflake refused, a missing grant or warehouse, throttling, the statement's deadline, a 5xx, the
+  network (a body that breaks off midway included), or a result body that is not the SQL API's JSON. The message says which, and what to fix, as the table below does.
 
 ### Memory
 
 A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each result partition as
-fresh JSON bytes, 10,000 rows a partition, and every envelope is kept: one inline copy each, as pipe-as-service keeps a
-pull's converted envelopes (inline up to 256 KiB; each test's docstring has the model)):
+fresh JSON bytes, a chunk at a time as the network does, and every envelope is kept: one inline copy each, as
+pipe-as-service keeps a pull's converted envelopes (inline up to 256 KiB; each test's docstring has the model)). Each
+pull was measured in a process of its own:
 
-| Pull | Rows | JSON of the rows | Peak |
-|---|---|---|---|
-| defaults: 10,000 rows of 50 `NUMBER` columns | 10,000 | 6.7 MiB | 47 MiB (65 MiB before) |
-| defaults: 10,000 rows of 18 mixed columns | 10,000 | 3.2 MiB | 21 MiB |
-| defaults: 10,000 rows of 4 wide `TEXT` columns (1 KB a row) | 10,000 | 9.9 MiB | 42 MiB |
-| `max_result_bytes` 64 MiB, 50 `NUMBER` columns | 90,000 | 60 MiB | 104 MiB (367 MiB at the old 100 MiB) |
-| `max_rows` 100,000, 18 mixed columns | 100,000 | 32 MiB | 53 MiB |
-| `max_result_bytes` 64 MiB, wide rows | 60,000 | 59 MiB | 93 MiB |
-| the same, in 50,000-row (49 MiB) partitions | 50,000 | 49 MiB | 207 MiB |
+| Pull | Rows | JSON of the rows | Peak | At 1a8b64e |
+|---|---|---|---|---|
+| defaults: 10,000 rows of 50 `NUMBER` columns, 10,000-row partitions | 10,000 | 6.8 MiB | 7.9 MiB | 38.4 MiB |
+| defaults: the same, partitions of 1,000 then 99,000 rows | 10,000 | 6.8 MiB | 7.9 MiB | 35.3 MiB |
+| caps: 50 `NUMBER` columns, 10,000-row partitions | 94,746 | 64 MiB | 74.1 MiB | 95.1 MiB |
+| caps: 50 `NUMBER` columns, ONE 100,000-row partition (52.5 MiB) | 94,746 | 64 MiB | 74.1 MiB | 380.0 MiB |
+| caps: 50 `NUMBER` columns, 1,000 rows then a 99,000-row partition | 94,746 | 64 MiB | 74.1 MiB | 376.8 MiB |
+| caps: 10 `NUMBER` columns, 100,000 rows in one partition | 100,000 | 12.6 MiB | 23.8 MiB | 88.2 MiB |
+| caps: 4 wide `TEXT` columns (1 KB a row), 10,000-row partitions | 64,852 | 64 MiB | 71.3 MiB | 73.9 MiB |
+| caps: the same, 60,000 rows in one 58 MiB partition | 64,852 | 64 MiB | 71.3 MiB | 135.5 MiB |
+| caps: rows of 4 `TEXT` cells of 2 MiB (8 MiB of JSON a row), ASCII | 7 | 56 MiB | 105.1 MiB | 88.0 MiB (5 rows) |
+| caps: the same, an emoji in every cell (the worst measured) | 7 | 56 MiB | **177.1 MiB** | 320.0 MiB (5 rows) |
+| defaults: the same | 3 | 24 MiB | 136.6 MiB | 320.0 MiB |
 
-How: each parsed partition is let go before the next is read, rows are converted one at a time, and the source keeps
-each row as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are byte for
-byte what they were). A batch's rows are let go once its envelope is built. Snowflake, not the connector, sizes the
-partitions; one is fetched only while its `uncompressedSize` fits the bytes left, so one partition is at most
-`max_result_bytes`. A pull peaks at about 1.35 times the rows' JSON plus about three times the largest partition
-(its bytes, their text, and the parsed rows): under 256 MiB at the caps whatever the partitions. A host keeps the
-envelopes too: pipe-as-service base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at
-64 MiB on a 512 MiB pod.
+(Caps: `max_rows` 100,000, `max_result_bytes` 64 MiB, `batch_size` 10,000. The review measured 417.9, 467.0 and 229.2
+MiB at 1a8b64e for three of these shapes with a fake that held each answer whole; this fake hands out chunks.)
+
+**No partition is parsed whole.** Snowflake, not the connector, decides how large a partition is (its docs show one
+of 76 MB uncompressed in one result), and parsing one whole costs about three times its bytes. So a result's body,
+the status answer that carries partition 0 included, is streamed 64 KiB at a time and split as it arrives
+(`aisquare_pipe_snowflake.stream`): every key but `data` (`resultSetMetaData`, the code, ...) is parsed on its own
+(8 MiB in all at most), and `data`'s rows (`jsonv2`: arrays of strings and nulls) one row at a time. Each row is
+converted, kept as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are
+byte for byte what they were) and let go; reading stops at `max_rows` or `max_result_bytes`, inside a partition if
+that is where the cap falls, and the partitions after it are never asked for. A batch's rows are let go once its
+envelope is built.
+
+So a pull peaks at about 1.15 times the rows' JSON plus the row being read, whatever the partitions: 74 MiB at the
+caps for ordinary rows. A row may be at most 8 MiB of JSON (`ROW_BYTES`; one over it is `RowTooLarge`, a 422, with
+its index and none of its values). Parsing one costs up to about nine times its bytes when an emoji makes Python hold
+its text at 4 bytes a character, so the worst pull measured is 177 MiB at the caps. A host keeps the envelopes too:
+pipe-as-service base64-encodes each (about 1.33 times more), which is why `max_result_bytes` stops at 64 MiB on a
+512 MiB pod.
 
 ## Security
 
