@@ -48,6 +48,9 @@ dev = [
     "responses",
     # AWS fakes (STS, S3) for connectors/aws's hermetic tests.
     "moto[s3,sts]>=5.0,<6",
+    # connectors/gcs tests make throwaway RSA/EC keys. google-auth only brings
+    # it in from 2.4x; [gcs] allows 2.20.
+    "cryptography>=38.0.3",
 ]
 # One extra per connector, named after its directory (connectors/<name>,
 # module aisquare_pipe_<name>): that connector's third-party deps beyond the
@@ -74,6 +77,11 @@ dropbox = [
     "dropbox>=12.0",
 ]
 gateway = []
+# Google Cloud Storage: the service account key is signed into tokens by
+# google-auth (explicit credentials only, never Application Default Credentials).
+gcs = [
+    "google-auth>=2.20,<3",
+]
 github = []
 # Glean: HTTP via requests (core), no deps of its own.
 glean = []
@@ -97,11 +105,11 @@ slack = []
 # Bundles of connector extras.
 popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
 # Every connector's deps (graphify's engine stays separate).
-full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
+full = ["aisquare-pipe[popular,aws,composio,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,salesforce,slack]"]
 # The deps of every connector that registers an `aisquare_pipe.toolkits`
 # entry point. Hosts (pipe-as-service) install this to serve every toolkit;
 # scripts/check_toolkits_extra.py (CI) keeps it complete.
-toolkits = ["aisquare-pipe[aws,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
+toolkits = ["aisquare-pipe[aws,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -119,6 +127,7 @@ docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
 dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
 dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
 aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
+gcs-source = "aisquare_pipe_gcs.connector:GcsSource"
 github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
 glean-source = "aisquare_pipe_glean.connector:GleanSource"
 googledrive-source = "aisquare_pipe_googledrive.connector:GoogleDriveSource"
@@ -141,6 +150,7 @@ graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
 bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
 s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
+gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
 github = "aisquare_pipe_github.toolkit:GitHubToolkit"
 glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
 gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
@@ -158,6 +168,7 @@ where = [
     "connectors/docusign/src",
     "connectors/dropbox/src",
     "connectors/gateway/src",
+    "connectors/gcs/src",
     "connectors/github/src",
     "connectors/glean/src",
     "connectors/gmail/src",
