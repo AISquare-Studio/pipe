@@ -194,9 +194,35 @@ def test_quotes_read_one_way_whatever_the_reader():
         assert check_select_only(sql) == sql
 
 
+#: sqlglot nests block comments unlike Spark: in each, Spark's reading (and
+#: the suite's spark_tokens) has a DROP, sqlglot's only comments. At 6e046cd
+#: the parser alone admitted them (seq 14046 m1'); the lexer refused them.
+NESTING_PAYLOADS = {
+    # sqlglot doesn't nest a /* right after a comment's opener: it reads the
+    # comment /*/**/, then a -- comment. Spark nests: SELECT 1 ; DROP TABLE t.
+    "no_nesting_right_after_the_opener": "SELECT 1 /*/**/ -- */ ; DROP TABLE t",
+    # Inside a nested comment sqlglot reads */* as a close and then an open:
+    # one comment. Spark: SELECT 1 ; DROP TABLE t ;, then a -- comment.
+    "star_slash_star_closes_and_reopens": "SELECT 1 /* /* */* */ ; DROP TABLE t ; -- */",
+    # sqlglot reads /*/*/ as the comment '/' and then a -- comment; Spark
+    # reads the second /* first, so the comment runs on to the second */.
+    # The comment text holds no /*: only "up to the closer's *" sees it.
+    "slash_before_the_closer": "SELECT 1 /*/*/ -- */ x */ ; DROP TABLE t",
+}
+
+
+@pytest.mark.parametrize("sql", NESTING_PAYLOADS.values(), ids=NESTING_PAYLOADS)
+def test_spark_reads_a_write_in_each_nesting_payload(sql):
+    assert _spark_sees_a_write(sql)
+    assert sqlguard._lexical(sql) is not None
+    with pytest.raises(NotReadOnly):
+        check_select_only(sql)
+
+
 #: Where sqlglot's reading and Spark's differ, the parser refuses on its own
 #: (seq 13990 m1: at 810abb2 the lexer alone refused the first two).
 THE_PARSER_ALONE_REFUSES = [
+    *((sql, r"/\* inside a comment") for sql in NESTING_PAYLOADS.values()),
     (REOPEN_PAYLOADS["backslash_lf_continues_the_comment"], "ends in a backslash"),
     ("SELECT `a` -- \\\n, `b` FROM t", "ends in a backslash"),
     ("SELECT '${env:HOME}'", r"\$\{"),
@@ -207,7 +233,7 @@ THE_PARSER_ALONE_REFUSES = [
     ("SELECT 1 /*+ DELETE */", "not right after SELECT"),
     # sqlglot nests a /*+ inside a comment, Spark doesn't: Spark's comment ends
     # at the first */, then ; DROP TABLE t.
-    ("SELECT 1 /* a /*+ */ ; DROP TABLE t -- */", "not right after SELECT"),
+    ("SELECT 1 /* a /*+ */ ; DROP TABLE t -- */", r"/\* inside a comment"),
     # A hint's insides beyond names and numbers: Spark reads the string first,
     # so its */ doesn't end the hint (then ; DROP TABLE t); sqlglot ends it there.
     ("SELECT /*+ x('*/' ; DROP TABLE t ; --') 1", "holds more than names"),
@@ -215,8 +241,10 @@ THE_PARSER_ALONE_REFUSES = [
     ("SELECT 1 {# ; DROP TABLE t; #}", r"\{#"),
     # Spark reads */ as one token, so */* opens no comment: ; DROP TABLE t.
     ("SELECT 2 */* ; DROP TABLE t */ 3", r"\*/ outside a comment"),
-    # Under spark.sql.ansi.doubleQuotedIdentifiers, "..." takes no escapes:
-    # the identifier "\" ends at its second quote.
+    # A reader that takes no escapes in "..." ends "\" at its second quote,
+    # then ; DROP TABLE t. Spark's lexer takes them there whatever
+    # spark.sql.ansi.doubleQuotedIdentifiers says (the flag only changes the
+    # parser rule), and so does sqlglot: this only refuses more than it needs.
     ('SELECT "\\" ; DROP TABLE t ; --"', "backslash in a"),
     ("SELECT ınsert FROM t", "non-ASCII"),
 ]
@@ -245,7 +273,8 @@ def test_a_hint_right_after_select_reads_alike_and_passes():
 ONLY_THE_LEXER_REFUSES = [
     "SELECT $1",  # sqlglot reads $ as a parameter; Databricks $$...$$ as text
     "SELECT a$b FROM t",
-    "SELECT 1 /* a /* b */ c */",  # Spark and sqlglot nest; other readers don't
+    # (A /* nested in a comment was here: since seq 14046 m1' the parser
+    # refuses one too, as a comment holding /*.)
     "SELECT 1 -- x\r, 2",  # Spark and sqlglot end it at the bare CR
     "SELECT 'a\\'b' FROM t",  # Spark and sqlglot take the \' escape
     "SELECT 'a\u2028b'",  # an LS, in a string
@@ -255,6 +284,11 @@ ONLY_THE_PARSER_REFUSES = [
     "SELECT (",
     "SELECT * FROM t WHERE",
     "SELECT /*+ SKEW('t') */ * FROM t",  # a hint with a string in it
+    # sqlglot's comment text doesn't say which kind of comment it was, so a --
+    # comment that holds /* or ends in / is refused as a block comment would be.
+    "SELECT 1 -- a /* b\nFROM t",
+    "SELECT 1 -- /*+ ; DROP x\n",
+    "SELECT * FROM t -- under /Volumes/main/",
 ]
 
 
@@ -306,6 +340,13 @@ SIDE_EFFECTS = [
     "SELECT * FROM vector_search(index => 'main.p.idx', query_text => 'x', num_results => 5)",
     "SELECT http_request(conn => 'c', method => 'POST', path => '/x')",
     "SELECT * FROM remote_query('c', query => 'DELETE FROM x')",
+    # The warehouse connects to the broker or endpoint the caller names.
+    "SELECT * FROM read_kafka(bootstrapServers => 'h:9092', subscribe => 't')",
+    "SELECT * FROM STREAM read_kafka(bootstrapServers => 'h:9092', subscribe => 't')",
+    "SELECT * FROM read_kinesis(streamName => 's', region => 'us-east-1')",
+    "SELECT * FROM read_pubsub(subscriptionId => 's', projectId => 'p', topicId => 't')",
+    "SELECT * FROM read_pulsar(serviceUrl => 'pulsar://h:6650', topic => 't')",
+    "SELECT * FROM `read_kafka`('h:9092')",
     "SELECT reflect('java.lang.Thread', 'sleep', 1000L)",
     "SELECT java_method('java.lang.Thread', 'sleep', 1000L)",
     "SELECT try_reflect('a', 'b')",
@@ -336,6 +377,7 @@ def test_side_effect_calls_are_refused_by_each_layer(sql):
         ("SELECT `ai_member_ssn_123456789`(x) FROM t", "AI_* function"),
         ("SELECT `system`.`builtin`.`ReFlect`('a', 'b')", "REFLECT"),
         ("SELECT * FROM List_Secrets()", "LIST_SECRETS"),
+        ("SELECT * FROM Read_Pulsar(topic => 't')", "READ_PULSAR"),
     ],
 )
 def test_a_refused_call_is_named_by_its_canonical_name_only(sql, label):
@@ -472,8 +514,8 @@ def test_sqlglot_still_logs_outside_the_guard(sqlglot_records):
 
 @pytest.mark.parametrize(
     "sql",
-    [*REOPEN_PAYLOADS.values(), *SIDE_EFFECTS],
-    ids=[*REOPEN_PAYLOADS, *range(len(SIDE_EFFECTS))],
+    [*REOPEN_PAYLOADS.values(), *NESTING_PAYLOADS.values(), *SIDE_EFFECTS],
+    ids=[*REOPEN_PAYLOADS, *NESTING_PAYLOADS, *range(len(SIDE_EFFECTS))],
 )
 def test_run_select_refuses_them_with_no_request(sql):
     fake = FakeDatabricks()
@@ -653,3 +695,25 @@ def test_whatever_the_parser_admits_spark_reads_as_one_statement_without_a_write
             writes += 1
             assert sqlguard._parsed(sql) is not None, repr(sql)
     assert checked > 300_000 and writes > 20_000
+
+
+#: Block comments only: where sqlglot nests unlike Spark, each shape needs
+#: six to eight pieces, past the exhaustive reach of the fuzz above.
+COMMENT_PIECES = ["/*", "*/", "/", "--", " ;DROP x "]
+
+
+def test_whatever_the_parser_admits_in_comments_spark_reads_without_a_write():
+    """The parser ALONE on every "SELECT 1 " + up to eight comment pieces
+    (488,280 strings, about 105,000 Spark writes). At 6e046cd it admitted
+    118 of them (seq 14046 m1'); refusing only a comment whose text holds /*
+    still admits 6 (``/*/*/--*/--*/ ;DROP x``), which reading the text up to
+    the closer's ``*`` refuses."""
+    checked = writes = 0
+    for count in range(1, 9):
+        for pieces in itertools.product(COMMENT_PIECES, repeat=count):
+            sql = "SELECT 1 " + "".join(pieces)
+            checked += 1
+            if _spark_sees_a_write(sql):
+                writes += 1
+                assert sqlguard._parsed(sql) is not None, repr(sql)
+    assert checked == 488_280 and writes > 100_000

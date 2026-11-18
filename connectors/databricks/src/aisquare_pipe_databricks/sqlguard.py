@@ -52,6 +52,7 @@ differ, and adds the statement's structure.
    ``CREATE``, ``DROP``, ``ALTER``, ``SET``, ``USE``, ``COPY``, ``INTO``,
    ``EXECUTE``, ...), calls none of the side-effect functions
    (:data:`SIDE_EFFECT_FUNCTIONS`: ``http_request``, ``remote_query``,
+   ``read_kafka``, ``read_kinesis``, ``read_pubsub``, ``read_pulsar``,
    ``reflect``, ``java_method``, ``secret``, ``list_secrets``,
    ``vector_search``, ``IDENTIFIER(...)``, and any ``ai_*``), plainly or as
    a quoted name, and has no ``USING '<script>'`` (``SELECT TRANSFORM(...)
@@ -65,19 +66,28 @@ differ, and adds the statement's structure.
    - a comment that ends in a backslash: Spark carries a ``--`` comment on
      past a backslash right before its line break, and sqlglot ends it there
      (the shape of seq 13947 FAIL 1);
+   - a comment whose text, up to its closer's ``*`` included, holds ``/*``
+     (the lexer's own rule, read from sqlglot's side). sqlglot and Spark nest
+     comments differently: sqlglot doesn't nest a ``/*`` right after a
+     comment's opener (``/*/**/``), reads ``*/*`` inside a nested comment as
+     a close and then an open, reads ``/*/*/`` as one comment where Spark
+     nests, and nests a ``/*+``, which Spark doesn't. sqlglot's comment text
+     doesn't say which kind of comment it was, so a ``--`` comment that holds
+     ``/*`` or ends in ``/`` is refused too (the lexer admits those);
    - a ``/*+`` outside a quoted token that is not a hint sqlglot parsed
      (right after ``SELECT``) whose insides are only names, numbers, commas
      and parentheses. Spark reads a hint's insides as tokens wherever it
-     stands; sqlglot reads ``/*+`` anywhere else as a comment, and nests it
-     inside a ``/* */`` comment, where Spark doesn't;
+     stands; sqlglot reads ``/*+`` anywhere else as a comment;
    - ``{#`` outside a quoted token: sqlglot reads ``{# ... #}`` as a (Jinja)
      comment in every dialect, Spark doesn't;
    - ``*`` right before ``/``: Spark reads ``*/`` as one token (a hint's
      end), so in ``*/*`` it opens no comment; sqlglot reads ``*`` and then a
      comment;
    - a ``"..."`` string that ends elsewhere when a backslash escapes nothing:
-     under ``spark.sql.ansi.doubleQuotedIdentifiers`` Spark reads ``"..."``
-     as an identifier, with no backslash escapes;
+     a reader may differ. Spark's lexer takes backslash escapes in ``"..."``
+     whatever ``spark.sql.ansi.doubleQuotedIdentifiers`` says (the flag only
+     makes the parser read the token as an identifier), and so does
+     sqlglot, so this only refuses more than it needs to;
    - a non-ASCII character in a token that is not quoted (Spark 3 upper-cases
      with ``Character.toUpperCase``).
 
@@ -180,7 +190,9 @@ _WRITE_NODES: tuple[type[exp.Expression], ...] = tuple(
 
 #: Functions a read-only query has no use for, refused when called (by name,
 #: qualified or quoted): an HTTP request or a query in another database
-#: through a Unity Catalog connection (either can write there), a Java
+#: through a Unity Catalog connection (either can write there), a read of a
+#: Kafka, Kinesis, Pub/Sub or Pulsar stream (the warehouse connects to the
+#: broker or endpoint the caller names, as ``http_request`` does), a Java
 #: method by reflection, a secret's value or the names of every secret
 #: scope and key, a vector search (it bills an embedding endpoint for its
 #: ``query_text``), and a name built from a string (``IDENTIFIER('...')``,
@@ -190,6 +202,10 @@ SIDE_EFFECT_FUNCTIONS = frozenset(
     {
         "HTTP_REQUEST",
         "REMOTE_QUERY",
+        "READ_KAFKA",
+        "READ_KINESIS",
+        "READ_PUBSUB",
+        "READ_PULSAR",
         "REFLECT",
         "JAVA_METHOD",
         "TRY_REFLECT",
@@ -334,6 +350,7 @@ _ESCAPED_STRINGS = frozenset(
 _PLAIN_HINT = re.compile(r"[A-Za-z0-9_(),.\s]*")
 _HINT_OPEN = "/*+"
 _HINT_CLOSE = "*/"
+_COMMENT_OPEN = "/*"
 _JINJA_COMMENT = "{#"
 
 
@@ -393,10 +410,16 @@ def _read_unlike_spark(sql: str, tokens: list[Token]) -> str | None:
     quoted: list[tuple[int, int]] = []
     hints: dict[int, Token] = {}
     for token in tokens:
-        if any(comment.endswith("\\") for comment in token.comments or ()):
+        comments = token.comments or ()
+        if any(comment.endswith("\\") for comment in comments):
             return (
                 "a comment ends in a backslash (Spark carries a -- comment on past "
                 "a backslash at its line break, sqlglot doesn't)"
+            )
+        if any(_holds_an_opener(comment) for comment in comments):
+            return (
+                "it has a /* inside a comment (sqlglot and Spark nest comments "
+                "differently)"
             )
         kind = token.token_type
         if kind in _QUOTED_TOKENS:
@@ -404,7 +427,7 @@ def _read_unlike_spark(sql: str, tokens: list[Token]) -> str | None:
             if kind in _ESCAPED_STRINGS and not _ends_alike_unescaped(sql, token):
                 return (
                     'a backslash in a "..." string makes where it ends depend on the '
-                    "reader (Spark can read it as an identifier, with no escapes)"
+                    "reader (a reader may take no escapes there)"
                 )
         elif kind == TokenType.HINT:
             hints[token.start] = token
@@ -440,6 +463,20 @@ def _read_unlike_spark(sql: str, tokens: list[Token]) -> str | None:
                 "(Spark reads its insides as SQL, sqlglot as a comment)"
             )
     return None
+
+
+def _holds_an_opener(comment: str) -> bool:
+    """Whether sqlglot's text of a comment, up to its closer's ``*``
+    included, holds a ``/*``: the lexer's rule, read from sqlglot's side.
+
+    sqlglot and Spark nest comments differently. sqlglot doesn't nest a
+    ``/*`` right after a comment's opener (``/*/**/``), reads ``*/*`` inside
+    a nested comment as a close and then an open, and in ``/*/*/`` reads
+    ``/`` and then the close where Spark reads a nested ``/*`` first and the
+    comment runs on. Where such a comment ends depends on the reader. The
+    text doesn't say which kind of comment it was, so a ``--`` comment that
+    holds ``/*`` or ends in ``/`` is refused too."""
+    return _COMMENT_OPEN in comment + "*"
 
 
 def _ends_alike_unescaped(sql: str, token: Token) -> bool:

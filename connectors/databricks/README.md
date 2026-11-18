@@ -60,10 +60,11 @@ they change.
 
 Before ANY HTTP call (`sqlguard.py`), two independent checks must both pass. Each one refuses every write on
 its own, so neither is a backup for the other: the suite runs each layer ALONE against a reference reading of
-Spark's lexer, on every combination of up to four pieces of a quote, comment, hint and escape alphabet and
-hundreds of thousands of seeded random strings, and whatever that layer admits has no write in Spark's
-reading. What only one layer refuses is pinned too (none of it a write in Spark's reading), so dropping
-either one fails the suite.
+Spark's lexer, on every combination of up to four pieces of a quote, comment, hint and escape alphabet,
+hundreds of thousands of seeded random strings and, for the parser, every combination of up to eight pieces
+of a block-comment alphabet (where sqlglot nests comments unlike Spark), and whatever that layer admits has
+no write in Spark's reading. What only one layer refuses is pinned too (none of it a write in Spark's
+reading), so dropping either one fails the suite.
 
 The two read the text differently. The lexer decides where Spark's tokens end and refuses wherever any two
 readers could disagree. The parser reads the text as sqlglot does, refuses wherever sqlglot's reading and
@@ -93,14 +94,19 @@ Spark's differ, and adds the statement's structure (a `FOR SHARE` lock, text tha
    Each place the two lexers differ is refused:
    - a comment that ends in a backslash (Spark carries a `--` comment on past it at a line break; sqlglot
      doesn't);
+   - a comment whose text, up to its closer's `*` included, holds `/*` (the lexer's rule, from sqlglot's
+     side). sqlglot nests comments unlike Spark: it doesn't nest a `/*` right after a comment's opener
+     (`/*/**/`), reads `*/*` inside a nested comment as a close and then an open, reads `/*/*/` as one
+     comment, and nests a `/*+`. Its comment text doesn't say which kind of comment it was, so a `--` comment
+     that holds `/*` or ends in `/` is refused too;
    - a `/*+` outside quotes that is not a hint sqlglot parsed (right after `SELECT`) holding only names,
      numbers, commas and parentheses (`/*+ BROADCAST(t) */`, `/*+ REPARTITION(8, c) */`). Spark reads a hint's
-     insides as tokens wherever it stands; sqlglot reads `/*+` anywhere else as a comment, and nests it inside
-     a `/* */` comment, where Spark doesn't;
+     insides as tokens wherever it stands; sqlglot reads `/*+` anywhere else as a comment;
    - `{#` outside quotes (sqlglot reads `{# ... #}` as a Jinja comment, Spark doesn't), and `*` right before
      `/` (Spark reads `*/` as one token, so `*/*` opens no comment);
-   - a `"..."` string that ends elsewhere when a backslash escapes nothing (under
-     `spark.sql.ansi.doubleQuotedIdentifiers`, Spark reads it as an identifier, without escapes);
+   - a `"..."` string that ends elsewhere when a backslash escapes nothing (a reader may take no escapes
+     there; Spark's lexer and sqlglot both take them whatever `spark.sql.ansi.doubleQuotedIdentifiers` says,
+     so this only refuses more than it needs to);
    - `${` anywhere, and non-ASCII outside quotes and comments.
 
    Then:
@@ -115,11 +121,13 @@ Spark's differ, and adds the statement's structure (a `FOR SHARE` lock, text tha
      statement.
 
 Both refuse calls of the functions with side effects outside the query: `http_request` and `remote_query`
-(a Unity Catalog connection can write there), `reflect`/`java_method`/`try_reflect`, `secret`/`try_secret`
-and `list_secrets` (every secret scope and key name), `vector_search` (it bills an embedding endpoint for its
-`query_text`, as `ai_*` does), `IDENTIFIER(...)` (a name built from a string), and any `ai_*` function (model
-serving, billed outside the warehouse), named plainly, qualified or quoted. Both refuse `TRANSFORM ... USING
-'<script>'`, which runs a command. A column named `secret` or `ai_score` is fine: only a call is refused.
+(a Unity Catalog connection can write there), `read_kafka`, `read_kinesis`, `read_pubsub` and `read_pulsar`
+(the warehouse connects to the broker or endpoint the caller names), `reflect`/`java_method`/`try_reflect`,
+`secret`/`try_secret` and `list_secrets` (every secret scope and key name), `vector_search` (it bills an
+embedding endpoint for its `query_text`, as `ai_*` does), `IDENTIFIER(...)` (a name built from a string), and
+any `ai_*` function (model serving, billed outside the warehouse), named plainly, qualified or quoted. Both
+refuse `TRANSFORM ... USING '<script>'`, which runs a command. A column named `secret` or `ai_score` is fine:
+only a call is refused.
 
 A refusal is `forbidden` ("only one SELECT (or WITH ... SELECT) may run: <why>"), and the message never echoes
 the SQL: a refused function is named by its canonical name (`REFLECT`, or "an AI_* function"), never as the

@@ -239,11 +239,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     depends on backslash escapes (Spark takes them in `'...'` and `"..."`, never in backticks), `${`, `$`
     outside quotes (Databricks reads `$$...$$` as text in places), and non-ASCII outside quotes. Hint
     contents are read as tokens. The parser first refuses where sqlglot's tokens read unlike Spark's: a
-    comment ending in a backslash, a `/*+` that is not a plain hint right after SELECT (sqlglot reads
-    one elsewhere as a comment, and nests one inside a comment), `{#` (a Jinja comment to sqlglot), `*`
-    right before `/` (one token in Spark), a `"..."` string whose end depends on escapes, `${`, non-ASCII
-    outside quotes. Both layers refuse calls of `http_request`, `remote_query`, `reflect`/`java_method`,
-    `secret`, `list_secrets`, `vector_search`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`,
+    comment ending in a backslash, a comment holding `/*` up to its closer's `*` (sqlglot nests
+    comments unlike Spark; a `--` comment holding `/*` or ending in `/` too), a `/*+` that is not a
+    plain hint right after SELECT (sqlglot reads one elsewhere as a comment), `{#` (a Jinja comment to
+    sqlglot), `*` right before `/` (one token in Spark), a `"..."` string whose end depends on escapes,
+    `${`, non-ASCII outside quotes. Both layers refuse calls of `http_request`, `remote_query`,
+    `read_kafka`/`read_kinesis`/`read_pubsub`/`read_pulsar`, `reflect`/`java_method`, `secret`,
+    `list_secrets`, `vector_search`, `IDENTIFIER(...)` and `ai_*`, and `TRANSFORM ... USING`,
     naming the function by its canonical name only. Tests pin what only one layer catches (none of it a
     write in Spark's reading), so dropping either fails the suite. The parser runs inside core's
     `quiet_sqlglot()`, so no SQL reaches a log, and below sqlglot 26.25 nothing runs.
