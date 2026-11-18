@@ -124,23 +124,75 @@ A refused AWS call is a tool error with AWS's error code, never AWS's message:
 
 ## Customer setup (registration checklist)
 
-Order matters: AISquare's role must exist before the customer saves the trust policy that
-names it. IAM refuses a trust policy whose principal doesn't exist ("Invalid principal in
-policy").
+Order matters, in both directions:
+
+- AISquare's role must exist before the customer saves the trust policy that names it. IAM
+  refuses a trust policy whose principal doesn't exist ("Invalid principal in policy").
+- AISquare's role can call `AssumeRole` only on the customer role ARNs its own policy lists,
+  and that ARN arrives last (the customer's step 3). Until it is added, every read fails with
+  `forbidden`.
+
+So AISquare creates its role first (the steps below), the customer creates theirs, and
+AISquare then adds the customer's role ARN and stores the blob
+([AISquare stores the blob](#aisquare-stores-the-blob)).
 
 ### Before the customer starts (AISquare devops)
 
 1. **Pick the environment that reads the account.** Its pipe-service role is the principal the
    customer trusts, and its secrets backend holds the blob:
-   - prod: cluster `aisquare-prod`, us-east-2. Use it for a customer's real data.
-   - nonprod: cluster `aisquare-nonprod`, us-east-1 (dev and stg). Use it for a trial only.
+   - prod: cluster `aisquare-prod`, us-east-2, namespace `prod`. Use it for a customer's real
+     data. As of 2026-11-17 prod's pipe-service still runs on ECS (no EKS release there yet),
+     so prod has two principals: see step 2.
+   - stg or dev: cluster `aisquare-nonprod`, us-east-1, namespace `stg` or `dev`. Use one of
+     them for a trial only.
 
-   They are different roles with different ARNs. To let both read, the customer lists both
-   ARNs in `Principal.AWS`, and both environments' secrets carry the same external ID. The
-   cluster's region doesn't limit what is read: the blob's `regions` do.
-2. **Create that environment's pipe-service role** (the EKS Pod Identity role for service
-   account `pipe` in its namespace), if it doesn't exist yet. As of 2026-11-17 none does.
-   Give it this policy, listing each customer role ARN rather than `*`:
+   Every environment has its own role with its own ARN; dev and stg don't share one. To let
+   several read, the customer lists each one's ARN in `Principal.AWS`, and each environment's
+   secret carries the same external ID. The cluster's region doesn't limit what is read: the
+   blob's `regions` do.
+2. **Create that environment's pipe-service role now**, before the customer starts. Its
+   permissions policy (below) names the customer's role, so it is attached later, when that
+   ARN arrives.
+   - **On EKS (dev, stg, and prod once it moves there):** the principal is the EKS Pod
+     Identity role from pipe-service's cutover runbook (pipe-as-service `DEPLOYMENT.md`,
+     "Cutover runbook" > "EKS", item 2; aisquare-infra creates it). The chart runs every
+     component under the one service account `pipe`, so add this policy to that role, not to a
+     second one. As of 2026-11-17 no environment has it yet. If it doesn't exist, create it now,
+     and the runbook's item 2 later adds its DynamoDB and KMS grants to the same role:
+     - one role per environment;
+     - its trust policy, EKS's Pod Identity one:
+
+       ```json
+       {
+         "Version": "2012-10-17",
+         "Statement": [{
+           "Sid": "AllowEksAuthToAssumeRoleForPodIdentity",
+           "Effect": "Allow",
+           "Principal": {"Service": "pods.eks.amazonaws.com"},
+           "Action": ["sts:AssumeRole", "sts:TagSession"]
+         }]
+       }
+       ```
+
+     - its Pod Identity association: cluster `aisquare-nonprod`, namespace `stg` (or `dev`),
+       service account `pipe`; for prod, cluster `aisquare-prod`, namespace `prod`, service
+       account `pipe`.
+   - **On ECS (prod, until it moves to EKS):** the principal is the ECS task role
+     `ais-studio-pipe-task-role-prod`, which exists. Cloud-Infra's Terraform manages it
+     (`aws-ecs-docker/modules/ecs/pipe_service.tf`, `aws_iam_role.pipe_service_task_role`), so
+     add the policy below there, as an `aws_iam_role_policy` beside its ECS Exec one, not by
+     hand.
+     ECS adds no session tags, so `sts:TagSession` is harmless there.
+   - **Prod: have the customer trust both prod roles from day one.** At prod's ECS → EKS
+     cutover the principal changes from the ECS task role to prod's Pod Identity role. A trust
+     policy that names only the ECS role then refuses every `AssumeRole` until the customer
+     edits it. So create prod's Pod Identity role now as well (IAM rejects a trust policy that
+     names a role that doesn't exist yet), and send the customer both ARNs. If it can't be
+     created first, send the ECS role alone. The customer must then add the EKS role's ARN
+     before cutover: tell them so, and don't cut prod over until they confirm it.
+
+   **When the customer sends their role ARN** (their step 3), attach this policy to every
+   AISquare role they trust (for prod, both). List each customer role ARN rather than `*`:
 
    ```json
    {
@@ -154,9 +206,7 @@ policy").
    }
    ```
 
-   `sts:GetCallerIdentity` needs no permission. Where pipe-service still runs on ECS (prod, as
-   of 2026-11-17: no EKS release there yet), the principal is its ECS task role instead. Give
-   that role the same policy. ECS adds no session tags, so `sts:TagSession` is harmless there.
+   `sts:GetCallerIdentity` needs no permission.
 
    **Why `sts:TagSession`:** EKS Pod Identity tags our session (cluster, namespace, service
    account), and those tags are transitive. STS passes them on our `AssumeRole` into the
@@ -184,8 +234,9 @@ policy").
 
 **AISquare sends the customer:**
 
-- **Our principal:** `arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_PIPE_SERVICE_ROLE>`,
-  the role from step 2.
+- **Our principal ARNs**, `arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_ROLE>`: each
+  role from step 2. For prod, both `ais-studio-pipe-task-role-prod` (ECS, today) and prod's
+  Pod Identity role (EKS, after the cutover).
 - **The external ID** from step 3.
 
 ### Which account (one per secret)
@@ -212,19 +263,30 @@ when both are in the same account, twice otherwise.
     {
       "Sid": "AISquareAssumesWithTheExternalId",
       "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_PIPE_SERVICE_ROLE>"},
+      "Principal": {"AWS": [
+        "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_ROLE_1>",
+        "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_ROLE_2>"
+      ]},
       "Action": "sts:AssumeRole",
       "Condition": {"StringEquals": {"sts:ExternalId": "<EXTERNAL_ID>"}}
     },
     {
       "Sid": "AISquareSessionTags",
       "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_PIPE_SERVICE_ROLE>"},
+      "Principal": {"AWS": [
+        "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_ROLE_1>",
+        "arn:aws:iam::<AISQUARE_ACCOUNT_ID>:role/<AISQUARE_ROLE_2>"
+      ]},
       "Action": "sts:TagSession"
     }
   ]
 }
 ```
+
+List every principal ARN AISquare sent, in both statements: two for prod (its ECS task role
+and its EKS Pod Identity role), one for a trial. If AISquare sent only prod's ECS role, it
+sends the EKS role's ARN later: add it to both statements before prod moves to EKS, or every
+read fails from the cutover on.
 
 `sts:TagSession` lets our session's EKS tags pass through (see step 2 above). On its own it
 grants nothing: the role can still only be assumed with the external ID. EKS's own
@@ -296,16 +358,20 @@ target-role example that uses an external ID splits the two statements the same 
 
 ### AISquare stores the blob
 
-Build the [credential blob](#the-credential-blob) from what the customer sent and the
-external ID. Store it in the environment from step 1, under the
-[secret names above](#the-credential-blob): `bedrock-agentcore-policies` for AgentCore and
-`s3` for S3. When both read the same account, the same JSON can go under both names.
+1. **Add the customer's role ARN to our role's policy** (step 2's `Resource`), on every
+   AISquare role they trust: for prod, both. Without it, the first `AssumeRole` fails with
+   `forbidden`.
+2. **Build the [credential blob](#the-credential-blob)** from what the customer sent and the
+   external ID. Store it in the environment from step 1, under the
+   [secret names above](#the-credential-blob): `bedrock-agentcore-policies` for AgentCore and
+   `s3` for S3. When both read the same account, the same JSON can go under both names. For
+   prod, store it again in prod's EKS environment when pipe-service moves there.
 
 ### If it fails
 
 | Error | Check |
 |---|---|
-| `AWS refused sts:AssumeRole: …` (`forbidden`) | In the trust policy: the principal ARN, the external ID and `sts:TagSession`. In our role's policy: `sts:AssumeRole` and `sts:TagSession` on that role ARN. |
+| `AWS refused sts:AssumeRole: …` (`forbidden`) | In the trust policy: the principal ARN, the external ID and `sts:TagSession`. In our role's policy: `sts:AssumeRole` and `sts:TagSession` on that role ARN. If it began at prod's EKS cutover: the trust policy lacks prod's Pod Identity role. |
 | `AWS is not configured on this host: no service principal …` | The `pipe` Pod Identity association, or the role, is missing in that environment. |
 | `refused: the role is in this service's own AWS account` (or "an AWS account this service is set to refuse") | The blob names an AISquare role, not the customer's. |
 | `AWS refused bedrock-agentcore:… (AccessDeniedException)` or `s3:… (AccessDenied)` / `(403)` | The permissions policy, the KMS grant, or the prefix. |

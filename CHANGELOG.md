@@ -21,8 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     default or empty credentials. The blob is
     `{role_arn, external_id, regions[], s3: {bucket, prefix, region}?}`. The
     README's registration checklist covers `sts:TagSession` (EKS Pod
-    Identity's session tags are transitive) and KMS `Decrypt` and
-    `DescribeKey` under `kms:ViaService`.
+    Identity's session tags are transitive), KMS `Decrypt` and
+    `DescribeKey` under `kms:ViaService`, and the order of the two sides'
+    steps. Prod's customer trusts both prod principals from day one: the ECS
+    task role `ais-studio-pipe-task-role-prod` and the EKS Pod Identity role
+    of pipe-service's cutover runbook.
   - `bedrock-agentcore-policies-source`: one envelope per Amazon Bedrock
     AgentCore policy, in every configured region (`ListPolicyEngines` →
     `ListPolicies`, every page; `GetPolicy` only for a policy listed without
