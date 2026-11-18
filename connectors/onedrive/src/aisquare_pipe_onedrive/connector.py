@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from aisquare.pipe.core.connector import AuthType, SinkConnector, SourceConnector
@@ -34,6 +34,59 @@ def _has_valid_auth_keys(config: dict[str, Any]) -> bool:
     return all(k in config for k in ("client_id", "client_secret", "tenant_id"))
 
 
+def _version_markers(*items: Mapping[str, Any]) -> dict[str, str]:
+    """``ctag`` and ``etag``: Graph's ``cTag`` and ``eTag``, verbatim, from
+    the first item that has each. A marker Graph does not send is left out,
+    never set to "" (two empty markers would compare equal and hide an edit).
+    """
+    markers: dict[str, str] = {}
+    for key, field in (("ctag", "cTag"), ("etag", "eTag")):
+        for item in items:
+            value = item.get(field)
+            if isinstance(value, str) and value:
+                markers[key] = value
+                break
+    return markers
+
+
+def _first(path: str, *items: Mapping[str, Any]) -> Any:
+    """The value at ``path`` (dotted, e.g. ``file.mimeType``) in the first
+    item that has one. None and "" count as missing."""
+    for item in items:
+        value: Any = item
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, Mapping) else None
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _describe(fresh: Any, listed: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The envelope's content type and metadata, from ``fresh`` (the item as
+    Graph returned it just before the bytes), field by field, else from the
+    listing. So the name, size, timestamps and markers all describe one
+    version, even when the file changed after the listing.
+    """
+    items = (fresh, listed) if isinstance(fresh, Mapping) else (listed,)
+    name = _first("name", *items)
+    content_type = _first("file.mimeType", *items)
+    if not content_type:
+        guessed, _ = mimetypes.guess_type(name)
+        content_type = guessed or "application/octet-stream"
+    parent_path = _first("parentReference.path", *items)
+    metadata = {
+        "filename": name,
+        "path": f"{parent_path}/{name}" if parent_path else name,
+        "size": _first("size", *items) or 0,
+        "item_id": _first("id", *items),
+        "last_modified": _first("lastModifiedDateTime", *items) or "",
+        "web_url": _first("webUrl", *items) or "",
+        "mime_type": content_type,
+        **_version_markers(*items),
+    }
+    return content_type, metadata
+
+
 class OneDriveSource(SourceConnector):
     """Pull files from OneDrive via Microsoft Graph API."""
 
@@ -53,6 +106,16 @@ class OneDriveSource(SourceConnector):
         ),
         "web_url": MetaField(type=str, required=False, description="Web URL to file"),
         "mime_type": MetaField(type=str, required=False, description="MIME type from OneDrive"),
+        "ctag": MetaField(
+            type=str,
+            required=False,
+            description="Graph's cTag: changes only when the file's content does",
+        ),
+        "etag": MetaField(
+            type=str,
+            required=False,
+            description="Graph's eTag: changes on any edit, a rename or a move too",
+        ),
     }
 
     def pull(
@@ -95,30 +158,15 @@ class OneDriveSource(SourceConnector):
             if limit is not None and count >= limit:
                 return
 
-            # MIME type from OneDrive metadata (unlike Dropbox, Graph API provides it)
-            content_type = item.get("file", {}).get("mimeType")
-            if not content_type:
-                guessed, _ = mimetypes.guess_type(name)
-                content_type = guessed or "application/octet-stream"
-
+            # Stream large files, buffer small ones. The listing picks what to
+            # pull and whether to stream. The envelope describes the item as
+            # Graph gave it just before the bytes (_describe): its markers are
+            # never newer than the bytes, so a re-check can re-read once too
+            # often but never miss an edit.
             item_id = item["id"]
-            size = item.get("size", 0)
-            parent_path = item.get("parentReference", {}).get("path", "")
-            item_path = f"{parent_path}/{name}" if parent_path else name
-
-            metadata = {
-                "filename": name,
-                "path": item_path,
-                "size": size,
-                "item_id": item_id,
-                "last_modified": item.get("lastModifiedDateTime", ""),
-                "web_url": item.get("webUrl", ""),
-                "mime_type": content_type,
-            }
-
-            # Stream large files, buffer small ones
-            if size > stream_threshold:
-                _, stream = client.download_stream(item_id)
+            if item.get("size", 0) > stream_threshold:
+                fresh, stream = client.download_stream(item_id)
+                content_type, metadata = _describe(fresh, item)
                 yield DataEnvelope(
                     content_type=content_type,
                     data=b"",
@@ -127,7 +175,8 @@ class OneDriveSource(SourceConnector):
                     metadata=metadata,
                 )
             else:
-                _, content = client.download(item_id)
+                fresh, content = client.download(item_id)
+                content_type, metadata = _describe(fresh, item)
                 yield DataEnvelope(
                     content_type=content_type,
                     data=content,
