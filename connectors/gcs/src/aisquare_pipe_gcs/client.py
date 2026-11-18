@@ -26,6 +26,7 @@ not a whole body, so a download also checks the deadline between chunks.
 
 from __future__ import annotations
 
+import io
 import time
 from collections.abc import Callable
 from typing import Any, Self
@@ -231,13 +232,16 @@ class GcsClient:
 
     def download(self, name: str, *, generation: str | None, max_bytes: int) -> bytes:
         """The object's bytes at ``generation`` (so the bytes match the
-        metadata read just before), at most ``max_bytes``."""
+        metadata read just before), at most ``max_bytes``. They accumulate in
+        one buffer whose ``getvalue()`` hands its bytes over without a copy,
+        so a download holds about one copy of the object, not the chunks and
+        then their join."""
         params: dict[str, Any] = {"alt": "media"}
         if generation:
             params["generation"] = generation
         resp = self._get(f"{self._bucket_url}/{object_path(name)}", params, stream=True)
         try:
-            chunks: list[bytes] = []
+            buffer = io.BytesIO()
             total = 0
             for chunk in resp.iter_content(_CHUNK):
                 remaining = self._remaining()
@@ -249,8 +253,8 @@ class GcsClient:
                         f"{name} is larger than {max_bytes} bytes",
                         status=resp.status_code,
                     )
-                chunks.append(chunk)
-            return b"".join(chunks)
+                buffer.write(chunk)
+            return buffer.getvalue()
         except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as e:
             # The body broke off midway: a read timeout (requests wraps it in
             # ConnectionError), a reset (ChunkedEncodingError), bad gzip...

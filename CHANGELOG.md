@@ -248,6 +248,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   step fails when it ran none (it used to pass having tested nothing).
 - S3: an object that grew past `max_object_bytes` between the listing and the read is skipped, not
   raised mid-pull.
+- GCS source memory: a download accumulates in one buffer (no chunk list and join), the source drops each
+  object before the next download, and it holds an envelope back for a truncated pull's marker only when
+  every object after it could still be skipped at download (unknown size, or stored gzip). `max_bytes`
+  for the source is at most 64 MiB (was 100 MiB; tools keep 100 MiB). Peak (tracemalloc, three objects):
+  25 MiB objects 50 MiB (was 100), 64 MiB objects 129 MiB (was 192 truncated), and 400 MiB at the old
+  100 MiB cap before.
 
 ## [0.5.0] - 2026-11-04
 
