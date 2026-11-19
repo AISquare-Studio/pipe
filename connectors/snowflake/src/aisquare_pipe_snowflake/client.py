@@ -535,7 +535,6 @@ class SnowflakeClient:
             if result.plan is not None:
                 result.plan.add(len(encoded))
             result.result_bytes += cost
-        return False
 
     def _cancel(self, handle: str) -> None:
         """Best effort: Snowflake stops the statement at its own ``timeout``
