@@ -163,6 +163,18 @@ def toolkit_compliance_suite(toolkit_class: type) -> type:
         def test_oauth_spec(self):
             _assert_checks(self, validation.check_toolkit_oauth(self.toolkit_cls))
 
+        def test_card(self):
+            _assert_checks(self, validation.check_toolkit_card(self.toolkit_cls))
+
+        def test_category(self):
+            _assert_checks(self, validation.check_toolkit_category(self.toolkit_cls))
+
+        def test_card_text(self):
+            _assert_checks(self, validation.check_toolkit_card_text(self.toolkit_cls))
+
+        def test_tool_metadata(self):
+            _assert_checks(self, validation.check_toolkit_tool_metadata(self.toolkit_cls))
+
     ToolkitComplianceTests.__name__ = f"{toolkit_class.__name__}Compliance"
     ToolkitComplianceTests.__qualname__ = f"{toolkit_class.__name__}Compliance"
     return ToolkitComplianceTests

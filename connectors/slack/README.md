@@ -1,4 +1,4 @@
-# aisquare-pipe-slack
+# aisquare-pipe[slack]
 
 Slack for [aisquare.pipe](../../README.md): `SlackToolkit`, registered as toolkit
 `slack` (`aisquare_pipe.toolkits`). It has 111 LLM-callable tools over Slack's Web API —
@@ -21,9 +21,17 @@ host's business.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[slack]` extra:
+
 ```bash
-cd connectors/slack
-pip install -e ".[dev]"
+pip install "aisquare-pipe[slack]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/slack && pytest tests
 ```
 
 ## Quick start
@@ -346,6 +354,22 @@ scopes_for(["messages", "pins:read"], "both")
 An unknown group, or a raw scope that no tool of that identity uses, raises
 `OAuthError(error="invalid_scope")`. It isn't sent to Slack, where it would fail the
 whole consent screen.
+
+**Router metadata.** `SlackToolkit.card()` is the connector's card for a router —
+category `chat`, plus `keywords` and `examples` phrased as users ask
+("what did the team say in #launch today", "DM Priya that the build is green"). Each tool's `ToolSpec` carries the scopes above as `required_scopes` — its
+user-token scopes, or its bot ones for a bot-only tool — and `risk`, from its
+tier through the flags: `read`; `write` for send and write; `destructive` for
+the destructive tier and edits. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+The check uses the connection's identity: a bot connection
+(`config["identity"] = "bot"`) is checked against each tool's bot scopes
+(`SlackToolkit.missing_scopes`). The tier and identity gate still comes first
+(`forbidden`). `pipe validate` warns that the two bot-only remote-file tools
+need `remote_files:*` scopes `SLACK_OAUTH.default_scopes` (the user scopes)
+does not list; the default consent asks for them on the bot side.
 
 ## Connecting (OAuth)
 

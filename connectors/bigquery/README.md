@@ -1,0 +1,600 @@
+# aisquare_pipe_bigquery: Google BigQuery (read-only, SELECT-only)
+
+A toolkit (`bigquery`) and a source (`bigquery-query-source`) that read a customer's BigQuery data warehouse with a
+service account key: list datasets and tables, describe a table, read a table's rows, and run ONE read-only
+GoogleSQL `SELECT` at a time, inside byte, row and time caps. Each source envelope carries the version markers a
+caller needs to re-read when the data changes. This is the native replacement for Composio's `GOOGLEBIGQUERY`
+stop-gap (GoodRx Smart Connectors, item 3c).
+
+Ships inside the `aisquare-pipe` distribution: `pip install "aisquare-pipe[bigquery]"` (or `[full]`, or
+`[toolkits]`). The extra adds two dependencies: `google-auth>=2.20,<3`, which signs the service account's key into
+short-lived tokens, and `sqlglot>=26.25,<28`, which parses SQL for the SELECT-only guard. HTTP goes through `requests`
+(core). Without the extra, `bigquery` and `bigquery-query-source` count as not installed.
+
+## Native name and the Composio mapping
+
+The toolkit is `bigquery`, a name of its own: Composio's toolkit is `googlebigquery`. They are different toolkits,
+so a host maps one onto the other. pipe-as-service lists `googlebigquery` among the Composio toolkits a native
+toolkit may also serve (`COMPOSIO_ALSO_SERVES`).
+
+| Composio (`googlebigquery`) | Native (`bigquery`) | Difference |
+|---|---|---|
+| `GOOGLEBIGQUERY_QUERY` | `BIGQUERY_RUN_SELECT` (primary) | SELECT only; a dry run checks the bytes first; row, byte and time caps. Composio's runs DML too. |
+| `GOOGLEBIGQUERY_LIST_TABLE_DATA` | `BIGQUERY_READ_TABLE_ROWS` | Pages by `start_index`; rows come back typed and keyed by column name. |
+| `GOOGLEBIGQUERY_LIST_DATASETS` | `BIGQUERY_LIST_DATASETS` | |
+| `GOOGLEBIGQUERY_LIST_TABLES` | `BIGQUERY_LIST_TABLES` | |
+| `GOOGLEBIGQUERY_GET_TABLE_SCHEMA` | `BIGQUERY_GET_TABLE_SCHEMA` | Adds `last_modified_time`, partitioning and clustering. |
+
+Composio's other ~58 BigQuery tools (job, table, dataset and routine writes) have no native counterpart, on purpose.
+
+## What it does
+
+| Tool | What it returns |
+|---|---|
+| `BIGQUERY_RUN_SELECT` (primary) | ONE GoogleSQL `SELECT` or `WITH ... SELECT`: the rows (objects keyed by column name), the columns' types, `row_count`, `total_rows`, `truncated`, `total_bytes_processed`, `job_id`. `max_rows` (default 100, at most 5,000). `max_bytes_processed` (default 1 GiB, or the configured ceiling when that is lower). `default_dataset` for unqualified table names. `dry_run=true` returns the byte estimate only. |
+| `BIGQUERY_READ_TABLE_ROWS` | Up to `max_rows` rows of one table from `start_index`, optionally only `selected_fields`, without a query job (free). `next_start_index` continues when rows remain. Views can't be read this way. |
+| `BIGQUERY_GET_TABLE_SCHEMA` | One table's columns (name, type, mode, description, nested fields), `num_rows`, `num_bytes`, partitioning, clustering and the version marker `last_modified_time`. |
+| `BIGQUERY_LIST_TABLES` | The tables and views in one dataset, with their types. |
+| `BIGQUERY_LIST_DATASETS` | The datasets the key can read, in the configured project or in another `project`. |
+
+A tool returns at most 4 MiB of JSON rows, and a single row larger than one page may hold (8 MiB of JSON or 100,000
+values, see [Memory](#memory)) is `invalid_arguments`. Tables are written `dataset.table` or `project.dataset.table`
+(backticks allowed); datasets `dataset` or `project.dataset`. Without a project, the tenant's `project_id` is meant.
+
+Values come back as JSON: `INT64` as numbers, `FLOAT64` as numbers (`NaN` and the infinities as strings), `BOOL` as
+booleans, `TIMESTAMP` as RFC 3339 UTC with microseconds, `NUMERIC`/`BIGNUMERIC` as exact strings, `RECORD` as
+objects, `REPEATED` as lists, and `DATE`, `TIME`, `DATETIME`, `GEOGRAPHY` (WKT), `JSON`, `BYTES` (base64) and the
+rest as the strings BigQuery sends.
+
+### The source
+
+`bigquery-query-source` pull params, exactly one of:
+- `table`: `dataset.table` or `project.dataset.table`, read with tabledata.list (free, no query job). Optional
+  `selected_fields` and `start_index`.
+- `sql`: one SELECT, guarded exactly as `BIGQUERY_RUN_SELECT`. Optional `default_dataset`, `max_bytes_processed`
+  (default 1 GiB, never above the ceiling) and `job_timeout_seconds` (default 120, at most 600).
+
+For both: `batch_size` rows per envelope (default 500, at most 10,000) and `max_batch_bytes` bytes of envelope data
+(default 256 KiB, what pipe-as-service returns inline in a synchronous pull, which answers 400 for a larger envelope
+without a blob store; at least 1 KiB, at most 64 MiB; a single larger row still gets its own envelope), whichever
+comes first, `max_rows` (default 10,000, at most 100,000) and `max_result_bytes` (bytes of the envelopes' data in
+all, each one's columns header included; default 25 MiB, at most 64 MiB, sized for a 512 MiB pod: see
+[Memory](#memory)).
+
+Each envelope is one batch of rows: `data` is JSON `{"columns": [...], "rows": [...]}` (`application/json`, and
+`schema` holds the columns too). A result with no rows is one envelope with no rows, so its markers still come out.
+
+**Version markers** (in every envelope's `metadata`):
+- `result_sha256`: SHA-256 of the whole result, the schema plus every row, whatever order the rows came in. It is
+  the same on every batch of one pull and changes when the data the pull read changes.
+- `table_last_modified` (RFC 3339) and `table_last_modified_ms` (BigQuery's `lastModifiedTime`): when the table last
+  changed. They are read BEFORE the rows, so a change made while the rows are read shows at the next pull. For a
+  `sql` pull they are the latest time over the tables the statement names, and they are set only when every one of
+  those could be read as a table. A query over a view, a wildcard table, `INFORMATION_SCHEMA` or a table function
+  has `result_sha256` only. `tables_last_modified` lists the times that were read.
+- `version`: `<table_last_modified_ms>:<result_sha256>`, or `result_sha256` alone when there is no table time.
+
+Store `version` and re-read when it changes. The cheap check is `BIGQUERY_GET_TABLE_SCHEMA`'s `last_modified_time`
+against the stored `table_last_modified`; then pull again only when it moved. Rows streamed in through the legacy
+streaming API may show before `lastModifiedTime` moves; `result_sha256` still catches them.
+
+Also in `metadata`: `kind` (`table` or `query`), `table` or `query_sha256` (the statement's hash, never its text),
+`batch_index`, `batch_count`, `first_row`, `row_count`, `batch_sha256`, `result_row_count`, `total_rows`, and for
+`sql` `job_id` and `total_bytes_processed`.
+
+**A pull that stops early says so.** At `max_rows`, `max_result_bytes` or 5,000 pages read, every envelope carries
+`truncated` (`max_rows`, `max_result_bytes` or `max_pages`), and a `table` pull also `next_start_index`: pass it as
+`start_index` and repeat until a pull is not truncated. Nothing is skipped or repeated while the table doesn't change. A truncated `sql` pull
+can't be continued: narrow the query or raise the caps. `result_sha256` then covers the rows read only.
+
+**How a pull fails** (pipe-as-service answers by the exception's type; neither message carries BigQuery's own error
+text, which can quote the SQL and name tables, nor the token endpoint's `error` and `error_description`, because
+hosts log these; the toolkit, which answers the caller, still shows both):
+- **422**, a `ValueError`: the secret is missing or malformed (`BigQueryNotConfigured`); a bad param; SQL that is
+  not one SELECT (`NotReadOnly`); the dry run over `max_bytes_processed` (`CapExceeded`); a single row larger than
+  one page may hold, 8 MiB of JSON or 100,000 values (`RowTooLarge`: its index and size, none of its values; see
+  [Memory](#memory)); and what BigQuery refused
+  that the caller can fix, as `BigQueryRequestError` (with BigQuery's `status` and `reason`): `invalidQuery` (with
+  BigQuery's "at [line:column]"), `invalid`, `notFound`, `responseTooLarge`, `resourcesExceeded`,
+  `bytesBilledLimitExceeded`, `billingTierLimitExceeded`.
+- **502** `upstream_error`, a `PipelineError` with `retry_after` when BigQuery sent `Retry-After` (a 429 or 503):
+  everything else. A key Google refused, a missing role, VPC Service Controls, billing off, a custom quota used up,
+  rate limits, timeouts, `backendError` and 5xx. The message says which, and what to fix, as the table below does.
+
+### Memory
+
+A pull's peak memory, measured with `tracemalloc` (`tests/test_memory.py`; the fake serves each REST page as fresh
+JSON bytes, and every envelope is kept: one inline copy each, as pipe-as-service keeps a pull's converted envelopes
+(inline up to 256 KiB; each test's docstring has the model)). Each pull was measured in a process of its own:
+
+| Pull | Rows | JSON of the rows | Peak |
+|---|---|---|---|
+| defaults: 10,000 rows of 50 `INT64` columns | 10,000 | 6.8 MiB | 20 MiB (149 MiB before pages were bounded) |
+| defaults: 10,000 rows of 20 mixed columns (`INT64`, `FLOAT64`, `BOOL`, `TIMESTAMP`, `DATE`, `NUMERIC`, short `STRING`s) | 10,000 | 4.1 MiB | 18 MiB |
+| defaults: 10,000 rows of 4 wide `STRING` columns (1 KB a row) | 10,000 | 9.9 MiB | 21 MiB (41 MiB when the first 10 MB page was parsed whole) |
+| `max_result_bytes` 64 MiB, 50 `INT64` columns | 94,709 | 64 MiB | 81 MiB |
+| `max_rows` 100,000, 20 mixed columns | 100,000 | 41 MiB | 58 MiB |
+| `max_result_bytes` 64 MiB, wide rows (the most bytes held) | 64,849 | 64 MiB | 82 MiB (241 MiB at the old 100 MiB) |
+
+How a page is sized: it asks for at most 50,000 cells (`PAGE_CELLS`; each REST cell is a `{"v": "..."}` object, about
+250 bytes once parsed), so 1,000 rows of 50 columns or 10,000 of 5. Once a page has come back, the next also asks for
+at most the rows that fit 4 MiB of JSON at its bytes a row (`PAGE_BYTES`; long values), and at most twice its rows
+(`PAGE_GROWTH`; a page that came back short grows back a step at a time). Each page is let go before the next is
+read, rows are converted one at a time, and the source keeps each row as its canonical JSON (about a fifth of the
+memory a row object takes; the envelopes and hashes are byte for byte what they were). A batch's rows are let go once
+its envelope is built. So a pull of ordinary rows peaks at about 1.35 times the rows' JSON plus 20-40 MiB (82 MiB at
+the caps); the worst page the read cap admits adds up to about 90 MiB (below), so the worst measured pull is 160 MiB
+at the caps. A host keeps the envelopes too: pipe-as-service base64-encodes each (about 1.33 times more) and builds its
+response from those, which is why `max_result_bytes` stops at 64 MiB on a 512 MiB pod.
+
+**What bounds a page is the read cap, not its sizing.** A page's body (every one: tabledata.list's, a query's first
+page in jobs.query's answer, and getQueryResults') is streamed, and its bytes and its cells (its `"v":` keys: a
+`REPEATED` column's every element and a `RECORD`'s every field included) are counted as they arrive, before any of
+it is parsed. A page over 8 MiB of JSON (`READ_BYTES`) or 100,000 cells (`READ_CELLS`) is dropped, and asked for
+again from its first row (`startIndex`, which tabledata.list and getQueryResults both document; not its page token
+sent again with a smaller `maxResults`, which BigQuery doesn't document) with fewer rows: half, or fewer when what was read of it says fewer fit 4 MiB and 50,000 cells (BigQuery's own
+page limit answers a page of long rows with as many as fit, whatever was asked, so halving alone would drop page
+after page). A query's dropped first page is asked for again from the job jobs.query's answer named. Down to one
+row: a single row over either cap is **refused**, `RowTooLarge` (422), which says the row's index and the size of
+the page that holds it alone (its bytes and values) and nothing of its values. A dropped page costs a request and at
+most 8 MiB read.
+
+So a page parsed holds at most 100,000 cells from at most 8 MiB of JSON, however long its arrays are. What parsing it
+costs depends on its text: Python holds a string with one astral character (an emoji, say) at 4 bytes a character.
+The worst shapes measured (`tests/test_memory.py`; one row a page, 99,002 cells in 7.4-7.7 MB of JSON, right under
+both read caps; every envelope kept, a process per pull):
+
+| Each cell (a `REPEATED STRING` element) | Peak at the defaults | Peak at the caps |
+|---|---|---|
+| 64 ASCII characters | 63.1 MiB | 102.2 MiB |
+| 64 characters, one row's first cell with an emoji | 99.2 MiB | 143.5 MiB |
+| 64 characters, each with an emoji | 120.7 MiB | **160.4 MiB** (the worst) |
+
+A `REPEATED` column's schema can't say how many elements a row holds: the FIRST page guesses 1,000 a column
+(`REPEATED_CELLS`; 49 rows for one `REPEATED INT64` column), and every next page is sized from the MEAN cells a row
+of the LAST page held. Not the most of the whole pull: one wide row would hold every later page to a row. Not the
+last page's widest row either: a wide row that recurs would hold the page after each one to a row (100,000 rows with
+a row of 25,001 cells every 500th: 1,786 requests sized from the widest, 104 from the mean). A page sized from the
+mean may meet rows wider than it. The read cap still bounds every page (above), but a pull of recurring wide rows
+parses larger pages than the widest row would size, so it may peak higher, up to that bound: at the caps, those
+100,000 rows peak at 33.4 MiB on either path (26.0 MiB sized from the widest), and with a wide row every 2nd, 80.5 MiB (72.7; both
+stop at `max_result_bytes` after the same 2,679 rows), all under the worst case above. One wide row first (60,000 elements in the first page's 49 rows, then 20,000 rows of one): the next
+page asks for 40 rows, pages double back up (40, 80, ... 2,560), and the default 10,000 rows come back in 9 requests
+(15 sized from the last page's widest row, 5,001 from the pull's). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
+elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
+and 10 MB for a table; 1,000 rows, so both stop at `max_result_bytes`):
+
+| Rows | Pull | Peak at the defaults (rows) | Peak at the caps (rows) | At e3d068b, defaults / caps |
+|---|---|---|---|---|
+| 20,000 elements each | `sql` | 36.7 MiB (163) | 76.0 MiB (419) | 266.1 / 266.1 MiB |
+| 22,000 elements each | `sql` | 37.9 MiB (148) | 77.1 MiB (381) | 292.9 / 292.9 MiB |
+| 34,000 one-character elements each | `sql` | 38.2 MiB (385) | 73.9 MiB (986) | 343.5 / 343.5 MiB |
+| `[]` for 50 rows, then 22,000 elements | `sql` | 37.9 MiB (198) | 77.2 MiB (431) | 286.9 / 286.9 MiB |
+| 20,000 elements each | `table` | 36.7 MiB (163) | 76.0 MiB (419) | 146.6 / 146.6 MiB |
+
+At e3d068b the first page asked for 49 rows (the guess, then a floor for every page) whatever their arrays held: up
+to 1.67 million cells, a 20 MB page parsed whole. BigQuery's page limit bounds a page's bytes, not what parsing it
+costs. Now that page is dropped once 100,000 of its cells are read, and asked for again with the rows that fit (one
+or two), then pages of two (one for the one-character rows). Rows whose arrays are short and then long (a column added
+later leaves the older rows `[]`; an `ORDER BY` array length puts the long ones last), on the `sql` path:
+
+| First 50 rows, then the rest | Peak at the defaults | Peak at the caps (rows) |
+|---|---|---|
+| `[]`, then 100 elements | 21 MiB | 81 MiB (82,051, `max_result_bytes`) |
+| 1 element, then 80 | 20 MiB | 80 MiB (100,000) |
+| `[]`, then 180 one-character elements | 14 MiB | 51 MiB (100,000) |
+
+A pull reads at most 5,000 pages (`MAX_PAGES`; then `truncated` is `max_pages`). Rows of more than 25,000 cells
+each (every column's, a `REPEATED` column's every element) page one at a time (`PAGE_CELLS` // their cells is 1), and
+`max_result_bytes` stops a run of such rows within about 1,350 pages at its 64 MiB cap (1,342 measured, for rows of
+25,001 one-digit integers: the fewest bytes such a row holds).
+
+## Security
+
+**SELECT only, before any request.** `BIGQUERY_RUN_SELECT` and a `sql` pull refuse anything but ONE read-only
+statement before a token is even minted. Two checks must both pass. The lexer decides where statements, strings and
+comments end; the parser decides what the one statement is. Neither alone is a complete guard (two escape payloads
+fool sqlglot about where a quote ends, so the lexer has the last word on that):
+1. **A lexer** that reads text as BigQuery does (backslash escapes always on in `'...'`, `"..."`, `'''...'''`,
+   `"""..."""` and backtick identifiers; `--`, `#` and `/* */` comments). With those blanked, the text must be one
+   statement (one trailing `;` is dropped) starting with `SELECT` or `WITH`, naming none of `INSERT`, `UPDATE`,
+   `DELETE`, `MERGE`, `TRUNCATE`, `CREATE`, `DROP`, `ALTER`, `UNDROP`, `GRANT`, `REVOKE`, `EXPORT`, `LOAD`,
+   `DECLARE`, `SET`, `BEGIN`, `COMMIT`, `ROLLBACK`, `TRANSACTION`, `CALL`, `EXECUTE`, `IMMEDIATE`, `ASSERT`,
+   `RAISE`, `RETURN`, `LOOP`, `WHILE`, `LEAVE`, `ITERATE`, `BREAK`, `CONTINUE`, `INTO`. A column with one of those
+   names must be quoted in backticks. As in BigQuery's tokenizer, a line ends at a CR or an LF, a bare CR
+   included: `--` and `#` comments end at either, and a one-line string or backtick identifier holding either is
+   refused. GoogleSQL `/* */` comments don't nest (the first `*/` ends one), so a `/*` inside one is refused.
+2. **A parser** (sqlglot `>=26.25`, BigQuery dialect; 25.3 to 26.24 read `/* */` comments as nested): exactly
+   one statement whose root is a query, with no write, DDL, scripting or transaction node anywhere in its tree.
+   Text it can't parse is refused. sqlglot logs pieces of the SQL while it parses (its "unsupported syntax"
+   warning, and "Invalid JSON path syntax" with the path for `JSON_VALUE(p, '$.a-1')`), so the guard parses inside
+   `aisquare.pipe.core.sql.quiet_sqlglot()`, the helper every SQL guard shares: nothing sqlglot logs then gets out,
+   not even through Python's `logging.lastResort`, and sqlglot logs as usual everywhere else. On a sqlglot older
+   than 26.25 (another package can bring one in) the guard refuses every statement. CI runs this suite a second
+   time at the sqlglot floor (`scripts/dep_floor.py`), not only at the newest sqlglot.
+
+So DML, DDL, DCL, scripts (`DECLARE`, `BEGIN ... END`, `EXECUTE IMMEDIATE`, `CALL`, `ASSERT`...) and several
+statements are refused (`invalid_arguments`), and the message never echoes the SQL. Google adds its own layers
+behind these:
+- The token's scope is `bigquery.readonly`. Every endpoint the connector calls accepts it; `jobs.insert` (load,
+  extract and copy jobs) and `jobs.cancel` don't.
+- The roles grant no write: `roles/bigquery.dataViewer` reads data, `roles/bigquery.jobUser` only runs jobs.
+- The dry run's `statementType` must be `SELECT`; any other is refused before the job starts.
+
+**Caps.**
+- **Bytes processed (cost).** A free dry run first: a query that would process more than `max_bytes_processed` is
+  refused before it runs. The job then carries `maximumBytesBilled` equal to the same cap, so BigQuery itself refuses
+  to bill more, even when the estimate was low (`bytesBilledLimitExceeded`, nothing billed). The cap defaults to
+  1 GiB; a caller may ask for more, up to the tenant's `max_bytes_billed` ceiling (default 10 GiB, at most 1 TiB).
+  It is at least 10 MiB, BigQuery's minimum charge per table.
+- **Rows and bytes returned.** `max_rows`, and at most 4 MiB of JSON rows from a tool (`max_result_bytes`, at most
+  64 MiB, for the source). A result cut short says `truncated`.
+- **Time.** A tool call fits inside the host's `timeout_seconds`, all of its requests together: each one, the token
+  POST included, gets the time left (at most 30 s), and a call with no time left fails `timeout` before it sends
+  anything more. Every request starts inside the budget and gets at most the time left (requests bounds each connect
+  and each socket read, so one request in flight may finish a little after it). The query job's deadline is the
+  budget left when it starts (60 s without a budget; `job_timeout_seconds` for the source), sent as `jobTimeoutMs`
+  so BigQuery stops the job then too. Polling stops at that deadline with `timeout`.
+
+**Server-controlled.** The key, `project_id` (where every job runs and is billed), `location` and the
+`max_bytes_billed` ceiling come only from the tenant's server-side blob. The tool schemas reject them
+(`additionalProperties: false`), and the source refuses them as pull params.
+
+**IAM is the boundary.** A table reference or a query may name another project's data (`other-proj.ds.table`), as
+any BigQuery client can; the key reads only what its roles grant. So grant `roles/bigquery.dataViewer` on the
+datasets (or tables) AISquare may read, never on a project (checklist step 1).
+
+**Application Default Credentials are never used**: no `google.auth.default()`, no `GOOGLE_APPLICATION_CREDENTIALS`,
+no metadata server. A missing or malformed blob fails closed with "BigQuery is not configured: <what is wrong>"
+(`not_connected`) and makes no request. So does a key that can't sign (not an RSA service account key). The key's
+`token_uri` must be Google's token endpoint and its `universe_domain` `googleapis.com`. Every API call goes to
+`https://bigquery.googleapis.com`. Redirects are not followed. Errors and logs never carry the key, the assertion or a
+token; the connector's own logs carry no SQL, table names or row values.
+
+**Tokens:** minted with ONE POST to the token endpoint, with no hidden retries; cached in memory per key until five
+minutes before they expire; a token BigQuery rejects (401) is dropped, and a call whose cached token was rejected
+retries once with a new one (a retried `jobs.query` keeps its `requestId`, so BigQuery runs it once).
+
+| Failure | `error_code` | Meaning |
+|---|---|---|
+| "BigQuery is not configured: ..." | `not_connected` | The secret is missing or malformed (the message says what). Fix the secret. |
+| "Google did not issue a token ...", "BigQuery failed (401 ...)" | `unauthorized` | Google refused the key: deleted, disabled or expired key, or a disabled service account. The customer makes a new key. |
+| "... lacks roles/bigquery.dataViewer ..." / "... lacks roles/bigquery.jobUser ..." | `forbidden` | The role is missing, or on another dataset or project. A job that fails `accessDenied` inside a finished answer maps the same way. |
+| "... backed by Google Drive ..." | `forbidden` | A Sheet or Drive-file external table: it needs a Drive scope, which no role grants. Not supported. |
+| "... the token lacks a scope ..." | `insufficient_scope` | Google's `WWW-Authenticate` challenge says the scope is short; the connector asks for `bigquery.readonly` only. |
+| "... VPC Service Controls perimeter ..." | `forbidden` | The project is in a perimeter with no ingress rule for the service account. |
+| "... billing is not enabled on project ..." | `forbidden` | The job project has no billing account. |
+| "only one SELECT (or WITH ... SELECT) may run: ..." | `invalid_arguments` | The SQL is not one read-only query. |
+| "the query would process N bytes, over max_bytes_processed ..." / `bytesBilledLimitExceeded` | `invalid_arguments` | The byte cap. Filter on the partition column, select fewer columns, or raise the cap (up to the ceiling). |
+| `invalidQuery`, `responseTooLarge`, `resourcesExceeded` | `invalid_arguments` | Fix the query (add a `LIMIT`, simplify it). |
+| "Custom quota exceeded ..." (`quotaExceeded`) | `forbidden` | A custom quota the customer's administrator set (query usage per day, per project or per user; checklist step 1) is used up. Retries fail until it resets at midnight Pacific time, or until the administrator raises it. |
+| `rateLimitExceeded`, other `quotaExceeded` (BigQuery sends them as 403) | `rate_limited` | Retry later. |
+| a timeout, "could not reach ...", `backendError`, a 5xx | `timeout`, `upstream_error` | Google or the network. Retryable. The credential is fine. |
+| "Google refused the token request's issue and expiry times: this host's clock is off ..." | `upstream_error` | Our clock is off. Fix NTP on the host. |
+
+**Not supported:**
+- Legacy SQL (every query runs as GoogleSQL), query parameters, sessions and multi-statement scripts.
+- Reading a view, materialized view or external table with `BIGQUERY_READ_TABLE_ROWS` or a `table` pull: use a SELECT.
+- External tables backed by Google Drive (a Sheet, a Drive file), even with a SELECT: reading them needs a Drive
+  scope on the token, and the connector only ever asks for `bigquery.readonly`. BigQuery answers `accessDenied`
+  ("Permission denied while getting Drive credentials"), and no role fixes it.
+- Continuing a truncated `BIGQUERY_RUN_SELECT` result page by page: narrow the query.
+- Cancelling a running job: the `bigquery.readonly` scope can't. The job deadline (`jobTimeoutMs`) stops it instead.
+
+**Later (not built):**
+- Per-person OAuth through AISquare's verified Google OAuth app (scope `bigquery.readonly`), so each user's own
+  BigQuery permissions apply instead of one service account's. That would make the toolkit `NATIVE_OAUTH`.
+- Workload Identity Federation from our AWS principal to the customer's service account, which avoids a long-lived
+  key.
+
+## Registration checklist
+
+### The customer: who can do it
+
+The steps need one admin, or several, holding:
+- `roles/iam.serviceAccountAdmin` (or `roles/iam.serviceAccountCreator`) on the job project, to create the service
+  account.
+- `roles/resourcemanager.projectIamAdmin` on the job project, to grant `roles/bigquery.jobUser`.
+- `roles/bigquery.dataOwner` (or `roles/bigquery.admin`) on each dataset AISquare may read, to grant
+  `roles/bigquery.dataViewer` on it.
+- `roles/iam.serviceAccountKeyAdmin` on the job project or the service account, to create the key.
+- Only behind VPC Service Controls: `roles/accesscontextmanager.policyEditor` on the access policy.
+
+Check these organization settings first:
+- **Key creation may be blocked.** In organizations created on or after 3 May 2024, Google enforces
+  `iam.managed.disableServiceAccountKeyCreation` by default (older organizations may set the legacy constraint
+  `iam.disableServiceAccountKeyCreation`). Step 5 then fails until an org-policy admin (`roles/orgpolicy.policyAdmin`)
+  makes an exception for the job project.
+- **Keys may expire.** If `iam.serviceAccountKeyExpiryHours` is set, the key expires after that time and the
+  connector goes `unauthorized`. Put the rotation (below) on a calendar ahead of the expiry.
+- **VPC Service Controls.** If the job project or a data project is inside a perimeter that restricts
+  `bigquery.googleapis.com`, AISquare's calls come from outside it and get 403 "Request is prohibited by
+  organization's policy". Add an ingress rule for the service account with `serviceName: bigquery.googleapis.com`
+  on each of those projects: `methodSelectors: [{method: "*"}]`, or permission selectors such as
+  `bigquery.jobs.create` and `bigquery.tables.getData` if your policy admin lists them one by one. Apply it with `gcloud access-context-manager perimeters update <perimeter> --policy=<policy-id>
+  --set-ingress-policies=<file>`. That flag REPLACES the perimeter's ingress rules, so the file must also list the
+  rules that exist today.
+
+### The customer: steps
+
+1. **Decide what AISquare may read, and where its queries run.**
+   - The **data**: grant on the datasets that hold only what AISquare may read (step 4), never on a project.
+     `roles/bigquery.dataViewer` on a dataset covers every table and view in it. To share some tables or some rows
+     only, put authorized views in a dedicated dataset (`aisquare_shared`, say) and grant on that dataset alone.
+   - The **job project**: every query runs as a job in ONE project and is billed there (on-demand, by bytes
+     processed). On BigQuery Editions or a reservation the cost is slot time instead, which the job deadline
+     (`jobTimeoutMs`) bounds and the byte cap doesn't. That is `project_id`. It may be the data's project or another one. A query reads data in other
+     projects when the data's datasets grant `dataViewer`.
+   - **Cost**: tell AISquare the most one query may process (`max_bytes_billed`; we default to 10 GiB). For a hard
+     daily limit too, set the job project's custom quota "Query usage per day per user" for the service account.
+     Once it is used up, queries fail "Custom quota exceeded" (`forbidden`, not a retry-later rate limit) until it
+     resets at midnight Pacific time.
+   - **Location**: if the data lives in one location (`US`, `EU`, `europe-west2`...), tell AISquare; jobs then run
+     there.
+2. **Create a service account** in the job project:
+   `gcloud iam service-accounts create aisquare-bq-reader --project=<job-project> --display-name="AISquare read-only (BigQuery)"`.
+3. **Grant it `roles/bigquery.jobUser` on the job project** (it may run query jobs; it reads nothing by itself):
+   `gcloud projects add-iam-policy-binding <job-project> --member=serviceAccount:aisquare-bq-reader@<job-project>.iam.gserviceaccount.com --role=roles/bigquery.jobUser`.
+4. **Grant it `roles/bigquery.dataViewer` on each dataset** AISquare may read, in the BigQuery console's query editor
+   (or with `bq query --nouse_legacy_sql`), once per dataset:
+
+   ```sql
+   GRANT `roles/bigquery.dataViewer`
+   ON SCHEMA `<data-project>.<dataset>`
+   TO "serviceAccount:aisquare-bq-reader@<job-project>.iam.gserviceaccount.com";
+   ```
+
+   For single tables instead, write ``ON TABLE `<data-project>.<dataset>.<table>` ``. Never grant `dataViewer`,
+   `dataEditor`, `user` or `admin` on a project or the organization.
+5. **Create a JSON key**:
+   `gcloud iam service-accounts keys create key.json --iam-account=aisquare-bq-reader@<job-project>.iam.gserviceaccount.com`.
+   Make one key per AISquare environment (one for production, one for staging), never the production key in staging.
+6. **Hand AISquare devops** key.json, the job project id, and, if any, the location and the byte ceiling.
+   - Hand over key.json only through AISquare's team vault (1Password): devops invites your admin as a guest to a
+     vault for this handoff, and you store key.json there as a document. Never by email, chat or a ticket.
+   - Delete your local copy of key.json afterwards.
+
+Before handing over, you can check the grants as the service account. The tester needs
+`roles/iam.serviceAccountTokenCreator` on it; `bq` follows gcloud's impersonation setting:
+
+```bash
+gcloud config set auth/impersonate_service_account aisquare-bq-reader@<job-project>.iam.gserviceaccount.com
+bq --project_id=<job-project> query --nouse_legacy_sql --dry_run 'SELECT 1 FROM `<data-project>.<dataset>.<table>`'
+bq --project_id=<job-project> query --nouse_legacy_sql --dry_run 'SELECT 1 FROM `<data-project>.<other-dataset>.<table>`'
+gcloud config unset auth/impersonate_service_account
+```
+
+The first dry run should succeed; the second, against a dataset AISquare must NOT read, should fail with "Access
+Denied".
+
+**Offboarding** (when AISquare should stop reading):
+1. Revoke the dataset grants, once per dataset:
+
+   ```sql
+   REVOKE `roles/bigquery.dataViewer`
+   ON SCHEMA `<data-project>.<dataset>`
+   FROM "serviceAccount:aisquare-bq-reader@<job-project>.iam.gserviceaccount.com";
+   ```
+
+2. Remove the job role:
+   `gcloud projects remove-iam-policy-binding <job-project> --member=serviceAccount:aisquare-bq-reader@<job-project>.iam.gserviceaccount.com --role=roles/bigquery.jobUser`.
+3. Delete the key (`gcloud iam service-accounts keys delete <key-id> --iam-account=aisquare-bq-reader@<job-project>.iam.gserviceaccount.com`)
+   or the whole service account (`gcloud iam service-accounts delete aisquare-bq-reader@<job-project>.iam.gserviceaccount.com`).
+
+Revoking the grants stops every read, a token AISquare already holds included, once the IAM change takes effect
+(usually within a few minutes).
+
+### AISquare devops
+
+**What has to be true first:**
+1. pipe-as-service runs credential-driven routing (task #30), which maps `bigquery-query` → `bigquery` in its
+   `TENANT_BLOBS` (`credentials/catalog.py`), so the source reads the same secret as the toolkit. Without that row,
+   `bigquery-query-source` looks for a secret named `bigquery-query`.
+2. Its image has a pipe release that contains `bigquery` (`aisquare-pipe[toolkits]`, from the first release with this
+   connector).
+
+**Where pipe-service runs today.** Production runs on ECS only. aisquare-releases has no prod pipe-service
+(`environments/prod/services/` holds only explainability-gateway and praxis), and aisquare-infra has no
+`prod/prod/pipe-service/*` secret. So GoodRx production follows the ECS path. `stg` runs on ECS and on EKS until the
+cutover, and `dev` runs on EKS only. While both `stg`s run, turn the tenant on in both (at the least, in the one the
+tenant's caller uses): the other one sends the tenant's BigQuery calls to Composio's `googlebigquery` (read-only
+guard), on whatever Composio connection the person has, not to the customer's service account.
+
+**One customer key per environment** (step 5): never put the production key in `stg` or `dev`. On EKS the value also
+sits in a GitHub environment secret of aisquare-infra (below), which more people and workflows can reach than an ECS
+secret.
+
+**Turning BigQuery on for a tenant is a deploy, today.** Every environment runs the env secrets backend
+(`PIPE_SERVICE_SECRETS_BACKEND=env`: EKS `deploy/values.yaml` and both ECS task definitions in pipe-as-service). The
+blob reaches the service only as the env var `PIPE_SECRET__<TENANT>__BIGQUERY__JSON`. Store the value first ("The
+secret's value" below, saved as a local `blob.json`), then add the entry that reads it. A pod or task reads the value
+when it starts.
+
+`<TENANT>` is the tenant id in upper case. Every run of characters other than A-Z and 0-9 becomes one `_`, and any `_`
+at either end is dropped (`acme-corp.eu` gives `PIPE_SECRET__ACME_CORP_EU__BIGQUERY__JSON`).
+
+- **ECS** (production, and `stg` until the cutover):
+  1. Create the secret in the task definition's region: prod `us-east-2`, stg `us-east-1`. The task execution role
+     reads only `ais-pipe-service/<env>/*` in its own region, so a secret anywhere else stops the task from starting:
+     `aws secretsmanager create-secret --region <region> --name ais-pipe-service/<env>/bigquery-<tenant> --secret-string file://blob.json`
+  2. Add an entry to the task definition's `secrets:` (`deploy/ecs/<env>/task-definition-pipe-service.json` in
+     pipe-as-service). Use the same ARN form as the entries already there:
+
+     ```json
+     {
+       "name": "PIPE_SECRET__<TENANT>__BIGQUERY__JSON",
+       "valueFrom": "arn:aws:secretsmanager:<region>:<account>:secret:ais-pipe-service/<env>/bigquery-<tenant>"
+     }
+     ```
+
+  3. Merge it, then run pipe-as-service's `deploy` workflow for that environment and region:
+     `gh workflow run deploy.yml --repo AISquare-Studio/pipe-as-service -f environment=<env> -f region=<region>`. The
+     new task-definition revision is the deploy. Terraform ignores `container_definitions`, so this workflow owns
+     them. The workflow builds and pushes the image from the head of the branch it runs on (`main`), so this deploy
+     also ships everything else merged to pipe-as-service `main` since the last one. Check what that is first, above
+     all in production.
+- **EKS** (`stg`, `dev`): never put the value into Secrets Manager by hand. aisquare-infra creates the secret from
+  `live/nonprod/data/supplied-secrets.json`. Its `secrets-nonprod` workflow fills the secret from the GitHub environment
+  `nonprod-secrets`, when run by hand and after every `apply-nonprod`. So a value edited in Secrets Manager is
+  overwritten with the GitHub one at the next sync. And if a listed secret's GitHub value is missing, the sync stops
+  for EVERY secret.
+
+  `<GH_SECRET>` below is the environment's own GitHub secret, because each environment has its own key:
+  `BIGQUERY_<TENANT>_JSON` for `stg`, and `DEV_BIGQUERY_<TENANT>_JSON` for `dev` (like `DEV_INTERNAL_AUTH_TOKEN`). Use
+  that one name in every step and command for the environment, so `dev` never reads or writes stg's secret.
+  1. Store the value in GitHub:
+     `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`.
+  2. In aisquare-infra, open one PR that adds the entry to `live/nonprod/data/supplied-secrets.json`:
+
+     ```json
+     {
+       "nonprod/<env>/pipe-service/bigquery-<tenant>": {
+         "github_secret": "<GH_SECRET>",
+         "description": "PIPE_SECRET__<TENANT>__BIGQUERY__JSON of the <env> pipe service: the BigQuery service account blob of <tenant>"
+       }
+     }
+     ```
+
+     The same PR adds its line to the `env` of the sync step in `.github/workflows/secrets-nonprod.yml`:
+     `<GH_SECRET>: ${{ secrets.<GH_SECRET> }}`. Merge only after step 1, so the sync can't fail on it. The merge runs `apply-nonprod`, which creates the secret and then runs `secrets-nonprod` to fill it.
+     Check that both ran green.
+  3. In aisquare-releases, add to `environments/<env>/services/pipe-service/release.yaml`. That file is written by
+     people. Never edit `values.yaml`, which the pipe-as-service build workflow overwrites:
+
+     ```yaml
+     secretEnv:
+       PIPE_SECRET__<TENANT>__BIGQUERY__JSON: { from: pipe-service/bigquery-<tenant> }
+     ```
+
+     Helm merges it with the `secretEnv` of `values.yaml`. A code owner merging that PR is the deploy. Argo CD syncs
+     the ExternalSecret `pipe` (key `<secrets.prefix>/pipe-service/bigquery-<tenant>`) before the Deployment. One
+     ExternalSecret carries every `secretEnv` entry, so a secret with no value yet fails that ExternalSecret and holds
+     the release.
+
+After storing the value, delete `blob.json`, the vault item and any local copy of key.json. Then remove the
+customer's guest access and the handoff vault.
+
+**Never switch the secrets backend for BigQuery.** `PIPE_SERVICE_SECRETS_BACKEND=aws` moves EVERY secret the service
+reads, the shared Composio key included, and a missing secret reads as no key. Flipping the backend "for BigQuery"
+takes Composio down for every connector in that environment. Moving to the aws backend is a whole-service migration
+(pipe-as-service `DEPLOYMENT.md`). After that migration, the tenant's secret is
+`<PIPE_SERVICE_SECRETS_PREFIX>/tenants/<tenant>/bigquery` and needs no deploy. A new secret is picked up within about
+60 s (a missing secret is not cached, so only the 60 s routing TTL applies), and a changed one within 300 s (the
+secret cache).
+
+**The secret's value** is one JSON object, read for both `bigquery` and `bigquery-query-source`:
+
+```json
+{
+  "service_account_json": {
+    "type": "service_account",
+    "project_id": "<job-project>",
+    "private_key_id": "<from key.json>",
+    "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+    "client_email": "aisquare-bq-reader@<job-project>.iam.gserviceaccount.com",
+    "client_id": "<from key.json>",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "universe_domain": "googleapis.com"
+  },
+  "project_id": "<job-project>",
+  "location": "US",
+  "max_bytes_billed": 10737418240
+}
+```
+
+`service_account_json` is key.json as it was downloaded (an object, or the same JSON as a string). `project_id` is
+required: the project jobs run in. `location` (`US`, `EU`, a region) and `max_bytes_billed` (bytes, 10 MiB to 1 TiB,
+default 10 GiB) are optional. Until the secret is read, the tenant's calls go to Composio's `googlebigquery`
+(routing rule d, read-only guard), not to the customer's service account.
+
+**Rotation**, at least before any key expiry:
+1. The customer creates a new key for the same service account (step 5) and hands it over (step 6).
+2. Replace `service_account_json` in the value. Then restart the service, which reads the value only when a pod or
+   task starts:
+   - ECS: `aws secretsmanager put-secret-value --region <region> --secret-id ais-pipe-service/<env>/bigquery-<tenant> --secret-string file://blob.json`,
+     then `aws ecs update-service --region <region> --cluster ais-studio-ecs-cluster-<env> --service ais-studio-pipe-service-<env> --force-new-deployment`.
+     Wait until the old tasks are gone.
+   - EKS, in this order (`<GH_SECRET>` as in "Turning BigQuery on", per environment):
+     1. `gh secret set <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra < blob.json`. Never
+        edit the value in Secrets Manager: the next sync puts the GitHub value back, and a pod that starts after that
+        reads the old key.
+     2. Run the sync and wait for it to finish. `gh workflow run secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra`
+        returns as soon as the run is queued. Find the run with
+        `gh run list --workflow secrets-nonprod.yml --repo AISquare-Studio/aisquare-infra --limit 1 --json databaseId,createdAt`
+        (its `createdAt` must be after your dispatch; a new run can take a few seconds to appear), then
+        `gh run watch <run-id> --repo AISquare-Studio/aisquare-infra --exit-status`. It must end green, and
+        `gh run view <run-id> --repo AISquare-Studio/aisquare-infra --log | grep pipe-service/bigquery-<tenant>` must
+        show `nonprod/<env>/pipe-service/bigquery-<tenant>: updated`.
+     3. Only then refresh the ExternalSecret. Its refresh interval is 1 h, the chart default, which pipe-service
+        doesn't override. Or force it now with
+        `kubectl -n <env> annotate externalsecret pipe force-sync=$(date +%s) --overwrite`. Then check that
+        `kubectl -n <env> get externalsecret pipe -o jsonpath='{.status.refreshTime}'` is later than the run's end
+        (`gh run view <run-id> --repo AISquare-Studio/aisquare-infra --json updatedAt`) and that
+        `kubectl -n <env> get externalsecret pipe` shows `SecretSynced`. A refresh that ran before the sync finished
+        copied the old key, and it still shows `SecretSynced`.
+     4. Restart the Deployment: `kubectl -n <env> rollout restart deployment/pipe-service`, then
+        `kubectl -n <env> rollout status deployment/pipe-service`. The chart has no checksum annotation or reloader,
+        so pods keep the old value until they restart.
+   - After a migration to the aws backend: no restart, but wait at least 300 s.
+3. Only when every pod or task runs with the new key does the customer delete the old one. Deleting it earlier breaks
+   calls on pods that still hold it.
+
+**Offboarding** (AISquare's copy):
+- ECS: remove the task definition's `secrets:` entry and deploy (as above). Then delete the secret:
+  `aws secretsmanager delete-secret --region <region> --secret-id ais-pipe-service/<env>/bigquery-<tenant>`. Keep that
+  order, because a task whose secret is gone does not start. The name stays taken for the recovery window (30 days by
+  default), so to turn the tenant back on within it, restore the secret
+  (`aws secretsmanager restore-secret --region <region> --secret-id ais-pipe-service/<env>/bigquery-<tenant>`) and
+  `put-secret-value` the new blob instead of `create-secret`.
+- EKS:
+  1. Remove the `secretEnv` entry from `release.yaml` (a deploy). Do this first: while the entry is listed, a deleted
+     secret fails the ExternalSecret.
+  2. In aisquare-infra, open one PR that removes the `supplied-secrets.json` entry and the `secrets-nonprod.yml` env
+     line, and the tenant's import block in `live/nonprod/data/imports.tf` if one is still there (below). Its
+     `apply-nonprod` deletes the Secrets Manager secret, with a 7-day recovery window.
+  3. After that merge, run
+     `gh secret delete <GH_SECRET> --env nonprod-secrets --repo AISquare-Studio/aisquare-infra`. If you delete it
+     earlier, while the entry is still listed, every sync stops.
+
+  **Never delete the Secrets Manager secret by hand.** `delete-secret` keeps the name for its recovery window (30 days
+  by default), and Terraform's AWS provider reads a secret that is pending deletion as gone. Until the window ends,
+  while the entry is listed:
+  - the next `apply-nonprod` of `live/nonprod/data` plans to create the secret, and `CreateSecret` fails ("already
+    scheduled for deletion"). The apply fails, and its `secrets-nonprod` job is skipped;
+  - `secrets-nonprod` fails on the secret and stops there, so no secret listed after it is written, other services'
+    included;
+  - the ExternalSecret `pipe` fails, which holds every later pipe-service release in that environment.
+
+  To undo it: `aws secretsmanager restore-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/bigquery-<tenant>`.
+  The value comes back with it. If an `apply-nonprod` ran on `live/nonprod/data` in between, its failure also dropped
+  the secret from Terraform's state, so import it (below) as well. Then run `secrets-nonprod`, wait for it and refresh
+  the ExternalSecret, as the EKS rotation above does.
+
+  **Turning the tenant back on within 7 days** of the offboarding apply fails the same way: the name is still pending
+  deletion. Wait out the window, or restore the secret (above) first. Only then open the PR that re-adds the entry:
+  the provider cannot import a secret that is still pending deletion, so a PR opened before the restore fails. In
+  that PR, add an import block to `live/nonprod/data/imports.tf` like the ones already there:
+
+  ```hcl
+  import {
+    to = aws_secretsmanager_secret.supplied["nonprod/<env>/pipe-service/bigquery-<tenant>"]
+    id = "<ARN>"
+  }
+  ```
+
+  `<ARN>` comes from
+  `aws secretsmanager describe-secret --region us-east-1 --secret-id nonprod/<env>/pipe-service/bigquery-<tenant> --query ARN --output text`.
+  The restored secret holds the old value until the sync writes the GitHub one.
+
+  **Remove the import block once the `apply-nonprod` that imported it is green**, in a follow-up PR (the secret stays
+  in Terraform's state). A block left behind outlives the entry: after the next offboarding removes the entry, every
+  plan of `live/nonprod/data` fails ("Configuration for import target does not exist"), so its `apply-nonprod` fails
+  and the sync is skipped. The two blocks already there are safe only while their entries stay listed.
+- Tell the customer to do their offboarding (above) as well: deleting our copy does not revoke the key.
+
+## Tests
+
+`pytest` from this directory, hermetic: core's socket guard blocks the network, and `tests/fakes.py` plays Google
+(the token endpoint decodes the signed assertion; the BigQuery API serves in-memory datasets and tables and canned
+query results, with dry runs, polling, paging and `maximumBytesBilled` enforced). `real_session()` puts the same fake
+behind a real `requests.Session`. Keys are generated per run; no real key or account is used.

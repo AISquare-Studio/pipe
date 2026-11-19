@@ -297,8 +297,8 @@ class GraphifyEngine:
         except FileNotFoundError as exc:
             raise PipelineError(
                 f"graphify binary {self.graphify_bin!r} not found on PATH — install the "
-                "[engine] extra (pip install 'aisquare-pipe-graphify[engine]') or pipx "
-                "install graphifyy==0.9.72"
+                "graph engine (pip install 'aisquare-pipe[graphify,graphify-engine]') or "
+                "pipx install graphifyy==0.9.106"
             ) from exc
         except subprocess.TimeoutExpired as exc:
             stderr = exc.stderr or b""

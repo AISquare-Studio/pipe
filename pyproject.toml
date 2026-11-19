@@ -1,20 +1,19 @@
 [build-system]
-requires = ["setuptools>=68.0", "setuptools-scm"]
+requires = ["setuptools>=84.2.1", "setuptools-scm"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisquare-pipe"
-version = "0.3.0"
+version = "0.5.0"
 description = "Universal anything-to-anything connector framework"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.11"
 authors = [{name = "AISquare Studio"}]
 keywords = ["connectors", "data-pipeline", "etl", "integration"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -25,6 +24,9 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.0",
+    # Used by most connectors, so they ship with the core.
+    "requests>=2.34.2",
+    "urllib3>=1.26",
 ]
 
 [project.urls]
@@ -35,21 +37,118 @@ Issues = "https://github.com/AISquare-Studio/pipe/issues"
 Changelog = "https://github.com/AISquare-Studio/pipe/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
-popular = [
-    "aisquare-pipe-local",
-    "aisquare-pipe-dropbox",
-    "aisquare-pipe-onedrive",
-    "aisquare-pipe-googledrive",
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pyyaml",
+    "types-requests",
+    "responses",
+    # AWS fakes (STS, S3) for connectors/aws's hermetic tests.
+    "moto[s3,sts]>=5.0,<6",
+    # connectors/gcs tests make throwaway RSA/EC keys. google-auth only brings
+    # it in from 2.4x; [gcs] allows 2.20.
+    "cryptography>=38.0.3",
 ]
-full = [
-    "aisquare-pipe[popular]",
-    "aisquare-pipe-salesforce",
-    "aisquare-pipe-docusign",
-    "aisquare-pipe-composio",
-    "aisquare-pipe-github",
-    "aisquare-pipe-slack",
+# One extra per connector, named after its directory (connectors/<name>,
+# module aisquare_pipe_<name>): that connector's third-party deps beyond the
+# core ones. It may be empty, and `pip install "aisquare-pipe[<name>]"` always
+# works. Without it the connector's code is installed but its entry points
+# count as not installed (the registry logs that at info level).
+# tests/test_distribution.py keeps these in step with connectors/.
+# AWS (cross-account role): AgentCore Policy (bedrock-agentcore-control
+# ListPolicyEngines / ListPolicies / GetPolicy) is in botocore's model from
+# 1.42.60 (GA), but a policy's enforcementMode only from 1.43.32: botocore
+# drops response members its model lacks, so an older one silently loses it.
+# sqlglot: Amazon Redshift (aisquare_pipe_aws.redshift) parses SQL so only one
+# SELECT is ever sent; >=26.25,<28 is the one specifier every extra naming
+# sqlglot shares (BigQuery #37, Databricks #34).
+aws = [
+    "boto3>=1.43.32,<2",
+    "botocore>=1.43.32,<2",
+    "sqlglot>=26.25,<28",
 ]
+# BigQuery: google-auth signs the service account key into tokens (explicit
+# credentials only, never Application Default Credentials); sqlglot parses
+# SQL so only one SELECT is ever sent. HTTP via requests (core).
+# sqlglot from 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested,
+# and GoogleSQL doesn't nest them. Every extra naming sqlglot gives it this
+# same specifier; CI runs their suites at its floor (scripts/dep_floor.py).
+bigquery = [
+    "google-auth>=2.20,<3",
+    "sqlglot>=26.25,<28",
+]
+# Composio: every composio release pins composio-client exactly, so the
+# client range picks the SDK. 1.x and 2.x are both supported (2.x moved the
+# trigger log to client._internal; aisquare_pipe_composio.client handles
+# both, and its tests/test_sdk_compat.py runs on the installed real SDK).
+composio = [
+    "composio>=0.13.1,<2.0",
+    "composio-client>=1.39,<3.0",
+]
+# Databricks: sqlglot parses SQL so only one SELECT is ever sent (HTTP via
+# requests, in core). Every extra naming sqlglot gives it this same specifier
+# (from 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested, and
+# 25.0 to 25.2 don't nest Spark's); CI runs their suites at its floor
+# (scripts/dep_floor.py).
+databricks = [
+    "sqlglot>=26.25,<28",
+]
+docusign = [
+    "docusign-esign>=4.0",
+]
+dropbox = [
+    "dropbox>=12.0",
+]
+gateway = []
+# Google Cloud Storage: the service account key is signed into tokens by
+# google-auth (explicit credentials only, never Application Default Credentials).
+gcs = [
+    "google-auth>=2.20,<3",
+]
+github = []
+# Glean: HTTP via requests (core), no deps of its own.
+glean = []
+gmail = []
+googlecalendar = []
+googledrive = []
+graphify = [
+    "tiktoken>=0.7",
+]
+# The graph engine itself, heavy and pinned; not part of [full].
+graphify-engine = ["graphifyy==0.9.106"]
+local = []
+n8n = []
+onedrive = [
+    "azure-identity>=1.27.0",
+]
+# Amazon Redshift ships in the AWS connector (aisquare_pipe_aws.redshift: it
+# assumes the role through aisquare_pipe_aws.credentials, and one connector
+# never imports another), so its deps are [aws]'s. This name is the install
+# line its README gives.
+redshift = ["aisquare-pipe[aws]"]
+salesforce = [
+    "simple-salesforce>=1.12",
+]
+slack = []
+# Snowflake (SQL API over requests, core): cryptography signs the key-pair
+# JWT with the tenant's RSA key; sqlglot parses SQL so only one SELECT is
+# ever sent. Every extra naming sqlglot gives it this same specifier (from
+# 26.25: 25.3 to 26.24 read BigQuery's /* */ comments as nested); CI runs
+# their suites at its floor (scripts/dep_floor.py).
+snowflake = [
+    "cryptography>=42,<60",
+    "sqlglot>=26.25,<28",
+]
+# Bundles of connector extras.
+popular = ["aisquare-pipe[local,dropbox,onedrive,googledrive]"]
+# Every connector's deps (graphify's engine stays separate).
+full = ["aisquare-pipe[popular,aws,bigquery,composio,databricks,docusign,gateway,gcs,github,glean,gmail,googlecalendar,graphify,n8n,redshift,salesforce,slack,snowflake]"]
+# The deps of every connector that registers an `aisquare_pipe.toolkits`
+# entry point. Hosts (pipe-as-service) install this to serve every toolkit;
+# scripts/check_toolkits_extra.py (CI) keeps it complete.
+toolkits = ["aisquare-pipe[aws,bigquery,databricks,gcs,github,glean,gmail,googlecalendar,googledrive,onedrive,slack,snowflake]"]
 
 [project.scripts]
 pipe = "aisquare.pipe.cli.main:cli"
@@ -57,15 +156,81 @@ pipe = "aisquare.pipe.cli.main:cli"
 [project.entry-points."aisquare_pipe.connectors"]
 mock-source = "aisquare.pipe.testing.mock_connectors:MockSource"
 mock-sink = "aisquare.pipe.testing.mock_connectors:MockSink"
+bedrock-agentcore-policies-source = "aisquare_pipe_aws.connector:BedrockAgentCorePoliciesSource"
+s3-source = "aisquare_pipe_aws.connector:S3Source"
+redshift-query-source = "aisquare_pipe_aws.redshift.connector:RedshiftQuerySource"
+bigquery-query-source = "aisquare_pipe_bigquery.connector:BigQueryQuerySource"
+composio-source = "aisquare_pipe_composio.connector:ComposioSource"
+composio-sink = "aisquare_pipe_composio.connector:ComposioSink"
+composio-triggers-source = "aisquare_pipe_composio.triggers:ComposioTriggersSource"
+databricks-files-source = "aisquare_pipe_databricks.connector:DatabricksFilesSource"
+docusign-source = "aisquare_pipe_docusign.connector:DocusignSource"
+docusign-sink = "aisquare_pipe_docusign.connector:DocusignSink"
+dropbox-source = "aisquare_pipe_dropbox.connector:DropboxSource"
+dropbox-sink = "aisquare_pipe_dropbox.connector:DropboxSink"
+aisquare-gateway-sink = "aisquare_pipe_gateway.connector:AISquareGatewaySink"
+gcs-source = "aisquare_pipe_gcs.connector:GcsSource"
+github-source = "aisquare_pipe_github.connector:GitHubRepoSource"
+glean-source = "aisquare_pipe_glean.connector:GleanSource"
+googledrive-source = "aisquare_pipe_googledrive.connector:GoogleDriveSource"
+googledrive-sink = "aisquare_pipe_googledrive.connector:GoogleDriveSink"
+graphify-source = "aisquare_pipe_graphify.connector:GraphifySource"
+local-source = "aisquare_pipe_local.connector:LocalSource"
+local-sink = "aisquare_pipe_local.connector:LocalSink"
+n8n-source = "aisquare_pipe_n8n.connector:N8nSource"
+onedrive-source = "aisquare_pipe_onedrive.connector:OneDriveSource"
+onedrive-sink = "aisquare_pipe_onedrive.connector:OneDriveSink"
+salesforce-source = "aisquare_pipe_salesforce.connector:SalesforceSource"
+salesforce-sink = "aisquare_pipe_salesforce.connector:SalesforceSink"
+slack-message-sink = "aisquare_pipe_slack.connector:SlackMessageSink"
+snowflake-query-source = "aisquare_pipe_snowflake.connector:SnowflakeQuerySource"
 
 [project.entry-points."aisquare_pipe.converters"]
 mock-converter = "aisquare.pipe.testing.mock_connectors:MockConverter"
+graphify-converter = "aisquare_pipe_graphify.converter:GraphifyConverter"
 
 [project.entry-points."aisquare_pipe.toolkits"]
 mock = "aisquare.pipe.testing.mock_connectors:MockToolkit"
-
+bedrock_agentcore = "aisquare_pipe_aws.toolkit:BedrockAgentCoreToolkit"
+s3 = "aisquare_pipe_aws.toolkit:S3Toolkit"
+redshift = "aisquare_pipe_aws.redshift.toolkit:RedshiftToolkit"
+bigquery = "aisquare_pipe_bigquery.toolkit:BigQueryToolkit"
+databricks = "aisquare_pipe_databricks.toolkit:DatabricksToolkit"
+gcs = "aisquare_pipe_gcs.toolkit:GcsToolkit"
+github = "aisquare_pipe_github.toolkit:GitHubToolkit"
+glean = "aisquare_pipe_glean.toolkit:GleanToolkit"
+gmail = "aisquare_pipe_gmail.toolkit:GmailToolkit"
+googlecalendar = "aisquare_pipe_googlecalendar.toolkit:GoogleCalendarToolkit"
+googledrive = "aisquare_pipe_googledrive.toolkit:GoogleDriveToolkit"
+onedrive = "aisquare_pipe_onedrive.toolkit:OneDriveToolkit"
+slack = "aisquare_pipe_slack.toolkit:SlackToolkit"
+snowflake = "aisquare_pipe_snowflake.toolkit:SnowflakeToolkit"
 [tool.setuptools.packages.find]
-where = ["src"]
+# The framework, then every connector's src dir. Each connector keeps its
+# own directory (code, tests, README); only this file packages it.
+where = [
+    "src",
+    "connectors/aws/src",
+    "connectors/bigquery/src",
+    "connectors/composio/src",
+    "connectors/databricks/src",
+    "connectors/docusign/src",
+    "connectors/dropbox/src",
+    "connectors/gateway/src",
+    "connectors/gcs/src",
+    "connectors/github/src",
+    "connectors/glean/src",
+    "connectors/gmail/src",
+    "connectors/googlecalendar/src",
+    "connectors/googledrive/src",
+    "connectors/graphify/src",
+    "connectors/local/src",
+    "connectors/n8n/src",
+    "connectors/onedrive/src",
+    "connectors/salesforce/src",
+    "connectors/slack/src",
+    "connectors/snowflake/src",
+]
 
 [tool.setuptools.package-data]
 "aisquare.pipe" = ["py.typed"]

@@ -13,6 +13,7 @@ from aisquare.pipe.errors import ConfigValidationError, PipelineError
 
 from aisquare_pipe_composio.client import (
     ComposioClient,
+    ComposioSDKShapeError,
     TriggerCursor,
     _to_plain,
     default_cursor_path,
@@ -144,6 +145,29 @@ class TestRetry:
         assert sleep.call_count == MAX_RETRIES - 1
 
 
+class TestSDKShape:
+    def test_a_missing_sdk_method_is_a_shape_error(self, mock_sdk, composio_config):
+        del mock_sdk.return_value.tools.execute
+        client = ComposioClient(composio_config)
+        with pytest.raises(ComposioSDKShapeError, match=r"no tools\.execute\(\)"):
+            client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1")
+
+    def test_execute_returning_a_non_dict_is_a_shape_error(
+        self, mock_sdk, composio_config
+    ):
+        mock_sdk.return_value.tools.execute.return_value = "not a dict"
+        client = ComposioClient(composio_config)
+        with pytest.raises(ComposioSDKShapeError, match="returned a str"):
+            client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1")
+
+    def test_execute_accepts_a_model_response(self, mock_sdk, composio_config):
+        model = MagicMock()
+        model.model_dump.return_value = {"successful": True, "data": {"id": "m_1"}}
+        mock_sdk.return_value.tools.execute.return_value = model
+        client = ComposioClient(composio_config)
+        assert client.execute_tool("GMAIL_FETCH_EMAILS", user_id="u1") == {"id": "m_1"}
+
+
 class TestNormalisation:
     def test_to_plain_model_dump(self):
         model = MagicMock()
@@ -161,10 +185,23 @@ class TestNormalisation:
         mock_sdk.return_value.toolkits.list.assert_called_once_with(limit=1)
 
 
+def _trigger_logs(mock_sdk, shape: str):
+    """Give the mocked SDK one shape (a MagicMock has every attribute) and
+    return its trigger-log resource: composio-client 2.x keeps it at
+    ``client._internal.logs.triggers``, 1.x at ``client.logs.triggers``."""
+    http = mock_sdk.return_value.client
+    if shape == "1.x":
+        del http._internal
+        return http.logs.triggers
+    del http.logs.triggers
+    return http._internal.logs.triggers
+
+
+@pytest.mark.parametrize("shape", ["1.x", "2.x"])
 class TestTriggerEvents:
-    def test_normalizes_and_sorts_events(self, mock_sdk, composio_config):
-        sdk = mock_sdk.return_value
-        sdk.client.logs.triggers.list.return_value = make_log_response(
+    def test_normalizes_and_sorts_events(self, mock_sdk, composio_config, shape):
+        logs = _trigger_logs(mock_sdk, shape)
+        logs.list.return_value = make_log_response(
             [
                 make_raw_log_item("evt_2", created_at="2023-11-14T22:14:00Z"),
                 make_raw_log_item("evt_1", created_at="2023-11-14T22:13:00Z"),
@@ -182,25 +219,24 @@ class TestTriggerEvents:
         assert first["payload"] == {"subject": "hi"}
         assert isinstance(first["timestamp_ms"], int)
 
-        kwargs = sdk.client.logs.triggers.list.call_args.kwargs
+        kwargs = logs.list.call_args.kwargs
         assert kwargs["entity_id"] == "test-user"
         assert kwargs["include_payload"] is True
 
-    def test_from_and_cursor_forwarded(self, mock_sdk, composio_config):
-        sdk = mock_sdk.return_value
-        sdk.client.logs.triggers.list.return_value = make_log_response([])
+    def test_from_and_cursor_forwarded(self, mock_sdk, composio_config, shape):
+        logs = _trigger_logs(mock_sdk, shape)
+        logs.list.return_value = make_log_response([])
         client = ComposioClient(composio_config)
         client.list_trigger_events(from_ms=1700000000000, cursor="cur_1", limit=50)
-        kwargs = sdk.client.logs.triggers.list.call_args.kwargs
+        kwargs = logs.list.call_args.kwargs
         assert kwargs["from_"] == 1700000000000
         assert kwargs["cursor"] == "cur_1"
         assert kwargs["limit"] == 50
 
-    def test_non_json_payload_kept_raw(self, mock_sdk, composio_config):
+    def test_non_json_payload_kept_raw(self, mock_sdk, composio_config, shape):
         item = make_raw_log_item("evt_1")
         item["meta"]["trigger_provider_payload"] = "not-json"
-        sdk = mock_sdk.return_value
-        sdk.client.logs.triggers.list.return_value = make_log_response([item])
+        _trigger_logs(mock_sdk, shape).list.return_value = make_log_response([item])
         client = ComposioClient(composio_config)
         events, _ = client.list_trigger_events()
         assert events[0]["payload"] == "not-json"

@@ -1,18 +1,20 @@
-# aisquare-pipe-dropbox
+# aisquare-pipe[dropbox]
 
 Dropbox source and sink connectors for [aisquare.pipe](../../README.md).
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[dropbox]` extra:
+
 ```bash
-pip install aisquare-pipe-dropbox
+pip install "aisquare-pipe[dropbox]"   # or "aisquare-pipe[full]": every connector
 ```
 
-Or for development (from the repo root):
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-cd connectors/dropbox
-pip install -e ".[dev]"
+pip install -e ".[full,dev]"
+cd connectors/dropbox && pytest tests
 ```
 
 ## Configuration
@@ -50,6 +52,8 @@ params = PullParams(params={
 for envelope in source.pull(config, params):
     print(f"{envelope.metadata['filename']} ({envelope.content_type})")
 ```
+
+Each envelope's metadata has `filename`, `path`, `size`, `dropbox_id`, `rev`, `server_modified` and `content_hash`, all from the download's own metadata (the same response as the bytes), so they describe the bytes delivered even when the file was edited after the folder listing. For a scheduled re-check, compare `rev` (new on every upload) or `content_hash` (Dropbox's hash of the bytes, so a changed `content_hash` means the file needs reading again). Both are Dropbox's values verbatim. Don't compare `server_modified` with Dropbox's own value: it is the SDK's naive UTC datetime in ISO form, without Dropbox's `Z` (`2026-11-17T10:01:00` for `2026-11-17T10:01:00Z`), so the two never match. A `content_hash` Dropbox does not send is left out.
 
 ### Push files to Dropbox
 

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import sys
+from typing import Any
 
 import click
 
@@ -14,9 +15,10 @@ from aisquare.pipe.core.envelope import PullParams, PushParams
 from aisquare.pipe.core.pipeline import Pipeline
 from aisquare.pipe.core.registry import (
     discover_connectors,
-    discover_toolkits,
     get_connector,
     get_toolkit,
+    installed_toolkits,
+    left_out_toolkits,
 )
 from aisquare.pipe.core.tools import Toolkit, ToolSpec
 from aisquare.pipe.core.types import TypeMatcher
@@ -101,7 +103,10 @@ def _one_line(text: str, width: int) -> str:
 )
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON (full ToolSpecs).")
 def tools_cmd(toolkit: str | None, query: str | None, limit: int | None, as_json: bool) -> None:
-    """List a toolkit's tools (slugs + descriptions), or all toolkits."""
+    """List a toolkit's tools (slugs + descriptions), or all toolkits.
+
+    Only the toolkits hosts serve (installed_toolkits): one left out, for its
+    name or a slug-prefix clash, is listed with why and cannot be opened."""
     if toolkit is None:
         _list_toolkits(as_json)
         return
@@ -118,7 +123,7 @@ def tools_cmd(toolkit: str | None, query: str | None, limit: int | None, as_json
         specs = catalog if limit is None else catalog[:limit]
 
     if as_json:
-        click.echo(json.dumps([spec.to_dict() for spec in specs], indent=2))
+        click.echo(json.dumps([spec.to_dict(metadata=True) for spec in specs], indent=2))
         return
     if not specs:
         click.echo("No tools found.")
@@ -131,8 +136,9 @@ def tools_cmd(toolkit: str | None, query: str | None, limit: int | None, as_json
 
 
 def _list_toolkits(as_json: bool) -> None:
-    toolkits = discover_toolkits()
-    rows = []
+    toolkits = installed_toolkits()
+    left_out = left_out_toolkits()
+    rows: list[dict[str, Any]] = []
     for name, cls in sorted(toolkits.items()):
         try:
             inst: Toolkit = cls()
@@ -144,10 +150,12 @@ def _list_toolkits(as_json: bool) -> None:
                     "tools": len(inst.tools()),
                     "oauth": inst.oauth.provider if inst.oauth else None,
                     "description": inst.description,
+                    **{k: v for k, v in inst.card().items() if k not in ("name", "description")},
                 }
             )
         except Exception as e:  # noqa: BLE001 — one broken toolkit must not hide the rest
             rows.append({"name": name, "error": f"{type(e).__name__}: {e}"})
+    rows += [{"name": name, "left_out": why} for name, why in left_out.items()]
     if as_json:
         click.echo(json.dumps(rows, indent=2))
         return
@@ -159,6 +167,9 @@ def _list_toolkits(as_json: bool) -> None:
     for row in rows:
         if "error" in row:
             click.echo(f"{row['name']:<20} failed to load: {row['error']}")
+            continue
+        if "left_out" in row:
+            click.echo(f"{row['name']:<20} left out: {row['left_out']}")
             continue
         click.echo(
             f"{row['name']:<20} {row['version']:<10} {row['auth']:<10} "
@@ -312,7 +323,7 @@ def _validate_file(path: str) -> None:
 @click.option("--live", is_flag=True, help="Also run live tests (tests/test_live.py) where present; they self-skip without their env credentials.")
 @click.option("--skip-tests", is_flag=True, help="Contract + hygiene only — skip the per-connector unit suites (fast).")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable JSON report.")
-@click.option("--install", "do_install", is_flag=True, help="pip install -e any missing/broken connector dirs before validating.")
+@click.option("--install", "do_install", is_flag=True, help='pip install -e ".[full,dev]" first if a connector is missing, broken or stale.')
 @click.option("--timeout", default=300, type=int, show_default=True, help="Per-suite subprocess timeout in seconds.")
 def validate(
     target: str | None,
@@ -363,7 +374,11 @@ def validate(
     only: str | None = None
     if target:
         names = [c.dir_name for c in list_connector_dirs(repo_root)]
+        # "slack", "aisquare-pipe[slack]" (its extra) or the old per-connector
+        # dist name "aisquare-pipe-slack" all name connectors/slack.
         resolved = target.removeprefix("aisquare-pipe-")
+        if target.startswith("aisquare-pipe[") and target.endswith("]"):
+            resolved = target[len("aisquare-pipe[") : -1]
         for candidate in (target, resolved):
             if candidate in names:
                 only = candidate

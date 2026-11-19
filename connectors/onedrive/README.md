@@ -1,4 +1,4 @@
-# aisquare-pipe-onedrive
+# aisquare-pipe[onedrive]
 
 Microsoft OneDrive for [aisquare.pipe](../../README.md), over the Microsoft Graph API:
 
@@ -7,9 +7,17 @@ Microsoft OneDrive for [aisquare.pipe](../../README.md), over the Microsoft Grap
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[onedrive]` extra:
+
 ```bash
-cd connectors/onedrive
-pip install -e ".[dev]"
+pip install "aisquare-pipe[onedrive]"   # or "aisquare-pipe[full]": every connector
+```
+
+For development, from the repo root (one editable install covers the framework and every connector):
+
+```bash
+pip install -e ".[full,dev]"
+cd connectors/onedrive && pytest tests
 ```
 
 ## Toolkit
@@ -86,6 +94,20 @@ The URLs contain a `{tenant}` placeholder: `https://login.microsoftonline.com/{t
 - **In Python**, pass the tenant to the constructor, as in `OneDriveToolkit(tenant="organizations")`, or use `microsoft_oauth("<tenant>")` to get a filled spec. If nothing fills the placeholder, the toolkit's flow methods use `common`.
 - **Valid tenant values** are `common` (any account), `organizations` (work and school accounts only), `consumers` (personal accounts only), a tenant ID (GUID), or a verified domain.
 
+**Router metadata.** `OneDriveToolkit.card()` is the connector's card for a router —
+category `files`, plus `keywords` and `examples` phrased as users ask
+("my recent Excel files", "share the budget workbook with a view-only link"). Each tool's `required_scopes` and `risk` (`read` / `write` /
+`destructive`, from its flags) are on its `ToolSpec`. Given the connection's
+granted scopes in `config["granted_scopes"]` (`OAuthToken.granted_scopes`),
+`available_tools` lists only the tools they cover and `call_tool` refuses the
+rest as `insufficient_scope` before any request.
+Read tools need `Files.Read.All` and write tools `Files.ReadWrite.All` (the
+`.All` forms: the tools reach items shared with the user and other drives).
+Graph permissions compare by short name and case-insensitively — Microsoft's
+token responses may spell them `https://graph.microsoft.com/files.read.all` —
+and `Files.ReadWrite.All` covers the read permissions, so the default consent
+covers every tool.
+
 **Disconnecting:** `revoke_token` always returns `False` and sends nothing. The Microsoft identity platform has no endpoint that revokes one app's delegated tokens, so the host forgets the token pair and the access token lapses within about an hour. `revokeSignInSessions` is deliberately not called, because it signs the user out of every app on every device. Users can withdraw consent at <https://myapps.microsoft.com> (work and school accounts) or <https://account.live.com/consent/Manage> (personal accounts).
 
 #### Azure app registration
@@ -113,6 +135,8 @@ params = PullParams(params={
     "stream_threshold": 50 * 1024 * 1024,  # stream files > 50MB
 })
 ```
+
+Each envelope's metadata has `filename`, `path`, `size`, `item_id`, `last_modified`, `web_url` and `mime_type`, plus two version markers for a scheduled re-check. `ctag` is Graph's `cTag`, which changes only when the file's content does, so a changed `ctag` means the file needs reading again. `etag` is Graph's `eTag`, which also changes on a rename or a move. Both are Graph's values verbatim, quotes included. All of it comes from the item as Graph returned it just before the download, field by field (the listing's value only where that response has none), so one envelope describes one version even when the file changed after the folder listing, and the markers are never newer than the bytes. A marker Graph does not send is left out, not set to `""`.
 
 ## Sink — push files to OneDrive
 

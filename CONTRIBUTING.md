@@ -4,6 +4,12 @@ This guide explains how to build a connector plugin for `aisquare.pipe` —
 its data-moving connectors and, optionally, its agent-facing toolkit
 (see [Building a Toolkit](#building-a-toolkit)).
 
+**Connectors in this repo ship inside the one `aisquare-pipe` distribution**
+(see [Adding a connector to this repo](#adding-a-connector-to-this-repo)): they
+have no `[project]` table of their own and are never separate PyPI packages.
+The scaffold below makes a standalone plugin project, which is how a
+connector *outside* this repo is built and published.
+
 ## Quick Start
 
 ```bash
@@ -144,7 +150,7 @@ It runs four layers per connector:
 | Layer | What it checks | Credentials |
 |---|---|---|
 | **Contract** | spec attributes, plus behavior with empty config under a socket guard: `validate_config({})` returns `False` without network, `pull({})` fails cleanly (`ConfigValidationError`/`ValueError`, never `KeyError`/`TypeError`), `push(garbage, {})` returns `PushResult(success=False)` without raising | none |
-| **Hygiene** | packaging rules (package name, `aisquare-pipe>=` dep, entry points resolve, class version == pyproject version), scaffold completeness, no cross-connector imports, no bare `except:` | none |
+| **Hygiene** | packaging rules (the root pyproject packages `connectors/<name>/src`, declares its entry points and its `[<name>]` extra, and `[full]` pulls it in; its own pyproject holds tool settings only; entry points resolve; its classes agree on one version), scaffold completeness, no cross-connector imports, no bare `except:` | none |
 | **Unit suite** | your `tests/` directory, run in its own pytest process | none — mock your service at the client boundary |
 | **Live** | optional `tests/test_live.py` against the real API | opt-in (`--live` + env vars) |
 
@@ -196,14 +202,19 @@ SEARCH = ToolSpec(
     },
     read_only=True,                        # destructive=True for deletes/overwrites
     tags=("files",),
+    required_scopes=("files.read",),       # OAuth scopes the tool needs (all of them)
+    # risk defaults from the flags: "read" here; "write" or "destructive" otherwise
 )
 
 
 class MyServiceToolkit(Toolkit):
     name = "mysvc"                         # == entry-point name
-    version = "0.1.0"                      # == pyproject version
+    version = "0.1.0"                      # the connector's own version (all its classes agree)
     display_name = "My Service"
     description = "Files in My Service"
+    category = "files"                     # one of aisquare.pipe.CATEGORIES (default "other")
+    keywords = ("files", "folders", "documents")
+    examples = ("find my budget spreadsheet", "what's in the shared folder?")   # 2-4 asks
     auth_type = AuthType.OAUTH2
     # slug_prefix defaults to name.upper() + "_"  ->  "MYSVC_"
     oauth = OAuthSpec(
@@ -231,6 +242,14 @@ class MyServiceToolkit(Toolkit):
         raise ToolError(f"{tool.slug} is not implemented", code=ERROR_UPSTREAM_ERROR)
 ```
 
+**Rating `risk` (every toolkit).** A delete, or an edit that overwrites (a
+body, file contents, a message's text, or a whole list such as attendees,
+recurrence or members), is `destructive=True` even though the object
+survives, as `GITHUB_UPDATE_AN_ISSUE`, `GOOGLEDRIVE_EDIT_FILE`,
+`SLACK_UPDATES_A_SLACK_MESSAGE` and `GOOGLECALENDAR_UPDATE_EVENT` are, while
+setting a label, name, topic or other metadata the caller can set back stays
+`write`.
+
 What the base class does for you:
 
 - **`call_tool(slug, arguments, config)` never raises.** It resolves the slug,
@@ -241,7 +260,9 @@ What the base class does for you:
   failure — unknown slug, bad arguments, no credentials, a `ToolError`, any
   other exception — comes back as `ToolResult(successful=False, error=...,
   error_code=...)`, with `error_code` set to `unknown_tool`,
-  `invalid_arguments` or `unauthorized` (missing credentials) by the base
+  `invalid_arguments`, `not_connected` (no usable credentials) or
+  `insufficient_scope` (the tool's `required_scopes` are not in
+  `config["granted_scopes"]`) by the base
   class, to the `ToolError`'s `code`, to `timeout` for a `TimeoutError`,
   to `error_code_for_status(status)` for an `urllib.error.HTTPError` (a
   `rate_limited` one also gets `retry_after` from `Retry-After`, capped at
@@ -252,18 +273,26 @@ What the base class does for you:
   escaped and `Bearer`-prefixed forms — are masked out of every error
   message. A malformed result (non-string `error`, unknown `error_code`) is
   normalized rather than raised.
+- **`card()`** (a classmethod) is the connector's short description for a
+  router that picks connectors before tools: `name`, `display_name`,
+  `description`, `category`, `keywords`, `examples`, `auth_type`. It reads
+  class attributes only. `aisquare.pipe.catalogue()` returns one card per
+  installed toolkit, and `search_tools_across(query, {name: config})` ranks
+  tools over several toolkits, each result naming its connector.
 - **`available_tools(config=None)`** is what a host lists to a model for one
-  connection. The default is every tool (`tools()`). Override it when config
+  connection. The default is every tool (`tools()`), minus the tools whose
+  `required_scopes` are not in `config["granted_scopes"]` when the host
+  passes that key (override `scope_granted` when a broad scope implies
+  narrower ones). Override it when config
   switches tools off (for example, risk tiers). Keep it offline. Listing is
   advisory, so `call_tool` must still refuse a switched-off tool. An override
   returns a subset of `tools()` and never raises (`[]` for an unreadable
   config), which `contract.toolkit.available-tools` checks. Hosts should list
   and search through it, not through `tools()`.
 - **`search_tools(query, limit=6, *, config=None)`** ranks
-  `available_tools(config)`. If you override it, keep the `*, config=None`
-  parameter. Ranking uses a deterministic keyword score (+2 per query
-  term in the slug, +1 in the description or tags; first-person queries
-  favour `..._AUTHENTICATED_...` tools).
+  `available_tools(config)` with the toolkit's cached BM25F search index
+  (see [Making tools findable](#making-tools-findable)). If you override it,
+  keep the `*, config=None` parameter.
 - **`validate_config(config)`** defaults to "has a non-empty
   `access_token` with no inner whitespace" (or always true for
   `AuthType.NONE`). `run_tool` receives the token with surrounding
@@ -297,10 +326,14 @@ Conventions:
 - Raise `ToolError("human-readable message", code=...)` for expected
   failures. `code` is one of the canonical `ERROR_*` constants —
   `unauthorized` (token rejected/expired: the host refreshes, then asks the
-  user to reconnect), `forbidden`, `not_found`, `rate_limited` (pass
+  user to reconnect), `not_connected` (no credentials at all),
+  `forbidden`, `insufficient_scope` (the token lacks a scope the call
+  needs: the user must reconnect and grant it), `not_found`, `rate_limited` (pass
   `retry_after` seconds), `invalid_arguments`, `conflict`, `timeout`, or
   `upstream_error` (the default). `error_code_for_status(status)` maps an
-  HTTP status; override it where the provider is quirky (e.g. GitHub's
+  HTTP status; pass `www_authenticate=` the response's `WWW-Authenticate`
+  header so an RFC 6750 `insufficient_scope` 403 is told apart from a plain
+  `forbidden`. Override it where the provider is quirky (e.g. GitHub's
   rate-limit 403). Never put tokens or the raw argument payload in the
   message, and never log them — log slugs, counts, timings.
 - A host may bound a whole call with `config["timeout_seconds"]`.
@@ -328,13 +361,34 @@ class TestMyServiceToolkit(toolkit_compliance_suite(MyServiceToolkit)):
     pass
 ```
 
+Then add the connector to the `[toolkits]` extra in the root `pyproject.toml`
+(it names connector extras of this same distribution):
+
+```toml
+toolkits = ["aisquare-pipe[github,gmail,...,mysvc]"]
+```
+
+`pip install "aisquare-pipe[toolkits]"` is how a host (pipe-as-service)
+installs every toolkit without naming them, and an installed toolkit is
+served there with no further edits. `scripts/check_toolkits_extra.py` (CI
+runs it) fails when a package registering an `aisquare_pipe.toolkits` entry
+point is missing from the extra, when an entry has no toolkit, or when an
+entry has no `>=` floor or one above the package's version here. To install
+the framework and every toolkit editable into another venv (a host's, say),
+run `scripts/dev_install_toolkits.sh` from that venv; it reads the same list.
+
 The suite (and the contract layer of `pipe validate`) checks, without
 credentials or network: zero-arg instantiation, name + semver version, the
 entry-point name equals `name`, slugs are unique and carry `slug_prefix`,
 every `input_schema` is `{"type": "object", "properties": {...}}` with
 `required` ⊆ `properties`, descriptions are non-empty and ≤ 1024 chars,
 `call_tool` of an unknown slug and of every real slug with `({}, {})` returns
-a failed `ToolResult`, and OAuth endpoints are `https`.
+a failed `ToolResult`, OAuth endpoints are `https`, `card()` is offline and
+well-formed, `category` is one of `CATEGORIES`, `examples` is empty or 2-4
+short asks, every `required_scopes` entry looks like an OAuth scope, and
+`risk` does not contradict `read_only`/`destructive`. `pipe validate` also
+fails two installed toolkits whose slug prefixes collide (equal, or one
+starting the other).
 
 For hermetic tests of code that *hosts* toolkits, use
 `aisquare.pipe.testing.mock_connectors.MockToolkit` (registered as toolkit
@@ -352,6 +406,118 @@ pipe tools mysvc                        # every slug + description
 pipe tools mysvc --search "find a file" # ranked, top 6
 pipe tools mysvc --json                 # full ToolSpecs
 ```
+
+### Making tools findable
+
+Hosts find tools through `aisquare.pipe.core.search`: a BM25F index per
+toolkit (`index_for(name)`, kept per toolkit and rebuilt only when its name,
+version, card or catalogue changes), a `ConnectorIndex` over the cards,
+`search_scored` / `search_tools_across` across installed toolkits, and
+`search_indexes` to rank a host's own `ToolIndex`es as one. No model and no
+network: what ranks a tool is the text you give it.
+
+- **Slug words weigh the most**, then **tags**, then the **description**,
+  then the input schema's property names and descriptions. The toolkit's
+  `slug_prefix` is left out of the slug words; the connector's name,
+  display name, category and keywords count a little for every tool (they
+  matter when several toolkits are searched together).
+- **Tags are your synonyms.** Add the words users say that the slug does
+  not: `("send", "post", "dm", "notify")` on a send-message tool,
+  `("who", "access", "sharing")` on a permissions tool. Lowercase words or
+  short phrases; they are tokenized like any text.
+- **Text is analysed the same way on both sides**: lowercased, UPPER_SNAKE
+  and camelCase split (`OneDrive` also stays `onedrive`), stopwords dropped,
+  light stemming (`repositories` = `repository`, `scheduled` = `schedule`).
+  First-person queries ("my repos", "assigned to me") add the term
+  `authenticated`, so `..._FOR_THE_AUTHENTICATED_USER` tools win them.
+- **Intent.** A query with only write verbs ("delete", "send", "share")
+  slightly favours tools that are not `read_only`; one with read verbs, or
+  no verb at all ("my unread emails"), favours `read_only` tools. Keep
+  `read_only` honest.
+- **Named connectors.** When several toolkits are searched and the query
+  names one *as the service to use*, that toolkit's scores are doubled
+  (`NAMED_BOOST`); nothing is filtered out. Service position means a cue
+  word next to the name: before it "in", "on", "to", "from", "via",
+  "using", "into", "with", "my", "search", ... ("post it in slack", "my
+  onedrive", "search slack for ..."), after it "channel", "repo",
+  "inbox", "folder", "calendar", "workspace", ... ("the slack channel",
+  "github repo"), or a leading "slack: ...". A name, display name or
+  slug-prefix spelling ("google drive", "one drive", "OneDrive") names a
+  toolkit; so does a card keyword no other searched toolkit lists ("in
+  gcal", "on my calendar"), and a name beats a keyword. A name used only as
+  a topic ("schedule a meeting about the slack migration", "slack
+  notifications are delayed") or as a modifier ("in slack style",
+  "github-flavored markdown", "slack-like") gets no boost and counts as a
+  weak search term (`TOPIC_WEIGHT`). Keep brand abbreviations among your
+  `keywords`.
+- **A toolkit's own name says nothing about which of its tools to use.** It
+  is left out of every tool field at index time, as a phrase
+  (`SLACK_CREATE_SLACK_LIST` indexes as "create list", "Search Google
+  Drive for files" as "search files"; "shared drives" keeps "drive"). So
+  repeating your toolkit's name in slugs and descriptions is harmless, and
+  it never ranks one of your tools above another.
+- **Idioms and opening noun-verbs.** "get rid of" reads as delete, "set
+  up" as create, "push back" as postpone, "look up/for" as search, "let
+  <someone> know" as notify; a query
+  opening with "email", "message" or "text" also means send, and "file a
+  bug" means create.
+- **Primary tools: the `pipe:primary` tag** (`PRIMARY_TAG`). Tag the one or
+  two tools a toolkit should offer first when a query is ambiguous (the main
+  search or send tool) with `pipe:primary`; their score is raised by 5%. The
+  native toolkits mark their main tools (Gmail fetch/send, Calendar
+  list/create event, Drive find/upload, OneDrive upload, Slack send/search
+  messages); check a toolkit's own ranking tests when you add one. It
+  is a ranking marker only: tags in the `pipe:` namespace are never indexed
+  as text. Don't use it on most tools (it then means nothing), and don't use
+  the word `important` for this: `important` is an ordinary content tag
+  (Gmail's IMPORTANT label) and gets no boost. Hosts read the constant
+  `aisquare.pipe.core.search.PRIMARY_TAG`, never the string.
+
+**Synonym table** (`aisquare.pipe.core.search.SYNONYMS`). A query word
+also matches the other members of its groups, counting
+`SYNONYM_WEIGHT` (0.15) of an exact match, so a tool named for the word
+still ranks first. Extend a group when the search eval shows a miss:
+
+| actions | objects |
+| --- | --- |
+| send · post · message · notify · ping · dm · tell · say | file · document · doc · attachment |
+| list · get · fetch · show · find · read · view · see · display · browse | email · mail · inbox · message |
+| create · add · new · make · open · start | event · meeting · calendar · invite · appointment |
+| delete · remove · trash · archive · erase · discard · bin | repo · repository · project · codebase |
+| update · edit · modify · change · rename · fix · amend | issue · ticket · bug |
+| search · find · query · lookup · locate | pr · pull request · merge request |
+| reply · respond · answer | channel · room |
+| upload · attach · put · store | folder · directory |
+| download · save · export | user · person · people · member · colleague · teammate · coworker |
+| schedule · book · plan · arrange | thread · conversation · replies |
+| move · relocate · reschedule | comment · note · feedback · remark |
+| reschedule · postpone · push · delay · shift · move · update | meeting · standup · sync · huddle · call · one on one · event |
+| cancel · delete | spreadsheet · sheet · excel · workbook |
+| copy · duplicate · clone | free · available · availability |
+| share · grant · invite · access | profile · account · whoami |
+| invite · bring | permission · access · rights |
+| star · favorite · favourite · bookmark | reminder · remind |
+| draft · compose · write | commit · change · diff |
+| react · reaction · emoji | release · version |
+| restore · undelete · recover · untrash | workflow · ci · build · pipeline |
+| mute · snooze · silence · dnd · do not disturb | link · url · permalink |
+| all · every · everything · everyone | unread · missed |
+| recent · latest · today | label · tag · category |
+| | contents · inside · children |
+
+**The search eval.** `tests/evals/tool_search_cases.yaml` holds labelled
+queries over the six native toolkits (`{query, connector, acceptable}`; many
+are paraphrases that share no word with the slug).
+`pytest tests/evals -s` prints recall@1/5/10 and MRR for the index and for
+the 0.4 keyword ranker it replaced, and lists the misses. When you add or
+rename tools in a native toolkit, run it; when you change the analyser or
+the synonym table, it must not get worse. `scripts/bench_search.py` checks
+build time and latency on synthetic catalogues
+(`aisquare.pipe.testing.synthetic.synthetic_catalog`) of 10,000 tools and
+1,000 connectors, and that the installed toolkits' indexes are reused
+(not rebuilt) through `search_scored`, `search_connectors`,
+`search_tools_across` and `Toolkit.search_tools` with 1,000 and 2,000
+toolkits installed.
 
 ## Live Tests (optional)
 
@@ -399,31 +565,51 @@ Conventions: env vars are named `<SERVICE>_API_KEY` (or the service's natural
 credential set), tests self-skip without them, and `pipe validate --live` is
 the only thing that runs them (`SKIP (no creds)` when the env is absent).
 
-## Publishing to PyPI
+## Adding a connector to this repo
 
-1. Name your package: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-google-drive`)
-2. Add `aisquare-pipe>=0.1.0` as a dependency (`>=0.3.0` if the package registers a toolkit)
-3. Register entry points as shown above
-4. Build and publish:
+Every connector here ships inside `aisquare-pipe` (one PyPI project, one
+trusted publisher; see [RELEASING.md](RELEASING.md)). For a connector
+`mysvc`:
 
-```bash
-python -m build
-twine upload dist/*
-```
+1. Code in `connectors/mysvc/src/aisquare_pipe_mysvc/`, tests in
+   `connectors/mysvc/tests/`, a README in `connectors/mysvc/README.md`.
+2. `connectors/mysvc/pyproject.toml` holds **tool settings only** (the
+   suite's `[tool.pytest.ini_options]`, with the `live` marker, and
+   `[tool.ruff.lint.isort]`). Copy `connectors/github/pyproject.toml`. No
+   `[project]` and no `[build-system]`.
+3. In the **root** `pyproject.toml`:
+   - add `"connectors/mysvc/src"` to `[tool.setuptools.packages.find] where`;
+   - register its entry points under `[project.entry-points."aisquare_pipe.connectors"]`
+     (and `.toolkits` / `.converters`);
+   - add an extra named exactly `mysvc` with its third-party deps beyond
+     core (core: click, requests, urllib3). It may be `[]`;
+   - add `mysvc` to `[full]`, and to `[toolkits]` if it registers a toolkit.
+4. Import its SDK at module top. Without `aisquare-pipe[mysvc]` installed, its
+   entry points then fail to import and discovery counts it as *not
+   installed* (one info log line), never as a broken plugin.
+5. `pip install -e ".[full,dev]"` and `pipe validate mysvc`.
+   `tests/test_distribution.py` and the hygiene checks fail until step 3 is
+   complete.
+
+A plugin outside this repo is its own distribution, named
+`aisquare-pipe-{service}` by convention, depending on `aisquare-pipe>=0.5.0`
+and registering the same entry-point groups. Build and publish it from its own
+repo (`python -m build`, then upload).
 
 ## Naming Convention
 
-- Package name: `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
+- In this repo: module `aisquare_pipe_{service}` in `connectors/{service}/`, installed as `aisquare-pipe[{service}]`
+- Outside it: package name `aisquare-pipe-{service}` (e.g., `aisquare-pipe-s3`)
 - Connector name attribute: `{service}` (e.g., `"s3"`)
 - Entry point name: `{service}` or `{service}-source` / `{service}-sink`
-- Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`)
+- Toolkit entry point name: exactly the toolkit's `name` (e.g. `"github"`), matching `TOOLKIT_NAME_RULE` `^[a-z][a-z0-9_]{0,63}$`: underscores, never hyphens (`one_drive`, not `one-drive`). It is the connector id hosts route on, and pipe-as-service keeps hyphenated names for pull/push connectors, so `pipe validate` and `scripts/check_toolkits_extra.py` fail a hyphenated toolkit and `installed_toolkits()` leaves it out. Connector entry-point names (`mysvc-source`) are not bound by it.
 
 ## Which Tier?
 
-All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`.
+All connectors live under `connectors/<name>/` regardless of popularity; the user-facing tier is controlled by the `[popular]` and `[full]` extras in the root `pyproject.toml`. Every connector is in `[full]`. A connector that registers a toolkit also goes in `[toolkits]` whatever its tier (see [Building a Toolkit](#building-a-toolkit)); CI enforces both.
 
-- **Super-popular and broadly useful** → add the package name to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
-- **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via direct install (`pip install aisquare-pipe-{service}`).
+- **Super-popular and broadly useful** → add its extra to `[popular]`. Users get it via `pip install "aisquare-pipe[popular]"`.
+- **Niche / enterprise / client-specific / experimental** → leave it out of `[popular]`. It still ships via `[full]` (`pip install "aisquare-pipe[full]"`) and via its own extra (`pip install "aisquare-pipe[{service}]"`).
 - **When in doubt, leave it out of `[popular]`.** Promoting later is cheap; demoting feels worse to users.
 
 ## Code & Folder Isolation

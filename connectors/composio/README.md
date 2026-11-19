@@ -1,17 +1,20 @@
-# aisquare-pipe-composio
+# aisquare-pipe[composio]
 
 One API key, 500+ SaaS toolkits: Gmail, Slack, GitHub, Notion, Google Drive, HubSpot, ... — this meta-connector bridges [aisquare.pipe](../../README.md) to the entire [Composio](https://composio.dev) catalog, so any pipe source can feed a Composio app and any Composio app can feed a pipe sink. Ships in `aisquare-pipe[full]`.
 
 ## Install
 
+This connector ships inside the `aisquare-pipe` distribution. Its third-party dependencies are the `[composio]` extra:
+
 ```bash
-pip install aisquare-pipe-composio
+pip install "aisquare-pipe[composio]"   # or "aisquare-pipe[full]": every connector
 ```
 
-For development:
+For development, from the repo root (one editable install covers the framework and every connector):
 
 ```bash
-pip install -e "connectors/composio[dev]"
+pip install -e ".[full,dev]"
+cd connectors/composio && pytest tests
 ```
 
 ## How it works
@@ -156,13 +159,17 @@ for envelope in source.pull(config):               # polls forever
 
 - One `application/json` envelope per event; `envelope.data["payload"]` is the app payload.
 - `idempotency_key` metadata (`composio:event:<id>`) is stable across re-polls, pairing with sinks that dedupe (e.g. aisquare-gateway).
-- Position is a timestamp watermark + bounded seen-id ring persisted atomically to `cursor_path`; `PullParams` `since` sets the initial watermark (default: now). `max_polls`/`sleep` params support tests and one-shot drains.
+- Position is a timestamp watermark + bounded seen-id ring (`SEEN_IDS_MAX`, 2000: two whole pulls of 10 pages of 100) persisted atomically to `cursor_path`; `PullParams` `since` sets the initial watermark (default: now). `max_polls`/`sleep` params support tests and one-shot drains. An entry read again moves to the ring's newest end, so one dated past the clock-skew ceiling (read on every poll) is never pushed out and delivered twice.
+- **Keeping the position in the host.** `TriggerCursor`, `save_trigger_cursor`, `load_trigger_cursor`, `SEEN_IDS_MAX`, `MAX_EVENT_CLOCK_SKEW_MS`, `MAX_TRIGGER_PAGES_PER_POLL` and `is_transient_error` are a public contract (`aisquare_pipe_composio.TRIGGER_CURSOR_API`, all in `__all__`). A host that stores the position itself (pipe-as-service's poller) saves it to a fresh `cursor_path`, runs one `pull` with `max_polls=1`, and loads what the pull wrote back. It copies every `TriggerCursor` field both ways. A cursor with `last_ts_ms == 0` and no `seen_ids` is a first run, which starts at `since`. `PullParams` `on_cycle_error` is called with a failed cycle's exception after its progress is saved, so a one-cycle host learns the read failed (the pull doesn't raise it).
 - `cursor_path` defaults to `~/.cache/aisquare-pipe/composio-cursor.json` (honouring `$XDG_CACHE_HOME`) — per-user, not shared `/tmp`. A pre-0.1.1 cursor at `/tmp/composio-pipe-cursor.json` is migrated automatically on first run.
+- A failed poll cycle is logged and retried on the next one. It saves the ids it read, and after a failure a retry can fix (HTTP 429/5xx, or no answer: `is_transient_error`) the page it stopped on, so the next cycle resumes there. Any other failure drops a saved page cursor (it may be what fails), and the window is read again from the held watermark. Two errors end the `pull` instead (raised, with one ERROR log line): Composio refusing the API key (HTTP 401/403, `ConfigValidationError`) and a composio SDK this connector doesn't support (`ComposioSDKShapeError`). That is per `pull`: a host that calls `pull` again (say once per poll, `max_polls=1`) gets the same error and line each time, so stopping or backing off is the host's.
+- A malformed event-log entry is skipped with a warning, so it can't stall the poller. Its id is recorded in the cursor, so later cycles and later pulls on the same `cursor_path` step past it silently. So do later pulls of a host that hands each pull the position the last one saved (pipe-as-service). A pull on an empty cursor warns again while the entry is in its window, and so does every cycle for an entry with no id (it can't be recorded). Its time still moves the watermark.
+- An event time more than 5 minutes past this host's clock (`MAX_EVENT_CLOCK_SKEW_MS`) never moves the watermark, and a stored watermark past it is reset to now: polling from a future watermark would read nothing until that time.
 - `list_resources(config)` browses available trigger types and your active trigger instances.
 
 ## Example pipelines
 
-These examples compose with other pipe connectors — install them first: `pip install aisquare-pipe-local aisquare-pipe-salesforce` (both included in `aisquare-pipe[full]`).
+These examples compose with other pipe connectors — install their extras too: `pip install "aisquare-pipe[composio,local,salesforce]"` (all included in `aisquare-pipe[full]`).
 
 ```python
 from aisquare.pipe import Pipeline, PullParams, PushParams
@@ -208,4 +215,4 @@ Pipeline(source=SalesforceSource(), sink=ComposioSink()).run(
 - **File downloads are buffered in memory** when yielded as envelopes (the SDK enforces a 100 MB cap per file); streamed envelopes are a future upgrade.
 - **Trigger polling reads Composio's event log** (the SDK's first-class trigger interface is a realtime websocket). The log endpoint is versioned under `/api/v3.1/internal/` — pinned SDK versions keep this stable, but it is the most drift-prone surface; all access is isolated in `client.py`.
 - **Tool arguments and results are never logged** — only tool slugs and counts.
-- The `composio` SDK is pinned `>=0.13.1,<2.0` (verified against 0.13.1 / SDK v1.0.0-rc2). All SDK touchpoints live in `client.py`; version bumps should only ever touch that file.
+- The `[composio]` extra allows `composio>=0.13.1,<2.0` with `composio-client>=1.39,<3.0` (1.x and 2.x). CI's `composio-sdk` job (validate.yml) runs this connector's tests on composio 0.18.1 + composio-client 1.43.0 (the pair pipe-as-service's lock pins, i.e. production's) and on the newest pair the extra resolves; `tests/test_sdk_compat.py` runs against the real installed SDK. All SDK touchpoints live in `client.py`; version bumps should only ever touch that file.

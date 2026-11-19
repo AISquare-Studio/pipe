@@ -38,6 +38,7 @@ from aisquare.pipe import (
     ERROR_INVALID_ARGUMENTS,
     ERROR_NOT_FOUND,
     ERROR_UPSTREAM_ERROR,
+    PRIMARY_TAG,
     ToolError,
     ToolResult,
     ToolSpec,
@@ -942,7 +943,17 @@ def _tool(
 ) -> SlackTool:
     """A row. ``read_only`` follows the read tier; ``destructive`` follows
     the destructive tier, or ``overwrites`` for a write that replaces content
-    (an edit) — the owner put edits in the opt-in write tier."""
+    (an edit) — the owner put edits in the opt-in write tier. So the spec's
+    ``risk`` (derived from those flags) is ``read`` for the read tier,
+    ``write`` for send and write, and ``destructive`` for the destructive
+    tier and edits.
+
+    ``required_scopes`` is the scopes of the tool's default identity: the
+    user's, or the bot's for a bot-only tool.
+    :meth:`~aisquare_pipe_slack.toolkit.SlackToolkit.missing_scopes` checks
+    a bot connection against the bot scopes."""
+    user_scopes = None if user is None else tuple(sorted(set(user)))
+    bot_scopes = None if bot is None else tuple(sorted(set(bot)))
     spec = ToolSpec(
         slug,
         description,
@@ -950,6 +961,7 @@ def _tool(
         read_only=tier == TIER_READ,
         destructive=tier == TIER_DESTRUCTIVE or overwrites,
         tags=tuple(tags),
+        required_scopes=user_scopes if user_scopes is not None else bot_scopes or (),
     )
     return SlackTool(
         spec=spec,
@@ -957,8 +969,8 @@ def _tool(
         tier=tier,
         area=area,
         methods=(methods,) if isinstance(methods, str) else methods,
-        user_scopes=None if user is None else tuple(sorted(set(user))),
-        bot_scopes=None if bot is None else tuple(sorted(set(bot))),
+        user_scopes=user_scopes,
+        bot_scopes=bot_scopes,
     )
 
 
@@ -991,7 +1003,10 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         _message_tool("chat.postMessage", _SEND_ARGS, text_arg="fallback_text"),
         user=("chat:write", *LOOKUP),
         bot=("chat:write", "chat:write.public", *LOOKUP),
-        tags=("post", "send", "write", "reply", "thread", "dm", "notify", "message", "chat"),
+        tags=(
+            "post", "send", "write", "reply", "thread", "dm", "notify", "message", "chat",
+            PRIMARY_TAG,
+        ),
     ),
     _tool(
         "SLACK_UPDATES_A_SLACK_MESSAGE", TIER_WRITE, "messages", "chat.update",
@@ -1232,7 +1247,7 @@ CORE_CATALOG: tuple[SlackTool, ...] = (
         _search("search.messages", ("messages",)),
         user=("search:read",),
         bot=None,
-        tags=("search", "find", "messages", "query", "lookup", "discussion"),
+        tags=("search", "find", "messages", "query", "lookup", "discussion", PRIMARY_TAG),
     ),
     _tool(
         "SLACK_SEARCH_FILES", TIER_READ, "search", "search.files",

@@ -115,6 +115,35 @@ def _mkdir_fakebin(tmp_path):
     yield
 
 
+class _OfflineEncoding:
+    """Stands in for tiktoken's o200k_base: one token per whitespace word."""
+
+    name = "o200k_base"
+
+    def encode(self, text: str) -> list[int]:
+        return list(range(len(text.split())))
+
+
+@pytest.fixture(autouse=True)
+def offline_tokenizer(monkeypatch):
+    """tiktoken downloads o200k_base on first use (from
+    openaipublic.blob.core.windows.net) unless it is cached, so the token
+    count made a test pass or fail on the network. Every test counts with a
+    stand-in instead; the names asked for are recorded."""
+    asked: list[str] = []
+    try:
+        import tiktoken
+    except ImportError:  # no [graphify] extra: count_tokens answers 0 offline anyway
+        return asked
+
+    def get_encoding(name: str) -> _OfflineEncoding:
+        asked.append(name)
+        return _OfflineEncoding()
+
+    monkeypatch.setattr(tiktoken, "get_encoding", get_encoding)
+    return asked
+
+
 @pytest.fixture()
 def checkout(tmp_path) -> str:
     src = tmp_path / "checkout"

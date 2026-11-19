@@ -114,7 +114,7 @@ class TestCatalog:
 
     def test_identity(self):
         toolkit = SlackToolkit()
-        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("slack", "0.1.0", "SLACK_")
+        assert (toolkit.name, toolkit.version, toolkit.slug_prefix) == ("slack", "0.2.0", "SLACK_")
         assert len(toolkit.tools()) == 111
 
     def test_every_tool_is_in_its_tier(self):

@@ -9,10 +9,12 @@ imports the ``composio`` / ``composio_client`` packages.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,14 +44,81 @@ from aisquare_pipe_composio.constants import (
     INITIAL_BACKOFF,
     MAX_RETRIES,
     SEEN_IDS_MAX,
+    TRIGGER_LOG_SDK_RETRIES,
     UPLOADS_SUBDIR,
 )
 
 logger = logging.getLogger("aisquare.pipe.composio")
 
+# Where each supported composio-client keeps the trigger-log resource, newest
+# first: 2.x moved ``client.logs.triggers`` to ``client._internal.logs.triggers``
+# (x-internal, "no compatibility promise"; its MIGRATION.md, 2.0.0-rc.22).
+_TRIGGER_LOG_PATHS: tuple[tuple[str, ...], ...] = (
+    ("_internal", "logs", "triggers"),
+    ("logs", "triggers"),
+)
+
+
+class ComposioSDKShapeError(PipelineError):
+    """The installed composio SDK lacks something this connector calls, or
+    calls it differently: an SDK version this connector doesn't support. Not
+    transient (retrying can't fix it), so the triggers source raises it
+    instead of polling on.
+
+    Only SDK access raises it (``_sdk_call``, ``ComposioClient._trigger_logs``):
+    a method that is gone, a call that doesn't bind to the installed
+    signature, or a return type the SDK no longer uses. Errors the call itself
+    raises, and malformed API data, keep their own types."""
+
+
+def _sdk_call(
+    method: Callable[..., Any] | None, label: str, *args: Any, **kwargs: Any
+) -> Any:
+    """Call the SDK's ``method`` (``label`` names it in errors) after binding
+    the arguments to its signature. A method that is missing, or a call that
+    doesn't bind, is ``ComposioSDKShapeError``. A TypeError raised inside the
+    call is the SDK's own and propagates as is."""
+    if not callable(method):
+        raise ComposioSDKShapeError(
+            f"the installed composio SDK has no {label}(); "
+            "this composio version is not supported"
+        )
+    return _bound_sdk_call(method, _signature(method), label, *args, **kwargs)
+
+
+def _bound_sdk_call(
+    method: Callable[..., Any],
+    signature: inspect.Signature | None,
+    label: str,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """``_sdk_call`` for a caller that already holds ``method``'s
+    ``_signature`` (None: not introspectable), so it isn't computed twice."""
+    if signature is not None:
+        try:
+            signature.bind(*args, **kwargs)
+        except TypeError as e:
+            raise ComposioSDKShapeError(
+                f"composio SDK {label}() does not take these arguments: {e}"
+            ) from e
+    return method(*args, **kwargs)
+
+
+def _signature(method: Callable[..., Any]) -> inspect.Signature | None:
+    """``method``'s signature, or None when it can't be introspected (then
+    the call itself decides what binds)."""
+    try:
+        return inspect.signature(method)
+    except (TypeError, ValueError):
+        return None
+
 
 def _map_composio_errors(func):  # type: ignore[no-untyped-def]
-    """Translate Composio SDK exceptions to framework errors."""
+    """Translate Composio SDK exceptions to framework errors. SDK drift is
+    already a ``ComposioSDKShapeError`` (raised by ``_sdk_call``); nothing
+    else is turned into one."""
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -67,6 +136,56 @@ def _map_composio_errors(func):  # type: ignore[no-untyped-def]
             raise PipelineError(f"Composio SDK error: {e}") from e
 
     return wrapper
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Whether a failed Composio call can succeed as is when tried again:
+    Composio answered HTTP 429 or 5xx, or didn't answer (a connection error
+    or timeout), after the SDK's and our own retries. Read from the SDK error
+    ``_map_composio_errors`` chained as the ``PipelineError``'s cause. A 4xx
+    (a request Composio won't take, an expired page cursor's included), an
+    SDK shape error and anything else are not."""
+    if not isinstance(exc, PipelineError) or isinstance(exc, ComposioSDKShapeError):
+        return False
+    cause = exc.__cause__
+    if isinstance(cause, (RateLimitError, APIConnectionError)):
+        return True  # a timeout is an APIConnectionError
+    if isinstance(cause, APIStatusError):
+        return cause.status_code >= 500
+    return False
+
+
+_SDK_ERRORS = (ComposioError, APIStatusError, APIConnectionError)
+
+
+def failure_label(exc: BaseException) -> str:
+    """How a Composio call failed, fit for a log line: the error's type, the
+    SDK error it was mapped from (``_map_composio_errors`` chains it as the
+    cause) and the HTTP status Composio answered. Never a message: an SDK
+    error's message carries Composio's answer (a 500's body text included),
+    which may echo request data."""
+    label = type(exc).__name__
+    cause = exc.__cause__
+    if cause is not None:
+        label += f" from {type(cause).__name__}"
+    status = getattr(cause if cause is not None else exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        label += f" (HTTP {status})"
+    return label
+
+
+def log_call_failure(log: logging.Logger, message: str, exc: BaseException) -> None:
+    """Log a failed call at ERROR. An error from Composio (a ``PipelineError``:
+    what ``_map_composio_errors`` turns every SDK error into, carrying the SDK
+    error's message; or an SDK error itself) is logged as ``failure_label``
+    with no traceback: the traceback prints both messages, Composio's answer
+    in them. Anything else is this connector's own and keeps its traceback."""
+    if isinstance(exc, (PipelineError, *_SDK_ERRORS)) or isinstance(
+        exc.__cause__, _SDK_ERRORS
+    ):
+        log.error("%s: %s", message, failure_label(exc))
+    else:
+        log.error(message, exc_info=exc)
 
 
 def _retry_on_rate_limit(func):  # type: ignore[no-untyped-def]
@@ -122,7 +241,10 @@ def _epoch_ms(timestamp: str | int | float | None) -> int | None:
         return None
     if isinstance(timestamp, (int, float)):
         # Heuristic: values below 1e12 are seconds, not milliseconds.
-        return int(timestamp if timestamp >= 1e12 else timestamp * 1000)
+        try:
+            return int(timestamp if timestamp >= 1e12 else timestamp * 1000)
+        except (OverflowError, ValueError):  # inf or nan: not a time
+            return None
     try:
         parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
     except ValueError:
@@ -206,12 +328,21 @@ class ComposioClient:
 
         self._sdk = Composio(**kwargs)
 
+    def _call(self, path: str, *args: Any, **kwargs: Any) -> Any:
+        """Call the SDK method at dotted ``path`` under the ``Composio``
+        object, through ``_sdk_call``: a missing method or a call that doesn't
+        bind is ``ComposioSDKShapeError``."""
+        node: Any = self._sdk
+        for part in path.split("."):
+            node = getattr(node, part, None)
+        return _sdk_call(node, path, *args, **kwargs)
+
     # -- core -----------------------------------------------------------
 
     @_map_composio_errors
     def validate(self) -> bool:
         """Make a cheap call to confirm the API key works."""
-        self._sdk.toolkits.list(limit=1)
+        self._call("toolkits.list", limit=1)
         return True
 
     @_map_composio_errors
@@ -241,7 +372,14 @@ class ComposioClient:
             # ToolVersionRequiredError, so skip the version check (resolves to
             # latest) when the caller hasn't pinned one.
             kwargs["dangerously_skip_version_check"] = True
-        response = self._sdk.tools.execute(slug, arguments or {}, **kwargs)
+        response = _to_plain(
+            self._call("tools.execute", slug, arguments or {}, **kwargs)
+        )
+        if not isinstance(response, dict):
+            raise ComposioSDKShapeError(
+                f"composio SDK tools.execute() returned a {type(response).__name__}, "
+                "not a dict"
+            )
         successful = bool(response.get("successful"))
         if not successful:
             error = response.get("error") or "unknown error"
@@ -253,7 +391,7 @@ class ComposioClient:
     @_map_composio_errors
     @_retry_on_rate_limit
     def list_toolkits(self, *, limit: int = DEFAULT_RESOURCE_LIMIT) -> list[dict[str, Any]]:
-        return _items(self._sdk.toolkits.list(limit=limit))
+        return _items(self._call("toolkits.list", limit=limit))
 
     @_map_composio_errors
     @_retry_on_rate_limit
@@ -264,7 +402,8 @@ class ComposioClient:
         search: str | None = None,
         limit: int = DEFAULT_TOOL_LIMIT,
     ) -> list[dict[str, Any]]:
-        tools = self._sdk.tools.get_raw_composio_tools(
+        tools = self._call(
+            "tools.get_raw_composio_tools",
             toolkits=[toolkit] if toolkit else None,
             search=search,
             limit=limit,
@@ -273,7 +412,7 @@ class ComposioClient:
 
     @_map_composio_errors
     def get_tool(self, slug: str) -> dict[str, Any]:
-        return _to_plain(self._sdk.tools.get_raw_composio_tool_by_slug(slug))
+        return _to_plain(self._call("tools.get_raw_composio_tool_by_slug", slug))
 
     # -- connected accounts ----------------------------------------------
 
@@ -290,12 +429,12 @@ class ComposioClient:
             kwargs["user_ids"] = [user_id]
         if toolkits:
             kwargs["toolkit_slugs"] = toolkits
-        return _items(self._sdk.connected_accounts.list(**kwargs))
+        return _items(self._call("connected_accounts.list", **kwargs))
 
     @_map_composio_errors
     def authorize_toolkit(self, *, user_id: str, toolkit: str) -> dict[str, Any]:
         """Start an OAuth connection using the toolkit's default auth config."""
-        request = self._sdk.toolkits.authorize(user_id=user_id, toolkit=toolkit)
+        request = self._call("toolkits.authorize", user_id=user_id, toolkit=toolkit)
         return self._connection_request_to_dict(request)
 
     @_map_composio_errors
@@ -306,8 +445,11 @@ class ComposioClient:
         auth_config_id: str,
         callback_url: str | None = None,
     ) -> dict[str, Any]:
-        request = self._sdk.connected_accounts.initiate(
-            user_id, auth_config_id, callback_url=callback_url
+        request = self._call(
+            "connected_accounts.initiate",
+            user_id,
+            auth_config_id,
+            callback_url=callback_url,
         )
         return self._connection_request_to_dict(request)
 
@@ -316,8 +458,8 @@ class ComposioClient:
         self, connection_id: str, *, timeout: float = 300.0
     ) -> dict[str, Any]:
         return _to_plain(
-            self._sdk.connected_accounts.wait_for_connection(
-                connection_id, timeout=timeout
+            self._call(
+                "connected_accounts.wait_for_connection", connection_id, timeout=timeout
             )
         )
 
@@ -327,7 +469,7 @@ class ComposioClient:
         kwargs: dict[str, Any] = {}
         if toolkit:
             kwargs["toolkit_slug"] = toolkit
-        return _items(self._sdk.auth_configs.list(**kwargs))
+        return _items(self._call("auth_configs.list", **kwargs))
 
     @staticmethod
     def _connection_request_to_dict(request: Any) -> dict[str, Any]:
@@ -347,7 +489,7 @@ class ComposioClient:
         kwargs: dict[str, Any] = {}
         if toolkits:
             kwargs["toolkit_slugs"] = toolkits
-        return _items(self._sdk.triggers.list(**kwargs))
+        return _items(self._call("triggers.list", **kwargs))
 
     @_map_composio_errors
     @_retry_on_rate_limit
@@ -357,7 +499,7 @@ class ComposioClient:
         kwargs: dict[str, Any] = {}
         if trigger_ids:
             kwargs["trigger_ids"] = trigger_ids
-        return _items(self._sdk.triggers.list_active(**kwargs))
+        return _items(self._call("triggers.list_active", **kwargs))
 
     @_map_composio_errors
     @_retry_on_rate_limit
@@ -375,6 +517,10 @@ class ComposioClient:
         Uses the trigger-logs endpoint (``/api/v3.1/internal/trigger/logs``)
         — the only poll-style event surface Composio exposes; the SDK's
         first-class alternative is a realtime websocket subscription.
+
+        A malformed log entry never raises: it comes back as an event with
+        ``skipped`` set (see ``_normalize_trigger_event``), so the caller can
+        step past it.
         """
         kwargs: dict[str, Any] = {
             "limit": limit,
@@ -387,15 +533,48 @@ class ComposioClient:
             kwargs["from_"] = from_ms
         if cursor:
             kwargs["cursor"] = cursor
-        response = self._sdk.client.logs.triggers.list(**kwargs)
+        list_logs = self._trigger_logs().list
+        signature = _signature(list_logs)
+        if signature is not None and "request_options" in signature.parameters:
+            # composio-client 2.x gives a POST no SDK retries (1.x retries
+            # every method). This POST only reads, so it asks for 1.x's.
+            kwargs["request_options"] = {"max_retries": TRIGGER_LOG_SDK_RETRIES}
+        # _trigger_logs() checked list is callable; bind it on this signature.
+        response = _bound_sdk_call(list_logs, signature, "trigger-log list", **kwargs)
         events = [self._normalize_trigger_event(item) for item in _items(response)]
         events.sort(key=lambda e: e.get("timestamp_ms") or 0)
         next_cursor = getattr(response, "next_cursor", None)
         return events, next_cursor
 
+    def _trigger_logs(self) -> Any:
+        """The installed SDK's trigger-log resource (``_TRIGGER_LOG_PATHS``),
+        or ``ComposioSDKShapeError`` naming where it looked."""
+        for path in _TRIGGER_LOG_PATHS:
+            node: Any = self._sdk.client
+            for part in path:
+                node = getattr(node, part, None)
+                if node is None:
+                    break
+            if node is not None and callable(getattr(node, "list", None)):
+                return node
+        looked = " or ".join("client." + ".".join(p) for p in _TRIGGER_LOG_PATHS)
+        raise ComposioSDKShapeError(
+            f"the installed composio SDK has no trigger-log resource ({looked}); "
+            "this composio-client version is not supported"
+        )
+
     @staticmethod
-    def _normalize_trigger_event(item: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_trigger_event(item: Any) -> dict[str, Any]:
+        """One trigger-log entry as a flat event. An entry is API data, not
+        SDK shape, so a malformed one (the entry or its ``meta`` not an
+        object) never raises. It comes back with ``skipped`` (the reason,
+        naming types only) and whatever could be read: ``id`` and
+        ``timestamp_ms``, so the poller can record it and step past."""
+        if not isinstance(item, dict):
+            return _skipped_event(None, f"the entry is a {type(item).__name__}")
         meta = item.get("meta") or {}
+        if not isinstance(meta, dict):
+            return _skipped_event(item, f"its meta is a {type(meta).__name__}")
         payload_raw = (
             meta.get("trigger_provider_payload")
             or meta.get("trigger_client_payload")
@@ -424,6 +603,17 @@ class ComposioClient:
         }
 
 
+def _skipped_event(item: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    """The event for a malformed trigger-log entry: only its id and time."""
+    timestamp = item.get("created_at") if item is not None else None
+    return {
+        "id": item.get("id") if item is not None else None,
+        "timestamp": timestamp,
+        "timestamp_ms": _epoch_ms(timestamp),
+        "skipped": f"malformed trigger-log entry ({reason}, not an object)",
+    }
+
+
 @dataclass
 class TriggerCursor:
     """Persisted polling position for the triggers source.
@@ -432,7 +622,17 @@ class TriggerCursor:
     polls: when one poll cycle hits its page cap before draining the event
     log, the next cycle resumes from the saved page cursor instead of
     re-reading (or worse, skipping) the remainder. The watermark only
-    advances once a window is fully drained.
+    advances once a window is fully drained. ``seen_ids`` is every entry id
+    read (the ones the config's filters drop included), oldest first.
+
+    Host contract (exported in ``aisquare_pipe_composio.__all__``, pinned by
+    ``tests/test_trigger_cursor_contract.py``): a host that keeps the position
+    itself (pipe-as-service keeps it in its own store) writes it with
+    ``save_trigger_cursor`` to the ``cursor_path`` of a one-cycle ``pull``
+    (``max_polls=1``) and reads it back with ``load_trigger_cursor``. A host
+    copies every field both ways, so a field added here is a contract change.
+    A cursor with ``last_ts_ms == 0`` and no ``seen_ids`` is a first run: the
+    pull starts at its ``since`` param.
     """
 
     last_ts_ms: int = 0
@@ -475,7 +675,8 @@ def load_trigger_cursor(path: str) -> TriggerCursor:
 
 
 def save_trigger_cursor(path: str, state: TriggerCursor) -> None:
-    """Atomically persist the trigger cursor, trimming the dedup ring."""
+    """Atomically persist the trigger cursor, trimming the dedup ring to its
+    newest ``SEEN_IDS_MAX`` ids."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
