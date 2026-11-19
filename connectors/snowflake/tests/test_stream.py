@@ -223,6 +223,86 @@ def test_pass_rows_refuses_a_body_that_ends_inside_data(body, take):
         _passed(body, 2, take)
 
 
+def _chunked(body: bytes, chunk: int) -> Body:
+    return Body(iter([body[i : i + chunk] for i in range(0, len(body), chunk)]))
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+@pytest.mark.parametrize("chunk", [*range(1, 12), 64, 1 << 20])
+def test_row_follows_says_whether_a_row_follows_before_and_between_rows(indent, chunk):
+    """#51 review seq 14199 n2: Body.row_follows, asked before rows() begins
+    and after each row it yields, however the body is chunked; rows() reads
+    on from where it left off, and the keys after data read the same."""
+    reader = _chunked(json.dumps(ANSWER, indent=indent).encode(), chunk)
+    head: dict[str, Any] = {}
+    taken: list[Any] = []
+    for key in reader.members():
+        if key != "data":
+            head[key] = reader.value()
+            continue
+        rows = reader.rows()
+        for _ in ROWS:
+            assert reader.row_follows() is True
+            assert reader.row_follows() is True  # asking again reads nothing
+            taken.append(next(rows))
+        assert reader.row_follows() is False
+        assert next(rows, None) is None
+    assert taken == ROWS
+    assert head == {k: v for k, v in ANSWER.items() if k != "data"}
+
+
+@pytest.mark.parametrize("data", [[], None])
+@pytest.mark.parametrize("chunk", [1, 2, 64])
+def test_row_follows_is_false_for_data_without_rows(data, chunk):
+    reader = _chunked(json.dumps({"data": data, "code": "1"}).encode(), chunk)
+    head: dict[str, Any] = {}
+    for key in reader.members():
+        if key == "data":
+            rows = reader.rows()
+            assert reader.row_follows() is False
+            assert list(rows) == []
+        else:
+            head[key] = reader.value()
+    assert head == {"code": "1"}
+
+
+@pytest.mark.parametrize("take", [0, 1])
+@pytest.mark.parametrize("chunk", [1, 7, 64 * 1024])
+def test_row_follows_reads_none_of_a_row_over_row_bytes(take, chunk, monkeypatch):
+    """The row that follows is over ROW_BYTES: row_follows says it is there,
+    without reading it (no RowOverCap), and pass_rows reads on past it to
+    the next key."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    big = ["1", MARK * 10_000]
+    rows_in = [["0", "a"], big] if take else [big, ["0", "a"]]
+    body = json.dumps({"data": rows_in, "code": "1"}).encode()
+    with pytest.raises(RowOverCap):
+        _read(body, chunk)
+    reader = _chunked(body, chunk)
+    head: dict[str, Any] = {}
+    for key in reader.members():
+        if key == "data":
+            rows = reader.rows()
+            assert [next(rows) for _ in range(take)] == rows_in[:take]
+            assert reader.row_follows() is True
+            assert reader.rows_read == take
+            reader.pass_rows()
+        else:
+            head[key] = reader.value()
+    assert head == {"code": "1"}
+
+
+@pytest.mark.parametrize("body", [b'{"data": [', b'{"data": [["a"]  '])
+def test_row_follows_refuses_a_body_that_ends_inside_data(body):
+    reader = _chunked(body, 2)
+    assert next(reader.members()) == "data"
+    rows = reader.rows()
+    if body.endswith(b"  "):
+        assert next(rows) == ["a"]
+    with pytest.raises(BadBody):
+        reader.row_follows()
+
+
 # -- the client and the source ----------------------------------------------------------
 
 
@@ -374,7 +454,7 @@ def _handle_after_the_rows(fake: FakeSnowflake) -> None:
 #: then a row over ROW_BYTES (64 KiB here) that the caller never gets. (A
 #: cut by max_rows leaves nothing to read through: the POST asks for
 #: ROWS_PER_RESULTSET = max_rows + 1, and Snowflake, like the fake, sends no
-#: more; the one over max_rows is read whole, to say that rows remain.)
+#: more; the one over max_rows is only seen to follow, never read: below.)
 _CUT_THEN_OVER = [["0", "n"], ["1", "y" * 1_000], ["2", MARK * 10_000], ["3", "n"]]
 
 
@@ -421,6 +501,62 @@ def test_rows_before_the_columns_meet_no_row_cap_until_they_are_read_again(
     with pytest.raises(RowTooLarge) as raised:
         _pull(fake, sql=SQL)
     assert raised.value.row == 2
+
+
+def _sql_handle(fake: FakeSnowflake) -> str:
+    (handle,) = [
+        h
+        for h, state in fake._statements.items()
+        if state["canned"] is fake.canned[SQL]
+    ]
+    return handle
+
+
+@pytest.mark.parametrize("path", ["202", "post-200"])
+def test_the_row_past_max_rows_is_never_read_so_it_meets_no_row_cap(path, monkeypatch):
+    """#51 review seq 14199 n2: at max_rows the next row (the one
+    ROWS_PER_RESULTSET = max_rows + 1 asks for, so a cut shows) was parsed
+    only to learn that rows remain, and so met the row cap: max_rows 1 and a
+    row over ROW_BYTES at row 1 was RowTooLarge row 1, both through the 202
+    polls (the handle before the rows) and from a POST answered 200 at once
+    (the handle after them). Now only whether a row follows is read: 1 row,
+    truncated max_rows, with the statement's query_id."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    fake = _fake([["0", "n"], ["1", MARK * 10_000]])
+    if path == "post-200":
+        _handle_after_the_rows(fake)
+    envelopes = _pull(fake, sql=SQL, max_rows=1)
+    assert _ids(envelopes) == [0]
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_rows"}
+    assert {e.metadata["query_id"] for e in envelopes} == {_sql_handle(fake)}
+    # A whole result at max_rows is not truncated: no row follows.
+    whole = _fake([["0", "n"]])
+    if path == "post-200":
+        _handle_after_the_rows(whole)
+    envelopes = _pull(whole, sql=SQL, max_rows=1)
+    assert _ids(envelopes) == [0]
+    assert "truncated" not in envelopes[-1].metadata
+    # A row over the cap is still refused when the caller would get it.
+    with pytest.raises(RowTooLarge) as raised:
+        _pull(fake, sql=SQL, max_rows=2)
+    assert raised.value.row == 1
+
+
+def test_the_row_past_max_rows_in_the_next_partition_is_never_read(monkeypatch):
+    """The same when partition 0 ends at max_rows: partition 1 is asked for
+    (only it can say whether rows remain), and its first row, over
+    ROW_BYTES, is only seen to be there."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    fake = _fake([["0", "n"], ["1", "n"], ["2", MARK * 10_000]], partition_rows=2)
+    envelopes = _pull(fake, sql=SQL, max_rows=2)
+    assert _ids(envelopes) == [0, 1]
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_rows"}
+    partitions = [
+        r["params"]["partition"]
+        for r in fake.api_calls()
+        if r["method"] == "GET" and "partition" in r["params"]
+    ]
+    assert partitions == [1]
 
 
 @pytest.mark.parametrize(
