@@ -94,15 +94,6 @@ def rest_cells(row: Any) -> int:
     return count
 
 
-def most_cells(rows: Any) -> int:
-    """The most :func:`rest_cells` of any row in a REST page (0 without rows)."""
-    return (
-        max((rest_cells(row) for row in rows), default=0)
-        if isinstance(rows, list)
-        else 0
-    )
-
-
 def mean_cells(rows: Any) -> int:
     """The mean :func:`rest_cells` a row of a REST page holds, rounded up (0
     without rows)."""
@@ -235,7 +226,6 @@ __all__ = [
     "iter_rows",
     "mean_cells",
     "millis_rfc3339",
-    "most_cells",
     "rest_cells",
     "result_sha256",
     "row_size",

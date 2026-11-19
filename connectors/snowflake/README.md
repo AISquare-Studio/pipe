@@ -149,9 +149,11 @@ the status answer that carries partition 0 included, is streamed 64 KiB at a tim
 (8 MiB in all at most), and `data`'s rows (`jsonv2`: arrays of strings and nulls) one row at a time. Each row is
 converted, kept as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are
 byte for byte what they were) and let go; reading stops at `max_rows` or `max_result_bytes`, inside a partition if
-that is where the cap falls, and the partitions after it are never asked for. (When the statement's handle comes
-after the rows, as in a result the POST answered at once, the rest of that partition is read through to it, scanned
-and let go unparsed: no row cap applies to rows the caller never gets. The same for rows that come before the
+that is where the cap falls, and the partitions after it are never asked for. At `max_rows` the next row (the one
+`ROWS_PER_RESULTSET`, `max_rows` plus one, asks for, so a cut shows) is never parsed, only checked to be there, so it
+meets no row cap. (When the statement's handle comes after the rows, as in a result the POST answered at once, the
+rest of that partition, that row included, is read through to it, scanned and let go unparsed: no row cap applies to
+rows the caller never gets. The same for rows that come before the
 columns, which partition 0, asked for again, then gives.) A batch's rows are let go once its envelope is built.
 
 So a pull peaks at about 1.15 times the rows' JSON plus the row being read, whatever the partitions: 74 MiB at the

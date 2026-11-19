@@ -10,7 +10,9 @@ and split as it arrives.
   nulls) is read a row at a time (:meth:`Body.rows`): each row is parsed on
   its own, at most :data:`ROW_BYTES` of JSON, so a partition costs one chunk
   and one row whatever its size, the first one (inside the status answer)
-  included. A caller that stops taking rows stops reading.
+  included. A caller that stops taking rows stops reading; one that only
+  needs to know whether another row follows asks :meth:`Body.row_follows`,
+  which parses none.
 * Every other key's value (``resultSetMetaData``, ``code``, ...) is parsed
   whole (:meth:`Body.value`), all of them together at most
   :data:`HEAD_BYTES`.
@@ -79,7 +81,8 @@ class Body:
     ``iter_content`` gives them). :meth:`members` yields its keys in order;
     after each, read its value with :meth:`value` or :meth:`rows` (or
     :meth:`pass_rows`, which may also finish what :meth:`rows` began) before
-    asking for the next key."""
+    asking for the next key. Before :meth:`rows` begins, or between the rows
+    it yields, :meth:`row_follows` says whether another row follows."""
 
     def __init__(self, chunks: Iterator[bytes]) -> None:
         self._chunks = chunks
@@ -200,13 +203,15 @@ class Body:
     def rows(self) -> Iterator[Any]:
         """The current key's value, an array of rows, one row at a time (a
         ``jsonv2`` row: a list of strings and nulls). A caller that stops
-        iterating stops reading; the body can't be read on after that."""
-        if self._peek() == ord("n"):  # "data": null
-            if self._decoded(4, head=True) is not None:
-                raise BadBody("data is not an array")
-            return
-        self._expect(b"[", "data is an array")
-        self._in_rows = True
+        iterating stops reading; only :meth:`pass_rows` reads on from
+        there."""
+        if not self._in_rows:  # else row_follows read data's "["
+            if self._peek() == ord("n"):  # "data": null
+                if self._decoded(4, head=True) is not None:
+                    raise BadBody("data is not an array")
+                return
+            self._expect(b"[", "data is an array")
+            self._in_rows = True
         first = True
         while True:
             char = self._peek()
@@ -226,6 +231,27 @@ class Body:
             else:
                 # Not an array (a null row, say): read whole, bounded.
                 yield self._decoded(ROW_BYTES, head=False)
+
+    def row_follows(self) -> bool:
+        """Whether another row of the current key's array follows, parsing
+        none: called before :meth:`rows` begins or between the rows it
+        yields. A caller that has taken all the rows it may asks this
+        instead of taking the next one (which meets the row cap) only to
+        learn that rows remain (#51 review seq 14199 n2). It reads data's
+        "[" (when :meth:`rows` hasn't) and blanks, never a row's bytes; only
+        whether the array ends here is checked, not what follows (a comma
+        and a row, or the first row): :meth:`rows` checks that if it is
+        read on."""
+        char = self._peek()
+        if not self._in_rows:
+            if char != ord("["):
+                return False  # null, or not an array: rows() says which
+            self._pos += 1
+            self._in_rows = True
+            char = self._peek()
+        if char is None:
+            raise BadBody("the body ends inside data")
+        return char != _CLOSE_ROW
 
     def pass_rows(self) -> None:
         """Read through the current key's rows, or the rest of them once
