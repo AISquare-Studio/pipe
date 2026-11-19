@@ -222,9 +222,12 @@ def page_rows(
 def _page_shape(answer: dict[str, Any], client: BigQueryClient) -> tuple[int, int, int]:
     """(mean cells a row held, rows, bytes of JSON) of the page ``answer``,
     the client's last response. The mean, not the most: a next page sized
-    from it may hold a wider row than the mean, and the read cap
-    (:data:`READ_CELLS`) bounds that page all the same (dropped and asked for
-    again with fewer rows), so this is speed only, never memory."""
+    from it may hold rows wider than the mean. The read cap
+    (:data:`READ_BYTES`, :data:`READ_CELLS`) still bounds every page (one
+    over it is dropped and asked for again with fewer rows), but a pull of
+    recurring wide rows parses larger pages than the widest row would size,
+    so it may peak higher, up to that bound (#51 review seq 14199 n1;
+    README "Memory")."""
     rows = answer.get("rows")
     count = len(rows) if isinstance(rows, list) else 0
     return mean_cells(rows), count, client.last_body_bytes

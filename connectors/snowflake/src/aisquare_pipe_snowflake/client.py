@@ -21,7 +21,9 @@ A result's body (the status answer that carries partition 0, and each later
 partition) is never parsed whole: Snowflake decides how large a partition
 is. It is streamed and split a row at a time
 (:class:`~aisquare_pipe_snowflake.stream.Body`), and reading stops at the
-row or byte cap. A single row over
+row or byte cap. The row past the row cap is never parsed: it is only
+checked to be there, and, when the handle comes after the rows, read
+through to it unparsed with the rest. A single row over
 :data:`~aisquare_pipe_snowflake.stream.ROW_BYTES` of JSON is
 :class:`RowTooLarge`.
 * ``POST /api/v2/statements/{handle}/cancel`` when the deadline passes.
@@ -98,6 +100,8 @@ TRUNCATED_MAX_RESULT_BYTES = "max_result_bytes"
 _HANDLE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _CODE = re.compile(r"^[0-9A-Za-z]{1,16}$")
 _MAX_DETAIL = 400
+# Body.rows() has no more rows (a row may be null).
+_NO_ROW = object()
 
 
 class SnowflakeAPIError(Exception):
@@ -402,9 +406,8 @@ class SnowflakeClient:
                         again = True
                         continue
                     result = self._result(head, handle, encoded, batching)
-                    rows = body.rows()
                     cut = self._take(
-                        result, rows, row_limit=row_limit, byte_limit=byte_limit
+                        result, body, row_limit=row_limit, byte_limit=byte_limit
                     )
                     if cut and result.query_id is not None:
                         break  # the rest is never read
@@ -487,7 +490,7 @@ class SnowflakeClient:
                     if key != "data":
                         body.value()
                     elif self._take(
-                        result, body.rows(), row_limit=row_limit, byte_limit=byte_limit
+                        result, body, row_limit=row_limit, byte_limit=byte_limit
                     ):
                         return True
             except RowOverCap as over:
@@ -498,14 +501,24 @@ class SnowflakeClient:
 
     @staticmethod
     def _take(
-        result: StatementResult, rows: Any, *, row_limit: int, byte_limit: int
+        result: StatementResult, body: Body, *, row_limit: int, byte_limit: int
     ) -> bool:
-        """Add ``rows``' rows (``jsonv2`` lists, one at a time) within the
-        caps; True when a cap stopped it."""
-        for cells in rows:
-            if result.count >= row_limit:
+        """Add the rows of ``body``'s current key (``jsonv2`` lists, read one
+        at a time) within the caps; True when a cap stopped it.
+
+        At ``row_limit`` rows the next row is never read: only whether one
+        follows (:meth:`Body.row_follows`), so a row past the limit (the one
+        ``ROWS_PER_RESULTSET = row_limit + 1`` asks for, to tell a cut
+        result from a whole one) never meets the row cap (#51 review seq
+        14199 n2: max_rows 1 and a row over it at row 1 was RowTooLarge)."""
+        rows = body.rows()
+        while True:
+            if result.count >= row_limit and body.row_follows():
                 result.truncated = TRUNCATED_MAX_ROWS
                 return True
+            cells = next(rows, _NO_ROW)
+            if cells is _NO_ROW:
+                return False
             row = convert_row(result.columns, cells)
             encoded = canonical(row)
             if result.plan is not None:
@@ -522,7 +535,6 @@ class SnowflakeClient:
             if result.plan is not None:
                 result.plan.add(len(encoded))
             result.result_bytes += cost
-        return False
 
     def _cancel(self, handle: str) -> None:
         """Best effort: Snowflake stops the statement at its own ``timeout``

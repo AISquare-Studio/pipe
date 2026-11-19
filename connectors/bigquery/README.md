@@ -155,8 +155,10 @@ A `REPEATED` column's schema can't say how many elements a row holds: the FIRST 
 of the LAST page held. Not the most of the whole pull: one wide row would hold every later page to a row. Not the
 last page's widest row either: a wide row that recurs would hold the page after each one to a row (100,000 rows with
 a row of 25,001 cells every 500th: 1,786 requests sized from the widest, 104 from the mean). A page sized from the
-mean may meet a row wider than it; the read cap bounds that page all the same (below), so the sizing is speed,
-never memory. One wide row first (60,000 elements in the first page's 49 rows, then 20,000 rows of one): the next
+mean may meet rows wider than it. The read cap still bounds every page (above), but a pull of recurring wide rows
+parses larger pages than the widest row would size, so it may peak higher, up to that bound: at the caps, those
+100,000 rows peak at 33.4 MiB on either path (26.0 MiB sized from the widest), and with a wide row every 2nd, 80.5 MiB (72.7; both
+stop at `max_result_bytes` after the same 2,679 rows), all under the worst case above. One wide row first (60,000 elements in the first page's 49 rows, then 20,000 rows of one): the next
 page asks for 40 rows, pages double back up (40, 80, ... 2,560), and the default 10,000 rows come back in 9 requests
 (15 sized from the last page's widest row, 5,001 from the pull's). Rows of 100 elements peak at 21 MiB at the defaults and 81 MiB at the caps; rows of 1,000
 elements at 78 MiB. `ARRAY_AGG` rows far longer than the guess (BigQuery's page limit faked at 20 MB for a query
