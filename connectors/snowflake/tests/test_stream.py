@@ -452,9 +452,9 @@ def _handle_after_the_rows(fake: FakeSnowflake) -> None:
 
 #: A cut by max_result_bytes at row 1 (row 0 fits 400 bytes, row 1 doesn't),
 #: then a row over ROW_BYTES (64 KiB here) that the caller never gets. (A
-#: cut by max_rows leaves nothing to read through: the POST asks for
+#: cut by max_rows leaves at most one row: the POST asks for
 #: ROWS_PER_RESULTSET = max_rows + 1, and Snowflake, like the fake, sends no
-#: more; the one over max_rows is only seen to follow, never read: below.)
+#: more. That row is never parsed either: below.)
 _CUT_THEN_OVER = [["0", "n"], ["1", "y" * 1_000], ["2", MARK * 10_000], ["3", "n"]]
 
 
@@ -513,14 +513,18 @@ def _sql_handle(fake: FakeSnowflake) -> str:
 
 
 @pytest.mark.parametrize("path", ["202", "post-200"])
-def test_the_row_past_max_rows_is_never_read_so_it_meets_no_row_cap(path, monkeypatch):
+def test_the_row_past_max_rows_is_never_parsed_so_it_meets_no_row_cap(
+    path, monkeypatch
+):
     """#51 review seq 14199 n2: at max_rows the next row (the one
     ROWS_PER_RESULTSET = max_rows + 1 asks for, so a cut shows) was parsed
     only to learn that rows remain, and so met the row cap: max_rows 1 and a
     row over ROW_BYTES at row 1 was RowTooLarge row 1, both through the 202
     polls (the handle before the rows) and from a POST answered 200 at once
-    (the handle after them). Now only whether a row follows is read: 1 row,
-    truncated max_rows, with the statement's query_id."""
+    (the handle after them). Now that row is never parsed: it is only
+    checked to be there, and from the POST answered 200 at once read through
+    to the handle unparsed (pass_rows). 1 row, truncated max_rows, with the
+    statement's query_id."""
     monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
     fake = _fake([["0", "n"], ["1", MARK * 10_000]])
     if path == "post-200":
@@ -542,10 +546,10 @@ def test_the_row_past_max_rows_is_never_read_so_it_meets_no_row_cap(path, monkey
     assert raised.value.row == 1
 
 
-def test_the_row_past_max_rows_in_the_next_partition_is_never_read(monkeypatch):
+def test_the_row_past_max_rows_in_the_next_partition_is_never_parsed(monkeypatch):
     """The same when partition 0 ends at max_rows: partition 1 is asked for
     (only it can say whether rows remain), and its first row, over
-    ROW_BYTES, is only seen to be there."""
+    ROW_BYTES, is only checked to be there, never parsed."""
     monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
     fake = _fake([["0", "n"], ["1", "n"], ["2", MARK * 10_000]], partition_rows=2)
     envelopes = _pull(fake, sql=SQL, max_rows=2)

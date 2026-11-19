@@ -21,8 +21,9 @@ A result's body (the status answer that carries partition 0, and each later
 partition) is never parsed whole: Snowflake decides how large a partition
 is. It is streamed and split a row at a time
 (:class:`~aisquare_pipe_snowflake.stream.Body`), and reading stops at the
-row or byte cap (the row past the row cap is only seen to follow, never
-read). A single row over
+row or byte cap. The row past the row cap is never parsed: it is only
+checked to be there, and, when the handle comes after the rows, read
+through to it unparsed with the rest. A single row over
 :data:`~aisquare_pipe_snowflake.stream.ROW_BYTES` of JSON is
 :class:`RowTooLarge`.
 * ``POST /api/v2/statements/{handle}/cancel`` when the deadline passes.

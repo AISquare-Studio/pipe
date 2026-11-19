@@ -355,14 +355,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the row cap no longer applies to rows the caller never gets (#46 re-review seq 14138 nit d). That is the rest
   of partition 0 after a cut, when the statement's handle comes after `data` (a result the POST answered at
   once), and rows that come before the columns (partition 0 is read again). A cut at row 1 with a row over
-  8 MiB at row 2 was `RowTooLarge` (422); it is now the row before the cut, `truncated`. (A cut by `max_rows`
-  leaves nothing to read through: the POST asks for `max_rows + 1` rows.) The README no longer says the
-  review's 1a8b64e numbers came from a fake that held each answer whole (nit e).
-- Snowflake: at `max_rows` the next row is never read, only seen to follow (`stream.Body.row_follows`, which
-  parses no row), so the row `ROWS_PER_RESULTSET` (`max_rows + 1`) asks for, to show a cut, meets no row cap (#51
-  review seq 14199 n2). `max_rows` 1 with a row over 8 MiB at row 1 was `RowTooLarge` (422) both through the 202
-  polls and from a POST answered 200 at once; it is now row 0, `truncated` `max_rows`. The same when partition 0
-  ends at `max_rows` and the next row opens partition 1.
+  8 MiB at row 2 was `RowTooLarge` (422); it is now the row before the cut, `truncated`. The README no longer
+  says the review's 1a8b64e numbers came from a fake that held each answer whole (nit e).
+- Snowflake: at `max_rows` the next row (the one `ROWS_PER_RESULTSET`, `max_rows + 1`, asks for, to show a cut)
+  is never parsed, so it meets no row cap (#51 review seq 14199 n2): it is only checked to be there
+  (`stream.Body.row_follows`, which parses no row). When the statement's handle comes after `data` (a POST
+  answered 200 at once), that row is read through to the handle, unparsed, as the rest of a cut partition is
+  (`stream.Body.pass_rows`). `max_rows` 1 with a row over 8 MiB at row 1 was `RowTooLarge` (422) both through
+  the 202 polls and from a POST answered 200 at once; it is now row 0, `truncated` `max_rows`. The same when
+  partition 0 ends at `max_rows` and the next row opens partition 1.
 - Redshift's README states what its memory bound assumes: AWS's `GetStatementResult` page size, which AWS doesn't
   document for JSON (measured: about nine times a page's JSON, over 256 MiB at a 25 MiB page), and why
   `GetStatementResultV2` (CSV) waits for a stg check (#46 review seq 14088 m1).
