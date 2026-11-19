@@ -49,7 +49,7 @@ from aisquare_pipe_bigquery.rows import (
     canonical,
     encoded_batch,
     iter_rows,
-    most_cells,
+    mean_cells,
     schema_fields,
 )
 from aisquare_pipe_bigquery.sqlguard import NotReadOnly
@@ -69,7 +69,7 @@ PAGE_CELLS = 50_000
 UNKNOWN_SCHEMA_PAGE_ROWS = 1_000
 #: What a ``REPEATED`` column is guessed to hold (its elements, each a cell)
 #: for the FIRST page: a schema can't say how long its arrays are. After it,
-#: each page is sized from the last one's widest row (:func:`page_rows`'s
+#: each page is sized from the last one's mean cells a row (:func:`page_rows`'s
 #: ``last_cells``). Neither bounds a page: the read cap does
 #: (:data:`READ_CELLS`).
 REPEATED_CELLS = 1_000
@@ -81,9 +81,9 @@ REPEATED_CELLS = 1_000
 PAGE_BYTES = 4 * 1024 * 1024
 #: A next page asks for at most this many times the rows the last page held,
 #: so a page that came back short (by its bytes, its cells, or BigQuery's page
-#: limit) grows back a step at a time: after a row of more than 25,000 cells
-#: (a page of one: :data:`PAGE_CELLS` // its cells is 1), narrow rows are
-#: back at :data:`PAGE_ROWS` a page within 14 pages.
+#: limit) grows back a step at a time: after a page of one row of more than
+#: 25,000 cells (:data:`PAGE_CELLS` // its cells is 1), narrow rows are back
+#: at :data:`PAGE_ROWS` a page within 14 pages.
 PAGE_GROWTH = 2
 #: The most one page's body may hold, counted as it is read and before it is
 #: parsed (:class:`~aisquare_pipe_bigquery.client.PageCap`): bytes of JSON,
@@ -193,12 +193,15 @@ def page_rows(
     """Rows to ask for in one page: at most ``wanted``, :data:`PAGE_ROWS`
     and :data:`PAGE_CELLS` cells.
 
-    A row's cells are ``last_cells`` (the most a row of the LAST page held)
-    once rows have come back; before that the schema's guess
-    (:func:`cells_per_row`, which counts a ``REPEATED`` column as
+    A row's cells are ``last_cells`` (the mean a row of the LAST page held,
+    :func:`_page_shape`) once rows have come back; before that the schema's
+    guess (:func:`cells_per_row`, which counts a ``REPEATED`` column as
     :data:`REPEATED_CELLS` elements), else :data:`UNKNOWN_SCHEMA_PAGE_ROWS`
     rows. Not the widest row of the whole pull: one wide row would hold every
-    later page to one row.
+    later page to one row. Not the last page's widest row either: a wide row
+    that recurs (every 500th, say) would hold the page after each one to a
+    row, and the pull to about 10 times the requests (#46 review seq 14138
+    nit a: 100,000 rows in 1,793 requests, 104 sized from the mean).
 
     Once a page has come back (``last_rows`` rows in ``last_bytes`` bytes of
     JSON), also at most the rows that fit :data:`PAGE_BYTES` at its bytes a
@@ -217,11 +220,14 @@ def page_rows(
 
 
 def _page_shape(answer: dict[str, Any], client: BigQueryClient) -> tuple[int, int, int]:
-    """(most cells a row held, rows, bytes of JSON) of the page ``answer``,
-    the client's last response."""
+    """(mean cells a row held, rows, bytes of JSON) of the page ``answer``,
+    the client's last response. The mean, not the most: a next page sized
+    from it may hold a wider row than the mean, and the read cap
+    (:data:`READ_CELLS`) bounds that page all the same (dropped and asked for
+    again with fewer rows), so this is speed only, never memory."""
     rows = answer.get("rows")
     count = len(rows) if isinstance(rows, list) else 0
-    return most_cells(rows), count, client.last_body_bytes
+    return mean_cells(rows), count, client.last_body_bytes
 
 
 def _cap(rows: int) -> PageCap:
@@ -534,7 +540,7 @@ def run_select(
     _plan(result, batching)
     pages = 1
     while True:
-        most, last_rows, last_bytes = _page_shape(answer, client)
+        per_row, last_rows, last_bytes = _page_shape(answer, client)
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(result.fields, answer.get("rows"))
@@ -556,7 +562,7 @@ def run_select(
             page_rows(
                 result.fields,
                 max_rows - result.count,
-                last_cells=most,
+                last_cells=per_row,
                 last_rows=last_rows,
                 last_bytes=last_bytes,
             ),
@@ -613,7 +619,7 @@ def read_table_rows(
     )
     _plan(result, batching)
     token: str | None = None
-    most = last_rows = last_bytes = 0
+    per_row = last_rows = last_bytes = 0
     names = [f["name"] for f in fields] if selected_fields else None
     for page_number in range(MAX_PAGES):
         answer = _read_capped(
@@ -627,7 +633,7 @@ def read_table_rows(
             page_rows(
                 fields,
                 max_rows - result.count,
-                last_cells=most,
+                last_cells=per_row,
                 last_rows=last_rows,
                 last_bytes=last_bytes,
             ),
@@ -643,7 +649,7 @@ def read_table_rows(
         total = _int(answer.get("totalRows"))
         if total is not None:
             result.total_rows = total
-        most, last_rows, last_bytes = _page_shape(answer, client)
+        per_row, last_rows, last_bytes = _page_shape(answer, client)
         # Converted one row at a time; the parsed page goes (with ``page``)
         # before the next one is read.
         page = iter_rows(fields, answer.get("rows"))

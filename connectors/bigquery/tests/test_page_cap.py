@@ -349,8 +349,9 @@ def test_a_row_page_that_breaks_off_midway_is_a_502(small_caps, error, says):
 
 
 #: Row-page requests a pull of one wide row then narrow rows may take: the
-#: wide row's page, one row after it, then pages that double back up to
-#: PAGE_ROWS (1, 2, 4, ... 8,192: 14), and the rest.
+#: wide row's page, then pages that double back up to PAGE_ROWS, and the
+#: rest (9 sized from the last page's mean cells a row; 15 from its widest
+#: row, which asked for one row after the wide one: 1, 2, 4, ... 4,096).
 WIDE_ROW_BUDGET = 20
 
 
@@ -358,9 +359,9 @@ WIDE_ROW_BUDGET = 20
 def test_one_wide_row_then_narrow_rows_all_come_back_in_a_few_requests(path):
     """At the real caps: row 0 holds 60,000 elements (more than PAGE_CELLS,
     under READ_CELLS), then 20,000 rows of one. Pages are sized from the LAST
-    page's widest row, so the pull asks for one row after the wide one and
-    grows back by PAGE_GROWTH: the default max_rows (10,000) all come back,
-    in order, cut by max_rows, within WIDE_ROW_BUDGET row pages."""
+    page's mean cells a row, never the pull's widest, and grow back by
+    PAGE_GROWTH: the default max_rows (10,000) all come back, in order, cut
+    by max_rows, within WIDE_ROW_BUDGET row pages."""
     lengths = [60_000] + [1] * 20_000
     if path == "sql":
         google = _query_google(lengths)
@@ -391,6 +392,42 @@ def test_a_wide_row_midway_costs_a_few_requests_not_the_rest_of_the_pull():
     assert len(_asked(google)) <= 2 * WIDE_ROW_BUDGET, _asked(google)
 
 
+#: Row-page requests 100,000 rows with a wide one every 500th may take: 104
+#: sized from the last page's mean cells a row; 1,786 from its widest row
+#: (#46 review seq 14138 nit a measured 1,793 with nine-digit elements).
+RECURRING_WIDE_BUDGET = 150
+
+
+@pytest.mark.parametrize("path", ["sql", "table"])
+def test_a_wide_row_that_recurs_does_not_hold_each_next_page_to_one_row(path):
+    """#46 review seq 14138 nit a, at the real caps: max_rows 100,000, and
+    every 500th row holds 25,001 cells (24,999 one-digit elements, its
+    column's cell and customer_id's), more than half of PAGE_CELLS; the rest
+    hold 3. Sized from the last page's WIDEST row, the page after each wide
+    one asked for one row and grew back a doubling at a time, only to meet
+    the next: 1,793 requests, minutes of sequential getQueryResults calls.
+    Sized from its MEAN cells a row, a page stays hundreds of rows. A page
+    that meets two wide rows still fits READ_CELLS, and one over it is
+    dropped and asked for again as before (the read cap bounds memory, not
+    the sizing). Every row comes back, in order."""
+    wide = [7] * 24_999  # one list, shared: the fake holds 100,000 rows
+    rows = [[wide if i % 500 == 499 else [7], i] for i in range(100_000)]
+    google = FakeGoogle()
+    if path == "sql":
+        google.add_dataset(f"{PROJECT}.sales")
+        google.add_query(SQL, CannedQuery(FIELDS, rows))
+        envelopes = _pull(google, {"sql": SQL, "max_rows": 100_000})
+    else:
+        google.add_table(f"{PROJECT}.sales.o", FakeTable(FIELDS, rows))
+        envelopes = _pull(google, {"table": "sales.o", "max_rows": 100_000})
+    assert _ids(envelopes) == list(range(100_000))
+    assert "truncated" not in envelopes[-1].metadata
+    asked = _asked(google)
+    assert len(asked) <= RECURRING_WIDE_BUDGET, (len(asked), asked[:40])
+    # Far past one row a page after the first wide row (widest: 1, 2, 4, ...).
+    assert sorted(asked)[len(asked) // 2] >= 500
+
+
 @pytest.mark.parametrize("path", ["sql", "table"])
 def test_a_pull_stopped_by_max_pages_says_max_pages(path, monkeypatch):
     """MAX_PAGES pages read, rows left: truncated is max_pages (not
@@ -414,7 +451,7 @@ def test_a_pull_stopped_by_max_pages_says_max_pages(path, monkeypatch):
 
 def test_page_rows_sizes_from_the_last_page_and_grows_back():
     fields = [field_("orders", "INT64", "REPEATED")]
-    # The last page's widest row held 60,000 cells: one row.
+    # The last page's rows held 60,000 cells each (its mean): one row.
     assert (
         query.page_rows(fields, 10_000, last_cells=60_000, last_rows=1, last_bytes=9)
         == 1

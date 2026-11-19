@@ -152,6 +152,77 @@ def test_a_long_row_costs_one_pass_per_doubling_not_one_per_chunk():
     assert calls["n"] <= 12
 
 
+def _passed(
+    body: bytes, chunk: int, take: int
+) -> tuple[dict[str, Any], list[Any], int]:
+    """(the keys, the rows taken, the most bytes buffered): ``take`` rows of
+    data through :meth:`Body.rows`, then the rest through ``pass_rows``."""
+    chunks = iter([body[i : i + chunk] for i in range(0, len(body), chunk)])
+    reader = Body(chunks)
+    most = {"n": 0}
+    fill = reader._fill
+
+    def watched(want: int) -> bool:
+        more = fill(want)
+        most["n"] = max(most["n"], len(reader._buf))
+        return more
+
+    reader._fill = watched  # type: ignore[method-assign]
+    head: dict[str, Any] = {}
+    taken: list[Any] = []
+    for key in reader.members():
+        if key == "data":
+            rows = reader.rows()
+            for _, row in zip(range(take), rows, strict=False):
+                taken.append(row)
+            reader.pass_rows()
+        else:
+            head[key] = reader.value()
+    return head, taken, most["n"]
+
+
+@pytest.mark.parametrize("take", [0, 1, 2, 6])
+@pytest.mark.parametrize("chunk", [*range(1, 12), 64, 1 << 20])
+def test_pass_rows_reads_on_to_the_next_key_however_it_is_chunked(take, chunk):
+    """Brackets and escaped quotes inside strings, split across chunks, and
+    from data's start or after rows taken: the keys after data read the
+    same."""
+    for indent in (None, 2):
+        body = json.dumps(ANSWER, indent=indent).encode()
+        head, taken, _ = _passed(body, chunk, take)
+        assert taken == ROWS[:take]
+        assert head == {k: v for k, v in ANSWER.items() if k != "data"}
+
+
+def test_pass_rows_reads_past_a_row_over_row_bytes_holding_about_a_chunk(monkeypatch):
+    """#46 review seq 14138 nit d: rows passed through meet no row cap (the
+    caller gets none of them), and are let go as they arrive."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    big = MARK + '\\"]["' + "x" * (stream_module.ROW_BYTES * 4)
+    body = json.dumps(
+        {"data": [["0", "a"], ["1", big], ["2", "c"]], "code": "1"}
+    ).encode()
+    with pytest.raises(RowOverCap):
+        _read(body, stream_module.READ_CHUNK)
+    head, taken, most = _passed(body, stream_module.READ_CHUNK, 1)
+    assert (head, taken) == ({"code": "1"}, [["0", "a"]])
+    assert most <= 2 * stream_module.READ_CHUNK + 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"data": [["a"], ["b"',
+        b'{"data": [["a"], ["b\\"]]}',  # an escaped quote: the string goes on
+        b'{"data": {"a": 1}}',
+    ],
+)
+@pytest.mark.parametrize("take", [0, 1])
+def test_pass_rows_refuses_a_body_that_ends_inside_data(body, take):
+    with pytest.raises(BadBody):
+        _passed(body, 2, take)
+
+
 # -- the client and the source ----------------------------------------------------------
 
 
@@ -278,6 +349,78 @@ def test_the_handle_after_the_rows_is_read_when_a_cap_cuts_them():
         if state["canned"] is fake.canned[SQL]
     ]
     assert {e.metadata["query_id"] for e in envelopes} == {handle}
+
+
+def _handle_after_the_rows(fake: FakeSnowflake) -> None:
+    """The SQL statement's POST answers 200 at once, its handle after data,
+    as Snowflake orders an answer's keys."""
+    original = fake._poll
+
+    def handle_last(handle: str) -> FakeResponse:
+        body = json.loads(original(handle).content)
+        meta, data = body.pop("resultSetMetaData"), body.pop("data")
+        return FakeResponse(200, {"resultSetMetaData": meta, "data": data, **body})
+
+    def submitted(body: Any, params: Any) -> FakeResponse:
+        answer = FakeSnowflake._submit(fake, body, params)
+        if body["statement"] != SQL:
+            return answer
+        return handle_last(answer.body["statementHandle"])
+
+    fake._submit = submitted  # type: ignore[method-assign]
+
+
+#: A cut by max_result_bytes at row 1 (row 0 fits 400 bytes, row 1 doesn't),
+#: then a row over ROW_BYTES (64 KiB here) that the caller never gets. (A
+#: cut by max_rows leaves nothing to read through: the POST asks for
+#: ROWS_PER_RESULTSET = max_rows + 1, and Snowflake, like the fake, sends no
+#: more; the one over max_rows is read whole, to say that rows remain.)
+_CUT_THEN_OVER = [["0", "n"], ["1", "y" * 1_000], ["2", MARK * 10_000], ["3", "n"]]
+
+
+def test_rows_read_through_to_the_handle_after_a_cut_meet_no_row_cap(monkeypatch):
+    """#46 review seq 14138 nit d: the POST answers 200 at once, the handle
+    after data, and a cap cuts partition 0's rows. Reading through the rest
+    of it to the handle applied the row cap to rows the caller never gets:
+    RowTooLarge (422) instead of the rows before the cut. Now 1 row,
+    truncated max_result_bytes, with the statement's query_id, as through
+    the 202 polls (the handle known before the rows)."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    fake = _fake(_CUT_THEN_OVER)
+    _handle_after_the_rows(fake)
+    envelopes = _pull(fake, sql=SQL, max_result_bytes=400)
+    assert _ids(envelopes) == [0]
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
+    (handle, *_) = [
+        h
+        for h, state in fake._statements.items()
+        if state["canned"] is fake.canned[SQL]
+    ]
+    assert {e.metadata["query_id"] for e in envelopes} == {handle}
+    # A row over the cap is still refused when the caller would get it.
+    with pytest.raises(RowTooLarge) as raised:
+        _pull(fake, sql=SQL)
+    assert raised.value.row == 2
+
+
+def test_rows_before_the_columns_meet_no_row_cap_until_they_are_read_again(
+    monkeypatch,
+):
+    """The same for rows that come before the columns: they are read
+    through (kept none) and partition 0 read again; only the rows that read
+    takes meet the row cap. A cut at row 1 and a row over ROW_BYTES at row
+    2: RowTooLarge before, 1 row now."""
+    monkeypatch.setattr(stream_module, "ROW_BYTES", 64 * 1024)
+    fake = _fake(_CUT_THEN_OVER)
+    _answer_sql(
+        fake, lambda body: FakeResponse(200, {"data": body.pop("data"), **body})
+    )
+    envelopes = _pull(fake, sql=SQL, max_result_bytes=400)
+    assert _ids(envelopes) == [0]
+    assert {e.metadata["truncated"] for e in envelopes} == {"max_result_bytes"}
+    with pytest.raises(RowTooLarge) as raised:
+        _pull(fake, sql=SQL)
+    assert raised.value.row == 2
 
 
 @pytest.mark.parametrize(

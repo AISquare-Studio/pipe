@@ -199,7 +199,10 @@ def parse_statements(
     apart), so a text refused there is refused for that reason even when it
     would not parse either. It refuses by raising; what it raises propagates
     as it is (never as :class:`Unparsable`), and nothing is parsed then. It is
-    not called when tokenizing fails.
+    not called when tokenizing fails. It gets a copy of the list of tokens
+    (clearing or reordering it changes nothing parsed), but the ``Token``
+    objects in it are the ones parsed: it must not change them (their text,
+    type or comments), or what is parsed is not what sqlglot read.
 
     sqlglot is imported here, not at the top: core does not depend on it."""
     import sqlglot
@@ -214,7 +217,9 @@ def parse_statements(
     except Exception:  # noqa: BLE001 — a tokenizer bug refuses, never admits
         raise Unparsable("sqlglot could not parse it") from None
     if check_tokens is not None:
-        check_tokens(list(tokens))  # a copy: what is parsed stays sqlglot's
+        # A copy of the list only: the Token objects are shared, so
+        # check_tokens must not change them (#50 review seq 14161 n3).
+        check_tokens(list(tokens))
     try:
         with quiet_sqlglot():
             parser = quiet_parser_class(dialect)(dialect=dialect)

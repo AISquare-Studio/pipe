@@ -52,6 +52,11 @@ _ROW = re.compile(rb'\[(?:[^"\[\]{}]++|"(?:[^"\\]++|\\.)*+")*+', re.DOTALL)
 _DECODER = json.JSONDecoder()
 _CLOSE_ROW = ord("]")
 _QUOTE = ord('"')
+# Rows passed through unparsed (Body.pass_rows): between strings, anything
+# but a quote or a bracket; inside one, up to its closing quote (an escape
+# is two bytes, so an escaped quote never ends it).
+_PASS_OUT = re.compile(rb'[^"\[\]]*+')
+_PASS_IN = re.compile(rb'(?:[^"\\]++|\\.)*+', re.DOTALL)
 
 
 class BadBody(Exception):
@@ -73,7 +78,8 @@ class Body:
     """One streamed JSON object body (``chunks``: its bytes, as
     ``iter_content`` gives them). :meth:`members` yields its keys in order;
     after each, read its value with :meth:`value` or :meth:`rows` (or
-    :meth:`skip_rows`) before asking for the next key."""
+    :meth:`pass_rows`, which may also finish what :meth:`rows` began) before
+    asking for the next key."""
 
     def __init__(self, chunks: Iterator[bytes]) -> None:
         self._chunks = chunks
@@ -85,6 +91,9 @@ class Body:
         self.bytes_read = 0
         #: The rows of ``data`` begun so far (a row over the cap included).
         self.rows_read = 0
+        #: Inside ``data``'s array: :meth:`rows` has read its "[" and not
+        #: its "]".
+        self._in_rows = False
 
     # -- reading -------------------------------------------------------------
 
@@ -197,6 +206,7 @@ class Body:
                 raise BadBody("data is not an array")
             return
         self._expect(b"[", "data is an array")
+        self._in_rows = True
         first = True
         while True:
             char = self._peek()
@@ -204,6 +214,7 @@ class Body:
                 raise BadBody("the body ends inside data")
             if char == _CLOSE_ROW:
                 self._pos += 1
+                self._in_rows = False
                 return
             if not first:
                 self._expect(b",", "a comma between rows")
@@ -216,9 +227,46 @@ class Body:
                 # Not an array (a null row, say): read whole, bounded.
                 yield self._decoded(ROW_BYTES, head=False)
 
-    def skip_rows(self) -> int:
-        """Read through the current key's rows, keeping none; their count."""
-        return sum(1 for _ in self.rows())
+    def pass_rows(self) -> None:
+        """Read through the current key's rows, or the rest of them once
+        :meth:`rows` has begun (a caller that stopped taking rows), keeping
+        and parsing none, WHATEVER their size: no row cap applies, since the
+        caller gets none of them (#46 review seq 14138 nit d). Their bytes
+        are scanned for where ``data`` ends and let go as they arrive, so at
+        most about a chunk is buffered. Only that end is checked: a row that
+        isn't ``jsonv2`` passes. :attr:`rows_read` doesn't count them."""
+        if not self._in_rows:
+            if self._peek() == ord("n"):  # "data": null
+                if self._decoded(4, head=True) is not None:
+                    raise BadBody("data is not an array")
+                return
+            self._expect(b"[", "data is an array")
+            self._in_rows = True
+        depth = 1  # inside data's array
+        while True:
+            self._pos = _PASS_OUT.match(self._buf, self._pos).end()  # type: ignore[union-attr]
+            if self._pos == len(self._buf):
+                if not self._fill(1):
+                    raise BadBody("the body ends inside data")
+                continue
+            char = self._buf[self._pos]
+            self._pos += 1
+            if char == _QUOTE:
+                while True:
+                    self._pos = _PASS_IN.match(self._buf, self._pos).end()  # type: ignore[union-attr]
+                    if self._pos < len(self._buf) and self._buf[self._pos] == _QUOTE:
+                        self._pos += 1
+                        break
+                    # The buffer ends inside the string, or on half an escape.
+                    if not self._fill(len(self._buf) - self._pos + 1):
+                        raise BadBody("the body ends inside data")
+            elif char == _CLOSE_ROW:
+                depth -= 1
+                if depth == 0:
+                    self._in_rows = False
+                    return
+            else:  # "["
+                depth += 1
 
     def _row(self) -> list[Any]:
         while True:

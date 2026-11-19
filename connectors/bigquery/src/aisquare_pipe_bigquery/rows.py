@@ -103,6 +103,14 @@ def most_cells(rows: Any) -> int:
     )
 
 
+def mean_cells(rows: Any) -> int:
+    """The mean :func:`rest_cells` a row of a REST page holds, rounded up (0
+    without rows)."""
+    if not isinstance(rows, list) or not rows:
+        return 0
+    return -(-sum(rest_cells(row) for row in rows) // len(rows))
+
+
 def _record(fields: list[dict[str, Any]], row: Any) -> dict[str, Any]:
     cells = row.get("f") if isinstance(row, dict) else None
     cells = cells if isinstance(cells, list) else []
@@ -225,6 +233,7 @@ __all__ = [
     "encoded_result_sha256",
     "encoded_rows_sha256",
     "iter_rows",
+    "mean_cells",
     "millis_rfc3339",
     "most_cells",
     "rest_cells",

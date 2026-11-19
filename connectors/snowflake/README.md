@@ -140,8 +140,7 @@ pull was measured in a process of its own:
 | caps: the same, an emoji in every cell (the worst measured) | 7 | 56 MiB | **177.1 MiB** | 320.0 MiB (5 rows) |
 | defaults: the same | 3 | 24 MiB | 136.6 MiB | 320.0 MiB |
 
-(Caps: `max_rows` 100,000, `max_result_bytes` 64 MiB, `batch_size` 10,000. The review measured 417.9, 467.0 and 229.2
-MiB at 1a8b64e for three of these shapes with a fake that held each answer whole; this fake hands out chunks.)
+(Caps: `max_rows` 100,000, `max_result_bytes` 64 MiB, `batch_size` 10,000.)
 
 **No partition is parsed whole.** Snowflake, not the connector, decides how large a partition is (its docs show one
 of 76 MB uncompressed in one result), and parsing one whole costs about three times its bytes. So a result's body,
@@ -150,8 +149,10 @@ the status answer that carries partition 0 included, is streamed 64 KiB at a tim
 (8 MiB in all at most), and `data`'s rows (`jsonv2`: arrays of strings and nulls) one row at a time. Each row is
 converted, kept as its canonical JSON (about a fifth of the memory a row object takes; the envelopes and hashes are
 byte for byte what they were) and let go; reading stops at `max_rows` or `max_result_bytes`, inside a partition if
-that is where the cap falls, and the partitions after it are never asked for. A batch's rows are let go once its
-envelope is built.
+that is where the cap falls, and the partitions after it are never asked for. (When the statement's handle comes
+after the rows, as in a result the POST answered at once, the rest of that partition is read through to it, scanned
+and let go unparsed: no row cap applies to rows the caller never gets. The same for rows that come before the
+columns, which partition 0, asked for again, then gives.) A batch's rows are let go once its envelope is built.
 
 So a pull peaks at about 1.15 times the rows' JSON plus the row being read, whatever the partitions: 74 MiB at the
 caps for ordinary rows. A row may be at most 8 MiB of JSON (`ROW_BYTES`; one over it is `RowTooLarge`, a 422, with
